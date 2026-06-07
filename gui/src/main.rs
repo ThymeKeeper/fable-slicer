@@ -36,6 +36,11 @@ struct App {
     view_preview: bool,
     /// Highest layer shown in preview (1-based).
     preview_layer: usize,
+    show_walls: bool,
+    show_solid: bool,
+    show_infill: bool,
+    show_skirt: bool,
+    show_travel: bool,
     needs_rebuild: bool,
 }
 
@@ -64,8 +69,33 @@ impl App {
             layer_ends: Vec::new(),
             view_preview: false,
             preview_layer: 1,
+            show_walls: true,
+            show_solid: true,
+            show_infill: true,
+            show_skirt: true,
+            show_travel: false,
             needs_rebuild: true,
         }
+    }
+
+    fn category_mask(&self) -> u32 {
+        let mut m = 0u32;
+        if self.show_skirt {
+            m |= 1;
+        }
+        if self.show_walls {
+            m |= 1 << 1;
+        }
+        if self.show_solid {
+            m |= 1 << 2;
+        }
+        if self.show_infill {
+            m |= 1 << 3;
+        }
+        if self.show_travel {
+            m |= 1 << 4;
+        }
+        m
     }
 
     fn reresolve(&mut self) {
@@ -205,6 +235,14 @@ impl eframe::App for App {
                 if self.view_preview {
                     ui.add(egui::Slider::new(&mut self.preview_layer, 1..=n_layers).text("layer"));
                     ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
+                    ui.add_space(2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut self.show_walls, "walls");
+                        ui.checkbox(&mut self.show_solid, "solid");
+                        ui.checkbox(&mut self.show_infill, "infill");
+                        ui.checkbox(&mut self.show_skirt, "skirt");
+                        ui.checkbox(&mut self.show_travel, "travel");
+                    });
                 }
                 ui.separator();
             }
@@ -242,12 +280,21 @@ impl eframe::App for App {
             self.scene.resize(&rs, w, h);
             let aspect = rect.width() / rect.height().max(1.0);
             let show_mesh = !(self.view_preview && self.sliced.is_some());
-            let toolpath_count = if self.view_preview {
-                self.layer_ends.get(self.preview_layer.saturating_sub(1)).copied().unwrap_or(0)
+            let preview = if self.view_preview && self.sliced.is_some() {
+                let n = self.layer_ends.len();
+                let count = self.layer_ends.get(self.preview_layer.saturating_sub(1)).copied().unwrap_or(0);
+                // Dim lower layers only when the slider is below the top.
+                let dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
+                Some(render::Preview {
+                    count,
+                    current_layer: self.preview_layer as f32,
+                    dim,
+                    mask: self.category_mask(),
+                })
             } else {
-                0
+                None
             };
-            self.scene.render(&rs, self.camera.view_proj(aspect), show_mesh, toolpath_count);
+            self.scene.render(&rs, self.camera.view_proj(aspect), show_mesh, preview);
 
             ui.painter().image(
                 self.scene.texture_id(),
@@ -275,32 +322,67 @@ fn combo(ui: &mut egui::Ui, label: &str, current: &mut String, options: &[String
 
 /// Flatten sliced layers into line-segment vertices (`[x,y,z,r,g,b]`, consecutive
 /// pairs = segments) plus a cumulative per-layer vertex count for the layer slider.
-fn build_toolpaths(layers: &[engine::LayerPlan]) -> (Vec<[f32; 6]>, Vec<u32>) {
-    let mut verts: Vec<[f32; 6]> = Vec::new();
+// Category ids — must match the bit positions in `App::category_mask`.
+const CAT_SKIRT: f32 = 0.0;
+const CAT_WALLS: f32 = 1.0;
+const CAT_SOLID: f32 = 2.0;
+const CAT_INFILL: f32 = 3.0;
+const CAT_TRAVEL: f32 = 4.0;
+
+/// Flatten sliced layers into line-segment vertices `[x,y,z,r,g,b,layer,category]`
+/// (consecutive pairs = segments), plus a cumulative per-layer vertex count for
+/// the layer slider. Travel (positioning) moves between paths are included as
+/// their own category so they can be toggled.
+fn build_toolpaths(layers: &[engine::LayerPlan]) -> (Vec<[f32; 8]>, Vec<u32>) {
+    let mut verts: Vec<[f32; 8]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
-    for layer in layers {
+    let travel_color = [0.45, 0.75, 0.85];
+    let mut prev_end: Option<geo2d::Point> = None;
+
+    for (li, layer) in layers.iter().enumerate() {
+        let layer_id = (li + 1) as f32; // 1-based, matches preview_layer
         let z = layer.print_z_mm as f32;
         for path in &layer.paths {
             if path.points.len() < 2 {
                 continue;
             }
+            if let Some(pe) = prev_end {
+                push_seg(&mut verts, pe, path.points[0], z, travel_color, layer_id, CAT_TRAVEL);
+            }
             let c = color_for(path.kind);
+            let cat = category_of(path.kind);
             for w in path.points.windows(2) {
-                push_seg(&mut verts, w[0], w[1], z, c);
+                push_seg(&mut verts, w[0], w[1], z, c, layer_id, cat);
             }
             if path.closed {
                 let last = path.points[path.points.len() - 1];
-                push_seg(&mut verts, last, path.points[0], z, c);
+                push_seg(&mut verts, last, path.points[0], z, c, layer_id, cat);
             }
+            prev_end = Some(if path.closed {
+                path.points[0]
+            } else {
+                path.points[path.points.len() - 1]
+            });
         }
         ends.push(verts.len() as u32);
     }
     (verts, ends)
 }
 
-fn push_seg(v: &mut Vec<[f32; 6]>, a: geo2d::Point, b: geo2d::Point, z: f32, c: [f32; 3]) {
-    v.push([a.x_mm() as f32, a.y_mm() as f32, z, c[0], c[1], c[2]]);
-    v.push([b.x_mm() as f32, b.y_mm() as f32, z, c[0], c[1], c[2]]);
+#[allow(clippy::too_many_arguments)]
+fn push_seg(v: &mut Vec<[f32; 8]>, a: geo2d::Point, b: geo2d::Point, z: f32, c: [f32; 3], layer: f32, cat: f32) {
+    v.push([a.x_mm() as f32, a.y_mm() as f32, z, c[0], c[1], c[2], layer, cat]);
+    v.push([b.x_mm() as f32, b.y_mm() as f32, z, c[0], c[1], c[2], layer, cat]);
+}
+
+fn category_of(kind: engine::PathKind) -> f32 {
+    use engine::PathKind::*;
+    match kind {
+        Skirt => CAT_SKIRT,
+        ExternalPerimeter | Perimeter => CAT_WALLS,
+        Solid => CAT_SOLID,
+        Infill => CAT_INFILL,
+    }
 }
 
 fn color_for(kind: engine::PathKind) -> [f32; 3] {

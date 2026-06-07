@@ -1,9 +1,12 @@
 //! wgpu renderer for the 3D viewport.
 //!
-//! Renders the scene (bed grid + model) into an offscreen color+depth texture,
-//! then hands that color texture to egui as a native texture to draw in the
-//! central panel. Doing our own pass (rather than egui's callback) gives us a
-//! depth buffer for correct 3D occlusion.
+//! Renders the scene (bed grid + model, or sliced toolpaths) into an offscreen
+//! color+depth texture, then hands that to egui as a native texture. Our own pass
+//! gives a depth buffer for correct 3D occlusion.
+//!
+//! Toolpaths carry a per-vertex layer index and path category, so the layer
+//! slider, per-category visibility, and "dim other layers" are all done in the
+//! shader from uniforms — scrubbing/toggling never rebuilds the buffer.
 
 use std::borrow::Cow;
 
@@ -16,9 +19,16 @@ use eframe::wgpu::util::DeviceExt;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 const SHADER: &str = r#"
-struct U { mvp: mat4x4<f32>, light: vec4<f32> };
+struct U {
+    mvp: mat4x4<f32>,
+    light: vec4<f32>,
+    // x = current (top visible) layer, y = dim factor for lower layers,
+    // z = category visibility bitmask, w = unused
+    ctrl: vec4<f32>,
+};
 @group(0) @binding(0) var<uniform> u: U;
 
+// --- mesh (shaded) ---
 struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
 @vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> MeshOut {
     var o: MeshOut;
@@ -33,6 +43,7 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
 }
 
+// --- plain lines (bed grid) ---
 struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f32> };
 @vertex fn vs_line(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>) -> LineOut {
     var o: LineOut;
@@ -42,6 +53,30 @@ struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f3
 }
 @fragment fn fs_line(i: LineOut) -> @location(0) vec4<f32> {
     return vec4<f32>(i.color, 1.0);
+}
+
+// --- toolpaths (layer-aware, category-filtered) ---
+struct TpOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) @interpolate(flat) layer: f32,
+    @location(2) @interpolate(flat) cat: f32,
+};
+@vertex fn vs_tp(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>, @location(2) lc: vec2<f32>) -> TpOut {
+    var o: TpOut;
+    o.clip = u.mvp * vec4<f32>(p, 1.0);
+    o.color = c;
+    o.layer = lc.x;
+    o.cat = lc.y;
+    return o;
+}
+@fragment fn fs_tp(i: TpOut) -> @location(0) vec4<f32> {
+    let mask = u32(u.ctrl.z + 0.5);
+    let cat = u32(i.cat + 0.5);
+    if ((mask & (1u << cat)) == 0u) { discard; }
+    var b = 1.0;
+    if (i.layer < u.ctrl.x - 0.5) { b = u.ctrl.y; } // below the current layer: dim
+    return vec4<f32>(i.color * b, 1.0);
 }
 "#;
 
@@ -64,12 +99,26 @@ struct LineVertex {
 struct Uniforms {
     mvp: [[f32; 4]; 4],
     light: [f32; 4],
+    ctrl: [f32; 4],
+}
+
+/// What/how to draw the toolpaths this frame.
+pub struct Preview {
+    /// Number of toolpath vertices to draw (through the current layer).
+    pub count: u32,
+    /// Current (top visible) layer, 1-based.
+    pub current_layer: f32,
+    /// Brightness multiplier for layers below the current one (1.0 = no dim).
+    pub dim: f32,
+    /// Category visibility bitmask (bit per category id).
+    pub mask: u32,
 }
 
 pub struct Scene {
     format: wgpu::TextureFormat,
     mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    toolpath_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     size: (u32, u32),
@@ -142,6 +191,12 @@ impl Scene {
             &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
             wgpu::PrimitiveTopology::LineList,
         );
+        let toolpath_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_tp", "fs_tp",
+            (8 * 4) as u64,
+            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+            wgpu::PrimitiveTopology::LineList,
+        );
 
         let (color_view, depth_view) = make_targets(device, format, 1, 1);
         let tex_id = rs.renderer.write().register_native_texture(
@@ -154,6 +209,7 @@ impl Scene {
             format,
             mesh_pipeline,
             line_pipeline,
+            toolpath_pipeline,
             uniform_buf,
             bind_group,
             size: (1, 1),
@@ -232,7 +288,6 @@ impl Scene {
             v.push(LineVertex { pos: [bed_x, y, 0.0], color: grid });
             y += step;
         }
-        // border
         let corners = [[0.0, 0.0], [bed_x, 0.0], [bed_x, bed_y], [0.0, bed_y]];
         for k in 0..4 {
             let a = corners[k];
@@ -244,17 +299,22 @@ impl Scene {
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
     }
 
-    /// Upload toolpath line vertices (`[x, y, z, r, g, b]` per vertex; consecutive
-    /// pairs form segments). `render`'s `toolpath_count` limits how many are drawn.
-    pub fn set_toolpaths(&mut self, device: &wgpu::Device, verts: &[[f32; 6]]) {
+    /// Upload toolpath vertices: `[x, y, z, r, g, b, layer, category]` each;
+    /// consecutive pairs form segments.
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, verts: &[[f32; 8]]) {
         self.toolpath_total = verts.len() as u32;
         self.toolpath_vbuf = make_vbuf(device, "toolpath_vbuf", bytemuck::cast_slice(verts));
     }
 
-    pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, toolpath_count: u32) {
+    pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, preview: Option<Preview>) {
+        let ctrl = match &preview {
+            Some(p) => [p.current_layer, p.dim, p.mask as f32, 0.0],
+            None => [0.0, 1.0, 0.0, 0.0],
+        };
         let uniforms = Uniforms {
             mvp: view_proj.to_cols_array_2d(),
             light: [0.4, 0.5, 0.85, 0.0],
+            ctrl,
         };
         rs.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -286,19 +346,24 @@ impl Scene {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
+
             if let Some(buf) = &self.line_vbuf {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.line_count, 0..1);
             }
-            let tp = toolpath_count.min(self.toolpath_total);
-            if tp > 0 {
-                if let Some(buf) = &self.toolpath_vbuf {
-                    pass.set_pipeline(&self.line_pipeline);
-                    pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..tp, 0..1);
+
+            if let Some(p) = &preview {
+                let count = p.count.min(self.toolpath_total);
+                if count > 0 {
+                    if let Some(buf) = &self.toolpath_vbuf {
+                        pass.set_pipeline(&self.toolpath_pipeline);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.draw(0..count, 0..1);
+                    }
                 }
             }
+
             if show_mesh {
                 if let Some(buf) = &self.mesh_vbuf {
                     pass.set_pipeline(&self.mesh_pipeline);
