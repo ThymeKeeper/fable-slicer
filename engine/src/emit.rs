@@ -379,7 +379,11 @@ fn visible(outline: &Polygons, p: Point, q: Point) -> bool {
     in_region(outline, mid) && !travel_crosses(outline, p, q)
 }
 
+/// Above this many outline vertices, skip the O(n²) diagonal precompute and
+/// route along the boundary only (still inside the part, never through a hole).
 const COMB_VERT_CAP: usize = 600;
+/// Hard ceiling for routing at all (beyond this, fall back to retract).
+const ROUTE_CAP: usize = 3000;
 
 /// Per-layer visibility graph over the outline vertices, used to route combing
 /// travels that would otherwise cross a wall.
@@ -430,7 +434,7 @@ impl CombGraph {
     /// (intermediates + `b`), or None if unreachable.
     fn route(&self, outline: &Polygons, a: Point, b: Point) -> Option<Vec<Point>> {
         let n = self.verts.len();
-        if n == 0 || n > COMB_VERT_CAP {
+        if n == 0 || n > ROUTE_CAP {
             return None;
         }
         let (ai, bi) = (n, n + 1);

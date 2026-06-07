@@ -10,7 +10,7 @@
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
 use config::{InfillPattern, SeamMode, Settings};
-use geo2d::{difference, intersection, offset, simplify, to_units, union, Point, Polygons};
+use geo2d::{difference, intersection, offset, to_units, union, Point, Polygons};
 use mesh::Mesh;
 
 use crate::{slice_mesh, SliceParams};
@@ -144,7 +144,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             print_z_mm: layers[i].print_z_mm,
             height_mm: layers[i].height_mm,
             paths,
-            outline: simplify(&layers[i].polygons, 0.2),
+            // Inset a touch so combing routes keep clearance from real walls/holes
+            // (offset also simplifies, keeping the visibility graph small).
+            outline: offset(&layers[i].polygons, -0.1),
             speed_scale: 1.0,
         });
     }
@@ -250,7 +252,9 @@ fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
     for k in 0..settings.skirt_loops {
         let delta = brim_extent + settings.skirt_gap_mm + lw * (0.5 + k as f64);
         for c in offset(first_layer, delta).contours {
-            if c.points.len() >= 3 {
+            // Outer loops only (CCW) — offsetting outward also shrinks holes into
+            // loops inside the part's holes, which we must not print.
+            if c.points.len() >= 3 && c.is_ccw() {
                 paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
             }
         }
@@ -266,7 +270,8 @@ fn brim_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
     for k in 0..settings.brim_loops {
         let delta = lw * (0.5 + k as f64);
         for c in offset(first_layer, delta).contours {
-            if c.points.len() >= 3 {
+            // Outer loops only — don't print brim loops inside the part's holes.
+            if c.points.len() >= 3 && c.is_ccw() {
                 paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
             }
         }
