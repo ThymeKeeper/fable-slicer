@@ -113,13 +113,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
 
             if !solid.is_empty() {
-                for seg in infill_lines(&solid, angle, lw) {
+                // drop_isolated: a solid line with no neighbour beside it is a
+                // lone strand — skip it.
+                for seg in infill_lines(&solid, angle, lw, true) {
                     paths.push(ToolPath { kind: PathKind::Solid, closed: false, width_mm: lw, points: seg });
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
                 let spacing = lw / settings.infill_density;
-                for seg in infill_lines(&sparse, angle, spacing) {
+                for seg in infill_lines(&sparse, angle, spacing, false) {
                     paths.push(ToolPath { kind: PathKind::Infill, closed: false, width_mm: lw, points: seg });
                 }
             }
@@ -211,7 +213,7 @@ fn center_on_bed(plans: &mut [LayerPlan], mesh: &Mesh, settings: &Settings) {
 /// Generate straight infill lines at `angle_deg`, spaced `spacing_mm` apart,
 /// clipped to `region` via an even-odd scanline. The region is rotated so infill
 /// lines become horizontal scanlines, then results are rotated back.
-fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<Point>> {
+fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, drop_isolated: bool) -> Vec<Vec<Point>> {
     let theta = angle_deg.to_radians();
     let (ct, st) = (theta.cos(), theta.sin());
     let rot = |x: f64, y: f64| (x * ct + y * st, -x * st + y * ct);
@@ -238,7 +240,9 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<P
         return Vec::new();
     }
 
-    let mut out = Vec::new();
+    // Collect the inside-intervals of each scanline (in the rotated frame).
+    let mut rows: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
     let mut y = ymin + spacing_mm * 0.5;
     while y < ymax {
         let mut xs: Vec<f64> = Vec::new();
@@ -251,18 +255,43 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<P
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
+        let mut row = Vec::new();
         let mut k = 0;
         while k + 1 < xs.len() {
             let (x0, x1) = (xs[k], xs[k + 1]);
             // Skip dabs shorter than this — not worth extruding.
             if x1 - x0 > 0.5 {
-                let (px0, py0) = unrot(x0, y);
-                let (px1, py1) = unrot(x1, y);
-                out.push(vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)]);
+                row.push((x0, x1));
             }
             k += 2;
         }
+        rows.push(row);
+        ys.push(y);
         y += spacing_mm;
+    }
+
+    // Two intervals "sit beside each other" if their x-ranges overlap.
+    let overlaps = |s: (f64, f64), others: &[(f64, f64)]| {
+        others.iter().any(|&(a0, a1)| a0 < s.1 && s.0 < a1)
+    };
+
+    let mut out = Vec::new();
+    for k in 0..rows.len() {
+        for &(x0, x1) in &rows[k] {
+            // For solid fill, drop a line with no neighbouring line on either
+            // adjacent scanline — a lone strand that serves no purpose.
+            if drop_isolated {
+                let above = k + 1 < rows.len() && overlaps((x0, x1), &rows[k + 1]);
+                let below = k > 0 && overlaps((x0, x1), &rows[k - 1]);
+                if !above && !below {
+                    continue;
+                }
+            }
+            let yk = ys[k];
+            let (px0, py0) = unrot(x0, yk);
+            let (px1, py1) = unrot(x1, yk);
+            out.push(vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)]);
+        }
     }
     out
 }
