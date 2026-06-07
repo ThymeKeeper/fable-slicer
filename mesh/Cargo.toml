@@ -1,0 +1,8 @@
+[package]
+name = "mesh"
+description = "Triangle mesh storage and STL I/O for the slicer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

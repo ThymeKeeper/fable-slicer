@@ -1,0 +1,8 @@
+[package]
+name = "gcode"
+description = "G-code AST, writer, and motion-sim time estimator (stub until M1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

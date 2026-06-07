@@ -1,0 +1,8 @@
+[package]
+name = "geo2d"
+description = "Integer 2D geometry primitives (Clipper-space polygons) for the slicer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

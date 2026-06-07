@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+description = "Slicer core: mesh -> layers -> (walls, infill) -> toolpaths -> g-code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+geo2d = { workspace = true }
+mesh = { workspace = true }

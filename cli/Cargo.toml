@@ -1,0 +1,17 @@
+[package]
+name = "cli"
+description = "Command-line front-end for the slicer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slicer"
+path = "src/main.rs"
+
+[dependencies]
+geo2d = { workspace = true }
+mesh = { workspace = true }
+engine = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

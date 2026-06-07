@@ -1,0 +1,36 @@
+# Workspace manifest.
+#
+# Crate layout (see docs/ARCHITECTURE.md):
+#   geo2d   - integer 2D geometry ("Clipper space"): points, contours, polygons
+#   mesh    - triangle mesh: STL I/O, indexed storage, primitives
+#   engine  - the slicer core: mesh -> layers -> walls -> infill -> toolpaths -> gcode
+#   gcode   - g-code AST, writer, motion-sim time estimate            (stub until M1)
+#   config  - printer/filament/process profile system                  (stub until M2)
+#   cli     - command-line front-end (binary: `slicer`)
+#
+# Project name is a placeholder; crate names are intentionally brand-neutral so a
+# rename costs nothing.
+[workspace]
+resolver = "2"
+members = ["geo2d", "mesh", "engine", "gcode", "config", "cli"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+geo2d = { path = "geo2d" }
+mesh = { path = "mesh" }
+engine = { path = "engine" }
+gcode = { path = "gcode" }
+config = { path = "config" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# Optimize geometry-heavy code even in dev so slicing big meshes stays usable.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
