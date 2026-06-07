@@ -9,6 +9,7 @@
 //! Still to come (see PLAN.md): top/bottom solid surfaces, retraction/combing,
 //! supports, variable layers, etc.
 
+mod arc;
 mod emit;
 mod plan;
 mod slice;

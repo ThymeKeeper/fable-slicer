@@ -501,7 +501,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         ExternalPerimeter | Perimeter => CAT_WALLS,
         Solid => CAT_SOLID,
         Infill => CAT_INFILL,
-        Support => CAT_SUPPORT,
+        Support | Bridge => CAT_SUPPORT,
     }
 }
 
@@ -514,5 +514,6 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Solid => [0.94, 0.80, 0.24],
         Infill => [0.32, 0.62, 0.95],
         Support => [0.55, 0.40, 0.70],
+        Bridge => [0.20, 0.85, 0.85],
     }
 }

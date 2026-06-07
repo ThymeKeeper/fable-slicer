@@ -87,7 +87,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 ### M4 — Supports & bridging
 - [x] Overhang detection: per-layer region not over the layer below within a printable cantilever (`support_overhang_angle_deg` from vertical ⇒ `h·tan(angle)`); thin slivers removed via morphological open
 - [x] Normal **grid supports**: project overhangs downward, sparse-line fill (`PathKind::Support`) with XY clearance from the part; `--support none|grid|arc`, GUI picker + "support" preview category (`gen_overhang` fixture). Interface layer + z-gap for clean removal still TODO.
-- [~] **Arc overhangs** (no-support option, McCulloch technique): fill flat overhangs with self-supporting concentric arcs seeded on the supported edge — *in progress* (`SupportMode::Arc`)
+- [x] **Arc overhangs** (no-support option, McCulloch technique): flat interior overhangs are filled with self-supporting concentric arcs (grid-tracked BFS flood fill, seeded on the supported edge, spaced by line width, `rmax` 40mm), printed slow as `PathKind::Bridge`; `--support arc` / GUI. Verified on `gen_overhang`: bridge layer arc-filled, no structure below. (v1: interior only — perimeters over overhangs still print normal; no per-feature cold/fan yet.)
 - [ ] Support painting (manual enforce/block) — API-level
 - [ ] Bridge detection; bridge flow/speed/fan; bridge line orientation along shortest span
 

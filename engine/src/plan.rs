@@ -15,6 +15,9 @@ use mesh::Mesh;
 
 use crate::{slice_mesh, Layer, SliceParams};
 
+/// Max arc radius for arc-overhangs (mm) — larger arcs bulge/sag.
+const ARC_RMAX_MM: f64 = 40.0;
+
 /// What a toolpath represents — drives speed, ordering, and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathKind {
@@ -28,6 +31,8 @@ pub enum PathKind {
     Infill,
     /// Removable support structure under overhangs.
     Support,
+    /// Self-supporting arc fill over a flat overhang (arc-overhang technique).
+    Bridge,
 }
 
 /// A single continuous extrusion path.
@@ -134,11 +139,35 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 Polygons::new()
             };
-            let solid = union(&solid_top, &solid_bottom);
-            let sparse = difference(inner, &solid);
+            // Arc-overhang mode: the flat unsupported part of this layer's interior
+            // is filled with self-supporting arcs instead of normal fill.
+            let arc_region = if settings.support_mode == SupportMode::Arc && i > 0 {
+                let allowance =
+                    settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+                let supported_below = offset(&layers[i - 1].polygons, allowance);
+                let oh = difference(&layers[i].polygons, &supported_below);
+                let oh = offset(&offset(&oh, -lw), lw); // open: drop slivers
+                intersection(&oh, inner)
+            } else {
+                Polygons::new()
+            };
+
+            let solid_all = union(&solid_top, &solid_bottom);
+            let solid = difference(&solid_all, &arc_region);
+            let sparse = difference(&difference(inner, &solid_all), &arc_region);
 
             // Alternate fill direction per layer for cross-hatching.
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
+
+            if !arc_region.is_empty() {
+                // Anchor the arcs on the supported interior they border.
+                let anchor = difference(inner, &arc_region);
+                for seg in crate::arc::arc_fill(&arc_region, &anchor, lw, ARC_RMAX_MM) {
+                    if seg.len() >= 2 {
+                        paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
+                    }
+                }
+            }
 
             if !solid.is_empty() {
                 // A perimeter loop following the solid region's boundary (so where
@@ -207,7 +236,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// projected downward and the support area (minus the part + clearance) is filled
 /// with sparse lines as `PathKind::Support`.
 fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
-    if settings.support_mode == SupportMode::None {
+    // Arc mode fills overhangs on-layer (in pass 2); only Grid adds structure below.
+    if settings.support_mode != SupportMode::Grid {
         return;
     }
     let n = layers.len();
