@@ -10,7 +10,7 @@
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
 use config::{InfillPattern, SeamMode, Settings, SupportMode};
-use geo2d::{difference, intersection, offset, simplify, to_units, union, Point, Polygons};
+use geo2d::{difference, intersection, offset, simplify, to_units, union, Contour, Point, Polygons};
 use mesh::Mesh;
 
 use crate::{slice_mesh, Layer, SliceParams};
@@ -163,14 +163,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 let supported_below = offset(&layers[i - 1].polygons, allowance);
-                // A true bridge (supported ≥2 sides) narrow enough to span gets
-                // straight bridge lines across the gap; everything else (a wide
-                // bridge, or a cantilever) is arc-filled, seeded only on support.
-                let segs = try_bridge(&arc_region, &supported_below, lw, settings.max_bridge_span_mm)
-                    .unwrap_or_else(|| crate::arc::arc_fill(&arc_region, &supported_below, lw, ARC_RMAX_MM));
-                for seg in segs {
-                    if seg.len() >= 2 {
-                        paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
+                // Decide per disjoint island: a short two-sided gap bridges with
+                // straight lines even if a wider gap on the same layer needs arcs;
+                // everything else (wide bridge, cantilever) is arc-filled.
+                for island in islands(&arc_region) {
+                    let segs = try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm)
+                        .unwrap_or_else(|| crate::arc::arc_fill(&island, &supported_below, lw, ARC_RMAX_MM));
+                    for seg in segs {
+                        if seg.len() >= 2 {
+                            paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
+                        }
                     }
                 }
             }
@@ -302,6 +304,26 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
             accum = union(&accum, &overhang[i + gap]);
         }
     }
+}
+
+/// Split a region into its disjoint islands (each CCW outer plus the holes inside
+/// it), so each can be handled — bridged or arc-filled — independently.
+fn islands(polys: &Polygons) -> Vec<Polygons> {
+    let outers: Vec<&Contour> = polys.contours.iter().filter(|c| c.points.len() >= 3 && c.is_ccw()).collect();
+    let holes: Vec<&Contour> = polys.contours.iter().filter(|c| c.points.len() >= 3 && !c.is_ccw()).collect();
+    outers
+        .iter()
+        .map(|o| {
+            let mut isl = Polygons::new();
+            isl.push((*o).clone());
+            for h in &holes {
+                if o.contains(h.points[0]) {
+                    isl.push((*h).clone());
+                }
+            }
+            isl
+        })
+        .collect()
 }
 
 /// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
@@ -719,6 +741,27 @@ mod tests {
         let region = rect(0.0, 0.0, 6.0, 6.0);
         let supported = rect(-3.0, -3.0, 9.0, 0.0);
         assert!(try_bridge(&region, &supported, 0.45, 6.0).is_none(), "one-sided support can't bridge");
+    }
+
+    #[test]
+    fn islands_splits_disjoint_gaps() {
+        // Two separate gaps must be decided independently (small → lines, wide → arcs).
+        let mut p = rect(0.0, 0.0, 4.0, 18.0);
+        p.contours.extend(rect(20.0, 0.0, 40.0, 18.0).contours);
+        let isl = islands(&p);
+        assert_eq!(isl.len(), 2, "two disjoint gaps → two islands");
+        let supported = {
+            let mut s = rect(-3.0, 0.0, 0.0, 18.0);
+            s.contours.extend(rect(4.0, 0.0, 7.0, 18.0).contours);
+            s.contours.extend(rect(17.0, 0.0, 20.0, 18.0).contours);
+            s.contours.extend(rect(40.0, 0.0, 43.0, 18.0).contours);
+            s
+        };
+        // 4mm island bridges; 20mm island does not.
+        let narrow = if isl[0].bounds().unwrap().width() < isl[1].bounds().unwrap().width() { &isl[0] } else { &isl[1] };
+        let wide = if std::ptr::eq(narrow, &isl[0]) { &isl[1] } else { &isl[0] };
+        assert!(try_bridge(narrow, &supported, 0.45, 6.0).is_some(), "4mm gap should bridge");
+        assert!(try_bridge(wide, &supported, 0.45, 6.0).is_none(), "20mm gap should not");
     }
 
     #[test]
