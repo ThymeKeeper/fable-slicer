@@ -110,6 +110,9 @@ pub struct Settings {
     /// Thickness of the first layer (often thicker for bed adhesion).
     pub first_layer_height_mm: f64,
     pub line_width_mm: f64,
+    /// Merge contour points whose deviation is below this (mm) before planning —
+    /// removes sub-resolution mesh-facet noise. 0 disables.
+    pub max_resolution_mm: f64,
     pub wall_count: usize,
     pub top_layers: usize,
     pub bottom_layers: usize,
@@ -165,6 +168,7 @@ impl Default for Settings {
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             line_width_mm: 0.45,
+            max_resolution_mm: 0.05,
             wall_count: 2,
             top_layers: 4,
             bottom_layers: 4,

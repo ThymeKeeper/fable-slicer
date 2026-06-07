@@ -53,6 +53,7 @@ pub struct ProcessProfile {
     pub layer_height_mm: Option<f64>,
     pub first_layer_height_mm: Option<f64>,
     pub line_width_mm: Option<f64>,
+    pub max_resolution_mm: Option<f64>,
     pub wall_count: Option<usize>,
     pub top_layers: Option<usize>,
     pub bottom_layers: Option<usize>,
@@ -109,7 +110,7 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
-            wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
+            max_resolution_mm, wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s,
             min_layer_time_s, min_print_speed_mm_s)
     }
@@ -177,6 +178,7 @@ impl Profiles {
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
             line_width_mm: pc.line_width_mm.unwrap_or(d.line_width_mm),
+            max_resolution_mm: pc.max_resolution_mm.unwrap_or(d.max_resolution_mm),
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),

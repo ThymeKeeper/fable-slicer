@@ -79,6 +79,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Per-feature speeds (external perimeter slowed) + min-layer-time cooling: layers faster than `min_layer_time_s` slow to a floor speed (per-layer `speed_scale`)
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
 - [x] Travel ordering (nearest-neighbour) + **combing**: travels are planned once (`emit::plan_travels`) and stored on each layer, so g-code and the GUI preview share one source of truth (preview renders the *actual* combed routes, not naive straight lines). A travel that would cross a wall is rerouted via a per-layer visibility graph over the layer outline, routing around holes; a travel with no in-region route (between separate islands, across a void) retracts and **z-hops** over the gap. Benchy: travel 67m→17m, retractions 5587→~400 (all z-hopped).
+- [x] Contour-resolution cleanup: merge sub-`max_resolution_mm` (0.05) mesh-facet noise after slicing — cleaner walls/preview, faster planning. Benchy g-code 236k→126k lines. (`dump_layer` example inspects a layer's raw contour roughness.)
 - [ ] Gap fill between colliding offsets
 - [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate; shown in GUI status + CLI
 - [ ] Coasting / wipe

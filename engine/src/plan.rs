@@ -69,13 +69,20 @@ pub struct LayerPlan {
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
-    let layers = slice_mesh(
+    let mut layers = slice_mesh(
         mesh,
         SliceParams {
             layer_height_mm: settings.layer_height_mm,
             first_layer_height_mm: settings.first_layer_height_mm,
         },
     );
+    // Contour-resolution cleanup: drop sub-resolution mesh-facet noise so walls
+    // aren't over-dense (cleaner preview, faster planning, smaller g-code).
+    if settings.max_resolution_mm > 0.0 {
+        for layer in &mut layers {
+            layer.polygons = simplify(&layer.polygons, settings.max_resolution_mm);
+        }
+    }
     let lw = settings.line_width_mm;
     let n = layers.len();
 
