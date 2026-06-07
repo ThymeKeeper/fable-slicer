@@ -103,7 +103,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
                 chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
                 continue; // radius limit — continue from the fan's frontier
             }
-            let (grew, ring_far) = draw_ring(f, &g, &kind, &mut owner, &mut unfilled, &mut arcs);
+            let (grew, ring_far) = draw_ring(f, region, &g, &kind, &mut owner, &mut unfilled, &mut arcs);
             if grew {
                 next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far), empty: 0 });
             } else if f.empty + 1 < EMPTY_LIMIT {
@@ -184,7 +184,7 @@ impl Grid {
 /// overhang that are unfilled or already this fan's. Runs break at the region
 /// edge, anchor cells, and other fans' cells. A run is emitted (and its unfilled
 /// cells claimed) only if it touches still-unfilled region.
-fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> (bool, Option<(f64, f64)>) {
+fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> (bool, Option<(f64, f64)>) {
     // Sample finer than a cell so the ring doesn't skip cells (aliasing leaves
     // 1-cell gaps that would otherwise need fragment fills).
     let dtheta = (g.cell * 0.5 / f.r).clamp(0.005, 0.4);
@@ -247,10 +247,57 @@ fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut
             }
         }
     }
-    for (p, _) in emitted {
+    // Snap each arc's ends to where the ring actually crosses the region boundary
+    // (against the polygon), so arcs reach the edge instead of stopping a sample
+    // short. Capped, so a run that ended at a seam only overlaps a touch.
+    let ext = (dtheta * 2.0).min(0.15);
+    for (mut p, _) in emitted {
+        let n = p.len();
+        if n >= 2 {
+            let pre = snap_end(p[0], f, -1.0, region, ext);
+            if (pre.x - p[0].x, pre.y - p[0].y) != (0, 0) {
+                p.insert(0, pre);
+            }
+            let last = p[p.len() - 1];
+            let post = snap_end(last, f, 1.0, region, ext);
+            if (post.x - last.x, post.y - last.y) != (0, 0) {
+                p.push(post);
+            }
+        }
         arcs.push(p);
     }
     (true, chain)
+}
+
+/// Push `p` (a ring endpoint, in the fan's frame) outward around the seed by up to
+/// `max_ext` radians (sign `dir`) and return the farthest position still inside the
+/// region — i.e. the point where the ring meets the region boundary.
+fn snap_end(p: Point, f: &Front, dir: f64, region: &Polygons, max_ext: f64) -> Point {
+    let rot = |da: f64| -> (f64, f64) {
+        let (dx, dy) = (p.x_mm() - f.x, p.y_mm() - f.y);
+        let (c, s) = ((dir * da).cos(), (dir * da).sin());
+        (f.x + dx * c - dy * s, f.y + dx * s + dy * c)
+    };
+    let inside = |da: f64| {
+        let (x, y) = rot(da);
+        in_poly(region, x, y)
+    };
+    // If the whole extension stays inside (a seam, not the boundary), cap it there.
+    if inside(max_ext) {
+        let (x, y) = rot(max_ext);
+        return Point::from_mm(x, y);
+    }
+    let (mut lo, mut hi) = (0.0, max_ext);
+    for _ in 0..14 {
+        let mid = 0.5 * (lo + hi);
+        if inside(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let (x, y) = rot(lo);
+    Point::from_mm(x, y)
 }
 
 /// Even-odd point-in-polygon over a region (outer contours + holes).
