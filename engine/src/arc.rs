@@ -106,7 +106,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
             seeds = border_seeds(&kind, &owner, &g, rmax);
         }
         for (x, y) in seeds {
-            fronts.push(Front { x, y, r: cell, id: next_id, far: None });
+            fronts.push(Front { x, y, r: cell, id: next_id, far: None, empty: 0 });
             next_id += 1;
         }
     }
@@ -124,7 +124,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
                 break;
             }
             for (x, y) in seeds {
-                fronts.push(Front { x, y, r: cell, id: next_id, far: None });
+                fronts.push(Front { x, y, r: cell, id: next_id, far: None, empty: 0 });
                 next_id += 1;
             }
         }
@@ -140,7 +140,11 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
             }
             let (grew, ring_far) = draw_ring(f, &g, &kind, &mut owner, &mut unfilled, &mut arcs);
             if grew {
-                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far) });
+                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far), empty: 0 });
+            } else if f.empty + 1 < EMPTY_LIMIT {
+                // No new coverage at this radius — keep probing outward (e.g. past
+                // the covered perimeter strip) before declaring the fan done.
+                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: f.far, empty: f.empty + 1 });
             } else {
                 chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
             }
@@ -158,7 +162,13 @@ struct Front {
     id: u32,
     /// Farthest frontier point this fan has reached (next center when it stalls).
     far: Option<(f64, f64)>,
+    /// Consecutive rings that added nothing — lets a fan grow past a covered strip
+    /// (e.g. the perimeter bead) before it's declared done.
+    empty: u32,
 }
+
+/// Rings a fan may grow through without adding coverage before it gives up.
+const EMPTY_LIMIT: u32 = 3;
 
 /// Continue a stalled fan by starting a new fan at its farthest frontier point
 /// (McCulloch chaining) — but only if that point still borders unfilled region.
@@ -166,7 +176,7 @@ fn chain_spawn(far: Option<(f64, f64)>, g: &Grid, kind: &[u8], owner: &[u32], ne
     if let Some((fx, fy)) = far {
         if let Some(ci) = g.index(fx, fy) {
             if has_unfilled_neighbour(g, kind, owner, ci) {
-                next.push(Front { x: fx, y: fy, r: g.cell, id: *next_id, far: None });
+                next.push(Front { x: fx, y: fy, r: g.cell, id: *next_id, far: None, empty: 0 });
                 *next_id += 1;
             }
         }
@@ -210,7 +220,9 @@ impl Grid {
 /// edge, anchor cells, and other fans' cells. A run is emitted (and its unfilled
 /// cells claimed) only if it touches still-unfilled region.
 fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> (bool, Option<(f64, f64)>) {
-    let dtheta = (g.cell / f.r).clamp(0.01, 0.4);
+    // Sample finer than a cell so the ring doesn't skip cells (aliasing leaves
+    // 1-cell gaps that would otherwise need fragment fills).
+    let dtheta = (g.cell * 0.5 / f.r).clamp(0.005, 0.4);
     let mut runs: Vec<(Vec<Point>, Vec<usize>, bool)> = Vec::new();
     let mut pts: Vec<Point> = Vec::new();
     let mut cells: Vec<usize> = Vec::new();
