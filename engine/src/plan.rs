@@ -18,6 +18,8 @@ use crate::{slice_mesh, SliceParams};
 /// What a toolpath represents — drives speed, ordering, and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathKind {
+    /// Priming loops around the first layer.
+    Skirt,
     ExternalPerimeter,
     Perimeter,
     /// Dense (100%) top/bottom shell fill.
@@ -48,7 +50,13 @@ pub struct LayerPlan {
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
-    let layers = slice_mesh(mesh, SliceParams { layer_height_mm: settings.layer_height_mm });
+    let layers = slice_mesh(
+        mesh,
+        SliceParams {
+            layer_height_mm: settings.layer_height_mm,
+            first_layer_height_mm: settings.first_layer_height_mm,
+        },
+    );
     let lw = settings.line_width_mm;
     let n = layers.len();
 
@@ -113,14 +121,38 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
         plans.push(LayerPlan {
             index: i,
-            print_z_mm: settings.layer_height_mm * (i as f64 + 1.0),
-            height_mm: settings.layer_height_mm,
+            print_z_mm: layers[i].print_z_mm,
+            height_mm: layers[i].height_mm,
             paths,
         });
     }
 
+    // Skirt: priming loops around the first layer, printed before anything else.
+    if settings.skirt_loops > 0 {
+        if let (Some(first), Some(plan0)) = (layers.first(), plans.first_mut()) {
+            let skirt = skirt_paths(&first.polygons, settings);
+            plan0.paths.splice(0..0, skirt);
+        }
+    }
+
     center_on_bed(&mut plans, mesh, settings);
     plans
+}
+
+/// Loops around the first-layer outline, offset outward, to prime the nozzle and
+/// establish flow before the part starts.
+fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
+    let lw = settings.line_width_mm;
+    let mut paths = Vec::new();
+    for k in 0..settings.skirt_loops {
+        let delta = settings.skirt_gap_mm + lw * (0.5 + k as f64);
+        for c in offset(first_layer, delta).contours {
+            if c.points.len() >= 3 {
+                paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
+            }
+        }
+    }
+    paths
 }
 
 /// Intersection of the `count` infill regions `count` layers away in direction
@@ -287,5 +319,25 @@ mod tests {
         let p = layers[50].paths[0].points[0];
         assert!((p.x_mm() - 110.0).abs() < 12.0, "x near bed center, got {}", p.x_mm());
         assert!((p.y_mm() - 110.0).abs() < 12.0, "y near bed center, got {}", p.y_mm());
+    }
+
+    #[test]
+    fn skirt_only_on_first_layer() {
+        let m = Mesh::cube(20.0);
+        let s = Settings::default(); // skirt_loops = 2
+        let layers = generate(&m, &s);
+        // Two loops around a single-region cube => 2 skirt paths on layer 0.
+        assert_eq!(count(&layers[0], PathKind::Skirt), 2);
+        assert_eq!(count(&layers[1], PathKind::Skirt), 0);
+    }
+
+    #[test]
+    fn first_layer_height_is_honored() {
+        let m = Mesh::cube(20.0);
+        let s = Settings { first_layer_height_mm: 0.3, layer_height_mm: 0.2, ..Settings::default() };
+        let layers = generate(&m, &s);
+        assert!((layers[0].height_mm - 0.3).abs() < 1e-9);
+        assert!((layers[0].print_z_mm - 0.3).abs() < 1e-9, "first layer top at 0.3");
+        assert!((layers[1].print_z_mm - 0.5).abs() < 1e-9, "second layer top at 0.5");
     }
 }

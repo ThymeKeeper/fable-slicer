@@ -45,11 +45,14 @@ pub struct FilamentProfile {
 pub struct ProcessProfile {
     pub inherits: Option<String>,
     pub layer_height_mm: Option<f64>,
+    pub first_layer_height_mm: Option<f64>,
     pub line_width_mm: Option<f64>,
     pub wall_count: Option<usize>,
     pub top_layers: Option<usize>,
     pub bottom_layers: Option<usize>,
     pub infill_density: Option<f64>,
+    pub skirt_loops: Option<usize>,
+    pub skirt_gap_mm: Option<f64>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
 }
@@ -92,8 +95,9 @@ impl Tier for ProcessProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, layer_height_mm, line_width_mm, wall_count, top_layers,
-            bottom_layers, infill_density, print_speed_mm_s, first_layer_speed_mm_s)
+        merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
+            wall_count, top_layers, bottom_layers, infill_density, skirt_loops, skirt_gap_mm,
+            print_speed_mm_s, first_layer_speed_mm_s)
     }
 }
 
@@ -154,11 +158,14 @@ impl Profiles {
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
+            first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
             line_width_mm: pc.line_width_mm.unwrap_or(d.line_width_mm),
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
+            skirt_loops: pc.skirt_loops.unwrap_or(d.skirt_loops),
+            skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),

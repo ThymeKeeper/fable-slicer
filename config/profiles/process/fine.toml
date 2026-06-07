@@ -1,4 +1,5 @@
 # 0.12mm fine quality. Thicker shells (more layers) to match the finer height.
+# First layer stays at 0.2mm for adhesion (inherited from standard).
 inherits = "standard"
 layer_height_mm = 0.12
 top_layers = 6

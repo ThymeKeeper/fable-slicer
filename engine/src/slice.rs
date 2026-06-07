@@ -9,46 +9,59 @@ use mesh::{Mesh, Vec3};
 #[derive(Clone, Copy, Debug)]
 pub struct SliceParams {
     pub layer_height_mm: f64,
+    pub first_layer_height_mm: f64,
 }
 
 impl Default for SliceParams {
     fn default() -> Self {
-        Self { layer_height_mm: 0.2 }
+        Self { layer_height_mm: 0.2, first_layer_height_mm: 0.2 }
     }
 }
 
-/// One sliced layer: its index, the z height it was sampled at, and the closed
-/// polygons describing solid material at that height.
+/// One sliced layer.
 #[derive(Clone, Debug)]
 pub struct Layer {
     pub index: usize,
+    /// World-space height the layer was sampled at.
     pub z_mm: f64,
+    /// This layer's thickness (the first layer may differ).
+    pub height_mm: f64,
+    /// Nozzle Z when printing this layer (top of the layer, model bottom = 0).
+    pub print_z_mm: f64,
     pub polygons: Polygons,
 }
 
-/// Slice a mesh into layers of the given height.
+/// Slice a mesh into layers, honoring a distinct first-layer height.
 ///
-/// Each layer is sampled at its vertical midpoint (`z = zmin + h*(i + 0.5)`),
-/// which avoids landing exactly on the flat top/bottom facets of axis-aligned
-/// parts. Layers run while the sample height stays below the top of the model.
+/// Each layer is sampled at its vertical midpoint, which avoids landing on flat
+/// top/bottom facets. `print_z_mm` accumulates layer thicknesses with the model
+/// bottom resting on the bed (z = 0).
 pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
-    let h = params.layer_height_mm;
     let Some((zmin, zmax)) = mesh.z_bounds() else {
         return Vec::new();
     };
 
     let mut layers = Vec::new();
     let mut i = 0usize;
+    let mut bottom = zmin; // world-z of the current layer's bottom face
     loop {
-        let z = zmin + h * (i as f64 + 0.5);
+        let h = if i == 0 {
+            params.first_layer_height_mm
+        } else {
+            params.layer_height_mm
+        };
+        let z = bottom + h * 0.5;
         if z >= zmax {
             break;
         }
         layers.push(Layer {
             index: i,
             z_mm: z,
+            height_mm: h,
+            print_z_mm: (bottom - zmin) + h,
             polygons: slice_at(mesh, z),
         });
+        bottom += h;
         i += 1;
     }
     layers
@@ -191,7 +204,7 @@ mod tests {
     #[test]
     fn slices_cube_into_squares() {
         let m = Mesh::cube(20.0);
-        let layers = slice_mesh(&m, SliceParams { layer_height_mm: 0.2 });
+        let layers = slice_mesh(&m, SliceParams { layer_height_mm: 0.2, first_layer_height_mm: 0.2 });
 
         // 20mm / 0.2mm = 100 layers sampled at midpoints 0.1 .. 19.9.
         assert_eq!(layers.len(), 100);

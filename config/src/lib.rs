@@ -41,12 +41,18 @@ pub struct Settings {
 
     // --- process ---
     pub layer_height_mm: f64,
+    /// Thickness of the first layer (often thicker for bed adhesion).
+    pub first_layer_height_mm: f64,
     pub line_width_mm: f64,
     pub wall_count: usize,
     pub top_layers: usize,
     pub bottom_layers: usize,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
     pub infill_density: f64,
+    /// Number of skirt loops around the first layer (0 disables).
+    pub skirt_loops: usize,
+    /// Gap between the skirt and the model (mm).
+    pub skirt_gap_mm: f64,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -74,11 +80,14 @@ impl Default for Settings {
             bed_size_x_mm: 220.0,
             bed_size_y_mm: 220.0,
             layer_height_mm: 0.2,
+            first_layer_height_mm: 0.2,
             line_width_mm: 0.45,
             wall_count: 2,
             top_layers: 4,
             bottom_layers: 4,
             infill_density: 0.15,
+            skirt_loops: 2,
+            skirt_gap_mm: 3.0,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             nozzle_temp_c: 200,

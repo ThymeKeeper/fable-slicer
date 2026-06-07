@@ -1,9 +1,12 @@
 # 0.20mm standard quality.
 layer_height_mm = 0.2
+first_layer_height_mm = 0.2
 line_width_mm = 0.45
 wall_count = 2
 top_layers = 4
 bottom_layers = 4
 infill_density = 0.15
+skirt_loops = 2
+skirt_gap_mm = 3.0
 print_speed_mm_s = 50.0
 first_layer_speed_mm_s = 20.0

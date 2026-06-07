@@ -17,11 +17,11 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M2 — surfaces, retraction, profiles (nearly done) |
+| **Current milestone** | GUI (pulled forward from M5, user request) — scoping |
 | **Last updated** | 2026-06-06 |
-| **Builds / tests** | `cargo test` green (18 tests); profile system (printer/filament/process, TOML, inheritance) live |
-| **Next action** | skirt/brim + first-layer height (finish M2), then M3 quality (seams, combing, time estimate) |
-| **Target printers** | Voron 2.4 = **350×350** (confirmed); Sovol Zero bed still TBC. Both Klipper (relative E, PRINT_START macros). |
+| **Builds / tests** | `cargo test` green (20 tests); M2 feature-complete (skirt + first-layer height landed) |
+| **Next action** | build the GUI (egui) once preview approach is chosen; then M3 quality |
+| **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -68,8 +68,8 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Sparse vs. solid region detection (solid shells dense-filled, core sparse)
 - [x] Retraction on travels between extrusions (z-hop still TODO)
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
-- [ ] Skirt / brim / (basic) raft
-- [ ] First-layer overrides (height, flow; speed already slowed)
+- [x] Skirt (configurable loops + gap, first layer only); brim / raft still TODO
+- [x] First-layer height override (separate first-layer thickness); first-layer flow tuning still TODO
 - [x] `config`: tiered profile model (printer/filament/process) + single-parent inheritance, TOML, built-in profiles, `--profile-dir`, `--list-profiles`
 - [x] Printer profiles carry start/end g-code templates with `{placeholders}`; Voron/Sovol use `PRINT_START`/`PRINT_END` macros
 - [ ] **Benchy prints cleanly** (needs hardware)
@@ -89,9 +89,12 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] Bridge detection; bridge flow/speed/fan; bridge line orientation along shortest span
 
 ### M5 — Usability: GUI, profiles, advanced geometry
-- [ ] GUI shell (`egui` + `wgpu`): load, arrange, slice, preview
+> **GUI pulled forward to now (user request, 2026-06-06).** Approach being scoped —
+> framework `egui`; 2D-vs-3D preview TBD. Headless dev box can't render a window,
+> so visual verification needs the user (or an xvfb screenshot harness).
+- [ ] GUI shell (`egui`): load STL, pick profiles, slice, preview, export g-code
 - [ ] G-code preview: feature-colored paths + layer slider
-- [ ] Profile management UI; ship a starter profile library (the real moat)
+- [x] Profile system + starter library (printer/filament/process) — landed early; *management UI* still TODO
 - [ ] Variable / adaptive layer height
 - [ ] Gyroid + more infill patterns
 - [ ] G2/G3 arc fitting

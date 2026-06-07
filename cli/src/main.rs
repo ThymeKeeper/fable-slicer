@@ -44,9 +44,14 @@ struct Args {
     #[arg(long)]
     layer_height: Option<f64>,
     #[arg(long)]
+    first_layer_height: Option<f64>,
+    #[arg(long)]
     walls: Option<usize>,
     #[arg(long)]
     infill: Option<f64>,
+    /// Number of skirt loops (0 disables).
+    #[arg(long)]
+    skirt: Option<usize>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
     #[arg(long)]
@@ -85,11 +90,17 @@ fn main() -> Result<()> {
     if let Some(v) = args.layer_height {
         settings.layer_height_mm = v;
     }
+    if let Some(v) = args.first_layer_height {
+        settings.first_layer_height_mm = v;
+    }
     if let Some(v) = args.walls {
         settings.wall_count = v;
     }
     if let Some(v) = args.infill {
         settings.infill_density = v;
+    }
+    if let Some(v) = args.skirt {
+        settings.skirt_loops = v;
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;
@@ -186,6 +197,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             continue;
         }
         let color = match path.kind {
+            PathKind::Skirt => "#999999",
             PathKind::ExternalPerimeter => "#1b5fb0",
             PathKind::Perimeter => "#5fa8e8",
             PathKind::Solid => "#2ca02c",

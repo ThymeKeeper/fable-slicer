@@ -1,10 +1,9 @@
-# Sovol Zero (Klipper, CoreXY, high-speed).
-# NOTE: bed size is a placeholder pending confirmation (post-cutoff release).
-# Override with --bed-x/--bed-y until verified.
+# Sovol Zero (Klipper, CoreXY, high-speed). Build volume 152.4 x 152.4 x 152.5 mm.
 inherits = "generic"
 
-bed_size_x_mm = 160.0
-bed_size_y_mm = 160.0
+bed_size_x_mm = 152.4
+bed_size_y_mm = 152.4
+# (max build height 152.5mm — not yet enforced by the slicer)
 
 retract_len_mm = 0.5
 retract_speed_mm_s = 40.0
