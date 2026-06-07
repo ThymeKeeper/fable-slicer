@@ -42,6 +42,7 @@ struct App {
     show_solid: bool,
     show_infill: bool,
     show_skirt: bool,
+    show_support: bool,
     show_travel: bool,
     show_seams: bool,
     needs_rebuild: bool,
@@ -77,6 +78,7 @@ impl App {
             show_solid: true,
             show_infill: true,
             show_skirt: true,
+            show_support: true,
             show_travel: false,
             show_seams: false,
             needs_rebuild: true,
@@ -102,6 +104,9 @@ impl App {
         }
         if self.show_seams {
             m |= 1 << 5;
+        }
+        if self.show_support {
+            m |= 1 << 6;
         }
         m
     }
@@ -243,6 +248,14 @@ impl eframe::App for App {
                 });
             pattern_combo(ui, "sparse fill", &mut self.settings.sparse_pattern);
             pattern_combo(ui, "solid fill", &mut self.settings.solid_pattern);
+            egui::ComboBox::from_label("support")
+                .selected_text(self.settings.support_mode.label())
+                .show_ui(ui, |ui| {
+                    use config::SupportMode::*;
+                    ui.selectable_value(&mut self.settings.support_mode, None, "none");
+                    ui.selectable_value(&mut self.settings.support_mode, Grid, "grid");
+                    ui.selectable_value(&mut self.settings.support_mode, Arc, "arc");
+                });
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -270,6 +283,7 @@ impl eframe::App for App {
                         ui.checkbox(&mut self.show_solid, "solid");
                         ui.checkbox(&mut self.show_infill, "infill");
                         ui.checkbox(&mut self.show_skirt, "skirt");
+                        ui.checkbox(&mut self.show_support, "support");
                         ui.checkbox(&mut self.show_travel, "travel");
                         ui.checkbox(&mut self.show_seams, "seams");
                     });
@@ -373,6 +387,7 @@ const CAT_SOLID: f32 = 2.0;
 const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 const CAT_SEAM: f32 = 5.0;
+const CAT_SUPPORT: f32 = 6.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
 /// plus joint blobs (one per extrusion vertex, to round ends and fill corners),
@@ -486,6 +501,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         ExternalPerimeter | Perimeter => CAT_WALLS,
         Solid => CAT_SOLID,
         Infill => CAT_INFILL,
+        Support => CAT_SUPPORT,
     }
 }
 
@@ -497,5 +513,6 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Perimeter => [0.36, 0.80, 0.45],
         Solid => [0.94, 0.80, 0.24],
         Infill => [0.32, 0.62, 0.95],
+        Support => [0.55, 0.40, 0.70],
     }
 }

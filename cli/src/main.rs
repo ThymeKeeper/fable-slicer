@@ -64,6 +64,9 @@ struct Args {
     /// Solid infill pattern: lines | grid | concentric.
     #[arg(long)]
     solid_infill: Option<String>,
+    /// Support mode: none | grid | arc.
+    #[arg(long)]
+    support: Option<String>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
     #[arg(long)]
@@ -130,6 +133,10 @@ fn main() -> Result<()> {
     if let Some(s) = &args.solid_infill {
         settings.solid_pattern = config::InfillPattern::parse(s)
             .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
+    }
+    if let Some(s) = &args.support {
+        settings.support_mode = config::SupportMode::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown support mode '{s}' (use none | grid | arc)"))?;
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;
@@ -239,6 +246,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::Perimeter => "#5fa8e8",
             PathKind::Solid => "#2ca02c",
             PathKind::Infill => "#e08a2b",
+            PathKind::Support => "#8c6bb1",
         };
         let mut d = String::from("M");
         for (i, &p) in path.points.iter().enumerate() {

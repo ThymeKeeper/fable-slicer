@@ -125,9 +125,11 @@ fn feed_for(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
     match kind {
         PathKind::ExternalPerimeter => s.print_speed_mm_s * 0.5 * 60.0,
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
-        PathKind::Skirt | PathKind::Perimeter | PathKind::Solid | PathKind::Infill => {
-            s.print_speed_mm_s * 60.0
-        }
+        PathKind::Skirt
+        | PathKind::Perimeter
+        | PathKind::Solid
+        | PathKind::Infill
+        | PathKind::Support => s.print_speed_mm_s * 60.0,
     }
 }
 

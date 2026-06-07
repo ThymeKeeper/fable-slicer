@@ -9,11 +9,11 @@
 //! the previous `bottom_layers` below; otherwise it is within a shell and printed
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
-use config::{InfillPattern, SeamMode, Settings};
+use config::{InfillPattern, SeamMode, Settings, SupportMode};
 use geo2d::{difference, intersection, offset, simplify, to_units, union, Point, Polygons};
 use mesh::Mesh;
 
-use crate::{slice_mesh, SliceParams};
+use crate::{slice_mesh, Layer, SliceParams};
 
 /// What a toolpath represents — drives speed, ordering, and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum PathKind {
     Solid,
     /// Sparse interior fill.
     Infill,
+    /// Removable support structure under overhangs.
+    Support,
 }
 
 /// A single continuous extrusion path.
@@ -192,11 +194,65 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         }
     }
 
+    add_supports(&mut plans, &layers, settings);
     order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
+}
+
+/// Generate removable grid support under overhangs. For each layer, the overhang
+/// is the region not over the layer below within a printable cantilever; this is
+/// projected downward and the support area (minus the part + clearance) is filled
+/// with sparse lines as `PathKind::Support`.
+fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
+    if settings.support_mode == SupportMode::None {
+        return;
+    }
+    let n = layers.len();
+    if n == 0 {
+        return;
+    }
+    let lw = settings.line_width_mm;
+    // A region is supported if within this of the layer below. Angle is from
+    // vertical, so the printable horizontal cantilever per layer is h·tan(angle).
+    let allowance =
+        settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+    let clearance = settings.support_xy_clearance_mm;
+
+    // Per-layer overhang, with thin slivers removed (a one-bead ledge is fine).
+    let mut overhang: Vec<Polygons> = vec![Polygons::new(); n];
+    for i in 1..n {
+        let supported = offset(&layers[i - 1].polygons, allowance);
+        let oh = difference(&layers[i].polygons, &supported);
+        overhang[i] = offset(&offset(&oh, -lw), lw); // morphological open
+    }
+
+    // Project downward: support at layer i holds overhangs accumulated from above,
+    // minus the part (+clearance). Where the part is, the column rests and stops.
+    let spacing = lw / settings.support_density.clamp(0.02, 1.0);
+    let mut accum = Polygons::new();
+    for i in (0..n).rev() {
+        let blocked = offset(&layers[i].polygons, clearance);
+        let here = difference(&accum, &blocked);
+        if !here.is_empty() {
+            let angle = if i % 2 == 0 { 0.0 } else { 90.0 };
+            fill_region(
+                &here,
+                InfillPattern::Lines,
+                spacing,
+                angle,
+                lw,
+                PathKind::Support,
+                settings.seam_mode,
+                i,
+                &mut plans[i].paths,
+            );
+        }
+        accum = difference(&accum, &layers[i].polygons);
+        accum = union(&accum, &overhang[i]);
+    }
 }
 
 /// Greedily order each layer's paths (nearest-neighbour) to cut travel, keeping

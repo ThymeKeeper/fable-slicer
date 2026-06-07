@@ -90,6 +90,37 @@ impl InfillPattern {
     }
 }
 
+/// How overhangs are handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SupportMode {
+    /// No support; overhangs print into air.
+    #[default]
+    None,
+    /// Normal support structure under overhangs (sparse fill, removable).
+    Grid,
+    /// Support-free: fill flat overhangs with self-supporting concentric arcs
+    /// (the "arc overhang" technique); steeper overhangs still get grid support.
+    Arc,
+}
+
+impl SupportMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(Self::None),
+            "grid" | "normal" | "on" => Some(Self::Grid),
+            "arc" | "arcs" | "arc-overhang" => Some(Self::Arc),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Grid => "grid",
+            Self::Arc => "arc",
+        }
+    }
+}
+
 /// Fully-resolved settings the pipeline runs on.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -130,6 +161,17 @@ pub struct Settings {
     pub brim_loops: usize,
     /// Where to place the wall seam.
     pub seam_mode: SeamMode,
+
+    // --- supports ---
+    /// How overhanging regions are handled.
+    pub support_mode: SupportMode,
+    /// Max printable overhang measured from vertical (deg); steeper needs support.
+    /// 45° ⇒ a region must sit within one layer-height of the layer below.
+    pub support_overhang_angle_deg: f64,
+    /// Support infill density, 0.0..=1.0.
+    pub support_density: f64,
+    /// Horizontal gap kept between support and the model (mm).
+    pub support_xy_clearance_mm: f64,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -179,6 +221,10 @@ impl Default for Settings {
             skirt_gap_mm: 3.0,
             brim_loops: 0,
             seam_mode: SeamMode::default(),
+            support_mode: SupportMode::default(),
+            support_overhang_angle_deg: 45.0,
+            support_density: 0.12,
+            support_xy_clearance_mm: 0.4,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,

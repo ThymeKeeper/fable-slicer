@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::{InfillPattern, SeamMode, Settings, GENERIC_END_GCODE, GENERIC_START_GCODE};
+use crate::{InfillPattern, SeamMode, Settings, SupportMode, GENERIC_END_GCODE, GENERIC_START_GCODE};
 
 /// Printer (machine) tier: bed, extruder, and start/end g-code.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -64,6 +64,10 @@ pub struct ProcessProfile {
     pub skirt_gap_mm: Option<f64>,
     pub brim_loops: Option<usize>,
     pub seam: Option<String>,
+    pub support: Option<String>,
+    pub support_overhang_angle_deg: Option<f64>,
+    pub support_density: Option<f64>,
+    pub support_xy_clearance_mm: Option<f64>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
     pub min_layer_time_s: Option<f64>,
@@ -111,7 +115,8 @@ impl Tier for ProcessProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             max_resolution_mm, wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
-            skirt_loops, skirt_gap_mm, brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s,
+            skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
+            support_density, support_xy_clearance_mm, print_speed_mm_s, first_layer_speed_mm_s,
             min_layer_time_s, min_print_speed_mm_s)
     }
 }
@@ -189,6 +194,12 @@ impl Profiles {
             skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
             brim_loops: pc.brim_loops.unwrap_or(d.brim_loops),
             seam_mode: pc.seam.as_deref().and_then(SeamMode::parse).unwrap_or(d.seam_mode),
+            support_mode: pc.support.as_deref().and_then(SupportMode::parse).unwrap_or(d.support_mode),
+            support_overhang_angle_deg: pc
+                .support_overhang_angle_deg
+                .unwrap_or(d.support_overhang_angle_deg),
+            support_density: pc.support_density.unwrap_or(d.support_density),
+            support_xy_clearance_mm: pc.support_xy_clearance_mm.unwrap_or(d.support_xy_clearance_mm),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),
