@@ -228,7 +228,9 @@ fn seed_centers(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f6
         return Vec::new();
     }
     cands.sort_by(|a, b| b.0.cmp(&a.0)); // most corner-like first
-    let min_sep = (rmax * 0.6).max(g.cell * 2.0);
+    // Pack seeds fairly tight (fans meet cleanly now) so even a small bridge gets
+    // starts on opposite sides rather than a single corner fan.
+    let min_sep = (rmax * 0.3).max(g.cell * 8.0);
     let mut chosen: Vec<(f64, f64)> = Vec::new();
     for (_, x, y) in cands {
         if chosen.iter().all(|&(ax, ay)| (ax - x).hypot(ay - y) >= min_sep) {
