@@ -5,6 +5,8 @@
 //!   3. Sloped overhang (a leaning post)
 //!   4. Arched bridge (a semicircular opening — continuously varying overhang)
 //!   5. Corner-wrapping overhang (a cap overhanging a central pillar on all sides)
+//!   6. Long cantilever (60mm arm — fan hits rMax and re-seeds outward)
+//!   7. Wide bridge (100mm span — arc fans from each end re-seed before meeting)
 //! `cargo run -p mesh --example gen_overhang_suite` → fixtures/overhang_suite.stl
 //! (Winding is irrelevant — the slicer re-orients per layer by nesting.)
 
@@ -100,6 +102,8 @@ fn main() -> std::io::Result<()> {
     let mut t: Vec<[V; 3]> = Vec::new();
     let (r1a, r1b) = (0.0, 18.0); // row 1 depth
     let (r2a, r2b) = (28.0, 46.0); // row 2 depth
+    let (r3a, r3b) = (56.0, 74.0); // row 3 depth
+    let (r4a, r4b) = (84.0, 102.0); // row 4 depth
 
     // 1) Flat bridges over 3 / 6 / 10 mm gaps (comb of pillars + top slab).
     extrude(
@@ -145,6 +149,28 @@ fn main() -> std::io::Result<()> {
     let xo = 40.0;
     add_box(&mut t, [xo + 8.0, r2a + 6.0, 0.0], [xo + 18.0, r2a + 12.0, 12.0]); // pillar
     add_box(&mut t, [xo, r2a, 12.0], [xo + 26.0, r2b, 15.0]); // overhanging cap
+
+    // 6) Long cantilever (60mm arm > rMax) — the fan should hit rMax and re-seed.
+    extrude(
+        &mut t,
+        vec![(0.0, 0.0), (8.0, 0.0), (8.0, 15.0), (68.0, 15.0), (68.0, 21.0), (0.0, 21.0)],
+        0.0,
+        r3a,
+        r3b,
+    );
+
+    // 7) Wide bridge (100mm span > 2·rMax) — arc fans from each end should re-seed
+    //    on their way to the middle.
+    extrude(
+        &mut t,
+        vec![
+            (0.0, 0.0), (10.0, 0.0), (10.0, 15.0), (110.0, 15.0), (110.0, 0.0),
+            (120.0, 0.0), (120.0, 18.0), (0.0, 18.0),
+        ],
+        0.0,
+        r4a,
+        r4b,
+    );
 
     let m = mesh::Mesh::from_triangle_soup(&t);
     std::fs::create_dir_all("fixtures")?;
