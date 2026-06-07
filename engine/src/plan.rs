@@ -160,14 +160,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
 
             if !arc_region.is_empty() {
-                // Seed/anchor arcs only on material actually held up by the layer
-                // below. A bridge (supported on ≥2 sides) then seeds from each side
-                // and the fans meet; a cantilever (1 side) seeds only there and the
-                // arcs grow outward over air — McCulloch's two cases, auto-selected.
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 let supported_below = offset(&layers[i - 1].polygons, allowance);
-                for seg in crate::arc::arc_fill(&arc_region, &supported_below, lw, ARC_RMAX_MM) {
+                // A true bridge (supported ≥2 sides) narrow enough to span gets
+                // straight bridge lines across the gap; everything else (a wide
+                // bridge, or a cantilever) is arc-filled, seeded only on support.
+                let segs = try_bridge(&arc_region, &supported_below, lw, settings.max_bridge_span_mm)
+                    .unwrap_or_else(|| crate::arc::arc_fill(&arc_region, &supported_below, lw, ARC_RMAX_MM));
+                for seg in segs {
                     if seg.len() >= 2 {
                         paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
                     }
@@ -301,6 +302,69 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
             accum = union(&accum, &overhang[i + gap]);
         }
     }
+}
+
+/// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
+/// with straight lines — return those lines (oriented across the shortest gap,
+/// solid spacing). Returns None for cantilevers or spans wider than `max_span`,
+/// which the caller arc-fills instead.
+fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -> Option<Vec<Vec<Point>>> {
+    if max_span <= 0.0 {
+        return None;
+    }
+    // Try a range of line directions; the bridge runs across the shortest spans.
+    let mut best: Option<(f64, f64)> = None; // (max line length, angle)
+    for k in 0..12 {
+        let angle = k as f64 * 15.0;
+        let segs = infill_lines(region, angle, lw);
+        let (mut total, mut anchored, mut max_len) = (0usize, 0usize, 0.0f64);
+        for seg in &segs {
+            if seg.len() < 2 {
+                continue;
+            }
+            let (a, b) = (seg[0], seg[seg.len() - 1]);
+            total += 1;
+            max_len = max_len.max(pt_dist_mm(a, b));
+            if bridge_anchored(a, b, supported, lw) {
+                anchored += 1;
+            }
+        }
+        // Need a real area, every line short enough, and (almost) all anchored on
+        // both ends — i.e. genuinely spanning between supports.
+        if total >= 2 && max_len <= max_span && anchored * 100 >= total * 85 && best.map_or(true, |(bl, _)| max_len < bl) {
+            best = Some((max_len, angle));
+        }
+    }
+    let (_, angle) = best?;
+    Some(infill_lines(region, angle, lw))
+}
+
+/// A bridge line is anchored if both ends, extended outward by a line width, land
+/// on supported material — so the line spans between two supports.
+fn bridge_anchored(a: Point, b: Point, supported: &Polygons, lw: f64) -> bool {
+    let (ax, ay, bx, by) = (a.x_mm(), a.y_mm(), b.x_mm(), b.y_mm());
+    let len = (bx - ax).hypot(by - ay);
+    if len < 1.0e-6 {
+        return false;
+    }
+    let (ux, uy) = ((bx - ax) / len, (by - ay) / len);
+    let ea = Point::from_mm(ax - ux * lw, ay - uy * lw);
+    let eb = Point::from_mm(bx + ux * lw, by + uy * lw);
+    point_in(supported, ea) && point_in(supported, eb)
+}
+
+fn point_in(polys: &Polygons, p: Point) -> bool {
+    let mut inside = false;
+    for c in &polys.contours {
+        if c.contains(p) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn pt_dist_mm(a: Point, b: Point) -> f64 {
+    (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm())
 }
 
 /// Greedily order each layer's paths (nearest-neighbour) to cut travel, keeping
@@ -614,6 +678,47 @@ mod tests {
 
     fn count(layer: &LayerPlan, kind: PathKind) -> usize {
         layer.paths.iter().filter(|p| p.kind == kind).count()
+    }
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygons {
+        let mut p = Polygons::new();
+        p.push(Contour::new(vec![
+            Point::from_mm(x0, y0),
+            Point::from_mm(x1, y0),
+            Point::from_mm(x1, y1),
+            Point::from_mm(x0, y1),
+        ]));
+        p
+    }
+
+    #[test]
+    fn bridge_lines_span_a_narrow_two_sided_gap() {
+        // A 20×4mm slot supported on its two long sides → bridge with short lines.
+        let region = rect(0.0, 0.0, 20.0, 4.0);
+        let mut supported = rect(-3.0, -3.0, 23.0, 0.0);
+        supported.contours.extend(rect(-3.0, 4.0, 23.0, 7.0).contours);
+        let lines = try_bridge(&region, &supported, 0.45, 6.0).expect("should bridge");
+        let max_len = lines
+            .iter()
+            .filter(|s| s.len() >= 2)
+            .map(|s| pt_dist_mm(s[0], s[s.len() - 1]))
+            .fold(0.0, f64::max);
+        assert!(max_len < 5.0, "lines should cross the 4mm gap, got {max_len:.1}mm");
+    }
+
+    #[test]
+    fn wide_span_is_not_bridged() {
+        let region = rect(0.0, 0.0, 20.0, 20.0);
+        let supported = rect(-3.0, -3.0, 23.0, 23.0);
+        assert!(try_bridge(&region, &supported, 0.45, 6.0).is_none(), "20mm > 6mm max span");
+    }
+
+    #[test]
+    fn cantilever_is_not_bridged() {
+        // Supported on one side only → no line is anchored at both ends.
+        let region = rect(0.0, 0.0, 6.0, 6.0);
+        let supported = rect(-3.0, -3.0, 9.0, 0.0);
+        assert!(try_bridge(&region, &supported, 0.45, 6.0).is_none(), "one-sided support can't bridge");
     }
 
     #[test]
