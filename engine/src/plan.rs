@@ -261,27 +261,40 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
 
     // Project downward: support at layer i holds overhangs accumulated from above,
     // minus the part (+clearance). Where the part is, the column rests and stops.
+    // A z-gap of `gap` empty layers under each overhang aids removal, and the top
+    // `iface` support layers are printed solid for a smoother overhang underside.
     let spacing = lw / settings.support_density.clamp(0.02, 1.0);
+    let gap = settings.support_z_gap_layers;
+    let iface = settings.support_interface_layers;
     let mut accum = Polygons::new();
     for i in (0..n).rev() {
         let blocked = offset(&layers[i].polygons, clearance);
         let here = difference(&accum, &blocked);
         if !here.is_empty() {
             let angle = if i % 2 == 0 { 0.0 } else { 90.0 };
-            fill_region(
-                &here,
-                InfillPattern::Lines,
-                spacing,
-                angle,
-                lw,
-                PathKind::Support,
-                settings.seam_mode,
-                i,
-                &mut plans[i].paths,
-            );
+            // Interface = the top `iface` support layers below an overhang (its top
+            // sits `gap` layers under the overhang). Those layers print solid.
+            let mut iface_region = Polygons::new();
+            for j in (i + 1 + gap)..=(i + gap + iface).min(n - 1) {
+                iface_region = union(&iface_region, &overhang[j]);
+            }
+            let iface_here = intersection(&here, &iface_region);
+            let body_here = difference(&here, &iface_here);
+            if !body_here.is_empty() {
+                fill_region(&body_here, InfillPattern::Lines, spacing, angle, lw,
+                    PathKind::Support, settings.seam_mode, i, &mut plans[i].paths);
+            }
+            if !iface_here.is_empty() {
+                fill_region(&iface_here, InfillPattern::Lines, lw, angle, lw,
+                    PathKind::Support, settings.seam_mode, i, &mut plans[i].paths);
+            }
         }
         accum = difference(&accum, &layers[i].polygons);
-        accum = union(&accum, &overhang[i]);
+        // Defer adding this layer's overhang by `gap` layers so the support tops
+        // out `gap` layers below it (leaving the removal gap).
+        if i + gap < n {
+            accum = union(&accum, &overhang[i + gap]);
+        }
     }
 }
 

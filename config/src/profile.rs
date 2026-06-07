@@ -68,6 +68,8 @@ pub struct ProcessProfile {
     pub support_overhang_angle_deg: Option<f64>,
     pub support_density: Option<f64>,
     pub support_xy_clearance_mm: Option<f64>,
+    pub support_z_gap_layers: Option<usize>,
+    pub support_interface_layers: Option<usize>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
     pub min_layer_time_s: Option<f64>,
@@ -116,8 +118,8 @@ impl Tier for ProcessProfile {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             max_resolution_mm, wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
-            support_density, support_xy_clearance_mm, print_speed_mm_s, first_layer_speed_mm_s,
-            min_layer_time_s, min_print_speed_mm_s)
+            support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
+            print_speed_mm_s, first_layer_speed_mm_s, min_layer_time_s, min_print_speed_mm_s)
     }
 }
 
@@ -200,6 +202,8 @@ impl Profiles {
                 .unwrap_or(d.support_overhang_angle_deg),
             support_density: pc.support_density.unwrap_or(d.support_density),
             support_xy_clearance_mm: pc.support_xy_clearance_mm.unwrap_or(d.support_xy_clearance_mm),
+            support_z_gap_layers: pc.support_z_gap_layers.unwrap_or(d.support_z_gap_layers),
+            support_interface_layers: pc.support_interface_layers.unwrap_or(d.support_interface_layers),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),

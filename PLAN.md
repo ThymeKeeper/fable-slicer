@@ -20,7 +20,7 @@ checkboxes and the status line as work lands. Architecture detail lives in
 | **Current milestone** | M4 — supports & bridging (grid supports landed; arc overhangs next) |
 | **Last updated** | 2026-06-07 |
 | **Builds / tests** | `cargo test` green (22 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | M4: arc overhangs (no-support), then support interface/z-gap, then bridging |
+| **Next action** | M4: bridge detection (flat unsupported spans), arc-mode fallback for steep overhangs |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -86,7 +86,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ### M4 — Supports & bridging
 - [x] Overhang detection: per-layer region not over the layer below within a printable cantilever (`support_overhang_angle_deg` from vertical ⇒ `h·tan(angle)`); thin slivers removed via morphological open
-- [x] Normal **grid supports**: project overhangs downward, sparse-line fill (`PathKind::Support`) with XY clearance from the part; `--support none|grid|arc`, GUI picker + "support" preview category (`gen_overhang` fixture). Interface layer + z-gap for clean removal still TODO.
+- [x] Normal **grid supports**: project overhangs downward, sparse-line fill (`PathKind::Support`) with XY clearance from the part; `--support none|grid|arc`, GUI picker + "support" preview category (`gen_overhang` fixture). **Z-gap** (`support_z_gap_layers`, default 1) leaves empty layers under the overhang for removal; **dense interface** (`support_interface_layers`, default 2) prints the top support layers solid for a smoother underside.
 - [x] **Arc overhangs** (no-support option, McCulloch technique): flat interior overhangs are filled with self-supporting concentric arcs (grid-tracked BFS flood fill, seeded on the supported edge, spaced by line width, `rmax` 40mm), printed slow as `PathKind::Bridge`; `--support arc` / GUI. Verified on `gen_overhang`: bridge layer arc-filled, no structure below. (v1: interior only — perimeters over overhangs still print normal; no per-feature cold/fan yet.)
 - [ ] Support painting (manual enforce/block) — API-level
 - [ ] Bridge detection; bridge flow/speed/fan; bridge line orientation along shortest span

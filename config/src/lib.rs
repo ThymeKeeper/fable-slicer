@@ -172,6 +172,10 @@ pub struct Settings {
     pub support_density: f64,
     /// Horizontal gap kept between support and the model (mm).
     pub support_xy_clearance_mm: f64,
+    /// Empty layers between a support top and the overhang it holds (removability).
+    pub support_z_gap_layers: usize,
+    /// Dense interface layers at the support top (smoother overhang underside).
+    pub support_interface_layers: usize,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -225,6 +229,8 @@ impl Default for Settings {
             support_overhang_angle_deg: 45.0,
             support_density: 0.12,
             support_xy_clearance_mm: 0.4,
+            support_z_gap_layers: 1,
+            support_interface_layers: 2,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
