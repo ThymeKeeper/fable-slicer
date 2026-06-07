@@ -17,10 +17,11 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M1 — first printable cube (code complete; pending a real print) |
+| **Current milestone** | M2 — surfaces + retraction (in progress) |
 | **Last updated** | 2026-06-06 |
-| **Builds / tests** | `cargo test` green (10 tests); cube + Benchy emit valid g-code |
-| **Next action** | center model on bed (Benchy has negative coords), then M2 (solid top/bottom + retraction) |
+| **Builds / tests** | `cargo test` green (14 tests); cube watertight (solid top/bottom), centered, Klipper output |
+| **Next action** | skirt/brim + first-layer height, then the real TOML profile system |
+| **Target printers** | Voron 2.4 + Sovol Zero (both Klipper → relative E). Bed sizes need confirming. |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -62,14 +63,15 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ### M2 — Printable Benchy (the real quality bar starts here)
 - [x] Multiple walls (concentric offsets) — landed in M1; outer/inner *ordering* tuning still TODO
-- [ ] Auto-center / place model on the bed (handle models with negative coordinates)
-- [ ] Top/bottom solid layers via boolean diff across N layers
-- [ ] Sparse vs. solid region detection
+- [x] Auto-center / place model on the bed (handles models with negative coordinates)
+- [x] Top/bottom solid layers via boolean diff across N layers (`top_layers`/`bottom_layers`)
+- [x] Sparse vs. solid region detection (solid shells dense-filled, core sparse)
+- [x] Retraction on travels between extrusions (z-hop still TODO)
+- [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
 - [ ] Skirt / brim / (basic) raft
-- [ ] Retraction + travel moves; z-hop
-- [ ] First-layer overrides (height, speed, flow, temp)
-- [ ] `config`: tiered profile model (printer/filament/process) + override resolution (TOML/serde)
-- [ ] **Benchy prints cleanly**
+- [ ] First-layer overrides (height, flow; speed already slowed)
+- [ ] `config`: tiered profile model (printer/filament/process) + override resolution (TOML/serde) — still a flat struct + presets
+- [ ] **Benchy prints cleanly** (needs hardware)
 
 ### M3 — Quality pass (what separates "prints" from "looks good")
 - [ ] Per-feature speeds; min-layer-time cooling slowdown

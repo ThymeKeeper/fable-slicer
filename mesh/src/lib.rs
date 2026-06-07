@@ -66,6 +66,20 @@ impl Mesh {
         ]
     }
 
+    /// XY bounding box `(min_x, min_y, max_x, max_y)` over all vertices, or
+    /// `None` if the mesh is empty. Used to place the model on the bed.
+    pub fn xy_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        let first = self.vertices.first()?;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (first[0], first[1], first[0], first[1]);
+        for v in &self.vertices {
+            min_x = min_x.min(v[0]);
+            min_y = min_y.min(v[1]);
+            max_x = max_x.max(v[0]);
+            max_y = max_y.max(v[1]);
+        }
+        Some((min_x, min_y, max_x, max_y))
+    }
+
     /// Minimum and maximum z over all vertices, or `None` if the mesh is empty.
     pub fn z_bounds(&self) -> Option<(f64, f64)> {
         let mut iter = self.vertices.iter();

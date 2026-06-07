@@ -5,8 +5,9 @@ fork of the Slic3r / PrusaSlicer / Bambu / Orca lineage. Algorithms are learned
 from papers and from reading reference engines (CuraEngine), then written fresh
 in idiomatic Rust.
 
-> Status: **M0** — mesh in, per-layer polygons out. See [PLAN.md](PLAN.md) for the
-> roadmap and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
+> Status: **M2** — STL in, Klipper g-code out: walls, solid top/bottom shells,
+> sparse infill, retraction, bed-centering. See [PLAN.md](PLAN.md) for the roadmap
+> and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
 ## Quick start
 
@@ -14,13 +15,13 @@ in idiomatic Rust.
 # Run the test suite (includes a cube-slicing acceptance test).
 cargo test
 
-# Generate the cube fixture, then slice it to per-layer SVGs.
+# Generate the cube fixture, then slice it to g-code (+ optional toolpath SVGs).
 cargo run -p mesh --example gen_cube
-cargo run --bin slicer -- fixtures/cube.stl --layer-height 0.2 --out out
-# -> out/layer_0000.svg ... open any of them to inspect the slice.
+cargo run --bin slicer -- fixtures/cube.stl --printer voron24 -o cube.gcode --svg svg/
+# -> cube.gcode, plus svg/layer_*.svg to inspect walls / shells / infill.
 
 # Slice your own model:
-cargo run --bin slicer -- path/to/model.stl --layer-height 0.2 --out out
+cargo run --bin slicer -- path/to/model.stl --printer voron24 -o out.gcode
 ```
 
 ## Workspace
@@ -29,9 +30,9 @@ cargo run --bin slicer -- path/to/model.stl --layer-height 0.2 --out out
 |----------|------|
 | `geo2d`  | integer 2D geometry (Clipper-space points / contours / polygons) |
 | `mesh`   | triangle mesh + STL I/O |
-| `engine` | the slicer core (slicing now; walls/infill/toolpaths later) |
-| `gcode`  | g-code AST + writer + time estimate (stub until M1) |
-| `config` | printer/filament/process profiles (stub until M2) |
+| `engine` | the slicer core (slicing, walls, solid/sparse infill, toolpaths, g-code) |
+| `gcode`  | low-level g-code emitter (relative E, retraction, temps/fan) |
+| `config` | settings + printer presets (full tiered profile system upcoming) |
 | `cli`    | command-line front-end (binary: `slicer`) |
 
 ## License

@@ -41,6 +41,18 @@ struct Args {
 
     #[arg(long, default_value_t = 60)]
     bed_temp: u32,
+
+    /// Printer preset: generic | voron24 | sovol-zero.
+    #[arg(long, default_value = "generic")]
+    printer: String,
+
+    /// Override bed width (mm).
+    #[arg(long)]
+    bed_x: Option<f64>,
+
+    /// Override bed depth (mm).
+    #[arg(long)]
+    bed_y: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -50,14 +62,26 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading STL {}", args.input.display()))?;
     println!("Loaded {}: {} triangles", args.input.display(), mesh.triangles.len());
 
-    let settings = Settings {
-        layer_height_mm: args.layer_height,
-        wall_count: args.walls,
-        infill_density: args.infill,
-        nozzle_temp_c: args.nozzle_temp,
-        bed_temp_c: args.bed_temp,
-        ..Settings::default()
+    let mut settings = match args.printer.as_str() {
+        "voron24" | "voron-24" | "voron_24" => Settings::voron_24(),
+        "sovol-zero" | "sovol_zero" | "sovolzero" => Settings::sovol_zero(),
+        _ => Settings::default(),
     };
+    settings.layer_height_mm = args.layer_height;
+    settings.wall_count = args.walls;
+    settings.infill_density = args.infill;
+    settings.nozzle_temp_c = args.nozzle_temp;
+    settings.bed_temp_c = args.bed_temp;
+    if let Some(x) = args.bed_x {
+        settings.bed_size_x_mm = x;
+    }
+    if let Some(y) = args.bed_y {
+        settings.bed_size_y_mm = y;
+    }
+    println!(
+        "Printer '{}': bed {}x{} mm",
+        args.printer, settings.bed_size_x_mm, settings.bed_size_y_mm
+    );
 
     let layers = generate(&mesh, &settings);
     let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
@@ -130,6 +154,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
         let color = match path.kind {
             PathKind::ExternalPerimeter => "#1b5fb0",
             PathKind::Perimeter => "#5fa8e8",
+            PathKind::Solid => "#2ca02c",
             PathKind::Infill => "#e08a2b",
         };
         let mut d = String::from("M");

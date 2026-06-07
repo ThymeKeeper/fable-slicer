@@ -1,22 +1,24 @@
 //! Low-level G-code emitter.
 //!
 //! This crate knows nothing about slicing — it just formats moves and tracks
-//! machine state (absolute extruder position + the last feed rate, so `F` is
-//! only emitted when it changes). `engine` drives it, computing the extrusion
-//! amounts. Extrusion is absolute (`M82` / `G92 E0`), the most compatible
-//! default for stock Marlin.
+//! machine state (the running filament total + the last feed rate, so `F` is only
+//! emitted when it changes). `engine` drives it, computing the extrusion amounts.
+//!
+//! Extrusion is **relative** (`M83`): each extruding move carries its own delta,
+//! and retraction is a plain negative-E move. This is what Klipper recommends, and
+//! it avoids unbounded absolute-E growth.
 
-/// Accumulates G-code text while tracking extruder position and feed rate.
+/// Accumulates G-code text while tracking the filament total and feed rate.
 #[derive(Debug)]
 pub struct GcodeBuilder {
     buf: String,
-    e: f64,
+    e_total: f64,
     last_feed: Option<f64>,
 }
 
 impl GcodeBuilder {
     pub fn new() -> Self {
-        Self { buf: String::new(), e: 0.0, last_feed: None }
+        Self { buf: String::new(), e_total: 0.0, last_feed: None }
     }
 
     pub fn comment(&mut self, text: &str) {
@@ -31,10 +33,9 @@ impl GcodeBuilder {
         self.buf.push('\n');
     }
 
-    /// `G92 E0` — zero the extruder and our running total.
-    pub fn reset_extruder(&mut self) {
-        self.e = 0.0;
-        self.raw("G92 E0");
+    /// Total filament consumed so far (mm), retraction included.
+    pub fn filament_used_mm(&self) -> f64 {
+        self.e_total
     }
 
     /// Returns a ` F{n}` token only when the feed rate has changed.
@@ -53,12 +54,25 @@ impl GcodeBuilder {
         self.buf.push_str(&format!("G0 X{x:.3} Y{y:.3}{f}\n"));
     }
 
-    /// Extruding move; `e_delta` is the filament length (mm) to add.
+    /// Extruding move; `e_delta` is the filament length (mm) for this segment.
     pub fn extrude(&mut self, x: f64, y: f64, e_delta: f64, feed_mm_min: f64) {
-        self.e += e_delta;
+        self.e_total += e_delta;
         let f = self.feed_token(feed_mm_min);
-        let e = self.e;
-        self.buf.push_str(&format!("G1 X{x:.3} Y{y:.3} E{e:.5}{f}\n"));
+        self.buf.push_str(&format!("G1 X{x:.3} Y{y:.3} E{e_delta:.5}{f}\n"));
+    }
+
+    /// Retract filament by `len` mm.
+    pub fn retract(&mut self, len: f64, feed_mm_min: f64) {
+        self.e_total -= len;
+        let f = self.feed_token(feed_mm_min);
+        self.buf.push_str(&format!("G1 E-{len:.5}{f}\n"));
+    }
+
+    /// Undo a retraction.
+    pub fn unretract(&mut self, len: f64, feed_mm_min: f64) {
+        self.e_total += len;
+        let f = self.feed_token(feed_mm_min);
+        self.buf.push_str(&format!("G1 E{len:.5}{f}\n"));
     }
 
     /// Change layer height (Z move only).

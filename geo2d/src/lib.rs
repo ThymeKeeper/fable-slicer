@@ -12,7 +12,7 @@
 //! contour / polygon types and the handful of predicates slicing needs.
 
 mod clipper;
-pub use clipper::offset;
+pub use clipper::{difference, intersection, offset, union};
 
 /// Integer units per millimeter (nanometer resolution).
 pub const UNITS_PER_MM: f64 = 1_000_000.0;
