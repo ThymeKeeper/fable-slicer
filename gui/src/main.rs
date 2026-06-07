@@ -125,7 +125,7 @@ impl App {
         let Some(layers) = self.mesh.as_ref().map(|m| generate(m, &self.settings)) else {
             return;
         };
-        let (verts, ends) = build_toolpaths(&layers);
+        let (verts, ends) = build_instances(&layers);
         self.scene.set_toolpaths(&rs.device, &verts);
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
@@ -329,34 +329,40 @@ const CAT_SOLID: f32 = 2.0;
 const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 
-/// Flatten sliced layers into line-segment vertices `[x,y,z,r,g,b,layer,category]`
-/// (consecutive pairs = segments), plus a cumulative per-layer vertex count for
-/// the layer slider. Travel (positioning) moves between paths are included as
-/// their own category so they can be toggled.
-fn build_toolpaths(layers: &[engine::LayerPlan]) -> (Vec<[f32; 8]>, Vec<u32>) {
-    let mut verts: Vec<[f32; 8]> = Vec::new();
+/// Flatten sliced layers into bead instances: one per extrusion (and travel)
+/// segment, with a cumulative per-layer instance count for the layer slider.
+/// Each instance: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
+/// Extrusions use the path width and layer height; travels are thin.
+fn build_instances(layers: &[engine::LayerPlan]) -> (Vec<[f32; 13]>, Vec<u32>) {
+    let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
     let travel_color = [0.45, 0.75, 0.85];
+    let travel_dim = 0.08_f32;
     let mut prev_end: Option<geo2d::Point> = None;
 
     for (li, layer) in layers.iter().enumerate() {
         let layer_id = (li + 1) as f32; // 1-based, matches preview_layer
-        let z = layer.print_z_mm as f32;
+        let z_top = layer.print_z_mm as f32;
+        let h = layer.height_mm as f32;
+        let z_center = z_top - h * 0.5; // bead spans [z_top - h, z_top]
+
         for path in &layer.paths {
             if path.points.len() < 2 {
                 continue;
             }
             if let Some(pe) = prev_end {
-                push_seg(&mut verts, pe, path.points[0], z, travel_color, layer_id, CAT_TRAVEL);
+                let zc = z_top - travel_dim * 0.5;
+                push_inst(&mut inst, pe, path.points[0], zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
             }
             let c = color_for(path.kind);
             let cat = category_of(path.kind);
-            for w in path.points.windows(2) {
-                push_seg(&mut verts, w[0], w[1], z, c, layer_id, cat);
+            let w = path.width_mm as f32;
+            for win in path.points.windows(2) {
+                push_inst(&mut inst, win[0], win[1], z_center, w, h, c, layer_id, cat);
             }
             if path.closed {
                 let last = path.points[path.points.len() - 1];
-                push_seg(&mut verts, last, path.points[0], z, c, layer_id, cat);
+                push_inst(&mut inst, last, path.points[0], z_center, w, h, c, layer_id, cat);
             }
             prev_end = Some(if path.closed {
                 path.points[0]
@@ -364,15 +370,37 @@ fn build_toolpaths(layers: &[engine::LayerPlan]) -> (Vec<[f32; 8]>, Vec<u32>) {
                 path.points[path.points.len() - 1]
             });
         }
-        ends.push(verts.len() as u32);
+        ends.push(inst.len() as u32);
     }
-    (verts, ends)
+    (inst, ends)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_seg(v: &mut Vec<[f32; 8]>, a: geo2d::Point, b: geo2d::Point, z: f32, c: [f32; 3], layer: f32, cat: f32) {
-    v.push([a.x_mm() as f32, a.y_mm() as f32, z, c[0], c[1], c[2], layer, cat]);
-    v.push([b.x_mm() as f32, b.y_mm() as f32, z, c[0], c[1], c[2], layer, cat]);
+fn push_inst(
+    v: &mut Vec<[f32; 13]>,
+    a: geo2d::Point,
+    b: geo2d::Point,
+    z_center: f32,
+    width: f32,
+    height: f32,
+    color: [f32; 3],
+    layer: f32,
+    cat: f32,
+) {
+    let (ax, ay) = (a.x_mm() as f32, a.y_mm() as f32);
+    let (bx, by) = (b.x_mm() as f32, b.y_mm() as f32);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0e-4 {
+        return;
+    }
+    v.push([
+        ax, ay, z_center,
+        dx / len, dy / len, len,
+        width, height,
+        color[0], color[1], color[2],
+        layer, cat,
+    ]);
 }
 
 fn category_of(kind: engine::PathKind) -> f32 {

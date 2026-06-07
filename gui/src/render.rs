@@ -1,12 +1,14 @@
 //! wgpu renderer for the 3D viewport.
 //!
-//! Renders the scene (bed grid + model, or sliced toolpaths) into an offscreen
-//! color+depth texture, then hands that to egui as a native texture. Our own pass
-//! gives a depth buffer for correct 3D occlusion.
+//! Scene (bed grid + model, or sliced toolpaths) is drawn into an offscreen
+//! color+depth texture, handed to egui as a native texture. Our own pass gives a
+//! depth buffer for correct 3D occlusion.
 //!
-//! Toolpaths carry a per-vertex layer index and path category, so the layer
-//! slider, per-category visibility, and "dim other layers" are all done in the
-//! shader from uniforms — scrubbing/toggling never rebuilds the buffer.
+//! Toolpaths are drawn as real **beads**: one unit box is instanced per extrusion
+//! segment and oriented/scaled to the segment's direction, length, line width and
+//! layer height in the vertex shader. Per-instance layer index + category drive
+//! the layer slider, per-category visibility, and dimming of lower layers — all
+//! in-shader, so scrubbing/toggling never rebuilds the buffer.
 
 use std::borrow::Cow;
 
@@ -22,8 +24,7 @@ const SHADER: &str = r#"
 struct U {
     mvp: mat4x4<f32>,
     light: vec4<f32>,
-    // x = current (top visible) layer, y = dim factor for lower layers,
-    // z = category visibility bitmask, w = unused
+    // x = current (top visible) layer, y = dim factor, z = category bitmask, w = unused
     ctrl: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -55,34 +56,51 @@ struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f3
     return vec4<f32>(i.color, 1.0);
 }
 
-// --- toolpaths (layer-aware, category-filtered) ---
-struct TpOut {
+// --- toolpath beads (instanced boxes) ---
+// base box vertex: lpos in (x:[0,1], y/z:[-0.5,0.5]); instance places/scales it.
+struct BeadOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0) color: vec3<f32>,
-    @location(1) @interpolate(flat) layer: f32,
-    @location(2) @interpolate(flat) cat: f32,
+    @location(0) normal: vec3<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) @interpolate(flat) layer: f32,
+    @location(3) @interpolate(flat) cat: f32,
 };
-@vertex fn vs_tp(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>, @location(2) lc: vec2<f32>) -> TpOut {
-    var o: TpOut;
-    o.clip = u.mvp * vec4<f32>(p, 1.0);
-    o.color = c;
+@vertex fn vs_bead(
+    @location(0) lpos: vec3<f32>,
+    @location(1) lnorm: vec3<f32>,
+    @location(2) p0: vec3<f32>,
+    @location(3) dir_len: vec3<f32>,
+    @location(4) dims: vec2<f32>,
+    @location(5) color: vec3<f32>,
+    @location(6) lc: vec2<f32>,
+) -> BeadOut {
+    let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
+    let zaxis = vec3<f32>(0.0, 0.0, 1.0);
+    let yaxis = cross(zaxis, xaxis);                  // across, in the bed plane
+    let local = xaxis * (lpos.x * dir_len.z) + yaxis * (lpos.y * dims.x) + zaxis * (lpos.z * dims.y);
+    var o: BeadOut;
+    o.clip = u.mvp * vec4<f32>(p0 + local, 1.0);
+    o.normal = xaxis * lnorm.x + yaxis * lnorm.y + zaxis * lnorm.z;
+    o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
     return o;
 }
-@fragment fn fs_tp(i: TpOut) -> @location(0) vec4<f32> {
+@fragment fn fs_bead(i: BeadOut) -> @location(0) vec4<f32> {
     let mask = u32(u.ctrl.z + 0.5);
     let cat = u32(i.cat + 0.5);
     if ((mask & (1u << cat)) == 0u) { discard; }
-    var b = 1.0;
-    if (i.layer < u.ctrl.x - 0.5) { b = u.ctrl.y; } // below the current layer: dim
-    return vec4<f32>(i.color * b, 1.0);
+    let l = normalize(u.light.xyz);
+    let d = max(dot(normalize(i.normal), l), 0.0);
+    var shade = 0.40 + 0.60 * d;
+    if (i.layer < u.ctrl.x - 0.5) { shade = shade * u.ctrl.y; } // dim lower layers
+    return vec4<f32>(i.color * shade, 1.0);
 }
 "#;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct MeshVertex {
+struct Vertex {
     pos: [f32; 3],
     normal: [f32; 3],
 }
@@ -102,9 +120,9 @@ struct Uniforms {
     ctrl: [f32; 4],
 }
 
-/// What/how to draw the toolpaths this frame.
+/// How to draw the toolpaths this frame.
 pub struct Preview {
-    /// Number of toolpath vertices to draw (through the current layer).
+    /// Number of bead instances to draw (through the current layer).
     pub count: u32,
     /// Current (top visible) layer, 1-based.
     pub current_layer: f32,
@@ -118,7 +136,7 @@ pub struct Scene {
     format: wgpu::TextureFormat,
     mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
-    toolpath_pipeline: wgpu::RenderPipeline,
+    bead_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     size: (u32, u32),
@@ -129,8 +147,10 @@ pub struct Scene {
     mesh_count: u32,
     line_vbuf: Option<wgpu::Buffer>,
     line_count: u32,
-    toolpath_vbuf: Option<wgpu::Buffer>,
-    toolpath_total: u32,
+    box_vbuf: wgpu::Buffer,
+    box_count: u32,
+    inst_vbuf: Option<wgpu::Buffer>,
+    inst_count: u32,
 }
 
 impl Scene {
@@ -181,22 +201,45 @@ impl Scene {
 
         let mesh_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_mesh", "fs_mesh",
-            std::mem::size_of::<MeshVertex>() as u64,
-            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            }],
             wgpu::PrimitiveTopology::TriangleList,
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
-            std::mem::size_of::<LineVertex>() as u64,
-            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<LineVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            }],
             wgpu::PrimitiveTopology::LineList,
         );
-        let toolpath_pipeline = make_pipeline(
-            device, &layout, &shader, format, "vs_tp", "fs_tp",
-            (8 * 4) as u64,
-            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
-            wgpu::PrimitiveTopology::LineList,
+        let bead_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_bead", "fs_bead",
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (13 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2],
+                },
+            ],
+            wgpu::PrimitiveTopology::TriangleList,
         );
+
+        let box_verts = box_vertices();
+        let box_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bead_box"),
+            contents: bytemuck::cast_slice(&box_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         let (color_view, depth_view) = make_targets(device, format, 1, 1);
         let tex_id = rs.renderer.write().register_native_texture(
@@ -209,7 +252,7 @@ impl Scene {
             format,
             mesh_pipeline,
             line_pipeline,
-            toolpath_pipeline,
+            bead_pipeline,
             uniform_buf,
             bind_group,
             size: (1, 1),
@@ -220,8 +263,10 @@ impl Scene {
             mesh_count: 0,
             line_vbuf: None,
             line_count: 0,
-            toolpath_vbuf: None,
-            toolpath_total: 0,
+            box_vbuf,
+            box_count: box_verts.len() as u32,
+            inst_vbuf: None,
+            inst_count: 0,
         }
     }
 
@@ -263,7 +308,7 @@ impl Scene {
             ];
             let n = flat_normal(p[0], p[1], p[2]);
             for pos in p {
-                verts.push(MeshVertex { pos, normal: n });
+                verts.push(Vertex { pos, normal: n });
             }
         }
         self.mesh_count = verts.len() as u32;
@@ -299,11 +344,10 @@ impl Scene {
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
     }
 
-    /// Upload toolpath vertices: `[x, y, z, r, g, b, layer, category]` each;
-    /// consecutive pairs form segments.
-    pub fn set_toolpaths(&mut self, device: &wgpu::Device, verts: &[[f32; 8]]) {
-        self.toolpath_total = verts.len() as u32;
-        self.toolpath_vbuf = make_vbuf(device, "toolpath_vbuf", bytemuck::cast_slice(verts));
+    /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat]`.
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, instances: &[[f32; 13]]) {
+        self.inst_count = instances.len() as u32;
+        self.inst_vbuf = make_vbuf(device, "bead_instances", bytemuck::cast_slice(instances));
     }
 
     pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, preview: Option<Preview>) {
@@ -354,12 +398,13 @@ impl Scene {
             }
 
             if let Some(p) = &preview {
-                let count = p.count.min(self.toolpath_total);
-                if count > 0 {
-                    if let Some(buf) = &self.toolpath_vbuf {
-                        pass.set_pipeline(&self.toolpath_pipeline);
-                        pass.set_vertex_buffer(0, buf.slice(..));
-                        pass.draw(0..count, 0..1);
+                let n = p.count.min(self.inst_count);
+                if n > 0 {
+                    if let Some(inst) = &self.inst_vbuf {
+                        pass.set_pipeline(&self.bead_pipeline);
+                        pass.set_vertex_buffer(0, self.box_vbuf.slice(..));
+                        pass.set_vertex_buffer(1, inst.slice(..));
+                        pass.draw(0..self.box_count, 0..n);
                     }
                 }
             }
@@ -374,6 +419,32 @@ impl Scene {
         }
         rs.queue.submit(std::iter::once(encoder.finish()));
     }
+}
+
+/// Unit box, length along +X (`x` in [0,1]), centered across (`y`,`z` in [-0.5,0.5]).
+/// Cull mode is off, so winding is irrelevant; normals are set per face.
+fn box_vertices() -> Vec<Vertex> {
+    fn quad(v: &mut Vec<Vertex>, n: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
+        for p in [a, b, c, a, c, d] {
+            v.push(Vertex { pos: p, normal: n });
+        }
+    }
+    let c000 = [0.0, -0.5, -0.5];
+    let c100 = [1.0, -0.5, -0.5];
+    let c110 = [1.0, 0.5, -0.5];
+    let c010 = [0.0, 0.5, -0.5];
+    let c001 = [0.0, -0.5, 0.5];
+    let c101 = [1.0, -0.5, 0.5];
+    let c111 = [1.0, 0.5, 0.5];
+    let c011 = [0.0, 0.5, 0.5];
+    let mut v = Vec::with_capacity(36);
+    quad(&mut v, [0.0, 0.0, 1.0], c001, c101, c111, c011); // top
+    quad(&mut v, [0.0, 0.0, -1.0], c000, c100, c110, c010); // bottom
+    quad(&mut v, [0.0, 1.0, 0.0], c010, c110, c111, c011); // +Y
+    quad(&mut v, [0.0, -1.0, 0.0], c000, c100, c101, c001); // -Y
+    quad(&mut v, [1.0, 0.0, 0.0], c100, c110, c111, c101); // +X
+    quad(&mut v, [-1.0, 0.0, 0.0], c000, c010, c011, c001); // -X
+    v
 }
 
 fn make_vbuf(device: &wgpu::Device, label: &str, data: &[u8]) -> Option<wgpu::Buffer> {
@@ -432,7 +503,6 @@ fn make_targets(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn make_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -440,8 +510,7 @@ fn make_pipeline(
     format: wgpu::TextureFormat,
     vs: &str,
     fs: &str,
-    stride: u64,
-    attrs: &[wgpu::VertexAttribute],
+    buffers: &[wgpu::VertexBufferLayout],
     topology: wgpu::PrimitiveTopology,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -450,11 +519,7 @@ fn make_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some(vs),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: stride,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: attrs,
-            }],
+            buffers,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
