@@ -66,6 +66,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Auto-center / place model on the bed (handles models with negative coordinates)
 - [x] Top/bottom solid layers via boolean diff across N layers (`top_layers`/`bottom_layers`)
 - [x] Sparse vs. solid region detection (solid shells dense-filled, core sparse)
+- [x] Drop sub-line-width infill slivers (morphological *open* of the fill region + minimum segment length)
 - [x] Retraction on travels between extrusions (z-hop still TODO)
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
 - [x] Skirt (configurable loops + gap, first layer only); brim / raft still TODO
@@ -93,7 +94,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 > framework `egui`; 2D-vs-3D preview TBD. Headless dev box can't render a window,
 > so visual verification needs the user (or an xvfb screenshot harness).
 - [x] GUI shell (`egui` + `wgpu`): load STL, pick profiles, edit settings, slice, export g-code; **3D model viewport** (orbit/zoom/pan, bed grid)
-- [x] 3D toolpath preview: feature-colored **3D beads** (real line-width × layer-height, rounded/oval cross-section, GPU-instanced) + travel moves, Model/Preview toggle, layer slider, per-category visibility toggles, and dimming of lower layers when scrubbing (layer/category/dim all in-shader from uniforms — no rebuild on scrub/toggle)
+- [x] 3D toolpath preview: feature-colored **3D beads** (real line-width × layer-height, rounded/oval cross-section, rounded ends + corner-filling joint blobs, GPU-instanced) + travel moves, Model/Preview toggle, layer slider, per-category visibility toggles, and dimming of lower layers when scrubbing (layer/category/dim all in-shader from uniforms — no rebuild on scrub/toggle)
 - [x] Profile system + starter library (printer/filament/process) — landed early; *management UI* still TODO
 - [ ] Variable / adaptive layer height
 - [ ] Gyroid + more infill patterns

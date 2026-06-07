@@ -30,8 +30,10 @@ struct App {
     camera: Camera,
     status: String,
     sliced: Option<Vec<engine::LayerPlan>>,
-    /// Cumulative toolpath vertex count after each layer (for the layer slider).
+    /// Cumulative bead-instance count after each layer (for the layer slider).
     layer_ends: Vec<u32>,
+    /// Cumulative joint-blob count after each layer.
+    joint_layer_ends: Vec<u32>,
     /// false = show the model mesh; true = show the sliced toolpaths.
     view_preview: bool,
     /// Highest layer shown in preview (1-based).
@@ -67,6 +69,7 @@ impl App {
             status: "Open an STL to begin.".to_string(),
             sliced: None,
             layer_ends: Vec::new(),
+            joint_layer_ends: Vec::new(),
             view_preview: false,
             preview_layer: 1,
             show_walls: true,
@@ -125,12 +128,14 @@ impl App {
         let Some(layers) = self.mesh.as_ref().map(|m| generate(m, &self.settings)) else {
             return;
         };
-        let (verts, ends) = build_instances(&layers);
+        let (verts, ends, joints, joint_ends) = build_instances(&layers);
         self.scene.set_toolpaths(&rs.device, &verts);
+        self.scene.set_joints(&rs.device, &joints);
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
         self.status = format!("Sliced {n} layers, {paths} toolpaths.");
         self.layer_ends = ends;
+        self.joint_layer_ends = joint_ends;
         self.preview_layer = n.max(1);
         self.view_preview = true;
         self.sliced = Some(layers);
@@ -282,11 +287,14 @@ impl eframe::App for App {
             let show_mesh = !(self.view_preview && self.sliced.is_some());
             let preview = if self.view_preview && self.sliced.is_some() {
                 let n = self.layer_ends.len();
-                let count = self.layer_ends.get(self.preview_layer.saturating_sub(1)).copied().unwrap_or(0);
+                let idx = self.preview_layer.saturating_sub(1);
+                let count = self.layer_ends.get(idx).copied().unwrap_or(0);
+                let joint_count = self.joint_layer_ends.get(idx).copied().unwrap_or(0);
                 // Dim lower layers only when the slider is below the top.
                 let dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
                 Some(render::Preview {
                     count,
+                    joint_count,
                     current_layer: self.preview_layer as f32,
                     dim,
                     mask: self.category_mask(),
@@ -329,13 +337,17 @@ const CAT_SOLID: f32 = 2.0;
 const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 
-/// Flatten sliced layers into bead instances: one per extrusion (and travel)
-/// segment, with a cumulative per-layer instance count for the layer slider.
-/// Each instance: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
-/// Extrusions use the path width and layer height; travels are thin.
-fn build_instances(layers: &[engine::LayerPlan]) -> (Vec<[f32; 13]>, Vec<u32>) {
+/// Flatten sliced layers into bead instances (one per extrusion/travel segment)
+/// plus joint blobs (one per extrusion vertex, to round ends and fill corners),
+/// each with a cumulative per-layer count for the layer slider.
+/// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
+/// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
+type Instances = (Vec<[f32; 13]>, Vec<u32>, Vec<[f32; 10]>, Vec<u32>);
+fn build_instances(layers: &[engine::LayerPlan]) -> Instances {
     let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
+    let mut joints: Vec<[f32; 10]> = Vec::new();
+    let mut joint_ends: Vec<u32> = Vec::with_capacity(layers.len());
     let travel_color = [0.45, 0.75, 0.85];
     let travel_dim = 0.08_f32;
     let mut prev_end: Option<geo2d::Point> = None;
@@ -364,6 +376,15 @@ fn build_instances(layers: &[engine::LayerPlan]) -> (Vec<[f32; 13]>, Vec<u32>) {
                 let last = path.points[path.points.len() - 1];
                 push_inst(&mut inst, last, path.points[0], z_center, w, h, c, layer_id, cat);
             }
+            // Joint blob at every vertex (extrusion paths only — travels stay bare).
+            for p in &path.points {
+                joints.push([
+                    p.x_mm() as f32, p.y_mm() as f32, z_center,
+                    w, h,
+                    c[0], c[1], c[2],
+                    layer_id, cat,
+                ]);
+            }
             prev_end = Some(if path.closed {
                 path.points[0]
             } else {
@@ -371,8 +392,9 @@ fn build_instances(layers: &[engine::LayerPlan]) -> (Vec<[f32; 13]>, Vec<u32>) {
             });
         }
         ends.push(inst.len() as u32);
+        joint_ends.push(joints.len() as u32);
     }
-    (inst, ends)
+    (inst, ends, joints, joint_ends)
 }
 
 #[allow(clippy::too_many_arguments)]

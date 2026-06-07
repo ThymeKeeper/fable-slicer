@@ -99,6 +99,25 @@ struct BeadOut {
     if (i.layer < u.ctrl.x - 0.5) { shade = shade * u.ctrl.y; } // dim lower layers
     return vec4<f32>(i.color * shade, 1.0);
 }
+
+// --- joint blobs (instanced; round path ends and fill corners) ---
+@vertex fn vs_joint(
+    @location(0) lpos: vec3<f32>,
+    @location(1) lnorm: vec3<f32>,
+    @location(2) p0: vec3<f32>,
+    @location(3) dims: vec2<f32>,
+    @location(4) color: vec3<f32>,
+    @location(5) lc: vec2<f32>,
+) -> BeadOut {
+    let r = vec3<f32>(dims.x * 0.5, dims.x * 0.5, dims.y * 0.5);
+    var o: BeadOut;
+    o.clip = u.mvp * vec4<f32>(p0 + lpos * r, 1.0);
+    o.normal = normalize(lnorm / r);
+    o.color = color;
+    o.layer = lc.x;
+    o.cat = lc.y;
+    return o;
+}
 "#;
 
 #[repr(C)]
@@ -125,8 +144,10 @@ struct Uniforms {
 
 /// How to draw the toolpaths this frame.
 pub struct Preview {
-    /// Number of bead instances to draw (through the current layer).
+    /// Number of bead (segment) instances to draw, through the current layer.
     pub count: u32,
+    /// Number of joint-blob instances to draw, through the current layer.
+    pub joint_count: u32,
     /// Current (top visible) layer, 1-based.
     pub current_layer: f32,
     /// Brightness multiplier for layers below the current one (1.0 = no dim).
@@ -154,6 +175,11 @@ pub struct Scene {
     box_count: u32,
     inst_vbuf: Option<wgpu::Buffer>,
     inst_count: u32,
+    joint_pipeline: wgpu::RenderPipeline,
+    blob_vbuf: wgpu::Buffer,
+    blob_count: u32,
+    joint_vbuf: Option<wgpu::Buffer>,
+    joint_count: u32,
 }
 
 impl Scene {
@@ -236,11 +262,33 @@ impl Scene {
             ],
             wgpu::PrimitiveTopology::TriangleList,
         );
+        let joint_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_joint", "fs_bead",
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (10 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Float32x3, 5 => Float32x2],
+                },
+            ],
+            wgpu::PrimitiveTopology::TriangleList,
+        );
 
         let box_verts = bead_vertices();
         let box_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bead_base"),
             contents: bytemuck::cast_slice(&box_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let blob_verts = blob_vertices();
+        let blob_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("joint_base"),
+            contents: bytemuck::cast_slice(&blob_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
@@ -270,6 +318,11 @@ impl Scene {
             box_count: box_verts.len() as u32,
             inst_vbuf: None,
             inst_count: 0,
+            joint_pipeline,
+            blob_vbuf,
+            blob_count: blob_verts.len() as u32,
+            joint_vbuf: None,
+            joint_count: 0,
         }
     }
 
@@ -353,6 +406,12 @@ impl Scene {
         self.inst_vbuf = make_vbuf(device, "bead_instances", bytemuck::cast_slice(instances));
     }
 
+    /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat]`.
+    pub fn set_joints(&mut self, device: &wgpu::Device, joints: &[[f32; 10]]) {
+        self.joint_count = joints.len() as u32;
+        self.joint_vbuf = make_vbuf(device, "joint_instances", bytemuck::cast_slice(joints));
+    }
+
     pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, preview: Option<Preview>) {
         let ctrl = match &preview {
             Some(p) => [p.current_layer, p.dim, p.mask as f32, 0.0],
@@ -410,6 +469,15 @@ impl Scene {
                         pass.draw(0..self.box_count, 0..n);
                     }
                 }
+                let jn = p.joint_count.min(self.joint_count);
+                if jn > 0 {
+                    if let Some(jinst) = &self.joint_vbuf {
+                        pass.set_pipeline(&self.joint_pipeline);
+                        pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
+                        pass.set_vertex_buffer(1, jinst.slice(..));
+                        pass.draw(0..self.blob_count, 0..jn);
+                    }
+                }
             }
 
             if show_mesh {
@@ -424,11 +492,10 @@ impl Scene {
     }
 }
 
-/// Unit bead: a tube along +X (`x` in [0,1]) with a rounded cross-section (unit
-/// circle of radius 0.5 in the Y-Z plane), plus flat end caps. The instance
-/// scales the cross-section to (line width, layer height) — giving an oval bead.
-/// Cull mode is off, so winding is irrelevant; normals are set per vertex
-/// (smooth radial around the tube; axial on the caps).
+/// Unit bead: an open tube along +X (`x` in [0,1]) with a rounded cross-section
+/// (unit circle radius 0.5 in the Y-Z plane). The instance scales the
+/// cross-section to (line width, layer height). Ends are left open; a joint blob
+/// at every vertex rounds the ends and fills corners between segments.
 fn bead_vertices() -> Vec<Vertex> {
     const N: usize = 8;
     let ring: Vec<[f32; 2]> = (0..N)
@@ -438,9 +505,7 @@ fn bead_vertices() -> Vec<Vertex> {
         })
         .collect();
 
-    let mut v = Vec::with_capacity(12 * N);
-
-    // Sides: a quad per facet with smooth radial normals.
+    let mut v = Vec::with_capacity(6 * N);
     for k in 0..N {
         let k1 = (k + 1) % N;
         let (y0, z0) = (ring[k][0], ring[k][1]);
@@ -453,16 +518,32 @@ fn bead_vertices() -> Vec<Vertex> {
         let d = Vertex { pos: [1.0, y0, z0], normal: n0 };
         v.extend_from_slice(&[a, b, c, a, c, d]);
     }
+    v
+}
 
-    // Flat end caps.
-    for k in 0..N {
-        let k1 = (k + 1) % N;
-        v.push(Vertex { pos: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] });
-        v.push(Vertex { pos: [0.0, ring[k1][0], ring[k1][1]], normal: [-1.0, 0.0, 0.0] });
-        v.push(Vertex { pos: [0.0, ring[k][0], ring[k][1]], normal: [-1.0, 0.0, 0.0] });
-        v.push(Vertex { pos: [1.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] });
-        v.push(Vertex { pos: [1.0, ring[k][0], ring[k][1]], normal: [1.0, 0.0, 0.0] });
-        v.push(Vertex { pos: [1.0, ring[k1][0], ring[k1][1]], normal: [1.0, 0.0, 0.0] });
+/// Unit joint blob: an octagonal bipyramid (unit equator, poles at z = ±1).
+/// The instance scales it to (width/2, width/2, height/2) and places it at a
+/// path vertex, rounding ends and filling corners. Vertex positions are unit
+/// vectors, so they double as normals.
+fn blob_vertices() -> Vec<Vertex> {
+    const S: usize = 8;
+    let eq: Vec<[f32; 3]> = (0..S)
+        .map(|k| {
+            let t = std::f32::consts::TAU * (k as f32) / (S as f32);
+            [t.cos(), t.sin(), 0.0]
+        })
+        .collect();
+    let top = [0.0, 0.0, 1.0];
+    let bot = [0.0, 0.0, -1.0];
+    let mut v = Vec::with_capacity(6 * S);
+    for k in 0..S {
+        let k1 = (k + 1) % S;
+        v.push(Vertex { pos: top, normal: top });
+        v.push(Vertex { pos: eq[k], normal: eq[k] });
+        v.push(Vertex { pos: eq[k1], normal: eq[k1] });
+        v.push(Vertex { pos: bot, normal: bot });
+        v.push(Vertex { pos: eq[k1], normal: eq[k1] });
+        v.push(Vertex { pos: eq[k], normal: eq[k] });
     }
     v
 }

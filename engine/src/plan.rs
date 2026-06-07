@@ -78,7 +78,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 }
             }
         }
-        inner_per_layer.push(offset(&layer.polygons, -lw * settings.wall_count as f64));
+        // Inset to the infill region, then morphologically "open" it (erode then
+        // dilate by half a line width) to drop slivers narrower than a line —
+        // those only produce tiny, useless dabs of infill.
+        let inset = offset(&layer.polygons, -lw * settings.wall_count as f64);
+        let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
+        inner_per_layer.push(opened);
         walls_per_layer.push(walls);
     }
 
@@ -248,7 +253,8 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<P
         let mut k = 0;
         while k + 1 < xs.len() {
             let (x0, x1) = (xs[k], xs[k + 1]);
-            if x1 - x0 > 0.1 {
+            // Skip dabs shorter than this — not worth extruding.
+            if x1 - x0 > 0.5 {
                 let (px0, py0) = unrot(x0, y);
                 let (px1, py1) = unrot(x1, y);
                 out.push(vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)]);
