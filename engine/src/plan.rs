@@ -160,10 +160,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
 
             if !arc_region.is_empty() {
-                // Anchor the arcs on everything that isn't the overhang itself —
-                // the walls and any supported interior the region borders.
-                let anchor = difference(&layers[i].polygons, &arc_region);
-                for seg in crate::arc::arc_fill(&arc_region, &anchor, lw, ARC_RMAX_MM) {
+                // Seed/anchor arcs only on material actually held up by the layer
+                // below. A bridge (supported on ≥2 sides) then seeds from each side
+                // and the fans meet; a cantilever (1 side) seeds only there and the
+                // arcs grow outward over air — McCulloch's two cases, auto-selected.
+                let allowance =
+                    settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+                let supported_below = offset(&layers[i - 1].polygons, allowance);
+                for seg in crate::arc::arc_fill(&arc_region, &supported_below, lw, ARC_RMAX_MM) {
                     if seg.len() >= 2 {
                         paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
                     }
