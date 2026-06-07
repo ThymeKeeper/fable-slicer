@@ -131,6 +131,8 @@ pub struct Settings {
     // --- retraction ---
     pub retract_len_mm: f64,
     pub retract_speed_mm_s: f64,
+    /// Z lift on travels that can't be combed (cross a void). 0 disables.
+    pub z_hop_mm: f64,
 
     // --- temperatures (°C) ---
     pub nozzle_temp_c: u32,
@@ -175,6 +177,7 @@ impl Default for Settings {
             seam_mode: SeamMode::default(),
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
+            z_hop_mm: 0.0,
             nozzle_temp_c: 200,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,

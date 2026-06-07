@@ -133,7 +133,8 @@ impl App {
         let Some(layers) = self.mesh.as_ref().map(|m| generate(m, &self.settings)) else {
             return;
         };
-        let (verts, ends, joints, joint_ends) = build_instances(&layers);
+        let (verts, ends, joints, joint_ends) =
+            build_instances(&layers, self.settings.z_hop_mm as f32);
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
         let n = layers.len();
@@ -379,7 +380,7 @@ const CAT_SEAM: f32 = 5.0;
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
 type Instances = (Vec<[f32; 13]>, Vec<u32>, Vec<[f32; 10]>, Vec<u32>);
-fn build_instances(layers: &[engine::LayerPlan]) -> Instances {
+fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
     let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
     let mut joints: Vec<[f32; 10]> = Vec::new();
@@ -394,13 +395,19 @@ fn build_instances(layers: &[engine::LayerPlan]) -> Instances {
         let h = layer.height_mm as f32;
         let z_center = z_top - h * 0.5; // bead spans [z_top - h, z_top]
 
-        for path in &layer.paths {
+        for (pi, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
                 continue;
             }
-            if let Some(pe) = prev_end {
-                let zc = z_top - travel_dim * 0.5;
-                push_inst(&mut inst, pe, path.points[0], zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
+            // Render the planned travel: the combed route (around holes/walls),
+            // raised when it z-hops over a void.
+            if let (Some(pe), Some(tr)) = (prev_end, layer.travels.get(pi)) {
+                let zc = if tr.hop { z_top + z_hop_mm } else { z_top } - travel_dim * 0.5;
+                let mut from = pe;
+                for &pt in &tr.points {
+                    push_inst(&mut inst, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
+                    from = pt;
+                }
             }
             let c = color_for(path.kind);
             let cat = category_of(path.kind);

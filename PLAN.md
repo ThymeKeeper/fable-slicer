@@ -67,7 +67,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Top/bottom solid layers via boolean diff across N layers (`top_layers`/`bottom_layers`)
 - [x] Sparse vs. solid region detection (solid shells dense-filled, core sparse)
 - [x] Solid infill: a perimeter loop around each solid region (a clean concentric bead along shell walls; absorbs thin bands so no lone strands), then straight-fill the interior. Sub-line-width slivers removed via morphological *open* + a minimum segment length.
-- [x] Retraction on travels between extrusions (z-hop still TODO)
+- [x] Retraction on travels between extrusions; **z-hop** on travels that can't be combed (cross a void between islands)
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
 - [x] Skirt (loops + gap, auto-clears any brim) and brim (loops, touching the part for adhesion) on the first layer; raft still TODO
 - [x] First-layer height override (separate first-layer thickness); first-layer flow tuning still TODO
@@ -78,7 +78,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 ### M3 — Quality pass (what separates "prints" from "looks good")
 - [x] Per-feature speeds (external perimeter slowed) + min-layer-time cooling: layers faster than `min_layer_time_s` slow to a floor speed (per-layer `speed_scale`)
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
-- [x] Travel ordering (nearest-neighbour) + **combing**: a travel that would cross a wall is rerouted via a per-layer visibility graph over the (simplified) layer outline to stay inside, routing around holes; only genuinely unroutable (cross-island) travels retract. Benchy: travel 67m→17m, retractions 5587→404.
+- [x] Travel ordering (nearest-neighbour) + **combing**: travels are planned once (`emit::plan_travels`) and stored on each layer, so g-code and the GUI preview share one source of truth (preview renders the *actual* combed routes, not naive straight lines). A travel that would cross a wall is rerouted via a per-layer visibility graph over the layer outline, routing around holes; a travel with no in-region route (between separate islands, across a void) retracts and **z-hops** over the gap. Benchy: travel 67m→17m, retractions 5587→~400 (all z-hopped).
 - [ ] Gap fill between colliding offsets
 - [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate; shown in GUI status + CLI
 - [ ] Coasting / wipe

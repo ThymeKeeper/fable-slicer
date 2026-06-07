@@ -167,6 +167,8 @@ fn main() -> Result<()> {
     );
     let (fil_mm, grams) = engine::estimate_filament(&layers, &settings);
     println!("Filament: {:.2} m, {:.1} g", fil_mm / 1000.0, grams);
+    let (cross, combed, fb, fb_hole) = engine::audit_combing(&layers);
+    println!("Combing: {cross} crossing travels — {combed} combed, {fb} straight ({fb_hole} cut a hole)");
 
     let gcode = to_gcode(&layers, &settings);
     std::fs::write(&args.output, &gcode)

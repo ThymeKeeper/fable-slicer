@@ -29,6 +29,7 @@ pub struct PrinterProfile {
     pub jerk: Option<f64>,
     pub retract_len_mm: Option<f64>,
     pub retract_speed_mm_s: Option<f64>,
+    pub z_hop_mm: Option<f64>,
     pub start_gcode: Option<String>,
     pub end_gcode: Option<String>,
 }
@@ -89,7 +90,7 @@ impl Tier for PrinterProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration, jerk,
-            retract_len_mm, retract_speed_mm_s, start_gcode, end_gcode)
+            retract_len_mm, retract_speed_mm_s, z_hop_mm, start_gcode, end_gcode)
     }
 }
 
@@ -188,6 +189,7 @@ impl Profiles {
             seam_mode: pc.seam.as_deref().and_then(SeamMode::parse).unwrap_or(d.seam_mode),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
+            z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
             // Printer speed (machine default) takes precedence over the process value.

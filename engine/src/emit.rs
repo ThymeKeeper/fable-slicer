@@ -12,7 +12,7 @@ use config::Settings;
 use gcode::GcodeBuilder;
 use geo2d::{Point, Polygons};
 
-use crate::plan::{LayerPlan, PathKind, ToolPath};
+use crate::plan::{LayerPlan, PathKind, ToolPath, Travel};
 
 /// Emit complete G-code for a planned model.
 pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
@@ -42,16 +42,14 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     emit_template(&mut g, &s.start_gcode, s);
     g.fan(0);
 
-    let mut last_pos: Option<Point> = None;
     for layer in layers {
         g.comment(&format!("LAYER {} z={:.3}", layer.index, layer.print_z_mm));
         if layer.index == 1 {
             g.fan(255); // part cooling on after the first layer
         }
         g.move_z(layer.print_z_mm, travel_f);
-        let mut comb: Option<CombGraph> = None;
 
-        for path in &layer.paths {
+        for (i, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
                 continue;
             }
@@ -59,35 +57,23 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let coeff = path.width_mm * layer.height_mm / area;
             let start = path.points[0];
 
-            // A travel that stays inside the part combs straight over printed
-            // material; one that would cross a wall is rerouted to stay inside,
-            // and only retracts if no in-region route exists.
-            if let Some(prev) = last_pos {
-                let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
-                    && travel_crosses(&layer.outline, prev, start);
-                if crosses {
-                    let graph = comb.get_or_insert_with(|| CombGraph::build(&layer.outline));
-                    match graph.route(&layer.outline, prev, start) {
-                        Some(route) => {
-                            for pt in route {
-                                g.travel(pt.x_mm(), pt.y_mm(), travel_f);
-                            }
-                        }
-                        None => {
-                            if s.retract_len_mm > 0.0 {
-                                g.retract(s.retract_len_mm, retract_f);
-                            }
-                            g.travel(start.x_mm(), start.y_mm(), travel_f);
-                            if s.retract_len_mm > 0.0 {
-                                g.unretract(s.retract_len_mm, retract_f);
-                            }
-                        }
-                    }
-                } else {
-                    g.travel(start.x_mm(), start.y_mm(), travel_f);
-                }
-            } else {
-                g.travel(start.x_mm(), start.y_mm(), travel_f);
+            // The travel (combed route, or a retracted/z-hopped hop over a void)
+            // was planned in `plan_travels` — replay it.
+            let tr = &layer.travels[i];
+            if tr.retract && s.retract_len_mm > 0.0 {
+                g.retract(s.retract_len_mm, retract_f);
+            }
+            if tr.hop && s.z_hop_mm > 0.0 {
+                g.move_z(layer.print_z_mm + s.z_hop_mm, travel_f);
+            }
+            for pt in &tr.points {
+                g.travel(pt.x_mm(), pt.y_mm(), travel_f);
+            }
+            if tr.hop && s.z_hop_mm > 0.0 {
+                g.move_z(layer.print_z_mm, travel_f);
+            }
+            if tr.retract && s.retract_len_mm > 0.0 {
+                g.unretract(s.retract_len_mm, retract_f);
             }
 
             let mut prev = start;
@@ -98,7 +84,6 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             if path.closed {
                 g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
             }
-            last_pos = Some(path_end(path));
         }
     }
 
@@ -168,7 +153,8 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
     total
 }
 
-/// Extrusion + intra-layer travel time for one layer, at the given speed scale.
+/// Extrusion + intra-layer travel time for one layer, at the given speed scale,
+/// using the planned travels.
 fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
     let accel = s.acceleration_mm_s2.max(1.0);
     let jerk = s.jerk_mm_s.max(0.1);
@@ -178,24 +164,77 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
     } else {
         0.0
     };
+    let hop_t = if s.z_hop_mm > 0.0 { 2.0 * s.z_hop_mm / travel_v } else { 0.0 };
     let mut t = 0.0;
     let mut last_pos: Option<Point> = None;
-    for path in &layer.paths {
+    for (i, path) in layer.paths.iter().enumerate() {
         if path.points.len() < 2 {
             continue;
         }
-        let start = path.points[0];
-        if let Some(prev) = last_pos {
-            if needs_retract(&layer.outline, prev, start, s) {
+        if let Some(tr) = layer.travels.get(i) {
+            // Travel length: from the previous position through the route points.
+            let mut len = 0.0;
+            let mut prev = last_pos;
+            for &pt in &tr.points {
+                if let Some(p) = prev {
+                    len += dist_mm(p, pt);
+                }
+                prev = Some(pt);
+            }
+            t += trapezoid_time(len, 0.0, 0.0, travel_v, accel);
+            if tr.retract {
                 t += retract_t;
             }
-            t += trapezoid_time(dist_mm(prev, start), 0.0, 0.0, travel_v, accel);
+            if tr.hop {
+                t += hop_t;
+            }
         }
         let v_nom = feed_for(path.kind, layer.index, s) / 60.0 * scale;
         t += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
         last_pos = Some(path_end(path));
     }
     t
+}
+
+/// Plan the lead-in travel for every path: comb a route that stays inside the
+/// part when one exists, else retract and z-hop straight over the gap. Stored on
+/// each layer so g-code and the GUI preview agree.
+pub(crate) fn plan_travels(plans: &mut [LayerPlan], s: &Settings) {
+    let mut last_pos: Option<Point> = None;
+    for plan in plans.iter_mut() {
+        let mut travels: Vec<Travel> = Vec::with_capacity(plan.paths.len());
+        let mut comb: Option<CombGraph> = None;
+        for path in &plan.paths {
+            if path.points.len() < 2 {
+                travels.push(Travel::default());
+                continue;
+            }
+            let start = path.points[0];
+            let travel = match last_pos {
+                None => Travel { points: vec![start], retract: false, hop: false },
+                Some(prev) => {
+                    let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
+                        && travel_crosses(&plan.outline, prev, start);
+                    if !crosses {
+                        Travel { points: vec![start], retract: false, hop: false }
+                    } else {
+                        let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
+                        match graph.route(&plan.outline, prev, start) {
+                            Some(route) => Travel { points: route, retract: false, hop: false },
+                            None => Travel {
+                                points: vec![start],
+                                retract: s.retract_len_mm > 0.0,
+                                hop: s.z_hop_mm > 0.0,
+                            },
+                        }
+                    }
+                }
+            };
+            last_pos = Some(path_end(path));
+            travels.push(travel);
+        }
+        plan.travels = travels;
+    }
 }
 
 /// Slow down layers that print faster than `min_layer_time_s` (down to a floor
@@ -324,12 +363,6 @@ fn path_end(p: &ToolPath) -> Point {
     } else {
         p.points[p.points.len() - 1]
     }
-}
-
-/// Retract only if the travel is long enough *and* its straight line crosses a
-/// wall (leaves the printed region). Travels that stay inside comb without one.
-fn needs_retract(outline: &Polygons, a: Point, b: Point, s: &Settings) -> bool {
-    s.retract_len_mm > 0.0 && dist_mm(a, b) >= MIN_TRAVEL_MM && travel_crosses(outline, a, b)
 }
 
 fn travel_crosses(outline: &Polygons, a: Point, b: Point) -> bool {
@@ -497,6 +530,51 @@ impl CombGraph {
         route.remove(0); // drop `a` (already there)
         Some(route)
     }
+}
+
+/// Diagnostic over the planned travels: `(crossing_travels, combed,
+/// fell_back_to_straight, straights_cutting_a_hole)`. A combed travel has a
+/// multi-point route; a fallback is a single retracted/z-hopped hop.
+pub fn audit_combing(layers: &[LayerPlan]) -> (usize, usize, usize, usize) {
+    let (mut crossing, mut combed, mut fallback, mut fallback_hole) = (0, 0, 0, 0);
+    for layer in layers {
+        let mut last_pos: Option<Point> = None;
+        for (i, path) in layer.paths.iter().enumerate() {
+            if path.points.len() < 2 {
+                continue;
+            }
+            let start = path.points[0];
+            if let (Some(prev), Some(tr)) = (last_pos, layer.travels.get(i)) {
+                if tr.points.len() > 1 {
+                    crossing += 1;
+                    combed += 1;
+                } else if tr.retract {
+                    crossing += 1;
+                    fallback += 1;
+                    if crosses_hole(&layer.outline, prev, start) {
+                        fallback_hole += 1;
+                    }
+                }
+            }
+            last_pos = Some(path_end(path));
+        }
+    }
+    (crossing, combed, fallback, fallback_hole)
+}
+
+fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
+    for c in &outline.contours {
+        if c.is_ccw() {
+            continue; // only holes (CW contours)
+        }
+        let n = c.points.len();
+        for i in 0..n {
+            if segments_intersect(a, b, c.points[i], c.points[(i + 1) % n]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

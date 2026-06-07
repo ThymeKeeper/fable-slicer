@@ -7,6 +7,8 @@ acceleration = 3000.0
 jerk = 10.0
 retract_len_mm = 0.8
 retract_speed_mm_s = 35.0
+# Lift over voids on travels that can't be combed.
+z_hop_mm = 0.4
 
 start_gcode = """
 M140 S{bed_temp}

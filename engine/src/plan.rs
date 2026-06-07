@@ -10,7 +10,7 @@
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
 use config::{InfillPattern, SeamMode, Settings};
-use geo2d::{difference, intersection, offset, to_units, union, Point, Polygons};
+use geo2d::{difference, intersection, offset, simplify, to_units, union, Point, Polygons};
 use mesh::Mesh;
 
 use crate::{slice_mesh, SliceParams};
@@ -38,6 +38,19 @@ pub struct ToolPath {
     pub points: Vec<Point>,
 }
 
+/// The non-extruding move that reaches a path's start. Computed once (combing +
+/// retraction + z-hop) so the g-code and the GUI preview share one source of truth.
+#[derive(Clone, Debug, Default)]
+pub struct Travel {
+    /// G0 destinations in order, ending at the path's start (the from-point — the
+    /// previous path's end — is implicit). Empty when there is no preceding move.
+    pub points: Vec<Point>,
+    /// Retract before this travel (it leaves the printed region).
+    pub retract: bool,
+    /// Z-hop over this travel (it can't be combed — crosses a void).
+    pub hop: bool,
+}
+
 /// Everything needed to emit one printed layer.
 #[derive(Clone, Debug)]
 pub struct LayerPlan {
@@ -46,6 +59,8 @@ pub struct LayerPlan {
     pub print_z_mm: f64,
     pub height_mm: f64,
     pub paths: Vec<ToolPath>,
+    /// Lead-in travel for each path (1:1 with `paths`).
+    pub travels: Vec<Travel>,
     /// The layer's solid outline (bed-centered), used for combing decisions.
     pub outline: Polygons,
     /// Speed multiplier (≤1) applied to this layer for min-layer-time cooling.
@@ -144,9 +159,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             print_z_mm: layers[i].print_z_mm,
             height_mm: layers[i].height_mm,
             paths,
-            // Inset a touch so combing routes keep clearance from real walls/holes
-            // (offset also simplifies, keeping the visibility graph small).
-            outline: offset(&layers[i].polygons, -0.1),
+            travels: Vec::new(), // filled by emit::plan_travels once paths are final
+            // Simplify (not offset) so the visibility graph stays small while
+            // topology is preserved — an inward offset can pinch thin necks into
+            // separate islands that then can't be combed.
+            outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
         });
     }
@@ -170,6 +187,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
     order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
+    crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
 }
