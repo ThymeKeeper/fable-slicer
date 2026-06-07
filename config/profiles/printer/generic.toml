@@ -1,0 +1,25 @@
+# Generic FDM printer (Marlin/Klipper-compatible). Heats and homes directly.
+bed_size_x_mm = 220.0
+bed_size_y_mm = 220.0
+nozzle_diameter_mm = 0.4
+travel_speed_mm_s = 120.0
+retract_len_mm = 0.8
+retract_speed_mm_s = 35.0
+
+start_gcode = """
+M140 S{bed_temp}
+M104 S{nozzle_temp}
+M190 S{bed_temp}
+M109 S{nozzle_temp}
+G28
+"""
+
+end_gcode = """
+M104 S0
+M140 S0
+M107
+G91
+G1 Z5 F600
+G90
+M84
+"""

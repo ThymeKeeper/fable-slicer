@@ -1,13 +1,36 @@
 //! Settings for the slicer.
 //!
-//! For now this is a single flat struct with sensible generic-PLA defaults plus a
-//! couple of printer presets. The full tiered profile system (printer / filament
-//! / process inheritance, TOML via serde) is still upcoming; this already lets
-//! `engine` and `gcode` depend on the right crate.
+//! [`Settings`] is the *resolved*, flat configuration the engine and g-code
+//! emitter consume. The [`profile`] module builds one of these from tiered
+//! printer / filament / process profiles (with inheritance), loaded from TOML.
+//! `Settings::default()` is the in-code fallback used by tests and for any field
+//! a profile leaves unset.
 
 use std::f64::consts::PI;
 
-/// All knobs the pipeline currently needs.
+mod profile;
+pub use profile::{FilamentProfile, PrinterProfile, ProcessProfile, Profiles};
+
+/// Default start g-code (generic, heats + homes directly). `{placeholders}` are
+/// substituted by the emitter. Used when a printer profile sets no `start_gcode`.
+pub const GENERIC_START_GCODE: &str = "\
+M140 S{bed_temp}
+M104 S{nozzle_temp}
+M190 S{bed_temp}
+M109 S{nozzle_temp}
+G28";
+
+/// Default end g-code (cool down, lift, disable steppers).
+pub const GENERIC_END_GCODE: &str = "\
+M104 S0
+M140 S0
+M107
+G91
+G1 Z5 F600
+G90
+M84";
+
+/// Fully-resolved settings the pipeline runs on.
 #[derive(Clone, Debug)]
 pub struct Settings {
     // --- machine ---
@@ -20,7 +43,6 @@ pub struct Settings {
     pub layer_height_mm: f64,
     pub line_width_mm: f64,
     pub wall_count: usize,
-    /// Number of fully-solid layers at the top and bottom of the part.
     pub top_layers: usize,
     pub bottom_layers: usize,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
@@ -38,6 +60,10 @@ pub struct Settings {
     pub print_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
     pub first_layer_speed_mm_s: f64,
+
+    // --- g-code templates (with {placeholders}) ---
+    pub start_gcode: String,
+    pub end_gcode: String,
 }
 
 impl Default for Settings {
@@ -53,13 +79,15 @@ impl Default for Settings {
             top_layers: 4,
             bottom_layers: 4,
             infill_density: 0.15,
-            retract_len_mm: 0.8, // direct-drive default
+            retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             nozzle_temp_c: 200,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
             first_layer_speed_mm_s: 20.0,
+            start_gcode: GENERIC_START_GCODE.to_string(),
+            end_gcode: GENERIC_END_GCODE.to_string(),
         }
     }
 }
@@ -69,29 +97,5 @@ impl Settings {
     pub fn filament_area_mm2(&self) -> f64 {
         let r = self.filament_diameter_mm / 2.0;
         PI * r * r
-    }
-
-    /// Voron 2.4 preset (Klipper, CoreXY, direct drive).
-    ///
-    /// NOTE: build size assumed 350mm — the 2.4 also ships as 250/300. Override
-    /// with `--bed-x/--bed-y` if yours differs.
-    pub fn voron_24() -> Self {
-        Self {
-            bed_size_x_mm: 350.0,
-            bed_size_y_mm: 350.0,
-            ..Self::default()
-        }
-    }
-
-    /// Sovol Zero preset (Klipper, CoreXY, high-speed).
-    ///
-    /// NOTE: bed size is a placeholder pending confirmation (post-cutoff release).
-    /// Override with `--bed-x/--bed-y`.
-    pub fn sovol_zero() -> Self {
-        Self {
-            bed_size_x_mm: 160.0,
-            bed_size_y_mm: 160.0,
-            ..Self::default()
-        }
     }
 }

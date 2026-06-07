@@ -1,0 +1,20 @@
+# Voron 2.4 (Klipper, CoreXY, direct drive).
+# Assumes a PRINT_START / PRINT_END macro in your printer.cfg that handles
+# homing, QGL, bed mesh, nozzle purge and (for PRINT_END) cooldown + park.
+inherits = "generic"
+
+# 350mm build (the 2.4 also ships as 250/300 — override with --bed-x/--bed-y).
+bed_size_x_mm = 350.0
+bed_size_y_mm = 350.0
+
+# Direct-drive extruder: short, fast retraction.
+retract_len_mm = 0.5
+retract_speed_mm_s = 40.0
+
+start_gcode = """
+PRINT_START EXTRUDER={nozzle_temp} BED={bed_temp}
+"""
+
+end_gcode = """
+PRINT_END
+"""

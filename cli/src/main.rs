@@ -1,21 +1,22 @@
 //! `slicer` — command-line front-end.
 //!
-//! M1 capability: load an STL, plan walls + infill, and emit G-code. Optionally
-//! dumps per-layer toolpath SVGs for visual inspection.
+//! Loads an STL, resolves printer/filament/process profiles into settings (with
+//! optional overrides), plans walls + infill, and emits Klipper-flavored g-code.
+//! Optionally dumps per-layer toolpath SVGs.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use config::Settings;
+use config::Profiles;
 use engine::{generate, to_gcode, LayerPlan, PathKind};
 use geo2d::{Aabb, Point, UNITS_PER_MM};
 
 #[derive(Parser)]
-#[command(name = "slicer", version, about = "From-scratch FDM slicer (M1: STL -> g-code)")]
+#[command(name = "slicer", version, about = "From-scratch FDM slicer")]
 struct Args {
-    /// Input mesh (STL, binary or ASCII).
-    input: PathBuf,
+    /// Input mesh (STL, binary or ASCII). Optional with --list-profiles.
+    input: Option<PathBuf>,
 
     /// Output g-code file.
     #[arg(short, long, default_value = "out.gcode")]
@@ -25,32 +26,33 @@ struct Args {
     #[arg(long)]
     svg: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 0.2)]
-    layer_height: f64,
-
-    /// Number of perimeters (walls).
-    #[arg(long, default_value_t = 2)]
-    walls: usize,
-
-    /// Sparse infill density, 0.0..=1.0.
-    #[arg(long, default_value_t = 0.15)]
-    infill: f64,
-
-    #[arg(long, default_value_t = 200)]
-    nozzle_temp: u32,
-
-    #[arg(long, default_value_t = 60)]
-    bed_temp: u32,
-
-    /// Printer preset: generic | voron24 | sovol-zero.
+    // --- profiles ---
     #[arg(long, default_value = "generic")]
     printer: String,
+    #[arg(long, default_value = "pla")]
+    filament: String,
+    #[arg(long, default_value = "standard")]
+    process: String,
+    /// Load extra profiles from <dir>/{printer,filament,process}/*.toml.
+    #[arg(long)]
+    profile_dir: Option<PathBuf>,
+    /// List available profiles and exit.
+    #[arg(long)]
+    list_profiles: bool,
 
-    /// Override bed width (mm).
+    // --- overrides (take precedence over the resolved profile) ---
+    #[arg(long)]
+    layer_height: Option<f64>,
+    #[arg(long)]
+    walls: Option<usize>,
+    #[arg(long)]
+    infill: Option<f64>,
+    #[arg(long)]
+    nozzle_temp: Option<u32>,
+    #[arg(long)]
+    bed_temp: Option<u32>,
     #[arg(long)]
     bed_x: Option<f64>,
-
-    /// Override bed depth (mm).
     #[arg(long)]
     bed_y: Option<f64>,
 }
@@ -58,30 +60,63 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mesh = mesh::Mesh::load_stl(&args.input)
-        .with_context(|| format!("loading STL {}", args.input.display()))?;
-    println!("Loaded {}: {} triangles", args.input.display(), mesh.triangles.len());
+    let mut profiles = Profiles::builtin();
+    if let Some(dir) = &args.profile_dir {
+        profiles.load_dir(dir).map_err(|e| anyhow!(e))?;
+    }
 
-    let mut settings = match args.printer.as_str() {
-        "voron24" | "voron-24" | "voron_24" => Settings::voron_24(),
-        "sovol-zero" | "sovol_zero" | "sovolzero" => Settings::sovol_zero(),
-        _ => Settings::default(),
-    };
-    settings.layer_height_mm = args.layer_height;
-    settings.wall_count = args.walls;
-    settings.infill_density = args.infill;
-    settings.nozzle_temp_c = args.nozzle_temp;
-    settings.bed_temp_c = args.bed_temp;
-    if let Some(x) = args.bed_x {
-        settings.bed_size_x_mm = x;
+    if args.list_profiles {
+        println!("printers:  {}", profiles.printer_names().join(", "));
+        println!("filaments: {}", profiles.filament_names().join(", "));
+        println!("processes: {}", profiles.process_names().join(", "));
+        return Ok(());
     }
-    if let Some(y) = args.bed_y {
-        settings.bed_size_y_mm = y;
+
+    let input = args
+        .input
+        .clone()
+        .context("no input STL given (use --list-profiles to see profiles)")?;
+
+    let mut settings = profiles
+        .resolve(&args.printer, &args.filament, &args.process)
+        .map_err(|e| anyhow!(e))?;
+
+    // Apply overrides.
+    if let Some(v) = args.layer_height {
+        settings.layer_height_mm = v;
     }
+    if let Some(v) = args.walls {
+        settings.wall_count = v;
+    }
+    if let Some(v) = args.infill {
+        settings.infill_density = v;
+    }
+    if let Some(v) = args.nozzle_temp {
+        settings.nozzle_temp_c = v;
+    }
+    if let Some(v) = args.bed_temp {
+        settings.bed_temp_c = v;
+    }
+    if let Some(v) = args.bed_x {
+        settings.bed_size_x_mm = v;
+    }
+    if let Some(v) = args.bed_y {
+        settings.bed_size_y_mm = v;
+    }
+
     println!(
-        "Printer '{}': bed {}x{} mm",
-        args.printer, settings.bed_size_x_mm, settings.bed_size_y_mm
+        "Profiles: printer={} filament={} process={} | bed {}x{} mm, layer {}mm",
+        args.printer,
+        args.filament,
+        args.process,
+        settings.bed_size_x_mm,
+        settings.bed_size_y_mm,
+        settings.layer_height_mm
     );
+
+    let mesh = mesh::Mesh::load_stl(&input)
+        .with_context(|| format!("loading STL {}", input.display()))?;
+    println!("Loaded {}: {} triangles", input.display(), mesh.triangles.len());
 
     let layers = generate(&mesh, &settings);
     let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
@@ -122,8 +157,7 @@ fn write_svgs(layers: &[LayerPlan], dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Render one layer's toolpaths as colored polylines: external perimeter (dark
-/// blue), inner perimeters (light blue), infill (orange).
+/// Render one layer's toolpaths as colored polylines.
 fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
     const TARGET_PX: f64 = 600.0;
     const MARGIN: f64 = 12.0;

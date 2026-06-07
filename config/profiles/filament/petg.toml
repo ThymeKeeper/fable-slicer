@@ -1,0 +1,4 @@
+# Generic PETG.
+filament_diameter_mm = 1.75
+nozzle_temp_c = 240
+bed_temp_c = 80

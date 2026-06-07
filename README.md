@@ -22,6 +22,9 @@ cargo run --bin slicer -- fixtures/cube.stl --printer voron24 -o cube.gcode --sv
 
 # Slice your own model:
 cargo run --bin slicer -- path/to/model.stl --printer voron24 -o out.gcode
+
+# Pick profiles (list them with --list-profiles); flags like --layer-height override:
+cargo run --bin slicer -- model.stl --printer voron24 --filament petg --process fine -o out.gcode
 ```
 
 ## Workspace
@@ -32,7 +35,7 @@ cargo run --bin slicer -- path/to/model.stl --printer voron24 -o out.gcode
 | `mesh`   | triangle mesh + STL I/O |
 | `engine` | the slicer core (slicing, walls, solid/sparse infill, toolpaths, g-code) |
 | `gcode`  | low-level g-code emitter (relative E, retraction, temps/fan) |
-| `config` | settings + printer presets (full tiered profile system upcoming) |
+| `config` | tiered printer/filament/process profiles (TOML, inheritance) + resolved settings |
 | `cli`    | command-line front-end (binary: `slicer`) |
 
 ## License

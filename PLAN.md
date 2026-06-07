@@ -17,11 +17,11 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M2 — surfaces + retraction (in progress) |
+| **Current milestone** | M2 — surfaces, retraction, profiles (nearly done) |
 | **Last updated** | 2026-06-06 |
-| **Builds / tests** | `cargo test` green (14 tests); cube watertight (solid top/bottom), centered, Klipper output |
-| **Next action** | skirt/brim + first-layer height, then the real TOML profile system |
-| **Target printers** | Voron 2.4 + Sovol Zero (both Klipper → relative E). Bed sizes need confirming. |
+| **Builds / tests** | `cargo test` green (18 tests); profile system (printer/filament/process, TOML, inheritance) live |
+| **Next action** | skirt/brim + first-layer height (finish M2), then M3 quality (seams, combing, time estimate) |
+| **Target printers** | Voron 2.4 = **350×350** (confirmed); Sovol Zero bed still TBC. Both Klipper (relative E, PRINT_START macros). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -70,7 +70,8 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
 - [ ] Skirt / brim / (basic) raft
 - [ ] First-layer overrides (height, flow; speed already slowed)
-- [ ] `config`: tiered profile model (printer/filament/process) + override resolution (TOML/serde) — still a flat struct + presets
+- [x] `config`: tiered profile model (printer/filament/process) + single-parent inheritance, TOML, built-in profiles, `--profile-dir`, `--list-profiles`
+- [x] Printer profiles carry start/end g-code templates with `{placeholders}`; Voron/Sovol use `PRINT_START`/`PRINT_END` macros
 - [ ] **Benchy prints cleanly** (needs hardware)
 
 ### M3 — Quality pass (what separates "prints" from "looks good")
@@ -141,6 +142,11 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
   placeholders. Renaming the project is cheap. *(Pick the real name later.)*
 - **Tolerant slicing over CGAL repair.** Avoid heavy C++/templated FFI; make the
   slicer survive imperfect meshes instead of perfecting them first.
+- **Profiles: Prusa-style named profiles + single-parent inheritance** (not Cura's
+  computed-setting graph). Three tiers (printer/filament/process) of all-`Option`
+  fields, merged child-over-parent, resolved to a flat `Settings`; unset fields
+  fall back to code defaults. Start/end g-code are templates with `{placeholders}`
+  on the printer profile — Klipper printers call `PRINT_START`/`PRINT_END` macros.
 
 ## Open questions
 - [ ] Real project name (current `slicer` is a placeholder).

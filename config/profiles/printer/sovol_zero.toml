@@ -1,0 +1,18 @@
+# Sovol Zero (Klipper, CoreXY, high-speed).
+# NOTE: bed size is a placeholder pending confirmation (post-cutoff release).
+# Override with --bed-x/--bed-y until verified.
+inherits = "generic"
+
+bed_size_x_mm = 160.0
+bed_size_y_mm = 160.0
+
+retract_len_mm = 0.5
+retract_speed_mm_s = 40.0
+
+start_gcode = """
+PRINT_START EXTRUDER={nozzle_temp} BED={bed_temp}
+"""
+
+end_gcode = """
+PRINT_END
+"""
