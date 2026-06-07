@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 geo2d = { workspace = true }
 mesh = { workspace = true }
+config = { workspace = true }
+gcode = { workspace = true }

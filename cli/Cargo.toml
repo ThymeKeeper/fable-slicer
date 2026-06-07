@@ -13,5 +13,6 @@ path = "src/main.rs"
 geo2d = { workspace = true }
 mesh = { workspace = true }
 engine = { workspace = true }
+config = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

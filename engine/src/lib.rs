@@ -1,22 +1,18 @@
 //! The slicer core.
 //!
-//! Current scope (M0): mesh -> per-layer closed polygons. Walls, infill, surface
-//! detection, supports, toolpath ordering, and g-code emission attach to this
-//! pipeline in later milestones (see PLAN.md).
+//! Pipeline so far:
+//!   1. `slice` — mesh -> per-layer closed polygons (M0).
+//!   2. `plan`  — polygons -> per-layer toolpaths: concentric walls + clipped
+//!                line infill (M1).
+//!   3. `emit`  — toolpaths + settings -> G-code (M1).
 //!
-//! ## Slicing algorithm
-//!
-//! For each horizontal plane `z`, every triangle that straddles the plane
-//! contributes one line segment (its intersection with the plane). Those
-//! segments are then stitched end-to-end into closed loops. We stitch using the
-//! integer endpoints directly: because intersection points are snapped to the
-//! shared nanometer grid, a point computed from two adjacent triangles is
-//! *bit-identical*, so loop connectivity is exact — no epsilon matching.
-//!
-//! Winding is fixed after stitching from signed area + nesting parity (outer
-//! loops CCW, holes CW), which is robust regardless of the mesh's facet
-//! orientation.
+//! Still to come (see PLAN.md): top/bottom solid surfaces, retraction/combing,
+//! supports, variable layers, etc.
 
+mod emit;
+mod plan;
 mod slice;
 
+pub use emit::to_gcode;
+pub use plan::{generate, LayerPlan, PathKind, ToolPath};
 pub use slice::{slice_mesh, Layer, SliceParams};

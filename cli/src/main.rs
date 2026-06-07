@@ -1,28 +1,46 @@
 //! `slicer` — command-line front-end.
 //!
-//! M0 capability: load an STL, slice it into layers, and write one SVG per layer
-//! so the slicing result can be inspected visually. (G-code output arrives at M1.)
+//! M1 capability: load an STL, plan walls + infill, and emit G-code. Optionally
+//! dumps per-layer toolpath SVGs for visual inspection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use engine::{slice_mesh, SliceParams};
-use geo2d::{Aabb, Point, Polygons, UNITS_PER_MM};
+use config::Settings;
+use engine::{generate, to_gcode, LayerPlan, PathKind};
+use geo2d::{Aabb, Point, UNITS_PER_MM};
 
 #[derive(Parser)]
-#[command(name = "slicer", version, about = "From-scratch FDM slicer (M0: STL -> per-layer SVG)")]
+#[command(name = "slicer", version, about = "From-scratch FDM slicer (M1: STL -> g-code)")]
 struct Args {
     /// Input mesh (STL, binary or ASCII).
     input: PathBuf,
 
-    /// Layer height in millimeters.
+    /// Output g-code file.
+    #[arg(short, long, default_value = "out.gcode")]
+    output: PathBuf,
+
+    /// Also write per-layer toolpath SVGs to this directory.
+    #[arg(long)]
+    svg: Option<PathBuf>,
+
     #[arg(long, default_value_t = 0.2)]
     layer_height: f64,
 
-    /// Output directory for per-layer SVG files.
-    #[arg(long, default_value = "out")]
-    out: PathBuf,
+    /// Number of perimeters (walls).
+    #[arg(long, default_value_t = 2)]
+    walls: usize,
+
+    /// Sparse infill density, 0.0..=1.0.
+    #[arg(long, default_value_t = 0.15)]
+    infill: f64,
+
+    #[arg(long, default_value_t = 200)]
+    nozzle_temp: u32,
+
+    #[arg(long, default_value_t = 60)]
+    bed_temp: u32,
 }
 
 fn main() -> Result<()> {
@@ -30,61 +48,72 @@ fn main() -> Result<()> {
 
     let mesh = mesh::Mesh::load_stl(&args.input)
         .with_context(|| format!("loading STL {}", args.input.display()))?;
-    println!(
-        "Loaded {}: {} triangles, {} vertices",
-        args.input.display(),
-        mesh.triangles.len(),
-        mesh.vertices.len()
-    );
+    println!("Loaded {}: {} triangles", args.input.display(), mesh.triangles.len());
 
-    let layers = slice_mesh(
-        &mesh,
-        SliceParams { layer_height_mm: args.layer_height },
-    );
-    println!("Sliced into {} layers at {} mm", layers.len(), args.layer_height);
+    let settings = Settings {
+        layer_height_mm: args.layer_height,
+        wall_count: args.walls,
+        infill_density: args.infill,
+        nozzle_temp_c: args.nozzle_temp,
+        bed_temp_c: args.bed_temp,
+        ..Settings::default()
+    };
 
-    // Shared bounds across all layers so every SVG uses the same coordinate frame.
-    let mut bounds: Option<Aabb> = None;
-    for l in &layers {
-        if let Some(b) = l.polygons.bounds() {
-            match &mut bounds {
-                Some(bb) => bb.union(&b),
-                None => bounds = Some(b),
-            }
-        }
+    let layers = generate(&mesh, &settings);
+    let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
+    println!("Planned {} layers, {} toolpaths", layers.len(), path_count);
+
+    let gcode = to_gcode(&layers, &settings);
+    std::fs::write(&args.output, &gcode)
+        .with_context(|| format!("writing {}", args.output.display()))?;
+    println!("Wrote {} ({} g-code lines)", args.output.display(), gcode.lines().count());
+
+    if let Some(dir) = &args.svg {
+        write_svgs(&layers, dir)?;
+        println!("Wrote {} toolpath SVGs to {}/", layers.len(), dir.display());
     }
-    let bounds = bounds.context("no geometry produced — is the mesh empty or below layer height?")?;
-
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("creating output dir {}", args.out.display()))?;
-    for l in &layers {
-        let svg = render_svg(&l.polygons, &bounds);
-        let path = args.out.join(format!("layer_{:04}.svg", l.index));
-        std::fs::write(&path, svg).with_context(|| format!("writing {}", path.display()))?;
-    }
-    println!("Wrote {} SVG layers to {}/", layers.len(), args.out.display());
 
     Ok(())
 }
 
-/// Render one layer's polygons to a standalone SVG string. Even-odd fill renders
-/// holes correctly when outer+hole contours are drawn as one path; here each
-/// contour is its own path (fine for M0 — solid parts only).
-fn render_svg(polys: &Polygons, bounds: &Aabb) -> String {
+fn write_svgs(layers: &[LayerPlan], dir: &Path) -> Result<()> {
+    let mut bounds: Option<Aabb> = None;
+    for l in layers {
+        for p in &l.paths {
+            for &pt in &p.points {
+                match &mut bounds {
+                    Some(b) => b.expand(pt),
+                    None => bounds = Some(Aabb { min: pt, max: pt }),
+                }
+            }
+        }
+    }
+    let Some(bounds) = bounds else { return Ok(()) };
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    for l in layers {
+        let svg = render_layer_svg(l, &bounds);
+        std::fs::write(dir.join(format!("layer_{:04}.svg", l.index)), svg)?;
+    }
+    Ok(())
+}
+
+/// Render one layer's toolpaths as colored polylines: external perimeter (dark
+/// blue), inner perimeters (light blue), infill (orange).
+fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
     const TARGET_PX: f64 = 600.0;
     const MARGIN: f64 = 12.0;
 
     let w_mm = (bounds.width() as f64 / UNITS_PER_MM).max(1.0e-6);
     let h_mm = (bounds.height() as f64 / UNITS_PER_MM).max(1.0e-6);
-    let scale = TARGET_PX / w_mm.max(h_mm); // px per mm
+    let scale = TARGET_PX / w_mm.max(h_mm);
     let px_w = w_mm * scale + 2.0 * MARGIN;
     let px_h = h_mm * scale + 2.0 * MARGIN;
-
-    let min_x_mm = bounds.min.x as f64 / UNITS_PER_MM;
-    let min_y_mm = bounds.min.y as f64 / UNITS_PER_MM;
+    let min_x = bounds.min.x as f64 / UNITS_PER_MM;
+    let min_y = bounds.min.y as f64 / UNITS_PER_MM;
     let to_px = |p: Point| {
-        let x = (p.x_mm() - min_x_mm) * scale + MARGIN;
-        let y = (p.y_mm() - min_y_mm) * scale + MARGIN;
+        let x = (p.x_mm() - min_x) * scale + MARGIN;
+        let y = (p.y_mm() - min_y) * scale + MARGIN;
         (x, px_h - y) // flip Y so +Y points up
     };
 
@@ -94,24 +123,26 @@ fn render_svg(polys: &Polygons, bounds: &Aabb) -> String {
     ));
     s.push_str(r##"<rect width="100%" height="100%" fill="#ffffff"/>"##);
 
-    for c in &polys.contours {
-        if c.points.len() < 3 {
+    for path in &layer.paths {
+        if path.points.len() < 2 {
             continue;
         }
-        // Outer loops (CCW) filled; holes (CW) left white.
-        let fill = if c.is_ccw() { "#cfe8ff" } else { "#ffffff" };
+        let color = match path.kind {
+            PathKind::ExternalPerimeter => "#1b5fb0",
+            PathKind::Perimeter => "#5fa8e8",
+            PathKind::Infill => "#e08a2b",
+        };
         let mut d = String::from("M");
-        for (i, &p) in c.points.iter().enumerate() {
+        for (i, &p) in path.points.iter().enumerate() {
             let (x, y) = to_px(p);
-            if i == 0 {
-                d.push_str(&format!("{x:.2} {y:.2} "));
-            } else {
-                d.push_str(&format!("L{x:.2} {y:.2} "));
-            }
+            let cmd = if i == 0 { "" } else { "L" };
+            d.push_str(&format!("{cmd}{x:.2} {y:.2} "));
         }
-        d.push('Z');
+        if path.closed {
+            d.push('Z');
+        }
         s.push_str(&format!(
-            r##"<path d="{d}" fill="{fill}" fill-rule="evenodd" stroke="#1b5fb0" stroke-width="1.2"/>"##
+            r##"<path d="{d}" fill="none" stroke="{color}" stroke-width="1"/>"##
         ));
     }
 

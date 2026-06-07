@@ -11,6 +11,9 @@
 //! (offsetting, booleans) lands here at M1; for now it provides the point /
 //! contour / polygon types and the handful of predicates slicing needs.
 
+mod clipper;
+pub use clipper::offset;
+
 /// Integer units per millimeter (nanometer resolution).
 pub const UNITS_PER_MM: f64 = 1_000_000.0;
 

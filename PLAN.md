@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M0 — slicing core |
+| **Current milestone** | M1 — first printable cube (code complete; pending a real print) |
 | **Last updated** | 2026-06-06 |
-| **Builds / tests** | `cargo test` green (cube slices to 100 squares) |
-| **Next action** | wire Clipper2 into `geo2d`, start M1 (walls + first g-code) |
+| **Builds / tests** | `cargo test` green (10 tests); cube + Benchy emit valid g-code |
+| **Next action** | center model on bed (Benchy has negative coords), then M2 (solid top/bottom + retraction) |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -42,7 +42,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Cube acceptance test + SVG smoke output
 - [ ] Robustness pass: degenerate triangles, coplanar facets, open edges (don't panic; best-effort loops)
 - [ ] Per-layer parallelism with `rayon`
-- [ ] Slice a real-world STL (e.g. 3DBenchy) without panicking; eyeball the SVGs
+- [x] Slice a real-world STL (3DBenchy, 225k tris) without panicking — 240 layers in ~0.4s
 - [ ] Golden-file test harness (snapshot SVG/loop output for a couple of fixtures)
 
 ### M1 — First printable cube
@@ -50,17 +50,19 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 **Acceptance:** sliced cube prints on a real printer as a solid/hollow cube.
 
-- [ ] Integrate **Clipper2** in `geo2d` (offset + boolean), adopt integer coords end-to-end
-- [ ] Single outer wall via inward offset (`line_width/2`)
-- [ ] Simple line/grid infill clipped to the wall interior
-- [ ] Extrusion math (`E = length * line_width * layer_height / filament_area`)
-- [ ] `gcode`: minimal AST + writer (G0/G1, set temp/fan, home, prime)
-- [ ] Start/end g-code (hard-coded for one printer to begin with)
-- [ ] CLI emits `.gcode`; verify in an external g-code previewer
-- [ ] **First real print**
+- [x] Integrate **Clipper2** in `geo2d` (offset via `One` scaler, integer coords) — boolean ops deferred to M2
+- [x] Walls via inward offset (`line_width/2`, then concentric) — configurable `--walls`
+- [x] Simple line infill clipped to the wall interior (even-odd scanline, alternating 45°/135°)
+- [x] Extrusion math (`E = length * line_width * layer_height / filament_area`)
+- [x] `gcode`: `GcodeBuilder` writer (G0/G1, temps, fan, home; absolute E)
+- [x] Start/end g-code (generic Marlin placeholder)
+- [x] CLI emits `.gcode` (cube verified; Benchy 240 layers / 190k lines in ~2s)
+- [ ] **Center model on bed** — Benchy is modeled around the origin (negative coords); needed before non-trivial models print
+- [ ] **First real print** (needs the target printer's start/end g-code + bed size)
 
 ### M2 — Printable Benchy (the real quality bar starts here)
-- [ ] Multiple walls (concentric offsets) + outer/inner ordering
+- [x] Multiple walls (concentric offsets) — landed in M1; outer/inner *ordering* tuning still TODO
+- [ ] Auto-center / place model on the bed (handle models with negative coordinates)
 - [ ] Top/bottom solid layers via boolean diff across N layers
 - [ ] Sparse vs. solid region detection
 - [ ] Skirt / brim / (basic) raft
