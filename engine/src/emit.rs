@@ -129,9 +129,135 @@ fn dist_mm(a: Point, b: Point) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// Estimate print time (seconds) via a trapezoidal motion simulation:
+/// acceleration-limited moves with a jerk-based junction speed limit and
+/// look-ahead. Mirrors the move sequence `to_gcode` emits; heating/homing in the
+/// start g-code is not counted.
+pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
+    let accel = s.acceleration_mm_s2.max(1.0);
+    let jerk = s.jerk_mm_s.max(0.1);
+    let travel_v = s.travel_speed_mm_s.max(1.0);
+    let retract_t = if s.retract_len_mm > 0.0 {
+        2.0 * s.retract_len_mm / s.retract_speed_mm_s.max(1.0)
+    } else {
+        0.0
+    };
+
+    let mut total = 0.0;
+    let mut pos: Option<(f64, f64)> = None;
+    let mut prev_z = 0.0;
+    for layer in layers {
+        total += (layer.print_z_mm - prev_z).abs() / travel_v;
+        prev_z = layer.print_z_mm;
+        for path in &layer.paths {
+            if path.points.len() < 2 {
+                continue;
+            }
+            let start = path.points[0];
+            if let Some((px, py)) = pos {
+                total += retract_t;
+                let d = ((px - start.x_mm()).powi(2) + (py - start.y_mm()).powi(2)).sqrt();
+                total += trapezoid_time(d, 0.0, 0.0, travel_v, accel);
+            }
+            let v_nom = feed_for(path.kind, layer.index, s) / 60.0;
+            total += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
+            let last = if path.closed {
+                path.points[0]
+            } else {
+                path.points[path.points.len() - 1]
+            };
+            pos = Some((last.x_mm(), last.y_mm()));
+        }
+    }
+    total
+}
+
+/// Time for an extrusion polyline, with junction-speed look-ahead. Both ends stop
+/// (a retraction brackets every path).
+fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64) -> f64 {
+    let n_pts = pts.len();
+    let count = if closed { n_pts } else { n_pts.saturating_sub(1) };
+    let mut dist: Vec<f64> = Vec::with_capacity(count);
+    let mut dir: Vec<(f64, f64)> = Vec::with_capacity(count);
+    for k in 0..count {
+        let p0 = pts[k];
+        let p1 = pts[(k + 1) % n_pts];
+        let (dx, dy) = (p1.x_mm() - p0.x_mm(), p1.y_mm() - p0.y_mm());
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < 1.0e-6 {
+            continue;
+        }
+        dist.push(d);
+        dir.push((dx / d, dy / d));
+    }
+    let n = dist.len();
+    if n == 0 {
+        return 0.0;
+    }
+
+    // Entry speed at each segment: start with the junction limit (full stop at
+    // the first), where a sharper corner allows a lower speed.
+    let mut entry = vec![v_nom; n];
+    entry[0] = 0.0;
+    for i in 1..n {
+        let cos = (dir[i - 1].0 * dir[i].0 + dir[i - 1].1 * dir[i].1).clamp(-1.0, 1.0);
+        let sin_half = ((1.0 - cos) * 0.5).max(0.0).sqrt();
+        let vj = if sin_half < 1.0e-6 { v_nom } else { jerk / (2.0 * sin_half) };
+        entry[i] = vj.min(v_nom);
+    }
+    // Reverse: cap so we can decelerate to the next entry over the move.
+    for i in (0..n).rev() {
+        let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
+        entry[i] = entry[i].min((exit * exit + 2.0 * accel * dist[i]).sqrt());
+    }
+    // Forward: cap so it's reachable by accelerating from the previous entry.
+    for i in 1..n {
+        entry[i] = entry[i].min((entry[i - 1] * entry[i - 1] + 2.0 * accel * dist[i - 1]).sqrt());
+    }
+
+    let mut t = 0.0;
+    for i in 0..n {
+        let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
+        t += trapezoid_time(dist[i], entry[i], exit, v_nom, accel);
+    }
+    t
+}
+
+/// Time for one move of `dist` mm from `v_entry` to `v_exit`, cruising up to
+/// `v_cruise`, at acceleration `accel`.
+fn trapezoid_time(dist: f64, v_entry: f64, v_exit: f64, v_cruise: f64, accel: f64) -> f64 {
+    if dist <= 0.0 {
+        return 0.0;
+    }
+    let vc = v_cruise.max(v_entry).max(v_exit);
+    let d_acc = ((vc * vc - v_entry * v_entry) / (2.0 * accel)).max(0.0);
+    let d_dec = ((vc * vc - v_exit * v_exit) / (2.0 * accel)).max(0.0);
+    if d_acc + d_dec <= dist {
+        let d_cruise = dist - d_acc - d_dec;
+        (vc - v_entry) / accel + d_cruise / vc.max(1.0e-6) + (vc - v_exit) / accel
+    } else {
+        let v_peak = (((2.0 * accel * dist + v_entry * v_entry + v_exit * v_exit) * 0.5).max(0.0)).sqrt();
+        let v_peak = v_peak.max(v_entry).max(v_exit).max(1.0e-6);
+        (v_peak - v_entry) / accel + (v_peak - v_exit) / accel
+    }
+}
+
+/// Format a duration like "1h 23m" / "12m 30s" / "45s".
+pub fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (h, m, sec) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {sec:02}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{generate, to_gcode};
+    use crate::{estimate_seconds, generate, to_gcode};
     use config::Settings;
 
     #[test]
@@ -161,5 +287,14 @@ mod tests {
         let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
         assert!(g.contains("PRINT_START EXTRUDER=215 BED=65"), "macro substituted");
         assert!(!g.contains("{nozzle_temp}"), "no leftover placeholders");
+    }
+
+    #[test]
+    fn time_estimate_is_sane() {
+        let m = mesh::Mesh::cube(20.0);
+        let s = Settings::default();
+        let secs = estimate_seconds(&generate(&m, &s), &s);
+        // A 20mm cube at these settings: minutes, not seconds or days.
+        assert!(secs > 60.0 && secs < 86_400.0, "got {secs}s");
     }
 }

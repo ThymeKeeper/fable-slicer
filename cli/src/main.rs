@@ -161,6 +161,10 @@ fn main() -> Result<()> {
     let layers = generate(&mesh, &settings);
     let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
     println!("Planned {} layers, {} toolpaths", layers.len(), path_count);
+    println!(
+        "Estimated print time: {}",
+        engine::format_duration(engine::estimate_seconds(&layers, &settings))
+    );
 
     let gcode = to_gcode(&layers, &settings);
     std::fs::write(&args.output, &gcode)

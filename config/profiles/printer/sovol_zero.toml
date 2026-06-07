@@ -5,6 +5,9 @@ bed_size_x_mm = 152.4
 bed_size_y_mm = 152.4
 # (max build height 152.5mm — not yet enforced by the slicer)
 
+acceleration = 10000.0
+jerk = 12.0
+
 retract_len_mm = 0.5
 retract_speed_mm_s = 40.0
 

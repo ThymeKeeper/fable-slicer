@@ -23,6 +23,8 @@ pub struct PrinterProfile {
     pub bed_size_y_mm: Option<f64>,
     pub nozzle_diameter_mm: Option<f64>,
     pub travel_speed_mm_s: Option<f64>,
+    pub acceleration: Option<f64>,
+    pub jerk: Option<f64>,
     pub retract_len_mm: Option<f64>,
     pub retract_speed_mm_s: Option<f64>,
     pub start_gcode: Option<String>,
@@ -81,7 +83,8 @@ impl Tier for PrinterProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, nozzle_diameter_mm,
-            travel_speed_mm_s, retract_len_mm, retract_speed_mm_s, start_gcode, end_gcode)
+            travel_speed_mm_s, acceleration, jerk, retract_len_mm, retract_speed_mm_s,
+            start_gcode, end_gcode)
     }
 }
 
@@ -161,6 +164,8 @@ impl Profiles {
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
+            acceleration_mm_s2: pr.acceleration.unwrap_or(d.acceleration_mm_s2),
+            jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
             line_width_mm: pc.line_width_mm.unwrap_or(d.line_width_mm),

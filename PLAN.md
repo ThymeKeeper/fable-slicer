@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M3 — print quality (seam placement landed) |
+| **Current milestone** | M3 — print quality (seams + time estimate landed) |
 | **Last updated** | 2026-06-07 |
-| **Builds / tests** | `cargo test` green (21 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | M3: combing, min-layer-time cooling, motion-simulated time estimate |
+| **Builds / tests** | `cargo test` green (22 tests). GUI verify = user screenshots (headless box) |
+| **Next action** | M3: combing, min-layer-time cooling, gap fill |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -80,7 +80,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
 - [ ] Combing (travel inside the part to avoid stringing)
 - [ ] Gap fill between colliding offsets
-- [ ] Accurate time estimate via trapezoidal motion simulation
+- [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead); shown in GUI status + CLI
 - [ ] Coasting / wipe
 
 ### M4 — Supports & bridging

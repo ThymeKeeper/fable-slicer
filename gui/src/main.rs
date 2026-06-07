@@ -138,7 +138,8 @@ impl App {
         self.scene.set_joints(&rs.device, &joints);
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
-        self.status = format!("Sliced {n} layers, {paths} toolpaths.");
+        let secs = engine::estimate_seconds(&layers, &self.settings);
+        self.status = format!("Sliced {n} layers, {paths} toolpaths · ~{}", engine::format_duration(secs));
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
         self.preview_layer = n.max(1);

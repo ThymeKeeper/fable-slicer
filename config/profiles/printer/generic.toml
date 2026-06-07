@@ -3,6 +3,8 @@ bed_size_x_mm = 220.0
 bed_size_y_mm = 220.0
 nozzle_diameter_mm = 0.4
 travel_speed_mm_s = 120.0
+acceleration = 3000.0
+jerk = 10.0
 retract_len_mm = 0.8
 retract_speed_mm_s = 35.0
 

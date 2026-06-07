@@ -13,6 +13,6 @@ mod emit;
 mod plan;
 mod slice;
 
-pub use emit::to_gcode;
+pub use emit::{estimate_seconds, format_duration, to_gcode};
 pub use plan::{generate, LayerPlan, PathKind, ToolPath};
 pub use slice::{slice_mesh, Layer, SliceParams};
