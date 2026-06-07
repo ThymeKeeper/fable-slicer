@@ -1,0 +1,21 @@
+[package]
+name = "gui"
+description = "Desktop GUI for the slicer (egui + wgpu 3D viewport)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slicer-gui"
+path = "src/main.rs"
+
+[dependencies]
+geo2d = { workspace = true }
+mesh = { workspace = true }
+engine = { workspace = true }
+config = { workspace = true }
+# Pinned to 0.34.1: eframe 0.34.3 requires egui_glow 0.34.3, which was never published.
+eframe = { version = "=0.34.1", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+glam = "0.33.1"
+rfd = "0.17.2"

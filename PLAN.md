@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | GUI (pulled forward from M5, user request) — scoping |
-| **Last updated** | 2026-06-06 |
-| **Builds / tests** | `cargo test` green (20 tests); M2 feature-complete (skirt + first-layer height landed) |
-| **Next action** | build the GUI (egui) once preview approach is chosen; then M3 quality |
+| **Current milestone** | GUI — increment 1 done (3D model viewport); toolpath preview next |
+| **Last updated** | 2026-06-07 |
+| **Builds / tests** | `cargo test` green (20 tests); `gui` builds (eframe 0.34.1 + wgpu 29). GUI verify = user screenshots (headless box) |
+| **Next action** | 3D toolpath preview + layer slider in the GUI; then M3 quality |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -92,8 +92,8 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 > **GUI pulled forward to now (user request, 2026-06-06).** Approach being scoped —
 > framework `egui`; 2D-vs-3D preview TBD. Headless dev box can't render a window,
 > so visual verification needs the user (or an xvfb screenshot harness).
-- [ ] GUI shell (`egui`): load STL, pick profiles, slice, preview, export g-code
-- [ ] G-code preview: feature-colored paths + layer slider
+- [x] GUI shell (`egui` + `wgpu`): load STL, pick profiles, edit settings, slice, export g-code; **3D model viewport** (orbit/zoom/pan, bed grid)
+- [ ] 3D toolpath preview + layer slider (next GUI increment)
 - [x] Profile system + starter library (printer/filament/process) — landed early; *management UI* still TODO
 - [ ] Variable / adaptive layer height
 - [ ] Gyroid + more infill patterns
@@ -150,6 +150,11 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
   fields, merged child-over-parent, resolved to a flat `Settings`; unset fields
   fall back to code defaults. Start/end g-code are templates with `{placeholders}`
   on the printer profile — Klipper printers call `PRINT_START`/`PRINT_END` macros.
+- **GUI: egui + wgpu (eframe), own offscreen render pass.** Renders the scene to a
+  color+depth texture shown via egui's native-texture path (gives a real depth
+  buffer for 3D). **eframe pinned to `=0.34.1`** — 0.34.3 requires `egui_glow 0.34.3`,
+  which was never published. wgpu is 29.x. GUI can't be rendered on this headless
+  box; verification is by the user's screenshots.
 
 ## Open questions
 - [ ] Real project name (current `slicer` is a placeholder).

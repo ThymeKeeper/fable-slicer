@@ -25,6 +25,9 @@ cargo run --bin slicer -- path/to/model.stl --printer voron24 -o out.gcode
 
 # Pick profiles (list them with --list-profiles); flags like --layer-height override:
 cargo run --bin slicer -- model.stl --printer voron24 --filament petg --process fine -o out.gcode
+
+# Desktop GUI (3D viewport): load an STL, pick profiles, slice, export. Needs a display.
+cargo run -p gui   # or: cargo run --release --bin slicer-gui
 ```
 
 ## Workspace
@@ -37,6 +40,7 @@ cargo run --bin slicer -- model.stl --printer voron24 --filament petg --process 
 | `gcode`  | low-level g-code emitter (relative E, retraction, temps/fan) |
 | `config` | tiered printer/filament/process profiles (TOML, inheritance) + resolved settings |
 | `cli`    | command-line front-end (binary: `slicer`) |
+| `gui`    | desktop GUI — egui + wgpu 3D viewport (binary: `slicer-gui`) |
 
 ## License
 

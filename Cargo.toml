@@ -12,7 +12,7 @@
 # rename costs nothing.
 [workspace]
 resolver = "2"
-members = ["geo2d", "mesh", "engine", "gcode", "config", "cli"]
+members = ["geo2d", "mesh", "engine", "gcode", "config", "cli", "gui"]
 
 [workspace.package]
 version = "0.0.0"
