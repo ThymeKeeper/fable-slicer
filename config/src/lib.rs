@@ -96,6 +96,8 @@ pub struct Settings {
     // --- machine ---
     pub nozzle_diameter_mm: f64,
     pub filament_diameter_mm: f64,
+    /// Filament density (g/cm³), for the weight estimate.
+    pub filament_density_g_cm3: f64,
     pub bed_size_x_mm: f64,
     pub bed_size_y_mm: f64,
     /// Acceleration (mm/s²) used for the time estimate.
@@ -149,6 +151,7 @@ impl Default for Settings {
         Self {
             nozzle_diameter_mm: 0.4,
             filament_diameter_mm: 1.75,
+            filament_density_g_cm3: 1.24,
             bed_size_x_mm: 220.0,
             bed_size_y_mm: 220.0,
             acceleration_mm_s2: 3000.0,

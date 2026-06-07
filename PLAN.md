@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M3 — print quality (seams + time estimate landed) |
+| **Current milestone** | M3 — print quality (seams, time/filament estimate, combing + travel ordering landed) |
 | **Last updated** | 2026-06-07 |
 | **Builds / tests** | `cargo test` green (22 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | M3: combing, min-layer-time cooling, gap fill |
+| **Next action** | M3: min-layer-time cooling, gap fill, geometric combing reroute |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -78,9 +78,9 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 ### M3 — Quality pass (what separates "prints" from "looks good")
 - [ ] Per-feature speeds; min-layer-time cooling slowdown
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
-- [ ] Combing (travel inside the part to avoid stringing)
+- [x] Travel ordering (nearest-neighbour, reversing open paths) + combing-aware retraction (retract only when the straight travel crosses a wall) — Benchy travel 67m→16m, retractions 5587→605. Full geometric reroute (travel *follows* the inside around holes) still TODO.
 - [ ] Gap fill between colliding offsets
-- [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead); shown in GUI status + CLI
+- [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate; shown in GUI status + CLI
 - [ ] Coasting / wipe
 
 ### M4 — Supports & bridging

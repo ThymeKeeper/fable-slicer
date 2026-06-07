@@ -165,6 +165,8 @@ fn main() -> Result<()> {
         "Estimated print time: {}",
         engine::format_duration(engine::estimate_seconds(&layers, &settings))
     );
+    let (fil_mm, grams) = engine::estimate_filament(&layers, &settings);
+    println!("Filament: {:.2} m, {:.1} g", fil_mm / 1000.0, grams);
 
     let gcode = to_gcode(&layers, &settings);
     std::fs::write(&args.output, &gcode)

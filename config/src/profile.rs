@@ -39,6 +39,7 @@ pub struct PrinterProfile {
 pub struct FilamentProfile {
     pub inherits: Option<String>,
     pub filament_diameter_mm: Option<f64>,
+    pub density_g_cm3: Option<f64>,
     pub nozzle_temp_c: Option<u32>,
     pub bed_temp_c: Option<u32>,
 }
@@ -95,7 +96,7 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, filament_diameter_mm, nozzle_temp_c, bed_temp_c)
+        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, bed_temp_c)
     }
 }
 
@@ -164,6 +165,7 @@ impl Profiles {
         Ok(Settings {
             nozzle_diameter_mm: pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm),
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
+            filament_density_g_cm3: fl.density_g_cm3.unwrap_or(d.filament_density_g_cm3),
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
             acceleration_mm_s2: pr.acceleration.unwrap_or(d.acceleration_mm_s2),

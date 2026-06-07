@@ -10,9 +10,9 @@
 
 use config::Settings;
 use gcode::GcodeBuilder;
-use geo2d::Point;
+use geo2d::{Point, Polygons};
 
-use crate::plan::{LayerPlan, PathKind};
+use crate::plan::{LayerPlan, PathKind, ToolPath};
 
 /// Emit complete G-code for a planned model.
 pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
@@ -42,6 +42,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     emit_template(&mut g, &s.start_gcode, s);
     g.fan(0);
 
+    let mut last_pos: Option<Point> = None;
     for layer in layers {
         g.comment(&format!("LAYER {} z={:.3}", layer.index, layer.print_z_mm));
         if layer.index == 1 {
@@ -49,7 +50,6 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         }
         g.move_z(layer.print_z_mm, travel_f);
 
-        let mut printed = false;
         for path in &layer.paths {
             if path.points.len() < 2 {
                 continue;
@@ -58,7 +58,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let coeff = path.width_mm * layer.height_mm / area;
             let start = path.points[0];
 
-            let retract = printed && s.retract_len_mm > 0.0;
+            // Retract only when the travel leaves the part (crosses a wall);
+            // travels that stay inside comb over printed material.
+            let retract = last_pos.is_some_and(|p| needs_retract(&layer.outline, p, start, s));
             if retract {
                 g.retract(s.retract_len_mm, retract_f);
             }
@@ -75,7 +77,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             if path.closed {
                 g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
             }
-            printed = true;
+            last_pos = Some(path_end(path));
         }
     }
 
@@ -144,7 +146,7 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
     };
 
     let mut total = 0.0;
-    let mut pos: Option<(f64, f64)> = None;
+    let mut last_pos: Option<Point> = None;
     let mut prev_z = 0.0;
     for layer in layers {
         total += (layer.print_z_mm - prev_z).abs() / travel_v;
@@ -154,19 +156,15 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
                 continue;
             }
             let start = path.points[0];
-            if let Some((px, py)) = pos {
-                total += retract_t;
-                let d = ((px - start.x_mm()).powi(2) + (py - start.y_mm()).powi(2)).sqrt();
-                total += trapezoid_time(d, 0.0, 0.0, travel_v, accel);
+            if let Some(prev) = last_pos {
+                if needs_retract(&layer.outline, prev, start, s) {
+                    total += retract_t;
+                }
+                total += trapezoid_time(dist_mm(prev, start), 0.0, 0.0, travel_v, accel);
             }
             let v_nom = feed_for(path.kind, layer.index, s) / 60.0;
             total += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
-            let last = if path.closed {
-                path.points[0]
-            } else {
-                path.points[path.points.len() - 1]
-            };
-            pos = Some((last.x_mm(), last.y_mm()));
+            last_pos = Some(path_end(path));
         }
     }
     total
@@ -253,6 +251,68 @@ pub fn format_duration(seconds: f64) -> String {
     } else {
         format!("{sec}s")
     }
+}
+
+/// Estimate filament used: `(length_mm, grams)`.
+pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
+    let mut volume = 0.0; // mm³
+    for layer in layers {
+        for path in &layer.paths {
+            let mut len = 0.0;
+            for w in path.points.windows(2) {
+                len += dist_mm(w[0], w[1]);
+            }
+            if path.closed && path.points.len() >= 2 {
+                len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
+            }
+            volume += len * path.width_mm * layer.height_mm;
+        }
+    }
+    let length_mm = volume / s.filament_area_mm2();
+    let grams = volume / 1000.0 * s.filament_density_g_cm3; // 1000 mm³ = 1 cm³
+    (length_mm, grams)
+}
+
+const MIN_TRAVEL_MM: f64 = 0.8;
+
+fn path_end(p: &ToolPath) -> Point {
+    if p.closed {
+        p.points[0]
+    } else {
+        p.points[p.points.len() - 1]
+    }
+}
+
+/// Retract only if the travel is long enough *and* its straight line crosses a
+/// wall (leaves the printed region). Travels that stay inside comb without one.
+fn needs_retract(outline: &Polygons, a: Point, b: Point, s: &Settings) -> bool {
+    s.retract_len_mm > 0.0 && dist_mm(a, b) >= MIN_TRAVEL_MM && travel_crosses(outline, a, b)
+}
+
+fn travel_crosses(outline: &Polygons, a: Point, b: Point) -> bool {
+    for c in &outline.contours {
+        let n = c.points.len();
+        for i in 0..n {
+            if segments_intersect(a, b, c.points[i], c.points[(i + 1) % n]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Proper segment intersection (touching/collinear treated as no crossing — the
+/// travel endpoints sit strictly inside the outline, so that's correct here).
+fn segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool {
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    o1 != 0 && o2 != 0 && o3 != 0 && o4 != 0 && (o1 > 0) != (o2 > 0) && (o3 > 0) != (o4 > 0)
+}
+
+fn orient(p: Point, q: Point, r: Point) -> i128 {
+    ((q.x - p.x) as i128) * ((r.y - p.y) as i128) - ((q.y - p.y) as i128) * ((r.x - p.x) as i128)
 }
 
 #[cfg(test)]

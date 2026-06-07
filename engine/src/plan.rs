@@ -46,6 +46,8 @@ pub struct LayerPlan {
     pub print_z_mm: f64,
     pub height_mm: f64,
     pub paths: Vec<ToolPath>,
+    /// The layer's solid outline (bed-centered), used for combing decisions.
+    pub outline: Polygons,
 }
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
@@ -140,6 +142,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             print_z_mm: layers[i].print_z_mm,
             height_mm: layers[i].height_mm,
             paths,
+            outline: layers[i].polygons.clone(),
         });
     }
 
@@ -160,8 +163,77 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         }
     }
 
+    order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
     plans
+}
+
+/// Greedily order each layer's paths (nearest-neighbour) to cut travel, keeping
+/// skirt/brim first. Open paths may be reversed to start at the nearer end.
+fn order_layers(plans: &mut [LayerPlan]) {
+    let mut cur = Point::new(0, 0);
+    for plan in plans.iter_mut() {
+        let all = std::mem::take(&mut plan.paths);
+        let (prime, rest): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|p| p.kind == PathKind::Skirt);
+        if let Some(last) = prime.last() {
+            cur = path_end(last);
+        }
+        let ordered = order_paths(rest, cur);
+        if let Some(last) = ordered.last() {
+            cur = path_end(last);
+        }
+        let mut paths = prime;
+        paths.extend(ordered);
+        plan.paths = paths;
+    }
+}
+
+fn order_paths(mut remaining: Vec<ToolPath>, start: Point) -> Vec<ToolPath> {
+    let mut out = Vec::with_capacity(remaining.len());
+    let mut cur = start;
+    while !remaining.is_empty() {
+        let mut best = 0usize;
+        let mut best_d = i128::MAX;
+        let mut best_rev = false;
+        for (i, p) in remaining.iter().enumerate() {
+            let ds = dist2(cur, p.points[0]);
+            if ds < best_d {
+                best_d = ds;
+                best = i;
+                best_rev = false;
+            }
+            if !p.closed {
+                let de = dist2(cur, p.points[p.points.len() - 1]);
+                if de < best_d {
+                    best_d = de;
+                    best = i;
+                    best_rev = true;
+                }
+            }
+        }
+        let mut p = remaining.swap_remove(best);
+        if best_rev {
+            p.points.reverse();
+        }
+        cur = path_end(&p);
+        out.push(p);
+    }
+    out
+}
+
+fn path_end(p: &ToolPath) -> Point {
+    if p.closed {
+        p.points[0]
+    } else {
+        p.points[p.points.len() - 1]
+    }
+}
+
+fn dist2(a: Point, b: Point) -> i128 {
+    let dx = (a.x - b.x) as i128;
+    let dy = (a.y - b.y) as i128;
+    dx * dx + dy * dy
 }
 
 /// Loops around the first-layer outline, offset outward, to prime the nozzle and
@@ -238,6 +310,12 @@ fn center_on_bed(plans: &mut [LayerPlan], mesh: &Mesh, settings: &Settings) {
     for plan in plans.iter_mut() {
         for path in &mut plan.paths {
             for p in &mut path.points {
+                p.x += dx;
+                p.y += dy;
+            }
+        }
+        for c in &mut plan.outline.contours {
+            for p in &mut c.points {
                 p.x += dx;
                 p.y += dy;
             }

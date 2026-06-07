@@ -1,4 +1,5 @@
 # Generic PLA.
 filament_diameter_mm = 1.75
+density_g_cm3 = 1.24
 nozzle_temp_c = 200
 bed_temp_c = 60

@@ -139,7 +139,13 @@ impl App {
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
         let secs = engine::estimate_seconds(&layers, &self.settings);
-        self.status = format!("Sliced {n} layers, {paths} toolpaths · ~{}", engine::format_duration(secs));
+        let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
+        self.status = format!(
+            "Sliced {n} layers, {paths} toolpaths · ~{} · {:.2} m / {:.0} g",
+            engine::format_duration(secs),
+            fil_mm / 1000.0,
+            grams
+        );
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
         self.preview_layer = n.max(1);
