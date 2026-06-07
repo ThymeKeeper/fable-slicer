@@ -60,9 +60,16 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
     let mut next_id = 1u32;
     let mut guard = 0usize;
     let cap = 400_000usize;
+    let mut last_reseed_unfilled = usize::MAX;
 
     while unfilled > 0 && guard < cap {
         if fronts.is_empty() {
+            // Stop if the previous reseed cycle made no progress (only tiny cusps
+            // left); the scanline cleanup below finishes those.
+            if unfilled >= last_reseed_unfilled {
+                break;
+            }
+            last_reseed_unfilled = unfilled;
             let seeds = seed_centers(&kind, &owner, &g, rmax);
             if seeds.is_empty() {
                 break;
@@ -86,6 +93,30 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
             }
         }
         fronts = next;
+    }
+
+    // Cleanup: cusps left where fans meet (concentric circles can't tile a corner)
+    // get short scanline segments, supported on both sides by the surrounding arcs.
+    for iy in 0..ny {
+        let mut start: Option<usize> = None;
+        for ix in 0..=nx {
+            let gap = ix < nx && kind[iy * nx + ix] == REGION && owner[iy * nx + ix] == 0;
+            if gap {
+                if start.is_none() {
+                    start = Some(ix);
+                }
+            } else if let Some(s) = start.take() {
+                let e = ix - 1;
+                if e > s {
+                    let (x0, y) = g.center(s, iy);
+                    let (x1, _) = g.center(e, iy);
+                    arcs.push(vec![Point::from_mm(x0, y), Point::from_mm(x1, y)]);
+                    for cx in s..=e {
+                        owner[iy * nx + cx] = u32::MAX;
+                    }
+                }
+            }
+        }
     }
     arcs
 }
@@ -269,9 +300,10 @@ mod tests {
                 len += (w[0].x_mm() - w[1].x_mm()).hypot(w[0].y_mm() - w[1].y_mm());
             }
         }
-        // Beads are ~lw apart, so length*lw ≈ area when there are no large gaps.
+        // Beads are ~lw apart, so length*lw ≈ area; the cleanup pass closes the
+        // fan-meeting cusps, so coverage should be high.
         let covered = len * lw;
-        assert!(covered > 400.0 * 0.6, "coverage {covered:.0}mm² of 400 — gaps?");
+        assert!(covered > 400.0 * 0.85, "coverage {covered:.0}mm² of 400 — gaps?");
     }
 
     #[test]
