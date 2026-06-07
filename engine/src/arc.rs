@@ -75,7 +75,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
                 break;
             }
             for (x, y) in seeds {
-                fronts.push(Front { x, y, r: cell, id: next_id });
+                fronts.push(Front { x, y, r: cell, id: next_id, far: None });
                 next_id += 1;
             }
         }
@@ -86,10 +86,14 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
                 break;
             }
             if f.r > rmax {
-                continue; // fan reached its limit; drop it
+                chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
+                continue; // radius limit — continue from the fan's frontier
             }
-            if draw_ring(f, &g, &kind, &mut owner, &mut unfilled, &mut arcs) {
-                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id });
+            let (grew, ring_far) = draw_ring(f, &g, &kind, &mut owner, &mut unfilled, &mut arcs);
+            if grew {
+                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far) });
+            } else {
+                chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
             }
         }
         fronts = next;
@@ -126,6 +130,31 @@ struct Front {
     y: f64,
     r: f64,
     id: u32,
+    /// Farthest frontier point this fan has reached (next center when it stalls).
+    far: Option<(f64, f64)>,
+}
+
+/// Continue a stalled fan by starting a new fan at its farthest frontier point
+/// (McCulloch chaining) — but only if that point still borders unfilled region.
+fn chain_spawn(far: Option<(f64, f64)>, g: &Grid, kind: &[u8], owner: &[u32], next: &mut Vec<Front>, next_id: &mut u32) {
+    if let Some((fx, fy)) = far {
+        if let Some(ci) = g.index(fx, fy) {
+            if has_unfilled_neighbour(g, kind, owner, ci) {
+                next.push(Front { x: fx, y: fy, r: g.cell, id: *next_id, far: None });
+                *next_id += 1;
+            }
+        }
+    }
+}
+
+fn has_unfilled_neighbour(g: &Grid, kind: &[u8], owner: &[u32], ci: usize) -> bool {
+    let (nx, ny) = (g.nx, g.ny);
+    let (ix, iy) = (ci % nx, ci / nx);
+    let unfilled = |c: usize| kind[c] == REGION && owner[c] == 0;
+    (ix > 0 && unfilled(ci - 1))
+        || (ix + 1 < nx && unfilled(ci + 1))
+        || (iy > 0 && unfilled(ci - nx))
+        || (iy + 1 < ny && unfilled(ci + nx))
 }
 
 struct Grid {
@@ -154,7 +183,7 @@ impl Grid {
 /// overhang that are unfilled or already this fan's. Runs break at the region
 /// edge, anchor cells, and other fans' cells. A run is emitted (and its unfilled
 /// cells claimed) only if it touches still-unfilled region.
-fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> bool {
+fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> (bool, Option<(f64, f64)>) {
     let dtheta = (g.cell / f.r).clamp(0.01, 0.4);
     let mut runs: Vec<(Vec<Point>, Vec<usize>, bool)> = Vec::new();
     let mut pts: Vec<Point> = Vec::new();
@@ -188,21 +217,37 @@ fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut
         runs.push((pts, cells, has_new));
     }
 
-    let mut any_new = false;
+    // Mark the new runs' cells as this fan's, then pick a frontier point (a just-
+    // printed cell still bordering unfilled region) as the fan's next center.
+    let mut emitted: Vec<(Vec<Point>, Vec<usize>)> = Vec::new();
     for (p, c, new) in runs {
         if p.len() < 2 || !new {
             continue;
         }
-        for ci in c {
+        for &ci in &c {
             if owner[ci] == 0 {
                 owner[ci] = f.id;
                 *unfilled -= 1;
             }
         }
-        arcs.push(p);
-        any_new = true;
+        emitted.push((p, c));
     }
-    any_new
+    if emitted.is_empty() {
+        return (false, None);
+    }
+    let mut chain = None;
+    'find: for (p, c) in &emitted {
+        for (k, &ci) in c.iter().enumerate() {
+            if has_unfilled_neighbour(g, kind, owner, ci) {
+                chain = Some((p[k].x_mm(), p[k].y_mm()));
+                break 'find;
+            }
+        }
+    }
+    for (p, _) in emitted {
+        arcs.push(p);
+    }
+    (true, chain)
 }
 
 /// Even-odd point-in-polygon over a region (outer contours + holes).
@@ -217,9 +262,10 @@ fn in_poly(polys: &Polygons, x: f64, y: f64) -> bool {
     inside
 }
 
-/// Seed centers on anchor / already-covered cells that border the unfilled region,
-/// preferring concave corners (more unfilled neighbours) and spaced ~`rmax*0.6`
-/// apart so fans start from several sides (e.g. opposite edges of a bridge).
+/// Seed centers on anchor / already-covered cells bordering the unfilled region.
+/// Prefers **true corners** (≥2 unfilled neighbours), one seed per corner; if the
+/// region has no corners (supported by a single straight edge), spreads seeds
+/// along that edge instead. Farthest-point chaining then covers the interior.
 fn seed_centers(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
     let (nx, ny) = (g.nx, g.ny);
     let is_unfilled = |c: usize| kind[c] == REGION && owner[c] == 0;
@@ -259,11 +305,16 @@ fn seed_centers(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f6
         return Vec::new();
     }
     cands.sort_by(|a, b| b.0.cmp(&a.0)); // most corner-like first
-    // Pack seeds fairly tight (fans meet cleanly now) so even a small bridge gets
-    // starts on opposite sides rather than a single corner fan.
-    let min_sep = (rmax * 0.3).max(g.cell * 8.0);
+    // True corners (≥2 unfilled neighbours) get one seed each (tight dedup). With
+    // none, fall back to spreading seeds along the single supported edge.
+    let corners: Vec<(i32, f64, f64)> = cands.iter().copied().filter(|c| c.0 >= 2).collect();
+    let (pool, min_sep) = if corners.is_empty() {
+        (cands, (rmax * 0.3).max(g.cell * 8.0))
+    } else {
+        (corners, g.cell * 3.0)
+    };
     let mut chosen: Vec<(f64, f64)> = Vec::new();
-    for (_, x, y) in cands {
+    for (_, x, y) in pool {
         if chosen.iter().all(|&(ax, ay)| (ax - x).hypot(ay - y) >= min_sep) {
             chosen.push((x, y));
         }
