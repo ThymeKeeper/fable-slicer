@@ -48,6 +48,8 @@ pub struct LayerPlan {
     pub paths: Vec<ToolPath>,
     /// The layer's solid outline (bed-centered), used for combing decisions.
     pub outline: Polygons,
+    /// Speed multiplier (≤1) applied to this layer for min-layer-time cooling.
+    pub speed_scale: f64,
 }
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
@@ -143,6 +145,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             height_mm: layers[i].height_mm,
             paths,
             outline: layers[i].polygons.clone(),
+            speed_scale: 1.0,
         });
     }
 
@@ -165,6 +168,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
     order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
+    crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
 }
 

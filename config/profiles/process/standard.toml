@@ -14,3 +14,5 @@ brim_loops = 0
 seam = "nearest"
 print_speed_mm_s = 50.0
 first_layer_speed_mm_s = 20.0
+min_layer_time_s = 8.0
+min_print_speed_mm_s = 10.0

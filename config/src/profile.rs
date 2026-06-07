@@ -64,6 +64,8 @@ pub struct ProcessProfile {
     pub seam: Option<String>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
+    pub min_layer_time_s: Option<f64>,
+    pub min_print_speed_mm_s: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -107,7 +109,8 @@ impl Tier for ProcessProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
-            skirt_loops, skirt_gap_mm, brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s)
+            skirt_loops, skirt_gap_mm, brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s,
+            min_layer_time_s, min_print_speed_mm_s)
     }
 }
 
@@ -191,6 +194,8 @@ impl Profiles {
             print_speed_mm_s: pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s),
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
             first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
+            min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
+            min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })

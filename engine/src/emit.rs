@@ -54,7 +54,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             if path.points.len() < 2 {
                 continue;
             }
-            let feed = feed_for(path.kind, layer.index, s);
+            let feed = feed_for(path.kind, layer.index, s) * layer.speed_scale;
             let coeff = path.width_mm * layer.height_mm / area;
             let start = path.points[0];
 
@@ -136,6 +136,19 @@ fn dist_mm(a: Point, b: Point) -> f64 {
 /// look-ahead. Mirrors the move sequence `to_gcode` emits; heating/homing in the
 /// start g-code is not counted.
 pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
+    let travel_v = s.travel_speed_mm_s.max(1.0);
+    let mut total = 0.0;
+    let mut prev_z = 0.0;
+    for layer in layers {
+        total += (layer.print_z_mm - prev_z).abs() / travel_v;
+        prev_z = layer.print_z_mm;
+        total += layer_print_seconds(layer, s, layer.speed_scale);
+    }
+    total
+}
+
+/// Extrusion + intra-layer travel time for one layer, at the given speed scale.
+fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
     let accel = s.acceleration_mm_s2.max(1.0);
     let jerk = s.jerk_mm_s.max(0.1);
     let travel_v = s.travel_speed_mm_s.max(1.0);
@@ -144,30 +157,39 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
     } else {
         0.0
     };
-
-    let mut total = 0.0;
+    let mut t = 0.0;
     let mut last_pos: Option<Point> = None;
-    let mut prev_z = 0.0;
-    for layer in layers {
-        total += (layer.print_z_mm - prev_z).abs() / travel_v;
-        prev_z = layer.print_z_mm;
-        for path in &layer.paths {
-            if path.points.len() < 2 {
-                continue;
+    for path in &layer.paths {
+        if path.points.len() < 2 {
+            continue;
+        }
+        let start = path.points[0];
+        if let Some(prev) = last_pos {
+            if needs_retract(&layer.outline, prev, start, s) {
+                t += retract_t;
             }
-            let start = path.points[0];
-            if let Some(prev) = last_pos {
-                if needs_retract(&layer.outline, prev, start, s) {
-                    total += retract_t;
-                }
-                total += trapezoid_time(dist_mm(prev, start), 0.0, 0.0, travel_v, accel);
-            }
-            let v_nom = feed_for(path.kind, layer.index, s) / 60.0;
-            total += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
-            last_pos = Some(path_end(path));
+            t += trapezoid_time(dist_mm(prev, start), 0.0, 0.0, travel_v, accel);
+        }
+        let v_nom = feed_for(path.kind, layer.index, s) / 60.0 * scale;
+        t += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
+        last_pos = Some(path_end(path));
+    }
+    t
+}
+
+/// Slow down layers that print faster than `min_layer_time_s` (down to a floor
+/// speed) so they have time to cool before the next layer.
+pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
+    if s.min_layer_time_s <= 0.0 {
+        return;
+    }
+    let floor = s.min_print_speed_mm_s / s.print_speed_mm_s.max(1.0);
+    for plan in plans.iter_mut() {
+        let t = layer_print_seconds(plan, s, 1.0);
+        if t > 0.0 && t < s.min_layer_time_s {
+            plan.speed_scale = (t / s.min_layer_time_s).clamp(floor, 1.0);
         }
     }
-    total
 }
 
 /// Time for an extrusion polyline, with junction-speed look-ahead. Both ends stop

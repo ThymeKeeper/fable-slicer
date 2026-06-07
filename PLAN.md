@@ -76,7 +76,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] **Benchy prints cleanly** (needs hardware)
 
 ### M3 — Quality pass (what separates "prints" from "looks good")
-- [ ] Per-feature speeds; min-layer-time cooling slowdown
+- [x] Per-feature speeds (external perimeter slowed) + min-layer-time cooling: layers faster than `min_layer_time_s` slow to a floor speed (per-layer `speed_scale`)
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
 - [x] Travel ordering (nearest-neighbour, reversing open paths) + combing-aware retraction (retract only when the straight travel crosses a wall) — Benchy travel 67m→16m, retractions 5587→605. Full geometric reroute (travel *follows* the inside around holes) still TODO.
 - [ ] Gap fill between colliding offsets
