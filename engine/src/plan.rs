@@ -9,7 +9,7 @@
 //! the previous `bottom_layers` below; otherwise it is within a shell and printed
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
-use config::Settings;
+use config::{SeamMode, Settings};
 use geo2d::{difference, intersection, offset, union, to_units, Point, Polygons};
 use mesh::Mesh;
 
@@ -74,7 +74,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
             for c in offset(&layer.polygons, inset).contours {
                 if c.points.len() >= 3 {
-                    walls.push(ToolPath { kind, closed: true, width_mm: lw, points: c.points });
+                    let points = place_seam(c.points, settings.seam_mode, layer.index);
+                    walls.push(ToolPath { kind, closed: true, width_mm: lw, points });
                 }
             }
         }
@@ -266,6 +267,48 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<P
     out
 }
 
+/// Rotate a closed wall loop so the seam (start/end) lands at the chosen vertex.
+fn place_seam(mut points: Vec<Point>, mode: SeamMode, layer_index: usize) -> Vec<Point> {
+    let n = points.len();
+    if n < 3 {
+        return points;
+    }
+    let start = match mode {
+        // Rear-most vertex (max Y, tie-break max X) — seams align into a column.
+        SeamMode::Nearest => (0..n)
+            .max_by_key(|&i| (points[i].y, points[i].x))
+            .unwrap(),
+        // Sharpest corner — tucks the seam where it's least visible.
+        SeamMode::Sharpest => (0..n)
+            .max_by(|&a, &b| sharpness(&points, a).total_cmp(&sharpness(&points, b)))
+            .unwrap(),
+        // Deterministic per-layer scatter.
+        SeamMode::Random => layer_index.wrapping_mul(2_654_435_761).wrapping_add(40_503) % n,
+    };
+    points.rotate_left(start);
+    points
+}
+
+/// Corner sharpness at vertex `i`: `1 - cos(turn)` (0 = straight, up to 2 = hairpin).
+fn sharpness(points: &[Point], i: usize) -> f64 {
+    let n = points.len();
+    let prev = points[(i + n - 1) % n];
+    let cur = points[i];
+    let next = points[(i + 1) % n];
+    let a = unit(cur.x_mm() - prev.x_mm(), cur.y_mm() - prev.y_mm());
+    let b = unit(next.x_mm() - cur.x_mm(), next.y_mm() - cur.y_mm());
+    1.0 - (a.0 * b.0 + a.1 * b.1)
+}
+
+fn unit(x: f64, y: f64) -> (f64, f64) {
+    let len = (x * x + y * y).sqrt();
+    if len > 0.0 {
+        (x / len, y / len)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +388,19 @@ mod tests {
         assert!((layers[0].height_mm - 0.3).abs() < 1e-9);
         assert!((layers[0].print_z_mm - 0.3).abs() < 1e-9, "first layer top at 0.3");
         assert!((layers[1].print_z_mm - 0.5).abs() < 1e-9, "second layer top at 0.5");
+    }
+
+    #[test]
+    fn seam_nearest_starts_at_rear() {
+        let m = Mesh::cube(20.0);
+        let s = Settings { seam_mode: SeamMode::Nearest, ..Settings::default() };
+        let layers = generate(&m, &s);
+        let ext = layers[10]
+            .paths
+            .iter()
+            .find(|p| p.kind == PathKind::ExternalPerimeter)
+            .unwrap();
+        let max_y = ext.points.iter().map(|p| p.y).max().unwrap();
+        assert_eq!(ext.points[0].y, max_y, "seam should start at the rear-most vertex");
     }
 }

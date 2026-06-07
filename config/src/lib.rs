@@ -30,6 +30,36 @@ G1 Z5 F600
 G90
 M84";
 
+/// Where the start/end seam of each closed wall loop is placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SeamMode {
+    /// Rear-most point of each loop — seams align into a vertical column.
+    #[default]
+    Nearest,
+    /// Sharpest corner of each loop — tucks the seam into a corner.
+    Sharpest,
+    /// Scattered per layer.
+    Random,
+}
+
+impl SeamMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "nearest" | "rear" | "aligned" => Some(Self::Nearest),
+            "sharpest" | "sharp" | "corner" => Some(Self::Sharpest),
+            "random" => Some(Self::Random),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Sharpest => "sharpest",
+            Self::Random => "random",
+        }
+    }
+}
+
 /// Fully-resolved settings the pipeline runs on.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -53,6 +83,8 @@ pub struct Settings {
     pub skirt_loops: usize,
     /// Gap between the skirt and the model (mm).
     pub skirt_gap_mm: f64,
+    /// Where to place the wall seam.
+    pub seam_mode: SeamMode,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -88,6 +120,7 @@ impl Default for Settings {
             infill_density: 0.15,
             skirt_loops: 2,
             skirt_gap_mm: 3.0,
+            seam_mode: SeamMode::default(),
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             nozzle_temp_c: 200,

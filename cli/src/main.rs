@@ -52,6 +52,9 @@ struct Args {
     /// Number of skirt loops (0 disables).
     #[arg(long)]
     skirt: Option<usize>,
+    /// Seam placement: nearest | sharpest | random.
+    #[arg(long)]
+    seam: Option<String>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
     #[arg(long)]
@@ -101,6 +104,12 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.skirt {
         settings.skirt_loops = v;
+    }
+    if let Some(s) = &args.seam {
+        match config::SeamMode::parse(s) {
+            Some(m) => settings.seam_mode = m,
+            None => anyhow::bail!("unknown seam mode '{s}' (use nearest | sharpest | random)"),
+        }
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;
