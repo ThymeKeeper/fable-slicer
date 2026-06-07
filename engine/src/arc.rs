@@ -62,15 +62,28 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
     let cap = 400_000usize;
     let mut last_reseed_unfilled = usize::MAX;
 
+    // Initial seeds at the region's convex corners (fall back to spreading along
+    // the supported border for a corner-free region). Chaining covers the rest.
+    {
+        let mut seeds = corner_seeds(region, &g, &kind, lw);
+        if seeds.is_empty() {
+            seeds = border_seeds(&kind, &owner, &g, rmax);
+        }
+        for (x, y) in seeds {
+            fronts.push(Front { x, y, r: cell, id: next_id, far: None });
+            next_id += 1;
+        }
+    }
+
     while unfilled > 0 && guard < cap {
         if fronts.is_empty() {
-            // Stop if the previous reseed cycle made no progress (only tiny cusps
-            // left); the scanline cleanup below finishes those.
+            // Reseed from the frontier of whatever's left; stop once a reseed
+            // cycle makes no progress (the scanline cleanup finishes the cusps).
             if unfilled >= last_reseed_unfilled {
                 break;
             }
             last_reseed_unfilled = unfilled;
-            let seeds = seed_centers(&kind, &owner, &g, rmax);
+            let seeds = border_seeds(&kind, &owner, &g, rmax);
             if seeds.is_empty() {
                 break;
             }
@@ -262,59 +275,101 @@ fn in_poly(polys: &Polygons, x: f64, y: f64) -> bool {
     inside
 }
 
-/// Seed centers on anchor / already-covered cells bordering the unfilled region.
-/// Prefers **true corners** (≥2 unfilled neighbours), one seed per corner; if the
-/// region has no corners (supported by a single straight edge), spreads seeds
-/// along that edge instead. Farthest-point chaining then covers the interior.
-fn seed_centers(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
-    let (nx, ny) = (g.nx, g.ny);
-    let is_unfilled = |c: usize| kind[c] == REGION && owner[c] == 0;
-    let unfilled_neighbours = |ix: usize, iy: usize| {
-        let mut n = 0;
-        if ix > 0 && is_unfilled(iy * nx + ix - 1) {
-            n += 1;
+/// Find the region's **convex corners** from the polygon and seed a fan at each
+/// one that sits on supported material. Uses a windowed turn angle (direction
+/// ~`lw*4` before vs after each vertex) so it survives the rounding that
+/// morphological-open leaves on corners and ignores gentle curves / staircase
+/// noise. One seed per corner.
+fn corner_seeds(region: &Polygons, g: &Grid, kind: &[u8], lw: f64) -> Vec<(f64, f64)> {
+    let w = (lw * 4.0).max(1.0); // look-around arc length (mm)
+    let mut found: Vec<(f64, f64, f64)> = Vec::new(); // (cornerness, x, y)
+    for c in &region.contours {
+        let n = c.points.len();
+        if n < 4 {
+            continue;
         }
-        if ix + 1 < nx && is_unfilled(iy * nx + ix + 1) {
-            n += 1;
+        let pt = |k: usize| (c.points[k % n].x_mm(), c.points[k % n].y_mm());
+        for i in 0..n {
+            let (vx, vy) = pt(i);
+            // Walk back and forward ~w to get the incoming/outgoing directions.
+            let walk = |dir: i64| {
+                let (mut x, mut y) = (vx, vy);
+                let mut acc = 0.0;
+                let mut k = i as i64;
+                for _ in 0..n {
+                    let kk = (k + dir).rem_euclid(n as i64) as usize;
+                    let (px, py) = pt(kk);
+                    acc += (x - px).hypot(y - py);
+                    x = px;
+                    y = py;
+                    k = kk as i64;
+                    if acc >= w {
+                        break;
+                    }
+                }
+                (x, y)
+            };
+            let (bx, by) = walk(-1);
+            let (fx, fy) = walk(1);
+            let (inx, iny) = (vx - bx, vy - by);
+            let (outx, outy) = (fx - vx, fy - vy);
+            if inx.hypot(iny) < 1e-6 || outx.hypot(outy) < 1e-6 {
+                continue;
+            }
+            let turn = (inx * outy - iny * outx).atan2(inx * outx + iny * outy).abs();
+            if turn > 1.0 && near_anchor(g, kind, vx, vy) {
+                found.push((turn, vx, vy));
+            }
         }
-        if iy > 0 && is_unfilled((iy - 1) * nx + ix) {
-            n += 1;
-        }
-        if iy + 1 < ny && is_unfilled((iy + 1) * nx + ix) {
-            n += 1;
-        }
-        n
+    }
+    found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    dedup(found.into_iter().map(|(_, x, y)| (x, y)).collect(), w * 1.5)
+}
+
+/// True if an ANCHOR cell sits within ~2 cells of `(x, y)`.
+fn near_anchor(g: &Grid, kind: &[u8], x: f64, y: f64) -> bool {
+    let Some(ci) = g.index(x, y) else {
+        return false;
     };
-    // Candidates: supported (anchor) or already-printed cells touching unfilled
-    // region, scored by how corner-like they are.
-    let mut cands: Vec<(i32, f64, f64)> = Vec::new();
+    let (nx, ny) = (g.nx, g.ny);
+    let (ix, iy) = ((ci % nx) as i64, (ci / nx) as i64);
+    for dy in -2..=2i64 {
+        for dx in -2..=2i64 {
+            let (jx, jy) = (ix + dx, iy + dy);
+            if jx >= 0 && jy >= 0 && (jx as usize) < nx && (jy as usize) < ny && kind[jy as usize * nx + jx as usize] == ANCHOR {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Fallback / reseed: anchor or already-covered cells bordering the unfilled
+/// region, spread ~`rmax*0.3` apart.
+fn border_seeds(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
+    let (nx, ny) = (g.nx, g.ny);
+    let unfilled = |c: usize| kind[c] == REGION && owner[c] == 0;
+    let mut cands: Vec<(f64, f64)> = Vec::new();
     for iy in 0..ny {
         for ix in 0..nx {
             let c = iy * nx + ix;
             let is_support = kind[c] == ANCHOR || (kind[c] == REGION && owner[c] != 0);
-            if is_support {
-                let k = unfilled_neighbours(ix, iy);
-                if k > 0 {
-                    let (x, y) = g.center(ix, iy);
-                    cands.push((k, x, y));
-                }
+            let borders = (ix > 0 && unfilled(c - 1))
+                || (ix + 1 < nx && unfilled(c + 1))
+                || (iy > 0 && unfilled(c - nx))
+                || (iy + 1 < ny && unfilled(c + nx));
+            if is_support && borders {
+                cands.push(g.center(ix, iy));
             }
         }
     }
-    if cands.is_empty() {
-        return Vec::new();
-    }
-    cands.sort_by(|a, b| b.0.cmp(&a.0)); // most corner-like first
-    // True corners (≥2 unfilled neighbours) get one seed each (tight dedup). With
-    // none, fall back to spreading seeds along the single supported edge.
-    let corners: Vec<(i32, f64, f64)> = cands.iter().copied().filter(|c| c.0 >= 2).collect();
-    let (pool, min_sep) = if corners.is_empty() {
-        (cands, (rmax * 0.3).max(g.cell * 8.0))
-    } else {
-        (corners, g.cell * 3.0)
-    };
+    dedup(cands, (rmax * 0.3).max(g.cell * 8.0))
+}
+
+/// Greedily keep points at least `min_sep` apart (input pre-sorted by priority).
+fn dedup(pts: Vec<(f64, f64)>, min_sep: f64) -> Vec<(f64, f64)> {
     let mut chosen: Vec<(f64, f64)> = Vec::new();
-    for (_, x, y) in pool {
+    for (x, y) in pts {
         if chosen.iter().all(|&(ax, ay)| (ax - x).hypot(ay - y) >= min_sep) {
             chosen.push((x, y));
         }

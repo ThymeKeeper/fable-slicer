@@ -160,8 +160,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
 
             if !arc_region.is_empty() {
-                // Anchor the arcs on the supported interior they border.
-                let anchor = difference(inner, &arc_region);
+                // Anchor the arcs on everything that isn't the overhang itself —
+                // the walls and any supported interior the region borders.
+                let anchor = difference(&layers[i].polygons, &arc_region);
                 for seg in crate::arc::arc_fill(&arc_region, &anchor, lw, ARC_RMAX_MM) {
                     if seg.len() >= 2 {
                         paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
