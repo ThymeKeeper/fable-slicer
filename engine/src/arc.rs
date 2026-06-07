@@ -5,15 +5,20 @@
 //! Coverage is tracked on a line-width grid; the arcs are analytic circular arcs.
 //! Multiple centers are seeded on the supported border (preferring concave
 //! corners) and their concentric rings grow outward in lockstep — so fans advance
-//! from several sides and meet in the middle, which lets bridges span further than
-//! a single corner fan. Each ring is emitted as a continuous arc (broken only at
-//! the region boundary), avoiding gaps where neighbouring rings overlap.
+//! from several sides and meet in the middle, letting bridges span further than a
+//! single corner fan.
+//!
+//! Each ring is emitted as a continuous arc but stops at: the region boundary,
+//! anchor (supported) cells, and cells owned by a *different* fan. So arcs stay
+//! inside the overhang (never drawing over neighbouring regions), don't break on
+//! their own fan's prior rings (no aliasing gaps), and meet cleanly where two fans
+//! touch (no overlap).
 
 use geo2d::{Point, Polygons};
 
-const OUT: u8 = 0; // outside the region
-const UNFILLED: u8 = 1; // region, not yet covered
-const FILLED: u8 = 2; // supported anchor, or already covered by an arc
+const OUT: u8 = 0; // outside the overhang region
+const REGION: u8 = 1; // overhang region (owner 0 = unfilled, else the fan that filled it)
+const ANCHOR: u8 = 2; // supported material bordering the region (seed from here, never draw on)
 
 /// Fill `region` with concentric arcs seeded where it borders `supported`.
 /// `lw` = line width (mm), `rmax` = max arc radius (mm). Returns arc polylines.
@@ -32,17 +37,17 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
     }
     let g = Grid { x0, y0, cell, nx, ny };
 
-    // Classify cells.
-    let mut grid = vec![OUT; nx * ny];
+    let mut kind = vec![OUT; nx * ny];
+    let mut owner = vec![0u32; nx * ny];
     let mut unfilled = 0usize;
     for iy in 0..ny {
         for ix in 0..nx {
             let (x, y) = g.center(ix, iy);
             if in_poly(region, x, y) {
-                grid[iy * nx + ix] = UNFILLED;
+                kind[iy * nx + ix] = REGION;
                 unfilled += 1;
             } else if in_poly(supported, x, y) {
-                grid[iy * nx + ix] = FILLED;
+                kind[iy * nx + ix] = ANCHOR;
             }
         }
     }
@@ -51,37 +56,45 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
     }
 
     let mut arcs: Vec<Vec<Point>> = Vec::new();
-    // Active fronts: (center_x, center_y, current_radius).
-    let mut fronts: Vec<(f64, f64, f64)> = Vec::new();
+    let mut fronts: Vec<Front> = Vec::new();
+    let mut next_id = 1u32;
     let mut guard = 0usize;
     let cap = 400_000usize;
 
     while unfilled > 0 && guard < cap {
         if fronts.is_empty() {
-            // (Re)seed from the supported/covered border touching unfilled region.
-            let seeds = seed_centers(&grid, &g, rmax);
+            let seeds = seed_centers(&kind, &owner, &g, rmax);
             if seeds.is_empty() {
                 break;
             }
-            fronts = seeds.into_iter().map(|(x, y)| (x, y, cell)).collect();
+            for (x, y) in seeds {
+                fronts.push(Front { x, y, r: cell, id: next_id });
+                next_id += 1;
+            }
         }
-        let mut next: Vec<(f64, f64, f64)> = Vec::new();
-        for &(cx, cy, r) in &fronts {
+        let mut next: Vec<Front> = Vec::new();
+        for f in &fronts {
             guard += 1;
             if guard >= cap {
                 break;
             }
-            if r > rmax {
+            if f.r > rmax {
                 continue; // fan reached its limit; drop it
             }
-            if draw_ring(cx, cy, r, &g, &mut grid, &mut unfilled, &mut arcs) {
-                next.push((cx, cy, r + cell)); // grew — keep expanding
+            if draw_ring(f, &g, &kind, &mut owner, &mut unfilled, &mut arcs) {
+                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id });
             }
-            // else: stalled (fully covered here) — drop; reseed picks up leftovers
         }
         fronts = next;
     }
     arcs
+}
+
+struct Front {
+    x: f64,
+    y: f64,
+    r: f64,
+    id: u32,
 }
 
 struct Grid {
@@ -106,29 +119,32 @@ impl Grid {
     }
 }
 
-/// Emit the in-region arc of `circle(c, r)`, broken only at the region boundary.
-/// A run is emitted (and its cells marked covered) only if it touches still-
-/// unfilled region; runs fully covered by another fan are skipped. Returns whether
-/// any new coverage was added.
-fn draw_ring(cx: f64, cy: f64, r: f64, g: &Grid, grid: &mut [u8], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> bool {
-    let dtheta = (g.cell / r).clamp(0.01, 0.4);
-    // Collect contiguous in-region runs as (points, cell indices, has_unfilled).
+/// Emit `circle(f, r)` where it lies in this fan's reachable region: cells in the
+/// overhang that are unfilled or already this fan's. Runs break at the region
+/// edge, anchor cells, and other fans' cells. A run is emitted (and its unfilled
+/// cells claimed) only if it touches still-unfilled region.
+fn draw_ring(f: &Front, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> bool {
+    let dtheta = (g.cell / f.r).clamp(0.01, 0.4);
     let mut runs: Vec<(Vec<Point>, Vec<usize>, bool)> = Vec::new();
     let mut pts: Vec<Point> = Vec::new();
     let mut cells: Vec<usize> = Vec::new();
     let mut has_new = false;
     let mut theta = 0.0;
     while theta < std::f64::consts::TAU {
-        let (x, y) = (cx + r * theta.cos(), cy + r * theta.sin());
-        match g.index(x, y) {
-            Some(ci) if grid[ci] != OUT => {
+        let (x, y) = (f.x + f.r * theta.cos(), f.y + f.r * theta.sin());
+        let reachable = match g.index(x, y) {
+            Some(ci) if kind[ci] == REGION && (owner[ci] == 0 || owner[ci] == f.id) => Some(ci),
+            _ => None,
+        };
+        match reachable {
+            Some(ci) => {
                 pts.push(Point::from_mm(x, y));
                 cells.push(ci);
-                if grid[ci] == UNFILLED {
+                if owner[ci] == 0 {
                     has_new = true;
                 }
             }
-            _ => {
+            None => {
                 if !pts.is_empty() {
                     runs.push((std::mem::take(&mut pts), std::mem::take(&mut cells), has_new));
                     has_new = false;
@@ -147,8 +163,8 @@ fn draw_ring(cx: f64, cy: f64, r: f64, g: &Grid, grid: &mut [u8], unfilled: &mut
             continue;
         }
         for ci in c {
-            if grid[ci] == UNFILLED {
-                grid[ci] = FILLED;
+            if owner[ci] == 0 {
+                owner[ci] = f.id;
                 *unfilled -= 1;
             }
         }
@@ -170,33 +186,36 @@ fn in_poly(polys: &Polygons, x: f64, y: f64) -> bool {
     inside
 }
 
-/// Seed centers on FILLED (supported/covered) cells bordering UNFILLED region,
-/// preferring concave corners (more unfilled orthogonal neighbours) and spaced
-/// ~`rmax*0.4` apart so fans start from several sides. Falls back to region cells.
-fn seed_centers(grid: &[u8], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
+/// Seed centers on anchor / already-covered cells that border the unfilled region,
+/// preferring concave corners (more unfilled neighbours) and spaced ~`rmax*0.6`
+/// apart so fans start from several sides (e.g. opposite edges of a bridge).
+fn seed_centers(kind: &[u8], owner: &[u32], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
     let (nx, ny) = (g.nx, g.ny);
+    let is_unfilled = |c: usize| kind[c] == REGION && owner[c] == 0;
     let unfilled_neighbours = |ix: usize, iy: usize| {
         let mut n = 0;
-        if ix > 0 && grid[iy * nx + ix - 1] == UNFILLED {
+        if ix > 0 && is_unfilled(iy * nx + ix - 1) {
             n += 1;
         }
-        if ix + 1 < nx && grid[iy * nx + ix + 1] == UNFILLED {
+        if ix + 1 < nx && is_unfilled(iy * nx + ix + 1) {
             n += 1;
         }
-        if iy > 0 && grid[(iy - 1) * nx + ix] == UNFILLED {
+        if iy > 0 && is_unfilled((iy - 1) * nx + ix) {
             n += 1;
         }
-        if iy + 1 < ny && grid[(iy + 1) * nx + ix] == UNFILLED {
+        if iy + 1 < ny && is_unfilled((iy + 1) * nx + ix) {
             n += 1;
         }
         n
     };
-    // Candidates: covered cells touching the unfilled region, scored by how
-    // "corner-like" they are (favours inside corners as start points).
+    // Candidates: supported (anchor) or already-printed cells touching unfilled
+    // region, scored by how corner-like they are.
     let mut cands: Vec<(i32, f64, f64)> = Vec::new();
     for iy in 0..ny {
         for ix in 0..nx {
-            if grid[iy * nx + ix] == FILLED {
+            let c = iy * nx + ix;
+            let is_support = kind[c] == ANCHOR || (kind[c] == REGION && owner[c] != 0);
+            if is_support {
                 let k = unfilled_neighbours(ix, iy);
                 if k > 0 {
                     let (x, y) = g.center(ix, iy);
@@ -209,7 +228,7 @@ fn seed_centers(grid: &[u8], g: &Grid, rmax: f64) -> Vec<(f64, f64)> {
         return Vec::new();
     }
     cands.sort_by(|a, b| b.0.cmp(&a.0)); // most corner-like first
-    let min_sep = (rmax * 0.4).max(g.cell * 2.0);
+    let min_sep = (rmax * 0.6).max(g.cell * 2.0);
     let mut chosen: Vec<(f64, f64)> = Vec::new();
     for (_, x, y) in cands {
         if chosen.iter().all(|&(ax, ay)| (ax - x).hypot(ay - y) >= min_sep) {
@@ -251,5 +270,19 @@ mod tests {
         // Beads are ~lw apart, so length*lw ≈ area when there are no large gaps.
         let covered = len * lw;
         assert!(covered > 400.0 * 0.6, "coverage {covered:.0}mm² of 400 — gaps?");
+    }
+
+    #[test]
+    fn arcs_stay_inside_the_region() {
+        let lw = 0.45;
+        let region = rect(0.0, 0.0, 20.0, 20.0);
+        let supported = rect(-5.0, -5.0, 25.0, 0.0); // wide anchor below
+        for a in arc_fill(&region, &supported, lw, 40.0) {
+            for p in a {
+                let (x, y) = (p.x_mm(), p.y_mm());
+                // arcs must not stray into the anchor (y<0) or outside the region
+                assert!(x > -lw && x < 20.0 + lw && y > -lw && y < 20.0 + lw, "arc point ({x:.2},{y:.2}) left the region");
+            }
+        }
     }
 }
