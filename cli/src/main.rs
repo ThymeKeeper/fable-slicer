@@ -52,6 +52,9 @@ struct Args {
     /// Number of skirt loops (0 disables).
     #[arg(long)]
     skirt: Option<usize>,
+    /// Number of brim loops (0 disables).
+    #[arg(long)]
+    brim: Option<usize>,
     /// Seam placement: nearest | sharpest | random.
     #[arg(long)]
     seam: Option<String>,
@@ -104,6 +107,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.skirt {
         settings.skirt_loops = v;
+    }
+    if let Some(v) = args.brim {
+        settings.brim_loops = v;
     }
     if let Some(s) = &args.seam {
         match config::SeamMode::parse(s) {

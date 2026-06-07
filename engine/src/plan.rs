@@ -149,6 +149,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         });
     }
 
+    // Brim: loops extending outward from the first-layer outline, touching the
+    // part for bed adhesion.
+    if settings.brim_loops > 0 {
+        if let (Some(first), Some(plan0)) = (layers.first(), plans.first_mut()) {
+            let brim = brim_paths(&first.polygons, settings);
+            plan0.paths.splice(0..0, brim);
+        }
+    }
+
     // Skirt: priming loops around the first layer, printed before anything else.
     if settings.skirt_loops > 0 {
         if let (Some(first), Some(plan0)) = (layers.first(), plans.first_mut()) {
@@ -168,6 +177,22 @@ fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
     let mut paths = Vec::new();
     for k in 0..settings.skirt_loops {
         let delta = settings.skirt_gap_mm + lw * (0.5 + k as f64);
+        for c in offset(first_layer, delta).contours {
+            if c.points.len() >= 3 {
+                paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
+            }
+        }
+    }
+    paths
+}
+
+/// Loops extending outward from the first-layer outline, the innermost touching
+/// the outer wall — a brim for bed adhesion. (Rendered as the skirt feature.)
+fn brim_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
+    let lw = settings.line_width_mm;
+    let mut paths = Vec::new();
+    for k in 0..settings.brim_loops {
+        let delta = lw * (0.5 + k as f64);
         for c in offset(first_layer, delta).contours {
             if c.points.len() >= 3 {
                 paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });

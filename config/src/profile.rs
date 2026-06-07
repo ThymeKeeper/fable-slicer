@@ -53,6 +53,7 @@ pub struct ProcessProfile {
     pub infill_density: Option<f64>,
     pub skirt_loops: Option<usize>,
     pub skirt_gap_mm: Option<f64>,
+    pub brim_loops: Option<usize>,
     pub seam: Option<String>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
@@ -98,7 +99,7 @@ impl Tier for ProcessProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             wall_count, top_layers, bottom_layers, infill_density, skirt_loops, skirt_gap_mm,
-            seam, print_speed_mm_s, first_layer_speed_mm_s)
+            brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s)
     }
 }
 
@@ -167,6 +168,7 @@ impl Profiles {
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             skirt_loops: pc.skirt_loops.unwrap_or(d.skirt_loops),
             skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
+            brim_loops: pc.brim_loops.unwrap_or(d.brim_loops),
             seam_mode: pc.seam.as_deref().and_then(SeamMode::parse).unwrap_or(d.seam_mode),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),

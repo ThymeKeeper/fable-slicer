@@ -8,6 +8,7 @@ bottom_layers = 4
 infill_density = 0.15
 skirt_loops = 2
 skirt_gap_mm = 3.0
+brim_loops = 0
 seam = "nearest"
 print_speed_mm_s = 50.0
 first_layer_speed_mm_s = 20.0

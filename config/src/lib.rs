@@ -83,6 +83,8 @@ pub struct Settings {
     pub skirt_loops: usize,
     /// Gap between the skirt and the model (mm).
     pub skirt_gap_mm: f64,
+    /// Number of brim loops extending outward from the part (0 disables).
+    pub brim_loops: usize,
     /// Where to place the wall seam.
     pub seam_mode: SeamMode,
 
@@ -120,6 +122,7 @@ impl Default for Settings {
             infill_density: 0.15,
             skirt_loops: 2,
             skirt_gap_mm: 3.0,
+            brim_loops: 0,
             seam_mode: SeamMode::default(),
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,

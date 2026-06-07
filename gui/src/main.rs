@@ -224,6 +224,7 @@ impl eframe::App for App {
             ui.add(egui::Slider::new(&mut self.settings.wall_count, 1..=6).text("walls"));
             ui.add(egui::Slider::new(&mut self.settings.infill_density, 0.0..=1.0).text("infill"));
             ui.add(egui::Slider::new(&mut self.settings.skirt_loops, 0..=5).text("skirt loops"));
+            ui.add(egui::Slider::new(&mut self.settings.brim_loops, 0..=20).text("brim loops"));
             egui::ComboBox::from_label("seam")
                 .selected_text(self.settings.seam_mode.label())
                 .show_ui(ui, |ui| {
