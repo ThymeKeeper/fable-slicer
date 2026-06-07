@@ -14,7 +14,7 @@
 //! their own fan's prior rings (no aliasing gaps), and meet cleanly where two fans
 //! touch (no overlap).
 
-use geo2d::{offset, Point, Polygons};
+use geo2d::{Point, Polygons};
 
 const OUT: u8 = 0; // outside the overhang region
 const REGION: u8 = 1; // overhang region (owner 0 = unfilled, else the fan that filled it)
@@ -58,41 +58,6 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
     let mut arcs: Vec<Vec<Point>> = Vec::new();
     let mut fronts: Vec<Front> = Vec::new();
     let mut next_id = 1u32;
-
-    // Perimeter: one bead just inside the region edge, along the supported parts
-    // (anchored on the walls). Gives the overhang a crisp, well-anchored edge so
-    // the arcs don't have to peter out near the boundary.
-    {
-        let boundary_id = next_id;
-        next_id += 1;
-        for c in offset(region, -lw * 0.5).contours {
-            let pts = &c.points;
-            let n = pts.len();
-            if n < 2 {
-                continue;
-            }
-            let mut run: Vec<Point> = Vec::new();
-            for k in 0..n {
-                let a = pts[k];
-                let b = pts[(k + 1) % n];
-                let (mx, my) = ((a.x_mm() + b.x_mm()) * 0.5, (a.y_mm() + b.y_mm()) * 0.5);
-                if near_anchor(&g, &kind, mx, my) {
-                    if run.is_empty() {
-                        run.push(a);
-                    }
-                    run.push(b);
-                    mark_segment(&g, &kind, &mut owner, &mut unfilled, boundary_id, a, b);
-                } else if run.len() >= 2 {
-                    arcs.push(std::mem::take(&mut run));
-                } else {
-                    run.clear();
-                }
-            }
-            if run.len() >= 2 {
-                arcs.push(run);
-            }
-        }
-    }
 
     let mut guard = 0usize;
     let cap = 400_000usize;
@@ -367,23 +332,6 @@ fn near_anchor(g: &Grid, kind: &[u8], x: f64, y: f64) -> bool {
         }
     }
     false
-}
-
-/// Claim the region cells a segment passes through for `id` (used by the
-/// perimeter bead so the fans stop at it).
-fn mark_segment(g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, id: u32, a: Point, b: Point) {
-    let (ax, ay) = (a.x_mm(), a.y_mm());
-    let (bx, by) = (b.x_mm(), b.y_mm());
-    let steps = ((bx - ax).hypot(by - ay) / (g.cell * 0.5)).ceil().max(1.0) as usize;
-    for s in 0..=steps {
-        let t = s as f64 / steps as f64;
-        if let Some(ci) = g.index(ax + (bx - ax) * t, ay + (by - ay) * t) {
-            if kind[ci] == REGION && owner[ci] == 0 {
-                owner[ci] = id;
-                *unfilled -= 1;
-            }
-        }
-    }
 }
 
 /// Fallback / reseed: anchor or already-covered cells bordering the unfilled
