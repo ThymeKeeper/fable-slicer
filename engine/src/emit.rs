@@ -49,6 +49,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             g.fan(255); // part cooling on after the first layer
         }
         g.move_z(layer.print_z_mm, travel_f);
+        let mut comb: Option<CombGraph> = None;
 
         for path in &layer.paths {
             if path.points.len() < 2 {
@@ -58,15 +59,35 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let coeff = path.width_mm * layer.height_mm / area;
             let start = path.points[0];
 
-            // Retract only when the travel leaves the part (crosses a wall);
-            // travels that stay inside comb over printed material.
-            let retract = last_pos.is_some_and(|p| needs_retract(&layer.outline, p, start, s));
-            if retract {
-                g.retract(s.retract_len_mm, retract_f);
-            }
-            g.travel(start.x_mm(), start.y_mm(), travel_f);
-            if retract {
-                g.unretract(s.retract_len_mm, retract_f);
+            // A travel that stays inside the part combs straight over printed
+            // material; one that would cross a wall is rerouted to stay inside,
+            // and only retracts if no in-region route exists.
+            if let Some(prev) = last_pos {
+                let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
+                    && travel_crosses(&layer.outline, prev, start);
+                if crosses {
+                    let graph = comb.get_or_insert_with(|| CombGraph::build(&layer.outline));
+                    match graph.route(&layer.outline, prev, start) {
+                        Some(route) => {
+                            for pt in route {
+                                g.travel(pt.x_mm(), pt.y_mm(), travel_f);
+                            }
+                        }
+                        None => {
+                            if s.retract_len_mm > 0.0 {
+                                g.retract(s.retract_len_mm, retract_f);
+                            }
+                            g.travel(start.x_mm(), start.y_mm(), travel_f);
+                            if s.retract_len_mm > 0.0 {
+                                g.unretract(s.retract_len_mm, retract_f);
+                            }
+                        }
+                    }
+                } else {
+                    g.travel(start.x_mm(), start.y_mm(), travel_f);
+                }
+            } else {
+                g.travel(start.x_mm(), start.y_mm(), travel_f);
             }
 
             let mut prev = start;
@@ -335,6 +356,143 @@ fn segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool {
 
 fn orient(p: Point, q: Point, r: Point) -> i128 {
     ((q.x - p.x) as i128) * ((r.y - p.y) as i128) - ((q.y - p.y) as i128) * ((r.x - p.x) as i128)
+}
+
+/// Even-odd containment in a polygon-with-holes.
+fn in_region(outline: &Polygons, p: Point) -> bool {
+    let mut inside = false;
+    for c in &outline.contours {
+        if c.contains(p) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// A segment is a valid in-region travel if its midpoint is inside the solid
+/// region and it crosses no contour edge.
+fn visible(outline: &Polygons, p: Point, q: Point) -> bool {
+    if p == q {
+        return true;
+    }
+    let mid = Point::new((p.x + q.x) / 2, (p.y + q.y) / 2);
+    in_region(outline, mid) && !travel_crosses(outline, p, q)
+}
+
+const COMB_VERT_CAP: usize = 600;
+
+/// Per-layer visibility graph over the outline vertices, used to route combing
+/// travels that would otherwise cross a wall.
+struct CombGraph {
+    verts: Vec<Point>,
+    adj: Vec<Vec<(usize, f64)>>,
+}
+
+impl CombGraph {
+    fn build(outline: &Polygons) -> Self {
+        let mut verts: Vec<Point> = Vec::new();
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for c in &outline.contours {
+            let m = c.points.len();
+            if m < 2 {
+                continue;
+            }
+            let base = verts.len();
+            verts.extend_from_slice(&c.points);
+            for k in 0..m {
+                edges.push((base + k, base + (k + 1) % m));
+            }
+        }
+        let n = verts.len();
+        let mut adj = vec![Vec::new(); n];
+        // Boundary edges are always traversable (route can follow the wall).
+        for &(i, j) in &edges {
+            let w = dist_mm(verts[i], verts[j]);
+            adj[i].push((j, w));
+            adj[j].push((i, w));
+        }
+        // Visibility diagonals (skip the O(n²) pass on very complex layers).
+        if n <= COMB_VERT_CAP {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if visible(outline, verts[i], verts[j]) {
+                        let w = dist_mm(verts[i], verts[j]);
+                        adj[i].push((j, w));
+                        adj[j].push((i, w));
+                    }
+                }
+            }
+        }
+        Self { verts, adj }
+    }
+
+    /// Shortest in-region route from `a` to `b`, as the points after `a`
+    /// (intermediates + `b`), or None if unreachable.
+    fn route(&self, outline: &Polygons, a: Point, b: Point) -> Option<Vec<Point>> {
+        let n = self.verts.len();
+        if n == 0 || n > COMB_VERT_CAP {
+            return None;
+        }
+        let (ai, bi) = (n, n + 1);
+        let total = n + 2;
+        let mut adj = self.adj.clone();
+        adj.push(Vec::new());
+        adj.push(Vec::new());
+        for (idx, p) in [(ai, a), (bi, b)] {
+            for k in 0..n {
+                if visible(outline, p, self.verts[k]) {
+                    let w = dist_mm(p, self.verts[k]);
+                    adj[idx].push((k, w));
+                    adj[k].push((idx, w));
+                }
+            }
+        }
+        let mut dist = vec![f64::INFINITY; total];
+        let mut prev = vec![usize::MAX; total];
+        let mut done = vec![false; total];
+        dist[ai] = 0.0;
+        loop {
+            let mut u = usize::MAX;
+            let mut best = f64::INFINITY;
+            for (k, &dk) in dist.iter().enumerate() {
+                if !done[k] && dk < best {
+                    best = dk;
+                    u = k;
+                }
+            }
+            if u == usize::MAX || u == bi {
+                break;
+            }
+            done[u] = true;
+            for &(v, w) in &adj[u] {
+                if dist[u] + w < dist[v] {
+                    dist[v] = dist[u] + w;
+                    prev[v] = u;
+                }
+            }
+        }
+        if !dist[bi].is_finite() {
+            return None;
+        }
+        let point = |idx: usize| {
+            if idx == ai {
+                a
+            } else if idx == bi {
+                b
+            } else {
+                self.verts[idx]
+            }
+        };
+        let mut route = Vec::new();
+        let mut cur = bi;
+        while cur != usize::MAX {
+            route.push(point(cur));
+            cur = prev[cur];
+        }
+        route.reverse();
+        route.remove(0); // drop `a` (already there)
+        Some(route)
+    }
 }
 
 #[cfg(test)]

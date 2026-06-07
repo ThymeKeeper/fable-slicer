@@ -63,6 +63,14 @@ pub fn offset(polys: &Polygons, delta_mm: f64) -> Polygons {
     from_paths(result)
 }
 
+/// Reduce vertex count, collapsing detail finer than `epsilon_mm`.
+pub fn simplify(polys: &Polygons, epsilon_mm: f64) -> Polygons {
+    let Some(paths) = to_paths(polys) else {
+        return Polygons::new();
+    };
+    from_paths(paths.simplify(epsilon_mm * UNITS_PER_MM, false))
+}
+
 /// Boolean union (`a ∪ b`).
 pub fn union(a: &Polygons, b: &Polygons) -> Polygons {
     match (to_paths(a), to_paths(b)) {

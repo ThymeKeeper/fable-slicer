@@ -10,7 +10,7 @@
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
 use config::{InfillPattern, SeamMode, Settings};
-use geo2d::{difference, intersection, offset, union, to_units, Point, Polygons};
+use geo2d::{difference, intersection, offset, simplify, to_units, union, Point, Polygons};
 use mesh::Mesh;
 
 use crate::{slice_mesh, SliceParams};
@@ -144,7 +144,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             print_z_mm: layers[i].print_z_mm,
             height_mm: layers[i].height_mm,
             paths,
-            outline: layers[i].polygons.clone(),
+            outline: simplify(&layers[i].polygons, 0.2),
             speed_scale: 1.0,
         });
     }
