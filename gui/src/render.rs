@@ -80,7 +80,10 @@ struct BeadOut {
     let local = xaxis * (lpos.x * dir_len.z) + yaxis * (lpos.y * dims.x) + zaxis * (lpos.z * dims.y);
     var o: BeadOut;
     o.clip = u.mvp * vec4<f32>(p0 + local, 1.0);
-    o.normal = xaxis * lnorm.x + yaxis * lnorm.y + zaxis * lnorm.z;
+    // Correct the normal for the non-uniform (width, height) scaling of the
+    // cross-section (inverse scale), then rotate into the segment frame.
+    let n_local = normalize(vec3<f32>(lnorm.x, lnorm.y / dims.x, lnorm.z / dims.y));
+    o.normal = xaxis * n_local.x + yaxis * n_local.y + zaxis * n_local.z;
     o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
@@ -234,9 +237,9 @@ impl Scene {
             wgpu::PrimitiveTopology::TriangleList,
         );
 
-        let box_verts = box_vertices();
+        let box_verts = bead_vertices();
         let box_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bead_box"),
+            label: Some("bead_base"),
             contents: bytemuck::cast_slice(&box_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
@@ -421,29 +424,46 @@ impl Scene {
     }
 }
 
-/// Unit box, length along +X (`x` in [0,1]), centered across (`y`,`z` in [-0.5,0.5]).
-/// Cull mode is off, so winding is irrelevant; normals are set per face.
-fn box_vertices() -> Vec<Vertex> {
-    fn quad(v: &mut Vec<Vertex>, n: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
-        for p in [a, b, c, a, c, d] {
-            v.push(Vertex { pos: p, normal: n });
-        }
+/// Unit bead: a tube along +X (`x` in [0,1]) with a rounded cross-section (unit
+/// circle of radius 0.5 in the Y-Z plane), plus flat end caps. The instance
+/// scales the cross-section to (line width, layer height) — giving an oval bead.
+/// Cull mode is off, so winding is irrelevant; normals are set per vertex
+/// (smooth radial around the tube; axial on the caps).
+fn bead_vertices() -> Vec<Vertex> {
+    const N: usize = 8;
+    let ring: Vec<[f32; 2]> = (0..N)
+        .map(|k| {
+            let t = std::f32::consts::TAU * (k as f32) / (N as f32);
+            [0.5 * t.cos(), 0.5 * t.sin()]
+        })
+        .collect();
+
+    let mut v = Vec::with_capacity(12 * N);
+
+    // Sides: a quad per facet with smooth radial normals.
+    for k in 0..N {
+        let k1 = (k + 1) % N;
+        let (y0, z0) = (ring[k][0], ring[k][1]);
+        let (y1, z1) = (ring[k1][0], ring[k1][1]);
+        let n0 = [0.0, y0 * 2.0, z0 * 2.0]; // (cos, sin) — unit radial
+        let n1 = [0.0, y1 * 2.0, z1 * 2.0];
+        let a = Vertex { pos: [0.0, y0, z0], normal: n0 };
+        let b = Vertex { pos: [0.0, y1, z1], normal: n1 };
+        let c = Vertex { pos: [1.0, y1, z1], normal: n1 };
+        let d = Vertex { pos: [1.0, y0, z0], normal: n0 };
+        v.extend_from_slice(&[a, b, c, a, c, d]);
     }
-    let c000 = [0.0, -0.5, -0.5];
-    let c100 = [1.0, -0.5, -0.5];
-    let c110 = [1.0, 0.5, -0.5];
-    let c010 = [0.0, 0.5, -0.5];
-    let c001 = [0.0, -0.5, 0.5];
-    let c101 = [1.0, -0.5, 0.5];
-    let c111 = [1.0, 0.5, 0.5];
-    let c011 = [0.0, 0.5, 0.5];
-    let mut v = Vec::with_capacity(36);
-    quad(&mut v, [0.0, 0.0, 1.0], c001, c101, c111, c011); // top
-    quad(&mut v, [0.0, 0.0, -1.0], c000, c100, c110, c010); // bottom
-    quad(&mut v, [0.0, 1.0, 0.0], c010, c110, c111, c011); // +Y
-    quad(&mut v, [0.0, -1.0, 0.0], c000, c100, c101, c001); // -Y
-    quad(&mut v, [1.0, 0.0, 0.0], c100, c110, c111, c101); // +X
-    quad(&mut v, [-1.0, 0.0, 0.0], c000, c010, c011, c001); // -X
+
+    // Flat end caps.
+    for k in 0..N {
+        let k1 = (k + 1) % N;
+        v.push(Vertex { pos: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] });
+        v.push(Vertex { pos: [0.0, ring[k1][0], ring[k1][1]], normal: [-1.0, 0.0, 0.0] });
+        v.push(Vertex { pos: [0.0, ring[k][0], ring[k][1]], normal: [-1.0, 0.0, 0.0] });
+        v.push(Vertex { pos: [1.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] });
+        v.push(Vertex { pos: [1.0, ring[k][0], ring[k][1]], normal: [1.0, 0.0, 0.0] });
+        v.push(Vertex { pos: [1.0, ring[k1][0], ring[k1][1]], normal: [1.0, 0.0, 0.0] });
+    }
     v
 }
 
