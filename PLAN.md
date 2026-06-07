@@ -66,7 +66,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Auto-center / place model on the bed (handles models with negative coordinates)
 - [x] Top/bottom solid layers via boolean diff across N layers (`top_layers`/`bottom_layers`)
 - [x] Sparse vs. solid region detection (solid shells dense-filled, core sparse)
-- [x] Drop sub-line-width infill slivers (morphological *open* of the fill region + minimum segment length); drop isolated single solid-infill lines (no neighbour beside them)
+- [x] Solid infill: a perimeter loop around each solid region (a clean concentric bead along shell walls; absorbs thin bands so no lone strands), then straight-fill the interior. Sub-line-width slivers removed via morphological *open* + a minimum segment length.
 - [x] Retraction on travels between extrusions (z-hop still TODO)
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
 - [x] Skirt (configurable loops + gap, first layer only); brim / raft still TODO

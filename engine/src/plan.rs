@@ -113,10 +113,24 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
 
             if !solid.is_empty() {
-                // drop_isolated: a solid line with no neighbour beside it is a
-                // lone strand — skip it.
-                for seg in infill_lines(&solid, angle, lw, true) {
-                    paths.push(ToolPath { kind: PathKind::Solid, closed: false, width_mm: lw, points: seg });
+                // A perimeter loop following the solid region's boundary (so where
+                // it runs alongside the shell it becomes a clean concentric bead),
+                // then straight-fill only the interior left inside that loop. Thin
+                // solid bands are consumed entirely by the loop — no lone strands.
+                let solid_loop = offset(&solid, -lw * 0.5);
+                for c in solid_loop.contours {
+                    if c.points.len() >= 3 {
+                        let points = place_seam(c.points, settings.seam_mode, i);
+                        paths.push(ToolPath { kind: PathKind::Solid, closed: true, width_mm: lw, points });
+                    }
+                }
+                let solid_core = offset(&solid, -lw);
+                if !solid_core.is_empty() {
+                    // The boundary loop already handles thin/edge solid, so keep all
+                    // interior lines (no isolated-line dropping needed here).
+                    for seg in infill_lines(&solid_core, angle, lw, false) {
+                        paths.push(ToolPath { kind: PathKind::Solid, closed: false, width_mm: lw, points: seg });
+                    }
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
