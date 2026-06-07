@@ -233,6 +233,8 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.settings.seam_mode, Sharpest, "sharpest");
                     ui.selectable_value(&mut self.settings.seam_mode, Random, "random");
                 });
+            pattern_combo(ui, "sparse fill", &mut self.settings.sparse_pattern);
+            pattern_combo(ui, "solid fill", &mut self.settings.solid_pattern);
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -327,6 +329,17 @@ impl eframe::App for App {
             );
         });
     }
+}
+
+fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPattern) {
+    use config::InfillPattern::*;
+    egui::ComboBox::from_label(label)
+        .selected_text(current.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(current, Lines, "lines");
+            ui.selectable_value(current, Grid, "grid");
+            ui.selectable_value(current, Concentric, "concentric");
+        });
 }
 
 fn combo(ui: &mut egui::Ui, label: &str, current: &mut String, options: &[String]) -> bool {

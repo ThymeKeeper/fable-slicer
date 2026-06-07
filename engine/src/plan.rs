@@ -9,7 +9,7 @@
 //! the previous `bottom_layers` below; otherwise it is within a shell and printed
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
-use config::{SeamMode, Settings};
+use config::{InfillPattern, SeamMode, Settings};
 use geo2d::{difference, intersection, offset, union, to_units, Point, Polygons};
 use mesh::Mesh;
 
@@ -126,18 +126,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 }
                 let solid_core = offset(&solid, -lw);
                 if !solid_core.is_empty() {
-                    // The boundary loop already handles thin/edge solid, so keep all
-                    // interior lines (no isolated-line dropping needed here).
-                    for seg in infill_lines(&solid_core, angle, lw, false) {
-                        paths.push(ToolPath { kind: PathKind::Solid, closed: false, width_mm: lw, points: seg });
-                    }
+                    fill_region(&solid_core, settings.solid_pattern, lw, angle, lw, PathKind::Solid, settings.seam_mode, i, &mut paths);
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
                 let spacing = lw / settings.infill_density;
-                for seg in infill_lines(&sparse, angle, spacing, false) {
-                    paths.push(ToolPath { kind: PathKind::Infill, closed: false, width_mm: lw, points: seg });
-                }
+                fill_region(&sparse, settings.sparse_pattern, spacing, angle, lw, PathKind::Infill, settings.seam_mode, i, &mut paths);
             }
         }
 
@@ -174,9 +168,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// establish flow before the part starts.
 fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
     let lw = settings.line_width_mm;
+    // Keep the skirt outside any brim (brim extends ~brim_loops line widths out).
+    let brim_extent = lw * settings.brim_loops as f64;
     let mut paths = Vec::new();
     for k in 0..settings.skirt_loops {
-        let delta = settings.skirt_gap_mm + lw * (0.5 + k as f64);
+        let delta = brim_extent + settings.skirt_gap_mm + lw * (0.5 + k as f64);
         for c in offset(first_layer, delta).contours {
             if c.points.len() >= 3 {
                 paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
@@ -252,7 +248,7 @@ fn center_on_bed(plans: &mut [LayerPlan], mesh: &Mesh, settings: &Settings) {
 /// Generate straight infill lines at `angle_deg`, spaced `spacing_mm` apart,
 /// clipped to `region` via an even-odd scanline. The region is rotated so infill
 /// lines become horizontal scanlines, then results are rotated back.
-fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, drop_isolated: bool) -> Vec<Vec<Point>> {
+fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64) -> Vec<Vec<Point>> {
     let theta = angle_deg.to_radians();
     let (ct, st) = (theta.cos(), theta.sin());
     let rot = |x: f64, y: f64| (x * ct + y * st, -x * st + y * ct);
@@ -279,9 +275,7 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, drop_isolate
         return Vec::new();
     }
 
-    // Collect the inside-intervals of each scanline (in the rotated frame).
-    let mut rows: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut ys: Vec<f64> = Vec::new();
+    let mut out = Vec::new();
     let mut y = ymin + spacing_mm * 0.5;
     while y < ymax {
         let mut xs: Vec<f64> = Vec::new();
@@ -294,45 +288,65 @@ fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, drop_isolate
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let mut row = Vec::new();
         let mut k = 0;
         while k + 1 < xs.len() {
             let (x0, x1) = (xs[k], xs[k + 1]);
             // Skip dabs shorter than this — not worth extruding.
             if x1 - x0 > 0.5 {
-                row.push((x0, x1));
+                let (px0, py0) = unrot(x0, y);
+                let (px1, py1) = unrot(x1, y);
+                out.push(vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)]);
             }
             k += 2;
         }
-        rows.push(row);
-        ys.push(y);
         y += spacing_mm;
     }
+    out
+}
 
-    // Two intervals "sit beside each other" if their x-ranges overlap.
-    let overlaps = |s: (f64, f64), others: &[(f64, f64)]| {
-        others.iter().any(|&(a0, a1)| a0 < s.1 && s.0 < a1)
-    };
-
-    let mut out = Vec::new();
-    for k in 0..rows.len() {
-        for &(x0, x1) in &rows[k] {
-            // For solid fill, drop a line with no neighbouring line on either
-            // adjacent scanline — a lone strand that serves no purpose.
-            if drop_isolated {
-                let above = k + 1 < rows.len() && overlaps((x0, x1), &rows[k + 1]);
-                let below = k > 0 && overlaps((x0, x1), &rows[k - 1]);
-                if !above && !below {
-                    continue;
+/// Fill a region with the chosen pattern, pushing toolpaths into `out`.
+#[allow(clippy::too_many_arguments)]
+fn fill_region(
+    region: &Polygons,
+    pattern: InfillPattern,
+    spacing: f64,
+    angle: f64,
+    lw: f64,
+    kind: PathKind,
+    seam_mode: SeamMode,
+    layer_index: usize,
+    out: &mut Vec<ToolPath>,
+) {
+    match pattern {
+        InfillPattern::Lines => {
+            for seg in infill_lines(region, angle, spacing) {
+                out.push(ToolPath { kind, closed: false, width_mm: lw, points: seg });
+            }
+        }
+        InfillPattern::Grid => {
+            for a in [angle, angle + 90.0] {
+                for seg in infill_lines(region, a, spacing) {
+                    out.push(ToolPath { kind, closed: false, width_mm: lw, points: seg });
                 }
             }
-            let yk = ys[k];
-            let (px0, py0) = unrot(x0, yk);
-            let (px1, py1) = unrot(x1, yk);
-            out.push(vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)]);
+        }
+        InfillPattern::Concentric => {
+            let mut d = lw * 0.5;
+            loop {
+                let loops = offset(region, -d);
+                if loops.is_empty() {
+                    break;
+                }
+                for c in loops.contours {
+                    if c.points.len() >= 3 {
+                        let points = place_seam(c.points, seam_mode, layer_index);
+                        out.push(ToolPath { kind, closed: true, width_mm: lw, points });
+                    }
+                }
+                d += spacing;
+            }
         }
     }
-    out
 }
 
 /// Rotate a closed wall loop so the seam (start/end) lands at the chosen vertex.

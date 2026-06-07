@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::{SeamMode, Settings, GENERIC_END_GCODE, GENERIC_START_GCODE};
+use crate::{InfillPattern, SeamMode, Settings, GENERIC_END_GCODE, GENERIC_START_GCODE};
 
 /// Printer (machine) tier: bed, extruder, and start/end g-code.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -51,6 +51,8 @@ pub struct ProcessProfile {
     pub top_layers: Option<usize>,
     pub bottom_layers: Option<usize>,
     pub infill_density: Option<f64>,
+    pub sparse_infill: Option<String>,
+    pub solid_infill: Option<String>,
     pub skirt_loops: Option<usize>,
     pub skirt_gap_mm: Option<f64>,
     pub brim_loops: Option<usize>,
@@ -98,8 +100,8 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
-            wall_count, top_layers, bottom_layers, infill_density, skirt_loops, skirt_gap_mm,
-            brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s)
+            wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
+            skirt_loops, skirt_gap_mm, brim_loops, seam, print_speed_mm_s, first_layer_speed_mm_s)
     }
 }
 
@@ -166,6 +168,8 @@ impl Profiles {
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
+            sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
+            solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
             skirt_loops: pc.skirt_loops.unwrap_or(d.skirt_loops),
             skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
             brim_loops: pc.brim_loops.unwrap_or(d.brim_loops),

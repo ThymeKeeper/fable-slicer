@@ -58,6 +58,12 @@ struct Args {
     /// Seam placement: nearest | sharpest | random.
     #[arg(long)]
     seam: Option<String>,
+    /// Sparse infill pattern: lines | grid | concentric.
+    #[arg(long)]
+    sparse_infill: Option<String>,
+    /// Solid infill pattern: lines | grid | concentric.
+    #[arg(long)]
+    solid_infill: Option<String>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
     #[arg(long)]
@@ -116,6 +122,14 @@ fn main() -> Result<()> {
             Some(m) => settings.seam_mode = m,
             None => anyhow::bail!("unknown seam mode '{s}' (use nearest | sharpest | random)"),
         }
+    }
+    if let Some(s) = &args.sparse_infill {
+        settings.sparse_pattern = config::InfillPattern::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
+    }
+    if let Some(s) = &args.solid_infill {
+        settings.solid_pattern = config::InfillPattern::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;

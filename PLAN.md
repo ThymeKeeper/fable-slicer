@@ -69,7 +69,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Solid infill: a perimeter loop around each solid region (a clean concentric bead along shell walls; absorbs thin bands so no lone strands), then straight-fill the interior. Sub-line-width slivers removed via morphological *open* + a minimum segment length.
 - [x] Retraction on travels between extrusions (z-hop still TODO)
 - [x] Klipper-flavored output: relative extrusion (M83) + `--printer` presets (voron24 / sovol-zero)
-- [x] Skirt (loops + gap) and brim (loops, touching the part for adhesion) on the first layer; raft still TODO
+- [x] Skirt (loops + gap, auto-clears any brim) and brim (loops, touching the part for adhesion) on the first layer; raft still TODO
 - [x] First-layer height override (separate first-layer thickness); first-layer flow tuning still TODO
 - [x] `config`: tiered profile model (printer/filament/process) + single-parent inheritance, TOML, built-in profiles, `--profile-dir`, `--list-profiles`
 - [x] Printer profiles carry start/end g-code templates with `{placeholders}`; Voron/Sovol use `PRINT_START`/`PRINT_END` macros
@@ -97,7 +97,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] 3D toolpath preview: feature-colored **3D beads** (real line-width × layer-height, rounded/oval cross-section, rounded ends + corner-filling joint blobs, GPU-instanced) + travel moves, Model/Preview toggle, layer slider, per-category visibility toggles, and dimming of lower layers when scrubbing (layer/category/dim all in-shader from uniforms — no rebuild on scrub/toggle)
 - [x] Profile system + starter library (printer/filament/process) — landed early; *management UI* still TODO
 - [ ] Variable / adaptive layer height
-- [ ] Gyroid + more infill patterns
+- [x] Infill patterns: lines / grid / concentric for both sparse and solid (GUI + CLI picker, `sparse_infill`/`solid_infill` profile keys); gyroid still TODO
 - [ ] G2/G3 arc fitting
 - [ ] 3MF load (zip + XML): multi-object, transforms, embedded settings
 

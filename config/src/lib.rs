@@ -60,6 +60,36 @@ impl SeamMode {
     }
 }
 
+/// Infill pattern for a region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InfillPattern {
+    /// Parallel lines (rectilinear), alternating direction per layer.
+    #[default]
+    Lines,
+    /// Two perpendicular sets of lines.
+    Grid,
+    /// Loops following the region boundary inward.
+    Concentric,
+}
+
+impl InfillPattern {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "lines" | "line" | "rectilinear" => Some(Self::Lines),
+            "grid" => Some(Self::Grid),
+            "concentric" => Some(Self::Concentric),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lines => "lines",
+            Self::Grid => "grid",
+            Self::Concentric => "concentric",
+        }
+    }
+}
+
 /// Fully-resolved settings the pipeline runs on.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -79,6 +109,10 @@ pub struct Settings {
     pub bottom_layers: usize,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
     pub infill_density: f64,
+    /// Pattern for sparse (interior) infill.
+    pub sparse_pattern: InfillPattern,
+    /// Pattern for solid (top/bottom) interior infill.
+    pub solid_pattern: InfillPattern,
     /// Number of skirt loops around the first layer (0 disables).
     pub skirt_loops: usize,
     /// Gap between the skirt and the model (mm).
@@ -120,6 +154,8 @@ impl Default for Settings {
             top_layers: 4,
             bottom_layers: 4,
             infill_density: 0.15,
+            sparse_pattern: InfillPattern::default(),
+            solid_pattern: InfillPattern::default(),
             skirt_loops: 2,
             skirt_gap_mm: 3.0,
             brim_loops: 0,
