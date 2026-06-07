@@ -77,7 +77,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ### M3 — Quality pass (what separates "prints" from "looks good")
 - [ ] Per-feature speeds; min-layer-time cooling slowdown
-- [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown
+- [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
 - [ ] Combing (travel inside the part to avoid stringing)
 - [ ] Gap fill between colliding offsets
 - [ ] Accurate time estimate via trapezoidal motion simulation

@@ -43,6 +43,7 @@ struct App {
     show_infill: bool,
     show_skirt: bool,
     show_travel: bool,
+    show_seams: bool,
     needs_rebuild: bool,
 }
 
@@ -77,6 +78,7 @@ impl App {
             show_infill: true,
             show_skirt: true,
             show_travel: false,
+            show_seams: false,
             needs_rebuild: true,
         }
     }
@@ -97,6 +99,9 @@ impl App {
         }
         if self.show_travel {
             m |= 1 << 4;
+        }
+        if self.show_seams {
+            m |= 1 << 5;
         }
         m
     }
@@ -255,6 +260,7 @@ impl eframe::App for App {
                         ui.checkbox(&mut self.show_infill, "infill");
                         ui.checkbox(&mut self.show_skirt, "skirt");
                         ui.checkbox(&mut self.show_travel, "travel");
+                        ui.checkbox(&mut self.show_seams, "seams");
                     });
                 }
                 ui.separator();
@@ -344,6 +350,7 @@ const CAT_WALLS: f32 = 1.0;
 const CAT_SOLID: f32 = 2.0;
 const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
+const CAT_SEAM: f32 = 5.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
 /// plus joint blobs (one per extrusion vertex, to round ends and fill corners),
@@ -391,6 +398,17 @@ fn build_instances(layers: &[engine::LayerPlan]) -> Instances {
                     w, h,
                     c[0], c[1], c[2],
                     layer_id, cat,
+                ]);
+            }
+            // Highlight the external-perimeter seam (loop start) with a larger
+            // magenta marker, toggleable via the "seams" category.
+            if path.kind == engine::PathKind::ExternalPerimeter {
+                let s = path.points[0];
+                joints.push([
+                    s.x_mm() as f32, s.y_mm() as f32, z_center,
+                    w * 2.5, h * 2.5,
+                    1.0, 0.2, 0.85,
+                    layer_id, CAT_SEAM,
                 ]);
             }
             prev_end = Some(if path.closed {
