@@ -80,6 +80,8 @@ pub struct Scene {
     mesh_count: u32,
     line_vbuf: Option<wgpu::Buffer>,
     line_count: u32,
+    toolpath_vbuf: Option<wgpu::Buffer>,
+    toolpath_total: u32,
 }
 
 impl Scene {
@@ -162,6 +164,8 @@ impl Scene {
             mesh_count: 0,
             line_vbuf: None,
             line_count: 0,
+            toolpath_vbuf: None,
+            toolpath_total: 0,
         }
     }
 
@@ -240,7 +244,14 @@ impl Scene {
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
     }
 
-    pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4) {
+    /// Upload toolpath line vertices (`[x, y, z, r, g, b]` per vertex; consecutive
+    /// pairs form segments). `render`'s `toolpath_count` limits how many are drawn.
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, verts: &[[f32; 6]]) {
+        self.toolpath_total = verts.len() as u32;
+        self.toolpath_vbuf = make_vbuf(device, "toolpath_vbuf", bytemuck::cast_slice(verts));
+    }
+
+    pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, toolpath_count: u32) {
         let uniforms = Uniforms {
             mvp: view_proj.to_cols_array_2d(),
             light: [0.4, 0.5, 0.85, 0.0],
@@ -280,10 +291,20 @@ impl Scene {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.line_count, 0..1);
             }
-            if let Some(buf) = &self.mesh_vbuf {
-                pass.set_pipeline(&self.mesh_pipeline);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..self.mesh_count, 0..1);
+            let tp = toolpath_count.min(self.toolpath_total);
+            if tp > 0 {
+                if let Some(buf) = &self.toolpath_vbuf {
+                    pass.set_pipeline(&self.line_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..tp, 0..1);
+                }
+            }
+            if show_mesh {
+                if let Some(buf) = &self.mesh_vbuf {
+                    pass.set_pipeline(&self.mesh_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.mesh_count, 0..1);
+                }
             }
         }
         rs.queue.submit(std::iter::once(encoder.finish()));

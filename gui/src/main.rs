@@ -30,6 +30,12 @@ struct App {
     camera: Camera,
     status: String,
     sliced: Option<Vec<engine::LayerPlan>>,
+    /// Cumulative toolpath vertex count after each layer (for the layer slider).
+    layer_ends: Vec<u32>,
+    /// false = show the model mesh; true = show the sliced toolpaths.
+    view_preview: bool,
+    /// Highest layer shown in preview (1-based).
+    preview_layer: usize,
     needs_rebuild: bool,
 }
 
@@ -55,6 +61,9 @@ impl App {
             camera: Camera::new(),
             status: "Open an STL to begin.".to_string(),
             sliced: None,
+            layer_ends: Vec::new(),
+            view_preview: false,
+            preview_layer: 1,
             needs_rebuild: true,
         }
     }
@@ -63,6 +72,7 @@ impl App {
         if let Ok(s) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
             self.settings = s;
             self.sliced = None;
+            self.view_preview = false;
             self.needs_rebuild = true;
         }
     }
@@ -74,19 +84,26 @@ impl App {
                 self.status = format!("Loaded {name} ({} triangles)", m.triangles.len());
                 self.mesh = Some(m);
                 self.sliced = None;
+                self.view_preview = false;
                 self.needs_rebuild = true;
             }
             Err(e) => self.status = format!("Load failed: {e}"),
         }
     }
 
-    fn slice(&mut self) {
-        let result = self.mesh.as_ref().map(|m| generate(m, &self.settings));
-        if let Some(layers) = result {
-            let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
-            self.status = format!("Sliced {} layers, {paths} toolpaths.", layers.len());
-            self.sliced = Some(layers);
-        }
+    fn slice(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        let Some(layers) = self.mesh.as_ref().map(|m| generate(m, &self.settings)) else {
+            return;
+        };
+        let (verts, ends) = build_toolpaths(&layers);
+        self.scene.set_toolpaths(&rs.device, &verts);
+        let n = layers.len();
+        let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
+        self.status = format!("Sliced {n} layers, {paths} toolpaths.");
+        self.layer_ends = ends;
+        self.preview_layer = n.max(1);
+        self.view_preview = true;
+        self.sliced = Some(layers);
     }
 
     fn export(&mut self) {
@@ -171,13 +188,27 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 if ui.add_enabled(self.mesh.is_some(), egui::Button::new("Slice")).clicked() {
-                    self.slice();
+                    self.slice(&rs);
                 }
                 if ui.add_enabled(self.sliced.is_some(), egui::Button::new("Export g-code…")).clicked() {
                     self.export();
                 }
             });
             ui.separator();
+
+            let n_layers = self.sliced.as_ref().map(|l| l.len()).unwrap_or(0);
+            if n_layers > 0 {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.view_preview, false, "Model");
+                    ui.selectable_value(&mut self.view_preview, true, "Preview");
+                });
+                if self.view_preview {
+                    ui.add(egui::Slider::new(&mut self.preview_layer, 1..=n_layers).text("layer"));
+                    ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
+                }
+                ui.separator();
+            }
+
             ui.label(format!(
                 "printer {} · bed {:.0}×{:.0} mm",
                 self.printer, self.settings.bed_size_x_mm, self.settings.bed_size_y_mm
@@ -210,7 +241,13 @@ impl eframe::App for App {
             let h = (rect.height() * ppp).round().max(1.0) as u32;
             self.scene.resize(&rs, w, h);
             let aspect = rect.width() / rect.height().max(1.0);
-            self.scene.render(&rs, self.camera.view_proj(aspect));
+            let show_mesh = !(self.view_preview && self.sliced.is_some());
+            let toolpath_count = if self.view_preview {
+                self.layer_ends.get(self.preview_layer.saturating_sub(1)).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            self.scene.render(&rs, self.camera.view_proj(aspect), show_mesh, toolpath_count);
 
             ui.painter().image(
                 self.scene.texture_id(),
@@ -234,4 +271,45 @@ fn combo(ui: &mut egui::Ui, label: &str, current: &mut String, options: &[String
             }
         });
     changed
+}
+
+/// Flatten sliced layers into line-segment vertices (`[x,y,z,r,g,b]`, consecutive
+/// pairs = segments) plus a cumulative per-layer vertex count for the layer slider.
+fn build_toolpaths(layers: &[engine::LayerPlan]) -> (Vec<[f32; 6]>, Vec<u32>) {
+    let mut verts: Vec<[f32; 6]> = Vec::new();
+    let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let z = layer.print_z_mm as f32;
+        for path in &layer.paths {
+            if path.points.len() < 2 {
+                continue;
+            }
+            let c = color_for(path.kind);
+            for w in path.points.windows(2) {
+                push_seg(&mut verts, w[0], w[1], z, c);
+            }
+            if path.closed {
+                let last = path.points[path.points.len() - 1];
+                push_seg(&mut verts, last, path.points[0], z, c);
+            }
+        }
+        ends.push(verts.len() as u32);
+    }
+    (verts, ends)
+}
+
+fn push_seg(v: &mut Vec<[f32; 6]>, a: geo2d::Point, b: geo2d::Point, z: f32, c: [f32; 3]) {
+    v.push([a.x_mm() as f32, a.y_mm() as f32, z, c[0], c[1], c[2]]);
+    v.push([b.x_mm() as f32, b.y_mm() as f32, z, c[0], c[1], c[2]]);
+}
+
+fn color_for(kind: engine::PathKind) -> [f32; 3] {
+    use engine::PathKind::*;
+    match kind {
+        Skirt => [0.60, 0.60, 0.66],
+        ExternalPerimeter => [0.92, 0.34, 0.22],
+        Perimeter => [0.36, 0.80, 0.45],
+        Solid => [0.94, 0.80, 0.24],
+        Infill => [0.32, 0.62, 0.95],
+    }
 }

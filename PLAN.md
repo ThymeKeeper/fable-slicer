@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | GUI — increment 1 done (3D model viewport); toolpath preview next |
+| **Current milestone** | GUI — 3D model viewport + toolpath preview done |
 | **Last updated** | 2026-06-07 |
 | **Builds / tests** | `cargo test` green (20 tests); `gui` builds (eframe 0.34.1 + wgpu 29). GUI verify = user screenshots (headless box) |
-| **Next action** | 3D toolpath preview + layer slider in the GUI; then M3 quality |
+| **Next action** | M3 quality (seams, combing, accurate time estimate); GUI polish as screenshots reveal |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -93,7 +93,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 > framework `egui`; 2D-vs-3D preview TBD. Headless dev box can't render a window,
 > so visual verification needs the user (or an xvfb screenshot harness).
 - [x] GUI shell (`egui` + `wgpu`): load STL, pick profiles, edit settings, slice, export g-code; **3D model viewport** (orbit/zoom/pan, bed grid)
-- [ ] 3D toolpath preview + layer slider (next GUI increment)
+- [x] 3D toolpath preview: feature-colored lines (perimeters/solid/infill/skirt), Model/Preview toggle, layer slider
 - [x] Profile system + starter library (printer/filament/process) — landed early; *management UI* still TODO
 - [ ] Variable / adaptive layer height
 - [ ] Gyroid + more infill patterns
