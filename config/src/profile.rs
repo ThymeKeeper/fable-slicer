@@ -23,6 +23,8 @@ pub struct PrinterProfile {
     pub bed_size_y_mm: Option<f64>,
     pub nozzle_diameter_mm: Option<f64>,
     pub travel_speed_mm_s: Option<f64>,
+    pub print_speed_mm_s: Option<f64>,
+    pub first_layer_speed_mm_s: Option<f64>,
     pub acceleration: Option<f64>,
     pub jerk: Option<f64>,
     pub retract_len_mm: Option<f64>,
@@ -83,8 +85,8 @@ impl Tier for PrinterProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, nozzle_diameter_mm,
-            travel_speed_mm_s, acceleration, jerk, retract_len_mm, retract_speed_mm_s,
-            start_gcode, end_gcode)
+            travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration, jerk,
+            retract_len_mm, retract_speed_mm_s, start_gcode, end_gcode)
     }
 }
 
@@ -183,9 +185,10 @@ impl Profiles {
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
-            print_speed_mm_s: pc.print_speed_mm_s.unwrap_or(d.print_speed_mm_s),
+            // Printer speed (machine default) takes precedence over the process value.
+            print_speed_mm_s: pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s),
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
-            first_layer_speed_mm_s: pc.first_layer_speed_mm_s.unwrap_or(d.first_layer_speed_mm_s),
+            first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })

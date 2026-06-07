@@ -7,9 +7,13 @@ inherits = "generic"
 bed_size_x_mm = 350.0
 bed_size_y_mm = 350.0
 
-# CoreXY, high acceleration.
-acceleration = 10000.0
-jerk = 12.0
+# Stock Voron 2.4 motion limits (max_accel / max_velocity / square_corner_velocity).
+# Conservative pre-tuning defaults — raise once input shaping is dialed in.
+acceleration = 3000.0
+jerk = 10.0
+travel_speed_mm_s = 350.0
+print_speed_mm_s = 150.0
+first_layer_speed_mm_s = 30.0
 
 # Direct-drive extruder: short, fast retraction.
 retract_len_mm = 0.5
