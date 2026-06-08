@@ -187,7 +187,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // everything else (wide bridge, cantilever) is arc-filled.
                 for island in islands(&arc_region) {
                     let segs = try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm)
-                        .unwrap_or_else(|| crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm));
+                        .unwrap_or_else(|| {
+                            crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm, settings.arc_seam_overlap_mm)
+                        });
                     for seg in segs {
                         if seg.len() >= 2 {
                             paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));

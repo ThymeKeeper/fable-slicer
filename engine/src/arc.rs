@@ -22,7 +22,7 @@ const ANCHOR: u8 = 2; // supported material bordering the region (seed from here
 
 /// Fill `region` with concentric arcs seeded where it borders `supported`.
 /// `lw` = line width (mm), `rmax` = max arc radius (mm). Returns arc polylines.
-pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> Vec<Vec<Point>> {
+pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, seam_overlap: f64) -> Vec<Vec<Point>> {
     let Some(bb) = region.bounds() else {
         return Vec::new();
     };
@@ -103,7 +103,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64) -> 
                 chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
                 continue; // radius limit — continue from the fan's frontier
             }
-            let (grew, ring_far) = draw_ring(f, region, &g, &kind, &mut owner, &mut unfilled, &mut arcs);
+            let (grew, ring_far) = draw_ring(f, region, &g, &kind, &mut owner, &mut unfilled, &mut arcs, seam_overlap);
             if grew {
                 next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far), empty: 0 });
             } else if f.empty + 1 < EMPTY_LIMIT {
@@ -184,7 +184,7 @@ impl Grid {
 /// overhang that are unfilled or already this fan's. Runs break at the region
 /// edge, anchor cells, and other fans' cells. A run is emitted (and its unfilled
 /// cells claimed) only if it touches still-unfilled region.
-fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>) -> (bool, Option<(f64, f64)>) {
+fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u32], unfilled: &mut usize, arcs: &mut Vec<Vec<Point>>, seam_overlap: f64) -> (bool, Option<(f64, f64)>) {
     // Sample finer than a cell so the ring doesn't skip cells (aliasing leaves
     // 1-cell gaps that would otherwise need fragment fills).
     let dtheta = (g.cell * 0.5 / f.r).clamp(0.005, 0.4);
@@ -247,19 +247,19 @@ fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u
             }
         }
     }
-    // Snap each arc's ends to where the ring actually crosses the region boundary
-    // (against the polygon), so arcs reach the edge instead of stopping a sample
-    // short. Capped, so a run that ended at a seam only overlaps a touch.
-    let ext = (dtheta * 2.0).min(0.15);
+    // Extend each arc's ends: at the region boundary (wall) snap right to it so the
+    // arc reaches the edge; at a fan seam (region continues past), overlap only a
+    // small, tunable amount so neighbouring fans mesh without over-extruding.
+    let wall_reach = (dtheta * 2.0).min(0.15);
     for (mut p, _) in emitted {
         let n = p.len();
         if n >= 2 {
-            let pre = snap_end(p[0], f, -1.0, region, ext);
+            let pre = snap_end(p[0], f, -1.0, region, wall_reach, seam_overlap);
             if (pre.x - p[0].x, pre.y - p[0].y) != (0, 0) {
                 p.insert(0, pre);
             }
             let last = p[p.len() - 1];
-            let post = snap_end(last, f, 1.0, region, ext);
+            let post = snap_end(last, f, 1.0, region, wall_reach, seam_overlap);
             if (post.x - last.x, post.y - last.y) != (0, 0) {
                 p.push(post);
             }
@@ -269,10 +269,11 @@ fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u
     (true, chain)
 }
 
-/// Push `p` (a ring endpoint, in the fan's frame) outward around the seed by up to
-/// `max_ext` radians (sign `dir`) and return the farthest position still inside the
-/// region — i.e. the point where the ring meets the region boundary.
-fn snap_end(p: Point, f: &Front, dir: f64, region: &Polygons, max_ext: f64) -> Point {
+/// Extend a ring endpoint `p` outward around the seed (sign `dir`). If the region
+/// boundary is within `wall_reach` radians, snap right to it (the arc reaches the
+/// wall). Otherwise the region continues — this is a fan seam — so overlap only
+/// `seam_overlap` mm into the neighbour so the fans mesh without over-extruding.
+fn snap_end(p: Point, f: &Front, dir: f64, region: &Polygons, wall_reach: f64, seam_overlap: f64) -> Point {
     let rot = |da: f64| -> (f64, f64) {
         let (dx, dy) = (p.x_mm() - f.x, p.y_mm() - f.y);
         let (c, s) = ((dir * da).cos(), (dir * da).sin());
@@ -282,12 +283,14 @@ fn snap_end(p: Point, f: &Front, dir: f64, region: &Polygons, max_ext: f64) -> P
         let (x, y) = rot(da);
         in_poly(region, x, y)
     };
-    // If the whole extension stays inside (a seam, not the boundary), cap it there.
-    if inside(max_ext) {
-        let (x, y) = rot(max_ext);
+    // Seam: region still inside at wall_reach → overlap a small fixed arc length.
+    if inside(wall_reach) {
+        let da = (seam_overlap / f.r.max(1.0e-3)).min(wall_reach);
+        let (x, y) = rot(da);
         return Point::from_mm(x, y);
     }
-    let (mut lo, mut hi) = (0.0, max_ext);
+    // Wall: binary-search the boundary crossing within reach.
+    let (mut lo, mut hi) = (0.0, wall_reach);
     for _ in 0..14 {
         let mid = 0.5 * (lo + hi);
         if inside(mid) {
@@ -435,7 +438,7 @@ mod tests {
         let lw = 0.45;
         let region = rect(0.0, 0.0, 20.0, 20.0); // 400 mm²
         let supported = rect(0.0, -2.0, 20.0, 0.0); // anchored on the y=0 edge
-        let arcs = arc_fill(&region, &supported, lw, 40.0);
+        let arcs = arc_fill(&region, &supported, lw, 40.0, 0.2);
         assert!(!arcs.is_empty(), "no arcs generated");
         let mut len = 0.0;
         for a in &arcs {
@@ -454,7 +457,7 @@ mod tests {
         let lw = 0.45;
         let region = rect(0.0, 0.0, 20.0, 20.0);
         let supported = rect(-5.0, -5.0, 25.0, 0.0); // wide anchor below
-        for a in arc_fill(&region, &supported, lw, 40.0) {
+        for a in arc_fill(&region, &supported, lw, 40.0, 0.2) {
             for p in a {
                 let (x, y) = (p.x_mm(), p.y_mm());
                 // arcs must not stray into the anchor (y<0) or outside the region

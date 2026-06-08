@@ -585,6 +585,8 @@ impl eframe::App for App {
                         .on_hover_text("Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
                     ui.add_enabled(arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0).text("arc radius mm"))
                         .on_hover_text("Arc mode: max arc-overhang radius before a fan re-seeds.");
+                    ui.add_enabled(arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6).text("arc seam overlap mm"))
+                        .on_hover_text("Arc mode: how far fans overlap where they meet (per fan). A little helps them mesh; too much over-extrudes the seam. 0 = butt.");
                 });
                 egui::CollapsingHeader::new("Bed adhesion").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.skirt_loops, 0..=5).text("skirt loops"))
