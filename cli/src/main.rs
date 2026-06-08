@@ -77,6 +77,9 @@ struct Args {
     bed_y: Option<f64>,
     #[arg(long)]
     bed_z: Option<f64>,
+    /// Brick layering: stagger odd perimeters by half a layer for wall interlocking.
+    #[arg(long)]
+    brick: bool,
 }
 
 fn main() -> Result<()> {
@@ -154,6 +157,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.bed_z {
         settings.bed_size_z_mm = v;
+    }
+    if args.brick {
+        settings.brick_layers = true;
     }
 
     println!(

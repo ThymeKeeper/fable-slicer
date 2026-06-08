@@ -58,6 +58,8 @@ pub struct ProcessProfile {
     pub wall_count: Option<usize>,
     pub top_layers: Option<usize>,
     pub bottom_layers: Option<usize>,
+    pub brick_layers: Option<bool>,
+    pub brick_flow: Option<f64>,
     pub infill_density: Option<f64>,
     pub sparse_infill: Option<String>,
     pub solid_infill: Option<String>,
@@ -120,7 +122,8 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
-            max_resolution_mm, wall_count, top_layers, bottom_layers, infill_density, sparse_infill, solid_infill,
+            max_resolution_mm, wall_count, top_layers, bottom_layers, brick_layers, brick_flow,
+            infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, print_speed_mm_s, first_layer_speed_mm_s,
@@ -195,6 +198,8 @@ impl Profiles {
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
+            brick_layers: pc.brick_layers.unwrap_or(d.brick_layers),
+            brick_flow: pc.brick_flow.unwrap_or(d.brick_flow),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),

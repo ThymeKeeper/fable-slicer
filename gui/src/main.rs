@@ -515,6 +515,10 @@ impl eframe::App for App {
                         .on_hover_text("Number of solid layers on top surfaces.");
                     ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"))
                         .on_hover_text("Number of solid layers on bottom surfaces.");
+                    ui.checkbox(&mut s.brick_layers, "brick layers")
+                        .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.");
+                    ui.add(egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
+                        .on_hover_text("Extra extrusion on the lifted brick perimeters so they fuse down into the valley.");
                 });
                 egui::CollapsingHeader::new("Infill").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
@@ -893,18 +897,21 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
             }
             let c = color_for(path.kind);
             let cat = category_of(path.kind);
-            let w = path.width_mm as f32;
+            // Brick-layered perimeters render half a layer up (z_offset) and a touch
+            // fatter (flow), so the staggered, over-packed walls are visible.
+            let zc = z_center + path.z_offset_mm as f32;
+            let w = (path.width_mm * path.flow) as f32;
             for win in path.points.windows(2) {
-                push_inst(&mut inst, win[0], win[1], z_center, w, h, c, layer_id, cat);
+                push_inst(&mut inst, win[0], win[1], zc, w, h, c, layer_id, cat);
             }
             if path.closed {
                 let last = path.points[path.points.len() - 1];
-                push_inst(&mut inst, last, path.points[0], z_center, w, h, c, layer_id, cat);
+                push_inst(&mut inst, last, path.points[0], zc, w, h, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
             for p in &path.points {
                 joints.push([
-                    p.x_mm() as f32, p.y_mm() as f32, z_center,
+                    p.x_mm() as f32, p.y_mm() as f32, zc,
                     w, h,
                     c[0], c[1], c[2],
                     layer_id, cat,
@@ -915,7 +922,7 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
             if path.kind == engine::PathKind::ExternalPerimeter {
                 let s = path.points[0];
                 joints.push([
-                    s.x_mm() as f32, s.y_mm() as f32, z_center,
+                    s.x_mm() as f32, s.y_mm() as f32, zc,
                     w * 2.5, h * 2.5,
                     1.0, 0.2, 0.85,
                     layer_id, CAT_SEAM,

@@ -40,6 +40,18 @@ pub struct ToolPath {
     pub closed: bool,
     pub width_mm: f64,
     pub points: Vec<Point>,
+    /// Z shift added to the layer Z for this path (brick layering staggers odd
+    /// perimeters by half a layer). 0 for everything else.
+    pub z_offset_mm: f64,
+    /// Extrusion-flow multiplier for this path (brick layering bumps the lifted
+    /// perimeters so they fuse into the valley). 1.0 = normal.
+    pub flow: f64,
+}
+
+impl ToolPath {
+    fn new(kind: PathKind, closed: bool, width_mm: f64, points: Vec<Point>) -> Self {
+        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0 }
+    }
 }
 
 /// The non-extruding move that reaches a path's start. Computed once (combing +
@@ -102,10 +114,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 PathKind::Perimeter
             };
+            // Brick layering: lift odd-indexed perimeters by half a layer (outer
+            // wall = index 0 stays put), so adjacent rings interlock like masonry;
+            // a flow bump fuses the lifted bead into the valley. Skip the first and
+            // last layers (base transition + top clamp).
+            let brick = settings.brick_layers && w % 2 == 1 && layer.index > 0 && layer.index + 1 < n;
+            let (z_offset_mm, flow) = if brick {
+                (0.5 * settings.layer_height_mm, settings.brick_flow)
+            } else {
+                (0.0, 1.0)
+            };
             for c in offset(&layer.polygons, inset).contours {
                 if c.points.len() >= 3 {
                     let points = place_seam(c.points, settings.seam_mode, layer.index);
-                    walls.push(ToolPath { kind, closed: true, width_mm: lw, points });
+                    walls.push(ToolPath { kind, closed: true, width_mm: lw, points, z_offset_mm, flow });
                 }
             }
         }
@@ -168,7 +190,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         .unwrap_or_else(|| crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm));
                     for seg in segs {
                         if seg.len() >= 2 {
-                            paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
+                            paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
                         }
                     }
                 }
@@ -183,7 +205,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 for c in solid_loop.contours {
                     if c.points.len() >= 3 {
                         let points = place_seam(c.points, settings.seam_mode, i);
-                        paths.push(ToolPath { kind: PathKind::Solid, closed: true, width_mm: lw, points });
+                        paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
                     }
                 }
                 let solid_core = offset(&solid, -lw);
@@ -467,7 +489,7 @@ fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
             // Outer loops only (CCW) — offsetting outward also shrinks holes into
             // loops inside the part's holes, which we must not print.
             if c.points.len() >= 3 && c.is_ccw() {
-                paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
+                paths.push(ToolPath::new(PathKind::Skirt, true, lw, c.points));
             }
         }
     }
@@ -484,7 +506,7 @@ fn brim_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
         for c in offset(first_layer, delta).contours {
             // Outer loops only — don't print brim loops inside the part's holes.
             if c.points.len() >= 3 && c.is_ccw() {
-                paths.push(ToolPath { kind: PathKind::Skirt, closed: true, width_mm: lw, points: c.points });
+                paths.push(ToolPath::new(PathKind::Skirt, true, lw, c.points));
             }
         }
     }
@@ -622,13 +644,13 @@ fn fill_region(
     match pattern {
         InfillPattern::Lines => {
             for seg in infill_lines(region, angle, spacing) {
-                out.push(ToolPath { kind, closed: false, width_mm: lw, points: seg });
+                out.push(ToolPath::new(kind, false, lw, seg));
             }
         }
         InfillPattern::Grid => {
             for a in [angle, angle + 90.0] {
                 for seg in infill_lines(region, a, spacing) {
-                    out.push(ToolPath { kind, closed: false, width_mm: lw, points: seg });
+                    out.push(ToolPath::new(kind, false, lw, seg));
                 }
             }
         }
@@ -642,7 +664,7 @@ fn fill_region(
                 for c in loops.contours {
                     if c.points.len() >= 3 {
                         let points = place_seam(c.points, seam_mode, layer_index);
-                        out.push(ToolPath { kind, closed: true, width_mm: lw, points });
+                        out.push(ToolPath::new(kind, true, lw, points));
                     }
                 }
                 d += spacing;
@@ -788,6 +810,29 @@ mod tests {
             .unwrap();
         let area = Contour::new(ext.points.clone()).area_mm2();
         assert!(area > 360.0 && area < 400.0, "outer wall area {area}");
+    }
+
+    #[test]
+    fn brick_layers_lift_odd_perimeters() {
+        let m = Mesh::cube(20.0);
+        let mut s = Settings::default();
+        s.brick_layers = true;
+        s.wall_count = 3;
+        let layers = generate(&m, &s);
+        let mid = &layers[50]; // interior layer (not first/last)
+        // The external perimeter (index 0) stays on the layer plane.
+        let ext = mid.paths.iter().find(|p| p.kind == PathKind::ExternalPerimeter).unwrap();
+        assert_eq!(ext.z_offset_mm, 0.0);
+        assert_eq!(ext.flow, 1.0);
+        // An odd inner perimeter is lifted half a layer and over-extruded.
+        let lifted = mid.paths.iter().any(|p| {
+            p.kind == PathKind::Perimeter
+                && (p.z_offset_mm - 0.5 * s.layer_height_mm).abs() < 1e-9
+                && p.flow > 1.0
+        });
+        assert!(lifted, "an odd inner perimeter should be brick-lifted");
+        // First layer is a base transition — nothing lifted.
+        assert!(layers[0].paths.iter().all(|p| p.z_offset_mm == 0.0), "base layer is flat");
     }
 
     #[test]

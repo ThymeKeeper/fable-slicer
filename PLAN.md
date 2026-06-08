@@ -106,6 +106,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] 3MF load (zip + XML): multi-object, transforms, embedded settings
 
 ### M6 — Advanced / parity
+- [~] **Brick layering** (opt-in, `brick_layers` + `brick_flow`): odd-indexed perimeters are lifted half a layer height (outer wall = index 0 stays put) so adjacent wall rings interlock like masonry — staggered inter-layer seams resist delamination. The lifted rings get a flow bump (default 1.05) to fuse into the valley; first/last layers are a flat transition/clamp. Per-path `z_offset_mm`/`flow` on `ToolPath`, honored by the emitter (Z + extrusion) and the 3D preview (beads shown lifted + fatter). CLI `--brick`. **TODO:** batch walls by Z to cut Z-bobbing at high wall counts; concentric-fill-at-density mode for fully brick-packed solids.
 - [ ] Tree / organic supports
 - [ ] Arachne-style variable-width walls
 - [ ] Multi-material / multi-color (sequencing, prime tower)

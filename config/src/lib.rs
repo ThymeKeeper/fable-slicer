@@ -149,6 +149,11 @@ pub struct Settings {
     pub wall_count: usize,
     pub top_layers: usize,
     pub bottom_layers: usize,
+    /// Brick layering: stagger odd-indexed perimeters by half a layer height so
+    /// adjacent wall rings interlock (the outer wall stays put).
+    pub brick_layers: bool,
+    /// Extrusion-flow multiplier for the lifted brick perimeters (fuse the valley).
+    pub brick_flow: f64,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
     pub infill_density: f64,
     /// Pattern for sparse (interior) infill.
@@ -230,6 +235,8 @@ impl Default for Settings {
             line_width_mm: 0.45,
             max_resolution_mm: 0.05,
             wall_count: 2,
+            brick_layers: false,
+            brick_flow: 1.05,
             top_layers: 4,
             bottom_layers: 4,
             infill_density: 0.15,

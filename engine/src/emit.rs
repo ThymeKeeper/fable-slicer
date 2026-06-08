@@ -52,30 +52,36 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             g.fan(255); // part cooling on after the first layer
         }
         g.move_z(layer.print_z_mm, travel_f);
+        let mut cur_z = layer.print_z_mm;
 
         for (i, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
                 continue;
             }
+            // Brick-layered perimeters print half a layer up and over-extrude a touch.
+            let z = layer.print_z_mm + path.z_offset_mm;
             let feed = feed_for(path.kind, layer.index, s) * layer.speed_scale;
-            let coeff = path.width_mm * layer.height_mm / area;
+            let coeff = path.width_mm * layer.height_mm / area * path.flow;
             let start = path.points[0];
 
             // The travel (combed route, or a retracted/z-hopped hop over a void)
-            // was planned in `plan_travels` — replay it.
+            // was planned in `plan_travels` — replay it, at this path's Z.
             let tr = &layer.travels[i];
             if tr.retract && s.retract_len_mm > 0.0 {
                 g.retract(s.retract_len_mm, retract_f);
             }
             if tr.hop && s.z_hop_mm > 0.0 {
-                g.move_z(layer.print_z_mm + s.z_hop_mm, travel_f);
+                g.move_z(z + s.z_hop_mm, travel_f);
+            } else if (z - cur_z).abs() > 1.0e-9 {
+                g.move_z(z, travel_f);
             }
             for pt in &tr.points {
                 g.travel(pt.x_mm(), pt.y_mm(), travel_f);
             }
             if tr.hop && s.z_hop_mm > 0.0 {
-                g.move_z(layer.print_z_mm, travel_f);
+                g.move_z(z, travel_f);
             }
+            cur_z = z;
             if tr.retract && s.retract_len_mm > 0.0 {
                 g.unretract(s.retract_len_mm, retract_f);
             }
