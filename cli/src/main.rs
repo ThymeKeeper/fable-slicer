@@ -80,6 +80,9 @@ struct Args {
     /// Brick layering: stagger odd perimeters by half a layer for wall interlocking.
     #[arg(long)]
     brick: bool,
+    /// Fit circular arcs to curved toolpaths and emit G2/G3 (needs firmware arc support).
+    #[arg(long)]
+    arc_fitting: bool,
 }
 
 fn main() -> Result<()> {
@@ -160,6 +163,9 @@ fn main() -> Result<()> {
     }
     if args.brick {
         settings.brick_layers = true;
+    }
+    if args.arc_fitting {
+        settings.arc_fitting = true;
     }
 
     println!(

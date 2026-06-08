@@ -146,6 +146,11 @@ pub struct Settings {
     /// Merge contour points whose deviation is below this (mm) before planning —
     /// removes sub-resolution mesh-facet noise. 0 disables.
     pub max_resolution_mm: f64,
+    /// Fit circular arcs to curved toolpath runs and emit G2/G3 (smaller g-code,
+    /// smoother motion). Needs firmware arc support (Klipper `[gcode_arcs]`).
+    pub arc_fitting: bool,
+    /// Max deviation (mm) a point may have from a fitted arc to be folded into it.
+    pub arc_tolerance_mm: f64,
     pub wall_count: usize,
     pub top_layers: usize,
     pub bottom_layers: usize,
@@ -234,6 +239,8 @@ impl Default for Settings {
             first_layer_height_mm: 0.2,
             line_width_mm: 0.45,
             max_resolution_mm: 0.05,
+            arc_fitting: false,
+            arc_tolerance_mm: 0.05,
             wall_count: 2,
             brick_layers: false,
             brick_flow: 1.05,

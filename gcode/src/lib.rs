@@ -61,6 +61,16 @@ impl GcodeBuilder {
         self.buf.push_str(&format!("G1 X{x:.3} Y{y:.3} E{e_delta:.5}{f}\n"));
     }
 
+    /// Extruding circular arc — `cw` selects G2 (clockwise) vs G3; `i`/`j` are the
+    /// arc center offset from the current position; `e_delta` is the filament for
+    /// the arc length. Needs firmware arc support (Klipper `[gcode_arcs]`).
+    pub fn arc(&mut self, cw: bool, x: f64, y: f64, i: f64, j: f64, e_delta: f64, feed_mm_min: f64) {
+        self.e_total += e_delta;
+        let f = self.feed_token(feed_mm_min);
+        let code = if cw { "G2" } else { "G3" };
+        self.buf.push_str(&format!("{code} X{x:.3} Y{y:.3} I{i:.3} J{j:.3} E{e_delta:.5}{f}\n"));
+    }
+
     /// Retract filament by `len` mm.
     pub fn retract(&mut self, len: f64, feed_mm_min: f64) {
         self.e_total -= len;

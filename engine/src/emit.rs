@@ -93,13 +93,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            let mut prev = start;
-            for &p in &path.points[1..] {
-                g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * coeff, feed);
-                prev = p;
-            }
-            if path.closed {
-                g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
+            if s.arc_fitting {
+                emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
+            } else {
+                let mut prev = start;
+                for &p in &path.points[1..] {
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * coeff, feed);
+                    prev = p;
+                }
+                if path.closed {
+                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
+                }
             }
         }
     }
@@ -157,6 +161,109 @@ fn dist_mm(a: Point, b: Point) -> f64 {
     let dx = a.x_mm() - b.x_mm();
     let dy = a.y_mm() - b.y_mm();
     (dx * dx + dy * dy).sqrt()
+}
+
+/// Need at least this many points to bother emitting an arc (avoids fitting corners).
+const ARC_MIN_PTS: usize = 4;
+/// Above this radius (mm) a run is treated as straight, not an arc.
+const ARC_MAX_R: f64 = 1000.0;
+
+/// Emit a path's extrusion, replacing runs of points that lie on a circular arc
+/// with a single G2/G3 and leaving the rest as G1 segments.
+fn emit_arcs(g: &mut GcodeBuilder, points: &[Point], closed: bool, coeff: f64, feed: f64, tol: f64) {
+    let mut pts: Vec<(f64, f64)> = points.iter().map(|p| (p.x_mm(), p.y_mm())).collect();
+    if closed {
+        pts.push(pts[0]); // walk the closing segment too
+    }
+    let n = pts.len();
+    let mut i = 0;
+    while i + 1 < n {
+        match fit_arc(&pts, i, tol) {
+            Some((j, cx, cy, cw)) => {
+                let len = arc_span_len(&pts[i..=j], cx, cy);
+                g.arc(cw, pts[j].0, pts[j].1, cx - pts[i].0, cy - pts[i].1, len * coeff, feed);
+                i = j;
+            }
+            None => {
+                let (x, y) = pts[i + 1];
+                g.extrude(x, y, pdist(pts[i], pts[i + 1]) * coeff, feed);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Longest run starting at `i` that lies on one circular arc within `tol`.
+/// Returns (end index, center x, center y, clockwise) or None for a straight run.
+fn fit_arc(pts: &[(f64, f64)], i: usize, tol: f64) -> Option<(usize, f64, f64, bool)> {
+    let n = pts.len();
+    if i + 2 >= n {
+        return None;
+    }
+    let (cx, cy) = circumcenter(pts[i], pts[i + 1], pts[i + 2])?;
+    let r = pdist(pts[i], (cx, cy));
+    if !(1.0e-3..=ARC_MAX_R).contains(&r) {
+        return None;
+    }
+    let cw = turn_cw(pts[i], pts[i + 1], pts[i + 2]);
+    // A segment "hugs" the arc when its chord deviates from the circle by ≤ tol
+    // (sagitta = r − distance(chord midpoint, center)). This rejects polygons whose
+    // vertices happen to be concyclic (e.g. a square's 4 corners) — only a densely
+    // sampled curve passes.
+    let hugs = |a: (f64, f64), b: (f64, f64)| {
+        let m = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        r - pdist(m, (cx, cy)) <= tol
+    };
+    if !hugs(pts[i], pts[i + 1]) || !hugs(pts[i + 1], pts[i + 2]) {
+        return None;
+    }
+    let mut j = i + 2;
+    while j + 1 < n {
+        let p = pts[j + 1];
+        if (pdist(p, (cx, cy)) - r).abs() > tol || turn_cw(pts[j - 1], pts[j], p) != cw || !hugs(pts[j], p) {
+            break;
+        }
+        j += 1;
+    }
+    if j + 1 - i < ARC_MIN_PTS {
+        return None;
+    }
+    // Refit on the run's endpoints + midpoint so I/J land accurately.
+    let (cx, cy) = circumcenter(pts[i], pts[(i + j) / 2], pts[j]).unwrap_or((cx, cy));
+    Some((j, cx, cy, cw))
+}
+
+fn pdist(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// Clockwise turn a→b→c in printer XY (G2 direction).
+fn turn_cw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> bool {
+    (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0) < 0.0
+}
+
+/// Center of the circle through three points (None if collinear).
+fn circumcenter(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> Option<(f64, f64)> {
+    let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
+    if d.abs() < 1.0e-9 {
+        return None;
+    }
+    let (a2, b2, c2) = (a.0 * a.0 + a.1 * a.1, b.0 * b.0 + b.1 * b.1, c.0 * c.0 + c.1 * c.1);
+    let ux = (a2 * (b.1 - c.1) + b2 * (c.1 - a.1) + c2 * (a.1 - b.1)) / d;
+    let uy = (a2 * (c.0 - b.0) + b2 * (a.0 - c.0) + c2 * (b.0 - a.0)) / d;
+    Some((ux, uy))
+}
+
+/// Arc length along a run of points about center (cx, cy): radius × total swept angle.
+fn arc_span_len(run: &[(f64, f64)], cx: f64, cy: f64) -> f64 {
+    let r = pdist(run[0], (cx, cy));
+    let mut ang = 0.0;
+    for w in run.windows(2) {
+        let v0 = (w[0].0 - cx, w[0].1 - cy);
+        let v1 = (w[1].0 - cx, w[1].1 - cy);
+        ang += (v0.0 * v1.1 - v0.1 * v1.0).atan2(v0.0 * v1.0 + v0.1 * v1.1).abs();
+    }
+    r * ang
 }
 
 /// Estimate print time (seconds) via a trapezoidal motion simulation:
@@ -611,8 +718,26 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{fit_arc, ARC_MIN_PTS};
     use crate::{estimate_seconds, generate, to_gcode};
     use config::Settings;
+
+    #[test]
+    fn arc_fit_curves_yes_corners_no() {
+        // A densely-sampled circle fits one arc...
+        let circle: Vec<(f64, f64)> = (0..64)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / 64.0;
+                (10.0 * a.cos(), 10.0 * a.sin())
+            })
+            .collect();
+        let fit = fit_arc(&circle, 0, 0.05).expect("dense circle is an arc");
+        assert!(fit.0 + 1 >= ARC_MIN_PTS, "arc spans several points");
+        assert!(fit.1.hypot(fit.2) < 0.2, "center near origin: ({}, {})", fit.1, fit.2);
+        // ...but a square's (concyclic) corners must NOT be rounded into an arc.
+        let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert!(fit_arc(&square, 0, 0.05).is_none(), "square is straight, not an arc");
+    }
 
     #[test]
     fn gcode_is_klipper_relative_with_retraction() {

@@ -525,6 +525,10 @@ impl eframe::App for App {
                         .on_hover_text("Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
+                    ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")
+                        .on_hover_text("Emit curved toolpaths as G2/G3 arcs — smaller g-code, smoother motion. Needs firmware arc support (Klipper [gcode_arcs]).");
+                    ui.add_enabled(s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2).text("arc tol mm"))
+                        .on_hover_text("Max deviation a point may have from a fitted arc to be folded into it.");
                 });
                 egui::CollapsingHeader::new("Walls & top/bottom").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
