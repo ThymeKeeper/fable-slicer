@@ -12,11 +12,61 @@ use config::{Profiles, Settings};
 use engine::generate;
 use std::sync::Arc;
 
-/// One object placed on the bed: shared mesh geometry plus its placement.
+/// One object placed on the bed: shared mesh geometry plus an editable placement
+/// (Euler rotation, uniform scale, and a bed-plane position for the footprint
+/// center). The object always rests on z=0 — its baked transform drops it there.
 struct SceneObject {
     name: String,
     mesh: Arc<mesh::Mesh>,
-    transform: mesh::Transform,
+    /// Euler rotation in degrees, applied X then Y then Z.
+    rot_deg: [f64; 3],
+    scale: f64,
+    /// Bed XY of the rotated/scaled footprint's center.
+    pos: [f64; 2],
+}
+
+impl SceneObject {
+    fn new(name: String, mesh: mesh::Mesh) -> Self {
+        Self { name, mesh: Arc::new(mesh), rot_deg: [0.0; 3], scale: 1.0, pos: [0.0, 0.0] }
+    }
+
+    /// Footprint of the rotated+scaled mesh (no placement): (minx,miny,maxx,maxy,minz).
+    fn footprint(&self) -> (f64, f64, f64, f64, f64) {
+        let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX);
+        for &v in &self.mesh.vertices {
+            let p = lin.apply_linear(v);
+            b.0 = b.0.min(p[0]);
+            b.1 = b.1.min(p[1]);
+            b.2 = b.2.max(p[0]);
+            b.3 = b.3.max(p[1]);
+            b.4 = b.4.min(p[2]);
+        }
+        b
+    }
+
+    /// Bake the placement into an affine transform: footprint centered on `pos`,
+    /// bottom dropped to z=0.
+    fn transform(&self) -> mesh::Transform {
+        let (minx, miny, maxx, maxy, minz) = self.footprint();
+        mesh::Transform {
+            rotation: euler_matrix(self.rot_deg),
+            scale: self.scale,
+            translation: [self.pos[0] - (minx + maxx) / 2.0, self.pos[1] - (miny + maxy) / 2.0, -minz],
+        }
+    }
+}
+
+/// Rotation matrix for Euler angles (degrees), applied X then Y then Z (R = Rz·Ry·Rx).
+fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
+    let (sx, cx) = deg[0].to_radians().sin_cos();
+    let (sy, cy) = deg[1].to_radians().sin_cos();
+    let (sz, cz) = deg[2].to_radians().sin_cos();
+    [
+        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+        [-sy, cy * sx, cy * cx],
+    ]
 }
 
 fn main() -> eframe::Result<()> {
@@ -142,7 +192,7 @@ impl App {
             Ok(m) => {
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "object".into());
                 self.status = format!("Imported {name} ({} triangles)", m.triangles.len());
-                self.objects.push(SceneObject { name, mesh: Arc::new(m), transform: mesh::Transform::IDENTITY });
+                self.objects.push(SceneObject::new(name, m));
                 self.selected = Some(self.objects.len() - 1);
                 self.after_scene_change();
             }
@@ -156,7 +206,9 @@ impl App {
         let copy = SceneObject {
             name: format!("{} copy", src.name),
             mesh: Arc::clone(&src.mesh),
-            transform: src.transform,
+            rot_deg: src.rot_deg,
+            scale: src.scale,
+            pos: src.pos,
         };
         self.objects.push(copy);
         self.selected = Some(self.objects.len() - 1);
@@ -183,13 +235,14 @@ impl App {
         self.refit_camera = true;
     }
 
-    /// Lay all objects out in a grid centered on the bed, each dropped to z=0.
+    /// Lay all objects out in a grid centered on the bed (each footprint centered
+    /// in its cell). Objects always sit on z=0 via their baked transform.
     fn arrange(&mut self) {
         let n = self.objects.len();
         if n == 0 {
             return;
         }
-        let foot: Vec<(f64, f64, f64, f64, f64)> = self.objects.iter().map(linear_bounds).collect();
+        let foot: Vec<(f64, f64, f64, f64, f64)> = self.objects.iter().map(SceneObject::footprint).collect();
         let cell_w = foot.iter().map(|f| f.2 - f.0).fold(0.0, f64::max) + 5.0;
         let cell_h = foot.iter().map(|f| f.3 - f.1).fold(0.0, f64::max) + 5.0;
         let cols = (n as f64).sqrt().ceil() as usize;
@@ -197,10 +250,10 @@ impl App {
         let x0 = self.settings.bed_size_x_mm / 2.0 - cols as f64 * cell_w / 2.0;
         let y0 = self.settings.bed_size_y_mm / 2.0 - rows as f64 * cell_h / 2.0;
         for (i, obj) in self.objects.iter_mut().enumerate() {
-            let (minx, miny, maxx, maxy, minz) = foot[i];
-            let cx = x0 + (i % cols) as f64 * cell_w + cell_w / 2.0;
-            let cy = y0 + (i / cols) as f64 * cell_h + cell_h / 2.0;
-            obj.transform.translation = [cx - (minx + maxx) / 2.0, cy - (miny + maxy) / 2.0, -minz];
+            obj.pos = [
+                x0 + (i % cols) as f64 * cell_w + cell_w / 2.0,
+                y0 + (i / cols) as f64 * cell_h + cell_h / 2.0,
+            ];
         }
     }
 
@@ -211,9 +264,10 @@ impl App {
         }
         let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
         for obj in &self.objects {
+            let t = obj.transform();
             for i in 0..obj.mesh.triangles.len() {
-                let t = obj.mesh.triangle(i);
-                tris.push([obj.transform.apply(t[0]), obj.transform.apply(t[1]), obj.transform.apply(t[2])]);
+                let tri = obj.mesh.triangle(i);
+                tris.push([t.apply(tri[0]), t.apply(tri[1]), t.apply(tri[2])]);
             }
         }
         Some(mesh::Mesh::from_triangle_soup(&tris))
@@ -271,7 +325,7 @@ impl App {
             .objects
             .iter()
             .enumerate()
-            .map(|(i, o)| (o.mesh.as_ref(), o.transform, self.selected == Some(i)))
+            .map(|(i, o)| (o.mesh.as_ref(), o.transform(), self.selected == Some(i)))
             .collect();
         let bounds = self.scene.set_mesh(&rs.device, &objs);
         // Only re-frame on scene changes (import/duplicate/delete/arrange/profile),
@@ -327,6 +381,41 @@ impl eframe::App for App {
                         self.selected = Some(i);
                         self.needs_rebuild = true; // refresh highlight (camera stays put)
                     }
+                }
+            }
+
+            // Transform controls for the selected object.
+            if let Some(i) = self.selected {
+                let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+                let obj = &mut self.objects[i];
+                let mut changed = false;
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label("move");
+                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[0]).speed(0.5).prefix("X ")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[1]).speed(0.5).prefix("Y ")).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("rot°");
+                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[0]).speed(1.0).prefix("X ")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[1]).speed(1.0).prefix("Y ")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[2]).speed(1.0).prefix("Z ")).changed();
+                });
+                changed |= ui.add(egui::Slider::new(&mut obj.scale, 0.1..=5.0).text("scale")).changed();
+                ui.horizontal(|ui| {
+                    if ui.button("Center").clicked() {
+                        obj.pos = [bx / 2.0, by / 2.0];
+                        changed = true;
+                    }
+                    if ui.button("Reset rot").clicked() {
+                        obj.rot_deg = [0.0; 3];
+                        changed = true;
+                    }
+                });
+                if changed {
+                    self.needs_rebuild = true;
+                    self.sliced = None;
+                    self.view_preview = false;
                 }
             }
             ui.separator();
@@ -507,21 +596,6 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
             ui.selectable_value(current, Grid, "grid");
             ui.selectable_value(current, Concentric, "concentric");
         });
-}
-
-/// XY bounds + min Z of an object's mesh after rotation+scale (no translation) —
-/// the footprint used for grid layout and dropping to the bed.
-fn linear_bounds(obj: &SceneObject) -> (f64, f64, f64, f64, f64) {
-    let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX);
-    for &v in &obj.mesh.vertices {
-        let p = obj.transform.apply_linear(v);
-        b.0 = b.0.min(p[0]);
-        b.1 = b.1.min(p[1]);
-        b.2 = b.2.max(p[0]);
-        b.3 = b.3.max(p[1]);
-        b.4 = b.4.min(p[2]);
-    }
-    b
 }
 
 fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) {
