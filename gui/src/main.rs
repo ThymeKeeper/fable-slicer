@@ -467,31 +467,44 @@ impl eframe::App for App {
             ui.label(&self.status);
             ui.separator();
 
+            // Prominent Model / Preview toggle (Preview enabled once sliced).
             let n_layers = self.sliced.as_ref().map(|l| l.len()).unwrap_or(0);
-            if n_layers > 0 {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.view_preview, false, "Model")
-                        .on_hover_text("Show the 3D model(s) on the bed.");
-                    ui.selectable_value(&mut self.view_preview, true, "Preview")
-                        .on_hover_text("Show the sliced toolpaths.");
-                });
-                if self.view_preview {
-                    ui.add(egui::Slider::new(&mut self.preview_layer, 1..=n_layers).text("layer"))
-                        .on_hover_text("Highest layer shown; lower layers are dimmed.");
-                    ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
-                    ui.add_space(2.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
-                        ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
-                        ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
-                        ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
-                        ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
-                        ui.checkbox(&mut self.show_travel, "travel").on_hover_text("Show non-printing travel moves.");
-                        ui.checkbox(&mut self.show_seams, "seams").on_hover_text("Highlight where each wall loop starts (the seam).");
-                    });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let bw = (ui.available_width() - 6.0) / 2.0;
+                if ui
+                    .add_sized([bw, 28.0], egui::Button::selectable(!self.view_preview, "Model"))
+                    .on_hover_text("Show the 3D model(s) on the bed.")
+                    .clicked()
+                {
+                    self.view_preview = false;
                 }
-                ui.separator();
+                let prev = ui
+                    .add_enabled_ui(n_layers > 0, |ui| {
+                        ui.add_sized([bw, 28.0], egui::Button::selectable(self.view_preview, "Preview"))
+                            .on_hover_text("Show the sliced toolpaths.")
+                    })
+                    .inner;
+                if prev.clicked() {
+                    self.view_preview = true;
+                }
+            });
+            if self.view_preview && n_layers > 0 {
+                ui.add(egui::Slider::new(&mut self.preview_layer, 1..=n_layers).text("layer"))
+                    .on_hover_text("Highest layer shown; lower layers are dimmed.");
+                ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
+                    ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
+                    ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
+                    ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
+                    ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
+                    ui.checkbox(&mut self.show_travel, "travel").on_hover_text("Show non-printing travel moves.");
+                    ui.checkbox(&mut self.show_seams, "seams").on_hover_text("Highlight where each wall loop starts (the seam).");
+                });
             }
+            ui.separator();
 
             // Settings, grouped into collapsible categories (Orca-style) and scrolled.
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -517,14 +530,16 @@ impl eframe::App for App {
                         .on_hover_text("Number of solid layers on bottom surfaces.");
                     ui.checkbox(&mut s.brick_layers, "brick layers")
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.");
-                    ui.add(egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
+                    ui.add_enabled(s.brick_layers, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
                         .on_hover_text("Extra extrusion on the lifted brick perimeters so they fuse down into the valley.");
                 });
                 egui::CollapsingHeader::new("Infill").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
                         .on_hover_text("Sparse interior fill density (0 = hollow, 1 = solid).");
-                    pattern_combo(ui, "sparse fill", &mut s.sparse_pattern)
-                        .on_hover_text("Pattern for the sparse interior infill.");
+                    ui.add_enabled_ui(s.infill_density > 0.0, |ui| {
+                        pattern_combo(ui, "sparse fill", &mut s.sparse_pattern)
+                            .on_hover_text("Pattern for the sparse interior infill.");
+                    });
                     pattern_combo(ui, "solid fill", &mut s.solid_pattern)
                         .on_hover_text("Pattern for the solid top/bottom layers.");
                 });
@@ -545,25 +560,27 @@ impl eframe::App for App {
                 egui::CollapsingHeader::new("Support").default_open(true).show(ui, |ui| {
                     support_combo(ui, &mut s.support_mode)
                         .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.");
-                    ui.add(egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0).text("overhang °"))
+                    let has_support = s.support_mode != config::SupportMode::None;
+                    let arc = s.support_mode == config::SupportMode::Arc;
+                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0).text("overhang °"))
                         .on_hover_text("Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
-                    ui.add(egui::Slider::new(&mut s.support_density, 0.0..=1.0).text("density"))
+                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_density, 0.0..=1.0).text("density"))
                         .on_hover_text("Infill density of grid supports.");
-                    ui.add(egui::Slider::new(&mut s.support_xy_clearance_mm, 0.0..=2.0).text("xy gap mm"))
+                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_xy_clearance_mm, 0.0..=2.0).text("xy gap mm"))
                         .on_hover_text("Horizontal gap between support and the model (for easy removal).");
-                    ui.add(egui::Slider::new(&mut s.support_z_gap_layers, 0..=5).text("z-gap layers"))
+                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_z_gap_layers, 0..=5).text("z-gap layers"))
                         .on_hover_text("Empty layers between a support top and the part it holds up.");
-                    ui.add(egui::Slider::new(&mut s.support_interface_layers, 0..=5).text("interface"))
+                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_interface_layers, 0..=5).text("interface"))
                         .on_hover_text("Dense solid layers at the support top for a smoother overhang underside.");
-                    ui.add(egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0).text("bridge span mm"))
+                    ui.add_enabled(arc, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0).text("bridge span mm"))
                         .on_hover_text("Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
-                    ui.add(egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0).text("arc radius mm"))
+                    ui.add_enabled(arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0).text("arc radius mm"))
                         .on_hover_text("Arc mode: max arc-overhang radius before a fan re-seeds.");
                 });
                 egui::CollapsingHeader::new("Bed adhesion").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.skirt_loops, 0..=5).text("skirt loops"))
                         .on_hover_text("Loops printed around the first layer to prime the nozzle. 0 = off.");
-                    ui.add(egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0).text("skirt gap mm"))
+                    ui.add_enabled(s.skirt_loops > 0, egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0).text("skirt gap mm"))
                         .on_hover_text("Distance from the skirt to the model.");
                     ui.add(egui::Slider::new(&mut s.brim_loops, 0..=20).text("brim loops"))
                         .on_hover_text("Loops attached around the first layer for adhesion. 0 = off.");
@@ -577,7 +594,7 @@ impl eframe::App for App {
                 egui::CollapsingHeader::new("Cooling").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
                         .on_hover_text("Minimum time per layer; thin layers slow down to allow cooling.");
-                    ui.add(egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
+                    ui.add_enabled(s.min_layer_time_s > 0.0, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
                         .on_hover_text("Floor speed when slowing down to hit the minimum layer time.");
                 });
                 egui::CollapsingHeader::new("Retraction").show(ui, |ui| {
@@ -608,6 +625,8 @@ impl eframe::App for App {
             let aspect = rect.width() / rect.height().max(1.0);
             let vp = self.camera.view_proj(aspect);
 
+            // Objects are only editable in Model view; Preview is read-only.
+            let edit = !self.view_preview;
             // Ignore viewport input when the cursor is over the transform overlay.
             let blocked = match (self.overlay_rect, ui.ctx().pointer_interact_pos()) {
                 (Some(r), Some(p)) => r.contains(p),
@@ -615,7 +634,7 @@ impl eframe::App for App {
             };
 
             // Left-press on an object grabs it for dragging; on empty space, orbits.
-            if !blocked && response.drag_started_by(egui::PointerButton::Primary) {
+            if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
@@ -656,7 +675,7 @@ impl eframe::App for App {
                 self.drag_obj = None;
             }
             // A plain click selects the object under the cursor, or deselects on empty.
-            if !blocked && response.clicked() {
+            if edit && !blocked && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
                     self.selected = self.pick(o, d);
@@ -705,8 +724,9 @@ impl eframe::App for App {
                 egui::Color32::WHITE,
             );
 
-            // Floating translucent transform panel — only while an object is selected.
-            if let Some(i) = self.selected {
+            // Floating translucent transform panel — only while an object is selected
+            // and we're in Model view (Preview is read-only).
+            if let (Some(i), false) = (self.selected, self.view_preview) {
                 let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
                 let mut changed = false;
                 let area = egui::Area::new(egui::Id::new("transform_overlay"))
