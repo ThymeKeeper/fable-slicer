@@ -40,6 +40,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     g.raw("G90"); // absolute XYZ
     g.raw("M83"); // relative extrusion (Klipper-recommended)
     emit_template(&mut g, &s.start_gcode, s);
+    // Motion limits, set after PRINT_START so our values win. M204 S is understood
+    // by Klipper and Marlin; SQUARE_CORNER_VELOCITY is Klipper's "jerk" equivalent.
+    g.raw(&format!("M204 S{:.0}", s.acceleration_mm_s2));
+    g.raw(&format!("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={:.1}", s.jerk_mm_s));
     g.fan(0);
 
     for layer in layers {
@@ -593,6 +597,8 @@ mod tests {
         let g = to_gcode(&generate(&m, &s), &s);
 
         assert!(g.contains("M83"), "relative extrusion mode");
+        assert!(g.contains("M204 S3000"), "emits acceleration limit");
+        assert!(g.contains("SQUARE_CORNER_VELOCITY=10.0"), "emits Klipper square corner velocity");
         assert!(g.contains("G28"), "homes (generic start template)");
         assert!(g.contains("M104 S200"), "nozzle temp substituted");
         assert!(g.contains("M140 S60"), "bed temp substituted");
