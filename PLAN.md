@@ -17,10 +17,10 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M4 — supports & bridging (grid supports, arc overhangs, bridge detection all landed) |
-| **Last updated** | 2026-06-07 |
-| **Builds / tests** | `cargo test` green (28 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | M4 polish (bridge flow/fan, expose rMax, support painting) or move to M5 |
+| **Current milestone** | M5/M6 — bed layout + brick layering landed (atop M4 supports/arc/bridge) |
+| **Last updated** | 2026-06-08 |
+| **Builds / tests** | `cargo test` green (33 tests). GUI verify = user screenshots (headless box) |
+| **Next action** | brick lift-ramp at base/top, concentric-fill brick mode, auto-orient (lay-flat), or M5 (variable layers, gyroid, 3MF, G2/G3) |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
