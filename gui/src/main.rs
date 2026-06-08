@@ -210,7 +210,7 @@ impl eframe::App for App {
             self.needs_rebuild = false;
         }
 
-        egui::Panel::left("controls").resizable(false).exact_size(250.0).show_inside(ui, |ui| {
+        egui::Panel::left("controls").resizable(false).exact_size(270.0).show_inside(ui, |ui| {
             ui.heading("slicer");
             ui.add_space(4.0);
             if ui.button("Open STL…").clicked() {
@@ -232,32 +232,7 @@ impl eframe::App for App {
             }
             ui.separator();
 
-            ui.add(egui::Slider::new(&mut self.settings.layer_height_mm, 0.05..=0.4).text("layer mm"));
-            ui.add(egui::Slider::new(&mut self.settings.first_layer_height_mm, 0.1..=0.4).text("first layer mm"));
-            ui.add(egui::Slider::new(&mut self.settings.wall_count, 1..=6).text("walls"));
-            ui.add(egui::Slider::new(&mut self.settings.infill_density, 0.0..=1.0).text("infill"));
-            ui.add(egui::Slider::new(&mut self.settings.skirt_loops, 0..=5).text("skirt loops"));
-            ui.add(egui::Slider::new(&mut self.settings.brim_loops, 0..=20).text("brim loops"));
-            egui::ComboBox::from_label("seam")
-                .selected_text(self.settings.seam_mode.label())
-                .show_ui(ui, |ui| {
-                    use config::SeamMode::*;
-                    ui.selectable_value(&mut self.settings.seam_mode, Nearest, "nearest");
-                    ui.selectable_value(&mut self.settings.seam_mode, Sharpest, "sharpest");
-                    ui.selectable_value(&mut self.settings.seam_mode, Random, "random");
-                });
-            pattern_combo(ui, "sparse fill", &mut self.settings.sparse_pattern);
-            pattern_combo(ui, "solid fill", &mut self.settings.solid_pattern);
-            egui::ComboBox::from_label("support")
-                .selected_text(self.settings.support_mode.label())
-                .show_ui(ui, |ui| {
-                    use config::SupportMode::*;
-                    ui.selectable_value(&mut self.settings.support_mode, None, "none");
-                    ui.selectable_value(&mut self.settings.support_mode, Grid, "grid");
-                    ui.selectable_value(&mut self.settings.support_mode, Arc, "arc");
-                });
-            ui.separator();
-
+            // Slice / export + status stay pinned above the scrollable settings.
             ui.horizontal(|ui| {
                 if ui.add_enabled(self.mesh.is_some(), egui::Button::new("Slice")).clicked() {
                     self.slice(&rs);
@@ -266,6 +241,7 @@ impl eframe::App for App {
                     self.export();
                 }
             });
+            ui.label(&self.status);
             ui.separator();
 
             let n_layers = self.sliced.as_ref().map(|l| l.len()).unwrap_or(0);
@@ -291,13 +267,69 @@ impl eframe::App for App {
                 ui.separator();
             }
 
-            ui.label(format!(
-                "printer {} · bed {:.0}×{:.0} mm",
-                self.printer, self.settings.bed_size_x_mm, self.settings.bed_size_y_mm
-            ));
-            ui.label(&self.status);
-            ui.add_space(8.0);
-            ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
+            // Settings, grouped into collapsible categories (Orca-style) and scrolled.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let s = &mut self.settings;
+                egui::CollapsingHeader::new("Quality").default_open(true).show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.layer_height_mm, 0.05..=0.4).text("layer mm"));
+                    ui.add(egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4).text("first layer mm"));
+                    ui.add(egui::Slider::new(&mut s.line_width_mm, 0.2..=1.0).text("line width mm"));
+                    ui.add(egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5).text("resolution mm"));
+                    seam_combo(ui, &mut s.seam_mode);
+                });
+                egui::CollapsingHeader::new("Walls & top/bottom").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"));
+                    ui.add(egui::Slider::new(&mut s.top_layers, 0..=10).text("top layers"));
+                    ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"));
+                });
+                egui::CollapsingHeader::new("Infill").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"));
+                    pattern_combo(ui, "sparse fill", &mut s.sparse_pattern);
+                    pattern_combo(ui, "solid fill", &mut s.solid_pattern);
+                });
+                egui::CollapsingHeader::new("Speed").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"));
+                    ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"));
+                    ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"));
+                });
+                egui::CollapsingHeader::new("Support").default_open(true).show(ui, |ui| {
+                    support_combo(ui, &mut s.support_mode);
+                    ui.add(egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0).text("overhang °"));
+                    ui.add(egui::Slider::new(&mut s.support_density, 0.0..=1.0).text("density"));
+                    ui.add(egui::Slider::new(&mut s.support_xy_clearance_mm, 0.0..=2.0).text("xy gap mm"));
+                    ui.add(egui::Slider::new(&mut s.support_z_gap_layers, 0..=5).text("z-gap layers"));
+                    ui.add(egui::Slider::new(&mut s.support_interface_layers, 0..=5).text("interface"));
+                    ui.add(egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0).text("bridge span mm"));
+                    ui.add(egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0).text("arc radius mm"));
+                });
+                egui::CollapsingHeader::new("Bed adhesion").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.skirt_loops, 0..=5).text("skirt loops"));
+                    ui.add(egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0).text("skirt gap mm"));
+                    ui.add(egui::Slider::new(&mut s.brim_loops, 0..=20).text("brim loops"));
+                });
+                egui::CollapsingHeader::new("Material & temperature").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.nozzle_temp_c, 150..=300).text("nozzle °C"));
+                    ui.add(egui::Slider::new(&mut s.bed_temp_c, 0..=120).text("bed °C"));
+                });
+                egui::CollapsingHeader::new("Cooling").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"));
+                    ui.add(egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"));
+                });
+                egui::CollapsingHeader::new("Retraction").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0).text("length mm"));
+                    ui.add(egui::Slider::new(&mut s.retract_speed_mm_s, 5.0..=100.0).text("speed mm/s"));
+                    ui.add(egui::Slider::new(&mut s.z_hop_mm, 0.0..=2.0).text("z-hop mm"));
+                });
+                egui::CollapsingHeader::new("Machine").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"));
+                    ui.add(egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0).text("bed Y mm"));
+                    ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"));
+                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel"));
+                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk"));
+                });
+                ui.add_space(6.0);
+                ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
+            });
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -361,6 +393,28 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
             ui.selectable_value(current, Lines, "lines");
             ui.selectable_value(current, Grid, "grid");
             ui.selectable_value(current, Concentric, "concentric");
+        });
+}
+
+fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) {
+    use config::SeamMode::*;
+    egui::ComboBox::from_label("seam")
+        .selected_text(current.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(current, Nearest, "nearest");
+            ui.selectable_value(current, Sharpest, "sharpest");
+            ui.selectable_value(current, Random, "random");
+        });
+}
+
+fn support_combo(ui: &mut egui::Ui, current: &mut config::SupportMode) {
+    use config::SupportMode::*;
+    egui::ComboBox::from_label("support")
+        .selected_text(current.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(current, None, "none");
+            ui.selectable_value(current, Grid, "grid");
+            ui.selectable_value(current, Arc, "arc");
         });
 }
 

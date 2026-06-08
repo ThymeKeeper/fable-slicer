@@ -15,9 +15,6 @@ use mesh::Mesh;
 
 use crate::{slice_mesh, Layer, SliceParams};
 
-/// Max arc radius for arc-overhangs (mm) — larger arcs bulge/sag.
-const ARC_RMAX_MM: f64 = 40.0;
-
 /// What a toolpath represents — drives speed, ordering, and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathKind {
@@ -168,7 +165,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // everything else (wide bridge, cantilever) is arc-filled.
                 for island in islands(&arc_region) {
                     let segs = try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm)
-                        .unwrap_or_else(|| crate::arc::arc_fill(&island, &supported_below, lw, ARC_RMAX_MM));
+                        .unwrap_or_else(|| crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm));
                     for seg in segs {
                         if seg.len() >= 2 {
                             paths.push(ToolPath { kind: PathKind::Bridge, closed: false, width_mm: lw, points: seg });
