@@ -20,6 +20,51 @@ pub struct Mesh {
     pub triangles: Vec<[u32; 3]>,
 }
 
+/// An affine placement of an object on the bed: scale, then rotate, then translate.
+/// `rotation` is a row-major 3×3 matrix (orthonormal for a rigid placement).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform {
+    pub rotation: [[f64; 3]; 3],
+    pub scale: f64,
+    pub translation: Vec3,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Transform {
+    pub const IDENTITY: Transform = Transform {
+        rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        scale: 1.0,
+        translation: [0.0, 0.0, 0.0],
+    };
+
+    /// Map a point: scale, rotate, then translate.
+    pub fn apply(&self, p: Vec3) -> Vec3 {
+        let s = [p[0] * self.scale, p[1] * self.scale, p[2] * self.scale];
+        let r = &self.rotation;
+        [
+            r[0][0] * s[0] + r[0][1] * s[1] + r[0][2] * s[2] + self.translation[0],
+            r[1][0] * s[0] + r[1][1] * s[1] + r[1][2] * s[2] + self.translation[1],
+            r[2][0] * s[0] + r[2][1] * s[1] + r[2][2] * s[2] + self.translation[2],
+        ]
+    }
+
+    /// The rotation+scale part only (no translation) — for measuring footprints.
+    pub fn apply_linear(&self, p: Vec3) -> Vec3 {
+        let s = [p[0] * self.scale, p[1] * self.scale, p[2] * self.scale];
+        let r = &self.rotation;
+        [
+            r[0][0] * s[0] + r[0][1] * s[1] + r[0][2] * s[2],
+            r[1][0] * s[0] + r[1][1] * s[1] + r[1][2] * s[2],
+            r[2][0] * s[0] + r[2][1] * s[1] + r[2][2] * s[2],
+        ]
+    }
+}
+
 impl Mesh {
     /// Build a mesh from a "triangle soup" (independent triangles), welding
     /// coincident vertices so the result is indexed. Degenerate triangles
@@ -57,6 +102,14 @@ impl Mesh {
 
     /// The three world-space vertices of triangle `i`.
     #[inline]
+    /// A copy with `t` applied to every vertex (bakes the placement into geometry).
+    pub fn transformed(&self, t: &Transform) -> Mesh {
+        Mesh {
+            vertices: self.vertices.iter().map(|&v| t.apply(v)).collect(),
+            triangles: self.triangles.clone(),
+        }
+    }
+
     pub fn triangle(&self, i: usize) -> [Vec3; 3] {
         let t = self.triangles[i];
         [
@@ -227,6 +280,18 @@ mod tests {
         assert_eq!(m.vertices.len(), 8);
         assert_eq!(m.triangles.len(), 12);
         assert_eq!(m.z_bounds(), Some((0.0, 20.0)));
+    }
+
+    #[test]
+    fn transform_bakes_translation_and_scale() {
+        assert_eq!(Transform::IDENTITY.apply([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+        let m = Mesh::cube(2.0); // spans 0..2 on each axis
+        let t = Transform { scale: 2.0, translation: [10.0, 0.0, 0.0], ..Transform::IDENTITY };
+        let tm = m.transformed(&t);
+        let (minx, _, maxx, _) = tm.xy_bounds().unwrap();
+        assert!((minx - 10.0).abs() < 1e-9, "min x {minx}"); // 0*2+10
+        assert!((maxx - 14.0).abs() < 1e-9, "max x {maxx}"); // 2*2+10
+        assert_eq!(tm.z_bounds(), Some((0.0, 4.0))); // scaled, untranslated in z
     }
 
     #[test]

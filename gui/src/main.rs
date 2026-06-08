@@ -1,5 +1,5 @@
-//! `slicer-gui` — desktop GUI: load an STL, choose profiles, slice, preview the
-//! model in 3D, and export g-code. (3D toolpath preview is the next increment.)
+//! `slicer-gui` — desktop GUI: import STLs as a multi-object scene, lay them out
+//! on the bed, choose profiles, slice, preview toolpaths in 3D, and export g-code.
 
 mod camera;
 mod render;
@@ -10,6 +10,14 @@ use render::Scene;
 
 use config::{Profiles, Settings};
 use engine::generate;
+use std::sync::Arc;
+
+/// One object placed on the bed: shared mesh geometry plus its placement.
+struct SceneObject {
+    name: String,
+    mesh: Arc<mesh::Mesh>,
+    transform: mesh::Transform,
+}
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -25,7 +33,8 @@ struct App {
     filament: String,
     process: String,
     settings: Settings,
-    mesh: Option<mesh::Mesh>,
+    objects: Vec<SceneObject>,
+    selected: Option<usize>,
     scene: Scene,
     camera: Camera,
     status: String,
@@ -58,14 +67,16 @@ impl App {
         let profiles = Profiles::builtin();
         let (printer, filament, process) =
             ("voron24".to_string(), "pla".to_string(), "standard".to_string());
-        let settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
+        let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
+        settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         Self {
             profiles,
             printer,
             filament,
             process,
             settings,
-            mesh: None,
+            objects: Vec::new(),
+            selected: None,
             scene,
             camera: Camera::new(),
             status: "Open an STL to begin.".to_string(),
@@ -114,30 +125,100 @@ impl App {
     fn reresolve(&mut self) {
         if let Ok(s) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
             self.settings = s;
+            self.settings.auto_center_on_bed = false;
             self.sliced = None;
             self.view_preview = false;
             self.needs_rebuild = true;
         }
     }
 
-    fn load_stl(&mut self, path: std::path::PathBuf) {
+    /// Load an STL and add it to the scene as a new object.
+    fn import_stl(&mut self, path: std::path::PathBuf) {
         match mesh::Mesh::load_stl(&path) {
             Ok(m) => {
-                let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                self.status = format!("Loaded {name} ({} triangles)", m.triangles.len());
-                self.mesh = Some(m);
-                self.sliced = None;
-                self.view_preview = false;
-                self.needs_rebuild = true;
+                let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "object".into());
+                self.status = format!("Imported {name} ({} triangles)", m.triangles.len());
+                self.objects.push(SceneObject { name, mesh: Arc::new(m), transform: mesh::Transform::IDENTITY });
+                self.selected = Some(self.objects.len() - 1);
+                self.after_scene_change();
             }
             Err(e) => self.status = format!("Load failed: {e}"),
         }
     }
 
+    fn duplicate_selected(&mut self) {
+        let Some(i) = self.selected else { return };
+        let src = &self.objects[i];
+        let copy = SceneObject {
+            name: format!("{} copy", src.name),
+            mesh: Arc::clone(&src.mesh),
+            transform: src.transform,
+        };
+        self.objects.push(copy);
+        self.selected = Some(self.objects.len() - 1);
+        self.after_scene_change();
+    }
+
+    fn delete_selected(&mut self) {
+        let Some(i) = self.selected else { return };
+        self.objects.remove(i);
+        self.selected = if self.objects.is_empty() {
+            None
+        } else {
+            Some(i.min(self.objects.len() - 1))
+        };
+        self.after_scene_change();
+    }
+
+    /// Invalidate slice/preview and re-layout after the object set changed.
+    fn after_scene_change(&mut self) {
+        self.arrange();
+        self.sliced = None;
+        self.view_preview = false;
+        self.needs_rebuild = true;
+    }
+
+    /// Lay all objects out in a grid centered on the bed, each dropped to z=0.
+    fn arrange(&mut self) {
+        let n = self.objects.len();
+        if n == 0 {
+            return;
+        }
+        let foot: Vec<(f64, f64, f64, f64, f64)> = self.objects.iter().map(linear_bounds).collect();
+        let cell_w = foot.iter().map(|f| f.2 - f.0).fold(0.0, f64::max) + 5.0;
+        let cell_h = foot.iter().map(|f| f.3 - f.1).fold(0.0, f64::max) + 5.0;
+        let cols = (n as f64).sqrt().ceil() as usize;
+        let rows = n.div_ceil(cols);
+        let x0 = self.settings.bed_size_x_mm / 2.0 - cols as f64 * cell_w / 2.0;
+        let y0 = self.settings.bed_size_y_mm / 2.0 - rows as f64 * cell_h / 2.0;
+        for (i, obj) in self.objects.iter_mut().enumerate() {
+            let (minx, miny, maxx, maxy, minz) = foot[i];
+            let cx = x0 + (i % cols) as f64 * cell_w + cell_w / 2.0;
+            let cy = y0 + (i / cols) as f64 * cell_h + cell_h / 2.0;
+            obj.transform.translation = [cx - (minx + maxx) / 2.0, cy - (miny + maxy) / 2.0, -minz];
+        }
+    }
+
+    /// Bake every object's placement into one mesh, in bed coordinates.
+    fn combined_mesh(&self) -> Option<mesh::Mesh> {
+        if self.objects.is_empty() {
+            return None;
+        }
+        let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+        for obj in &self.objects {
+            for i in 0..obj.mesh.triangles.len() {
+                let t = obj.mesh.triangle(i);
+                tris.push([obj.transform.apply(t[0]), obj.transform.apply(t[1]), obj.transform.apply(t[2])]);
+            }
+        }
+        Some(mesh::Mesh::from_triangle_soup(&tris))
+    }
+
     fn slice(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        let Some(layers) = self.mesh.as_ref().map(|m| generate(m, &self.settings)) else {
+        let Some(m) = self.combined_mesh() else {
             return;
         };
+        let layers = generate(&m, &self.settings);
         let (verts, ends, joints, joint_ends) =
             build_instances(&layers, self.settings.z_hop_mm as f32);
         self.scene.set_toolpaths(&rs.device, &verts);
@@ -180,18 +261,18 @@ impl App {
         let by = self.settings.bed_size_y_mm as f32;
         self.scene.set_bed(&rs.device, bx, by);
 
-        if let Some(m) = self.mesh.as_ref() {
+        if let Some(m) = self.combined_mesh() {
+            // Objects are already baked into bed coordinates by `arrange`.
             let (minx, miny, maxx, maxy) = m.xy_bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
             let (zmin, zmax) = m.z_bounds().unwrap_or((0.0, 0.0));
-            let offset = [
-                bx / 2.0 - ((minx + maxx) / 2.0) as f32,
-                by / 2.0 - ((miny + maxy) / 2.0) as f32,
-                -(zmin as f32),
-            ];
-            self.scene.set_mesh(&rs.device, m, offset);
+            self.scene.set_mesh(&rs.device, &m, [0.0, 0.0, 0.0]);
             let span = ((maxx - minx).max(maxy - miny).max(zmax - zmin)) as f32;
             self.camera.frame(
-                glam::Vec3::new(bx / 2.0, by / 2.0, ((zmax - zmin) / 2.0) as f32),
+                glam::Vec3::new(
+                    ((minx + maxx) / 2.0) as f32,
+                    ((miny + maxy) / 2.0) as f32,
+                    ((zmin + zmax) / 2.0) as f32,
+                ),
                 span * 0.5 + 1.0,
             );
         } else {
@@ -213,9 +294,28 @@ impl eframe::App for App {
         egui::Panel::left("controls").resizable(false).exact_size(270.0).show_inside(ui, |ui| {
             ui.heading("slicer");
             ui.add_space(4.0);
-            if ui.button("Open STL…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("STL", &["stl"]).pick_file() {
-                    self.load_stl(path);
+            ui.horizontal(|ui| {
+                if ui.button("Import STL…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("STL", &["stl"]).pick_file() {
+                        self.import_stl(path);
+                    }
+                }
+                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Duplicate")).clicked() {
+                    self.duplicate_selected();
+                }
+                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Delete")).clicked() {
+                    self.delete_selected();
+                }
+            });
+            if self.objects.is_empty() {
+                ui.weak("Import an STL to begin.");
+            } else {
+                for i in 0..self.objects.len() {
+                    let sel = self.selected == Some(i);
+                    let name = self.objects[i].name.clone();
+                    if ui.selectable_label(sel, name).clicked() {
+                        self.selected = Some(i);
+                    }
                 }
             }
             ui.separator();
@@ -234,7 +334,7 @@ impl eframe::App for App {
 
             // Slice / export + status stay pinned above the scrollable settings.
             ui.horizontal(|ui| {
-                if ui.add_enabled(self.mesh.is_some(), egui::Button::new("Slice")).clicked() {
+                if ui.add_enabled(!self.objects.is_empty(), egui::Button::new("Slice")).clicked() {
                     self.slice(&rs);
                 }
                 if ui.add_enabled(self.sliced.is_some(), egui::Button::new("Export g-code…")).clicked() {
@@ -396,6 +496,21 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
             ui.selectable_value(current, Grid, "grid");
             ui.selectable_value(current, Concentric, "concentric");
         });
+}
+
+/// XY bounds + min Z of an object's mesh after rotation+scale (no translation) —
+/// the footprint used for grid layout and dropping to the bed.
+fn linear_bounds(obj: &SceneObject) -> (f64, f64, f64, f64, f64) {
+    let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX);
+    for &v in &obj.mesh.vertices {
+        let p = obj.transform.apply_linear(v);
+        b.0 = b.0.min(p[0]);
+        b.1 = b.1.min(p[1]);
+        b.2 = b.2.max(p[0]);
+        b.3 = b.3.max(p[1]);
+        b.4 = b.4.min(p[2]);
+    }
+    b
 }
 
 fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) {

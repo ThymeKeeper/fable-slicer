@@ -518,6 +518,9 @@ fn coverage(inners: &[Polygons], i: usize, dir: isize, count: usize, n: usize) -
 
 /// Shift all toolpaths so the model's XY center sits at the bed center.
 fn center_on_bed(plans: &mut [LayerPlan], mesh: &Mesh, settings: &Settings) {
+    if !settings.auto_center_on_bed {
+        return; // caller positioned the geometry already (e.g. GUI multi-object layout)
+    }
     let Some((min_x, min_y, max_x, max_y)) = mesh.xy_bounds() else {
         return;
     };

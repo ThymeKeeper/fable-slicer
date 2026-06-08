@@ -202,6 +202,7 @@ impl Profiles {
             skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
             brim_loops: pc.brim_loops.unwrap_or(d.brim_loops),
             seam_mode: pc.seam.as_deref().and_then(SeamMode::parse).unwrap_or(d.seam_mode),
+            auto_center_on_bed: d.auto_center_on_bed, // runtime flag, not profile-driven
             support_mode: pc.support.as_deref().and_then(SupportMode::parse).unwrap_or(d.support_mode),
             support_overhang_angle_deg: pc
                 .support_overhang_angle_deg

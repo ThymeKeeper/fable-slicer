@@ -163,6 +163,9 @@ pub struct Settings {
     pub brim_loops: usize,
     /// Where to place the wall seam.
     pub seam_mode: SeamMode,
+    /// Auto-center the model on the bed before slicing. The GUI positions objects
+    /// explicitly (multi-object layout) so it turns this off; the CLI keeps it on.
+    pub auto_center_on_bed: bool,
 
     // --- supports ---
     /// How overhanging regions are handled.
@@ -236,6 +239,7 @@ impl Default for Settings {
             skirt_gap_mm: 3.0,
             brim_loops: 0,
             seam_mode: SeamMode::default(),
+            auto_center_on_bed: true,
             support_mode: SupportMode::default(),
             support_overhang_angle_deg: 45.0,
             support_density: 0.12,
