@@ -55,6 +55,8 @@ struct App {
     show_travel: bool,
     show_seams: bool,
     needs_rebuild: bool,
+    /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
+    refit_camera: bool,
 }
 
 impl App {
@@ -93,6 +95,7 @@ impl App {
             show_travel: false,
             show_seams: false,
             needs_rebuild: true,
+            refit_camera: true,
         }
     }
 
@@ -129,6 +132,7 @@ impl App {
             self.sliced = None;
             self.view_preview = false;
             self.needs_rebuild = true;
+            self.refit_camera = true;
         }
     }
 
@@ -176,6 +180,7 @@ impl App {
         self.sliced = None;
         self.view_preview = false;
         self.needs_rebuild = true;
+        self.refit_camera = true;
     }
 
     /// Lay all objects out in a grid centered on the bed, each dropped to z=0.
@@ -261,23 +266,28 @@ impl App {
         let by = self.settings.bed_size_y_mm as f32;
         self.scene.set_bed(&rs.device, bx, by);
 
-        if let Some(m) = self.combined_mesh() {
-            // Objects are already baked into bed coordinates by `arrange`.
-            let (minx, miny, maxx, maxy) = m.xy_bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
-            let (zmin, zmax) = m.z_bounds().unwrap_or((0.0, 0.0));
-            self.scene.set_mesh(&rs.device, &m, [0.0, 0.0, 0.0]);
-            let span = ((maxx - minx).max(maxy - miny).max(zmax - zmin)) as f32;
-            self.camera.frame(
-                glam::Vec3::new(
-                    ((minx + maxx) / 2.0) as f32,
-                    ((miny + maxy) / 2.0) as f32,
-                    ((zmin + zmax) / 2.0) as f32,
-                ),
-                span * 0.5 + 1.0,
-            );
-        } else {
-            self.scene.clear_mesh();
-            self.camera.frame(glam::Vec3::new(bx / 2.0, by / 2.0, 0.0), bx.max(by) * 0.5);
+        // The selected object is flagged so the renderer highlights it.
+        let objs: Vec<(&mesh::Mesh, mesh::Transform, bool)> = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.mesh.as_ref(), o.transform, self.selected == Some(i)))
+            .collect();
+        let bounds = self.scene.set_mesh(&rs.device, &objs);
+        // Only re-frame on scene changes (import/duplicate/delete/arrange/profile),
+        // not when the user merely selects an object.
+        if self.refit_camera {
+            match bounds {
+                Some((lo, hi)) => {
+                    let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]);
+                    self.camera.frame(
+                        glam::Vec3::new((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0),
+                        span * 0.5 + 1.0,
+                    );
+                }
+                None => self.camera.frame(glam::Vec3::new(bx / 2.0, by / 2.0, 0.0), bx.max(by) * 0.5),
+            }
+            self.refit_camera = false;
         }
     }
 }
@@ -315,6 +325,7 @@ impl eframe::App for App {
                     let name = self.objects[i].name.clone();
                     if ui.selectable_label(sel, name).clicked() {
                         self.selected = Some(i);
+                        self.needs_rebuild = true; // refresh highlight (camera stays put)
                     }
                 }
             }

@@ -30,17 +30,19 @@ struct U {
 @group(0) @binding(0) var<uniform> u: U;
 
 // --- mesh (shaded) ---
-struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
-@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> MeshOut {
+struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) @interpolate(flat) sel: f32 };
+@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) sel: f32) -> MeshOut {
     var o: MeshOut;
     o.clip = u.mvp * vec4<f32>(p, 1.0);
     o.normal = n;
+    o.sel = sel;
     return o;
 }
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
     let l = normalize(u.light.xyz);
     let d = max(dot(normalize(i.normal), l), 0.0);
-    let base = vec3<f32>(0.30, 0.55, 0.90);
+    // unselected = blue, selected = orange
+    let base = mix(vec3<f32>(0.30, 0.55, 0.90), vec3<f32>(0.96, 0.62, 0.18), i.sel);
     return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
 }
 
@@ -125,6 +127,15 @@ struct BeadOut {
 struct Vertex {
     pos: [f32; 3],
     normal: [f32; 3],
+}
+
+/// Mesh vertex with a selection flag (0 = normal, 1 = highlighted).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshVertex {
+    pos: [f32; 3],
+    normal: [f32; 3],
+    sel: f32,
 }
 
 #[repr(C)]
@@ -231,9 +242,9 @@ impl Scene {
         let mesh_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_mesh", "fs_mesh",
             &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as u64,
+                array_stride: std::mem::size_of::<MeshVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32],
             }],
             wgpu::PrimitiveTopology::TriangleList,
         );
@@ -353,22 +364,39 @@ impl Scene {
     }
 
     /// Upload a mesh, translated by `offset` (used to center the model on the bed).
-    pub fn set_mesh(&mut self, device: &wgpu::Device, mesh: &mesh::Mesh, offset: [f32; 3]) {
-        let mut verts = Vec::with_capacity(mesh.triangles.len() * 3);
-        for i in 0..mesh.triangles.len() {
-            let tri = mesh.triangle(i);
-            let p: [[f32; 3]; 3] = [
-                [tri[0][0] as f32 + offset[0], tri[0][1] as f32 + offset[1], tri[0][2] as f32 + offset[2]],
-                [tri[1][0] as f32 + offset[0], tri[1][1] as f32 + offset[1], tri[1][2] as f32 + offset[2]],
-                [tri[2][0] as f32 + offset[0], tri[2][1] as f32 + offset[1], tri[2][2] as f32 + offset[2]],
-            ];
-            let n = flat_normal(p[0], p[1], p[2]);
-            for pos in p {
-                verts.push(Vertex { pos, normal: n });
+    /// Upload all scene objects (each: mesh, placement, selected?) as one buffer,
+    /// baking the transform into bed coordinates and flagging the selected object
+    /// for highlight. Returns the combined bounding box (min, max), or None if empty.
+    pub fn set_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        objects: &[(&mesh::Mesh, mesh::Transform, bool)],
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let mut verts: Vec<MeshVertex> = Vec::new();
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for (mesh, t, selected) in objects {
+            let sel = if *selected { 1.0 } else { 0.0 };
+            for i in 0..mesh.triangles.len() {
+                let tri = mesh.triangle(i);
+                let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
+                let p: [[f32; 3]; 3] = [f3(t.apply(tri[0])), f3(t.apply(tri[1])), f3(t.apply(tri[2]))];
+                let n = flat_normal(p[0], p[1], p[2]);
+                for pos in p {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(pos[k]);
+                        hi[k] = hi[k].max(pos[k]);
+                    }
+                    verts.push(MeshVertex { pos, normal: n, sel });
+                }
             }
+        }
+        if verts.is_empty() {
+            self.clear_mesh();
+            return None;
         }
         self.mesh_count = verts.len() as u32;
         self.mesh_vbuf = make_vbuf(device, "mesh_vbuf", bytemuck::cast_slice(&verts));
+        Some((lo, hi))
     }
 
     /// Build the bed grid (gray lines on z=0 plus a brighter border).
