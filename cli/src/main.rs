@@ -75,6 +75,8 @@ struct Args {
     bed_x: Option<f64>,
     #[arg(long)]
     bed_y: Option<f64>,
+    #[arg(long)]
+    bed_z: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -149,6 +151,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.bed_y {
         settings.bed_size_y_mm = v;
+    }
+    if let Some(v) = args.bed_z {
+        settings.bed_size_z_mm = v;
     }
 
     println!(

@@ -115,6 +115,7 @@ fn substitute(template: &str, s: &Settings) -> String {
         .replace("{bed_temp}", &s.bed_temp_c.to_string())
         .replace("{bed_x}", &format!("{:.3}", s.bed_size_x_mm))
         .replace("{bed_y}", &format!("{:.3}", s.bed_size_y_mm))
+        .replace("{bed_z}", &format!("{:.3}", s.bed_size_z_mm))
         .replace("{layer_height}", &format!("{:.3}", s.layer_height_mm))
         .replace("{first_layer_height}", &format!("{:.3}", s.layer_height_mm))
         .replace("{nozzle_diameter}", &format!("{:.3}", s.nozzle_diameter_mm))

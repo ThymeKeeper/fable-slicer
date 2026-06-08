@@ -131,6 +131,8 @@ pub struct Settings {
     pub filament_density_g_cm3: f64,
     pub bed_size_x_mm: f64,
     pub bed_size_y_mm: f64,
+    /// Max build height (mm).
+    pub bed_size_z_mm: f64,
     /// Acceleration (mm/s²) used for the time estimate.
     pub acceleration_mm_s2: f64,
     /// Junction speed limit (mm/s) used for the time estimate.
@@ -217,6 +219,7 @@ impl Default for Settings {
             filament_density_g_cm3: 1.24,
             bed_size_x_mm: 220.0,
             bed_size_y_mm: 220.0,
+            bed_size_z_mm: 250.0,
             acceleration_mm_s2: 3000.0,
             jerk_mm_s: 10.0,
             layer_height_mm: 0.2,

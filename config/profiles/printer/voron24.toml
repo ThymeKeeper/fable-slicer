@@ -6,6 +6,7 @@ inherits = "generic"
 # 350mm build (the 2.4 also ships as 250/300 — override with --bed-x/--bed-y).
 bed_size_x_mm = 350.0
 bed_size_y_mm = 350.0
+bed_size_z_mm = 340.0
 
 # Stock Voron 2.4 motion limits (max_accel / max_velocity / square_corner_velocity).
 # Conservative pre-tuning defaults — raise once input shaping is dialed in.

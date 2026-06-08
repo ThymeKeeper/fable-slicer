@@ -21,6 +21,7 @@ pub struct PrinterProfile {
     pub inherits: Option<String>,
     pub bed_size_x_mm: Option<f64>,
     pub bed_size_y_mm: Option<f64>,
+    pub bed_size_z_mm: Option<f64>,
     pub nozzle_diameter_mm: Option<f64>,
     pub travel_speed_mm_s: Option<f64>,
     pub print_speed_mm_s: Option<f64>,
@@ -98,7 +99,7 @@ impl Tier for PrinterProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, nozzle_diameter_mm,
+        merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, start_gcode, end_gcode)
     }
@@ -184,6 +185,7 @@ impl Profiles {
             filament_density_g_cm3: fl.density_g_cm3.unwrap_or(d.filament_density_g_cm3),
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
+            bed_size_z_mm: pr.bed_size_z_mm.unwrap_or(d.bed_size_z_mm),
             acceleration_mm_s2: pr.acceleration.unwrap_or(d.acceleration_mm_s2),
             jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
@@ -282,6 +284,7 @@ mod tests {
         // voron24 inherits generic: gets generic's nozzle dia, its own bed + macro.
         let s = p.resolve("voron24", "pla", "standard").unwrap();
         assert_eq!(s.bed_size_x_mm, 350.0);
+        assert_eq!(s.bed_size_z_mm, 340.0); // build height
         assert_eq!(s.nozzle_diameter_mm, 0.4); // inherited from generic
         assert_eq!(s.nozzle_temp_c, 200); // from pla
         assert_eq!(s.layer_height_mm, 0.2); // from standard

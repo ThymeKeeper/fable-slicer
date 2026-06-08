@@ -326,6 +326,7 @@ impl eframe::App for App {
                 egui::CollapsingHeader::new("Machine").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"));
                     ui.add(egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0).text("bed Y mm"));
+                    ui.add(egui::Slider::new(&mut s.bed_size_z_mm, 50.0..=600.0).text("bed Z mm"));
                     ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"));
                 });
                 ui.add_space(6.0);
