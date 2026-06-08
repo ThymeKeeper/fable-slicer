@@ -107,6 +107,10 @@ struct App {
     needs_rebuild: bool,
     /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
     refit_camera: bool,
+    /// Object being dragged in the viewport (None = orbiting the camera).
+    drag_obj: Option<usize>,
+    /// Offset (bed XY) between the dragged object's pos and the cursor at grab time.
+    drag_grab: [f64; 2],
 }
 
 impl App {
@@ -146,7 +150,30 @@ impl App {
             show_seams: false,
             needs_rebuild: true,
             refit_camera: true,
+            drag_obj: None,
+            drag_grab: [0.0, 0.0],
         }
+    }
+
+    /// Index of the object whose surface the ray (world origin/dir) first hits.
+    fn pick(&self, o: glam::Vec3, d: glam::Vec3) -> Option<usize> {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, obj) in self.objects.iter().enumerate() {
+            let t = obj.transform();
+            let v = |p: [f64; 3]| {
+                let q = t.apply(p);
+                glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
+            };
+            for k in 0..obj.mesh.triangles.len() {
+                let tri = obj.mesh.triangle(k);
+                if let Some(dist) = ray_triangle(o, d, v(tri[0]), v(tri[1]), v(tri[2])) {
+                    if best.map_or(true, |(bd, _)| dist < bd) {
+                        best = Some((dist, i));
+                    }
+                }
+            }
+        }
+        best.map(|(_, i)| i)
     }
 
     fn category_mask(&self) -> u32 {
@@ -535,11 +562,58 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            let aspect = rect.width() / rect.height().max(1.0);
+            let vp = self.camera.view_proj(aspect);
 
+            // Left-press on an object grabs it for dragging; on empty space, orbits.
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                self.drag_obj = None;
+                if let Some(p) = response.interact_pointer_pos() {
+                    let (o, d) = pointer_ray(vp, rect, p);
+                    if let Some(i) = self.pick(o, d) {
+                        self.selected = Some(i);
+                        self.drag_obj = Some(i);
+                        if let Some(xy) = ray_plane_z0(o, d) {
+                            let pos = self.objects[i].pos;
+                            self.drag_grab = [pos[0] - xy.x as f64, pos[1] - xy.y as f64];
+                        }
+                        self.needs_rebuild = true;
+                    }
+                }
+            }
             if response.dragged_by(egui::PointerButton::Primary) {
-                let d = response.drag_delta();
-                self.camera.orbit(d.x, d.y);
+                match self.drag_obj {
+                    Some(i) => {
+                        if let Some(p) = response.interact_pointer_pos() {
+                            let (o, d) = pointer_ray(vp, rect, p);
+                            if let Some(xy) = ray_plane_z0(o, d) {
+                                self.objects[i].pos =
+                                    [xy.x as f64 + self.drag_grab[0], xy.y as f64 + self.drag_grab[1]];
+                                self.needs_rebuild = true;
+                                self.sliced = None;
+                                self.view_preview = false;
+                            }
+                        }
+                    }
+                    None => {
+                        let d = response.drag_delta();
+                        self.camera.orbit(d.x, d.y);
+                    }
+                }
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.drag_obj = None;
+            }
+            // A plain click (no drag) selects the object under the cursor.
+            if response.clicked() {
+                if let Some(p) = response.interact_pointer_pos() {
+                    let (o, d) = pointer_ray(vp, rect, p);
+                    if let Some(i) = self.pick(o, d) {
+                        self.selected = Some(i);
+                        self.needs_rebuild = true;
+                    }
+                }
             }
             if response.dragged_by(egui::PointerButton::Secondary) {
                 let d = response.drag_delta();
@@ -556,7 +630,6 @@ impl eframe::App for App {
             let w = (rect.width() * ppp).round().max(1.0) as u32;
             let h = (rect.height() * ppp).round().max(1.0) as u32;
             self.scene.resize(&rs, w, h);
-            let aspect = rect.width() / rect.height().max(1.0);
             let show_mesh = !(self.view_preview && self.sliced.is_some());
             let preview = if self.view_preview && self.sliced.is_some() {
                 let n = self.layer_ends.len();
@@ -575,7 +648,7 @@ impl eframe::App for App {
             } else {
                 None
             };
-            self.scene.render(&rs, self.camera.view_proj(aspect), show_mesh, preview);
+            self.scene.render(&rs, vp, show_mesh, preview);
 
             ui.painter().image(
                 self.scene.texture_id(),
@@ -596,6 +669,48 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
             ui.selectable_value(current, Grid, "grid");
             ui.selectable_value(current, Concentric, "concentric");
         });
+}
+
+/// World-space ray (origin, normalized dir) through a screen position in `rect`.
+fn pointer_ray(vp: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> (glam::Vec3, glam::Vec3) {
+    let ndc_x = 2.0 * (pos.x - rect.left()) / rect.width().max(1.0) - 1.0;
+    let ndc_y = 1.0 - 2.0 * (pos.y - rect.top()) / rect.height().max(1.0);
+    let inv = vp.inverse();
+    let near = inv.project_point3(glam::Vec3::new(ndc_x, ndc_y, 0.0));
+    let far = inv.project_point3(glam::Vec3::new(ndc_x, ndc_y, 1.0));
+    (near, (far - near).normalize_or_zero())
+}
+
+/// Where a ray meets the bed plane z=0 (None if parallel or behind the origin).
+fn ray_plane_z0(o: glam::Vec3, d: glam::Vec3) -> Option<glam::Vec2> {
+    if d.z.abs() < 1e-6 {
+        return None;
+    }
+    let t = -o.z / d.z;
+    (t >= 0.0).then(|| (o + d * t).truncate())
+}
+
+/// Möller–Trumbore ray/triangle hit distance (either face), if the ray hits it.
+fn ray_triangle(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3, c: glam::Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = d.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-7 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = o - a;
+    let u = tv.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tv.cross(e1);
+    let v = d.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > 1e-4).then_some(t)
 }
 
 fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) {
@@ -771,5 +886,34 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Infill => [0.32, 0.62, 0.95],
         Support => [0.55, 0.40, 0.70],
         Bridge => [0.20, 0.85, 0.85],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ray_plane_and_triangle_math() {
+        let down = glam::Vec3::new(0.0, 0.0, -1.0);
+        // Straight down at (5,5) meets z=0 at (5,5).
+        let xy = ray_plane_z0(glam::Vec3::new(5.0, 5.0, 10.0), down).unwrap();
+        assert!((xy.x - 5.0).abs() < 1e-4 && (xy.y - 5.0).abs() < 1e-4);
+        // Triangle (0,0)-(10,0)-(0,10) on z=0: hit inside at (2,2), miss at (20,20).
+        let (a, b, c) =
+            (glam::Vec3::ZERO, glam::Vec3::new(10.0, 0.0, 0.0), glam::Vec3::new(0.0, 10.0, 0.0));
+        let t = ray_triangle(glam::Vec3::new(2.0, 2.0, 5.0), down, a, b, c).unwrap();
+        assert!((t - 5.0).abs() < 1e-4, "t={t}");
+        assert!(ray_triangle(glam::Vec3::new(20.0, 20.0, 5.0), down, a, b, c).is_none());
+    }
+
+    #[test]
+    fn euler_identity_and_z_rotation() {
+        assert_eq!(euler_matrix([0.0; 3]), mesh::Transform::IDENTITY.rotation);
+        // 90° about Z maps +X to +Y.
+        let r = euler_matrix([0.0, 0.0, 90.0]);
+        let t = mesh::Transform { rotation: r, ..Default::default() };
+        let p = t.apply_linear([1.0, 0.0, 0.0]);
+        assert!((p[0]).abs() < 1e-9 && (p[1] - 1.0).abs() < 1e-9, "{p:?}");
     }
 }
