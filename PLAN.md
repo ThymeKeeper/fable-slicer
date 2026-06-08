@@ -20,7 +20,7 @@ checkboxes and the status line as work lands. Architecture detail lives in
 | **Current milestone** | M5/M6 — bed layout + brick layering landed (atop M4 supports/arc/bridge) |
 | **Last updated** | 2026-06-08 |
 | **Builds / tests** | `cargo test` green (33 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | brick lift-ramp at base/top, concentric-fill brick mode, auto-orient (lay-flat), or M5 (variable layers, gyroid, 3MF, G2/G3) |
+| **Next action** | auto-orient (lay-flat), or M5 (variable layers, gyroid, 3MF, G2/G3) |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
@@ -106,7 +106,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] 3MF load (zip + XML): multi-object, transforms, embedded settings
 
 ### M6 — Advanced / parity
-- [~] **Brick layering** (opt-in, `brick_layers` + `brick_flow`): odd-indexed perimeters are lifted half a layer height (outer wall = index 0 stays put) so adjacent wall rings interlock like masonry — staggered inter-layer seams resist delamination. The lifted rings get a flow bump (default 1.05) to fuse into the valley; first/last layers are a flat transition/clamp. Per-path `z_offset_mm`/`flow` on `ToolPath`, honored by the emitter (Z + extrusion) and the 3D preview (beads shown lifted + fatter). **Brick-aware motion:** the planner prints the on-plane (low) phase fully before the lifted (high) phase (`order_layers` groups by Z phase), and any travel into/out of a lifted perimeter is forced to **retract + Z-hop** clear (≥ a full bead) so the nozzle never drags through a bead at the other Z — no more per-ring Z-bobbing. CLI `--brick`. **TODO:** concentric-fill-at-density mode for fully brick-packed solids.
+- [x] **Brick layering** (opt-in, `brick_layers` + `brick_flow`): odd-indexed perimeters are lifted half a layer height (outer wall = index 0 stays put) so adjacent wall rings interlock like masonry — staggered inter-layer seams resist delamination. The lifted rings get a flow bump (default 1.05) to fuse into the valley; first/last layers are a flat transition/clamp. Per-path `z_offset_mm`/`flow` on `ToolPath`, honored by the emitter (Z + extrusion) and the 3D preview (beads shown lifted + fatter). **Brick-aware motion:** the planner prints the on-plane (low) phase fully before the lifted (high) phase (`order_layers` groups by Z phase), and any travel into/out of a lifted perimeter is forced to **retract + Z-hop** clear (≥ a full bead) so the nozzle never drags through a bead at the other Z — no more per-ring Z-bobbing. CLI `--brick`.
 - [ ] Tree / organic supports
 - [ ] Arachne-style variable-width walls
 - [ ] Multi-material / multi-color (sequencing, prime tower)
