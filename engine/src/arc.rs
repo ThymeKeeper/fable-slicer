@@ -2,7 +2,8 @@
 //! bridge region with concentric arcs anchored on the supported edge, so each bead
 //! rests on already-printed material and the span prints without support.
 //!
-//! Coverage is tracked on a line-width grid; the arcs are analytic circular arcs.
+//! Coverage is tracked on a sub-line-width grid (finer than the ring spacing, for
+//! clean fan meets); rings are spaced one bead apart and the arcs are analytic.
 //! Multiple centers are seeded on the supported border (preferring concave
 //! corners) and their concentric rings grow outward in lockstep — so fans advance
 //! from several sides and meet in the middle, letting bridges span further than a
@@ -26,7 +27,8 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
     let Some(bb) = region.bounds() else {
         return Vec::new();
     };
-    let cell = lw.max(0.05);
+    let step = lw.max(0.05); // ring spacing — keep arcs one bead apart
+    let cell = (lw * 0.5).max(0.05); // finer coverage grid → cleaner fan meets + sampling
     let pad = lw * 2.0;
     let x0 = bb.min.x_mm() - pad;
     let y0 = bb.min.y_mm() - pad;
@@ -35,7 +37,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
     if nx < 2 || ny < 2 || nx.saturating_mul(ny) > 4_000_000 {
         return Vec::new();
     }
-    let g = Grid { x0, y0, cell, nx, ny };
+    let g = Grid { x0, y0, cell, step, nx, ny };
 
     let mut kind = vec![OUT; nx * ny];
     let mut owner = vec![0u32; nx * ny];
@@ -71,7 +73,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
             seeds = border_seeds(&kind, &owner, &g, rmax);
         }
         for (x, y) in seeds {
-            fronts.push(Front { x, y, r: cell, id: next_id, far: None, empty: 0 });
+            fronts.push(Front { x, y, r: step, id: next_id, far: None, empty: 0 });
             next_id += 1;
         }
     }
@@ -89,7 +91,7 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
                 break;
             }
             for (x, y) in seeds {
-                fronts.push(Front { x, y, r: cell, id: next_id, far: None, empty: 0 });
+                fronts.push(Front { x, y, r: step, id: next_id, far: None, empty: 0 });
                 next_id += 1;
             }
         }
@@ -105,11 +107,11 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
             }
             let (grew, ring_far) = draw_ring(f, region, &g, &kind, &mut owner, &mut unfilled, &mut arcs, seam_overlap);
             if grew {
-                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: ring_far.or(f.far), empty: 0 });
+                next.push(Front { x: f.x, y: f.y, r: f.r + step, id: f.id, far: ring_far.or(f.far), empty: 0 });
             } else if f.empty + 1 < EMPTY_LIMIT {
                 // No new coverage at this radius — keep probing outward (e.g. past
                 // the covered perimeter strip) before declaring the fan done.
-                next.push(Front { x: f.x, y: f.y, r: f.r + cell, id: f.id, far: f.far, empty: f.empty + 1 });
+                next.push(Front { x: f.x, y: f.y, r: f.r + step, id: f.id, far: f.far, empty: f.empty + 1 });
             } else {
                 chain_spawn(f.far, &g, &kind, &owner, &mut next, &mut next_id);
             }
@@ -141,7 +143,7 @@ fn chain_spawn(far: Option<(f64, f64)>, g: &Grid, kind: &[u8], owner: &[u32], ne
     if let Some((fx, fy)) = far {
         if let Some(ci) = g.index(fx, fy) {
             if has_unfilled_neighbour(g, kind, owner, ci) {
-                next.push(Front { x: fx, y: fy, r: g.cell, id: *next_id, far: None, empty: 0 });
+                next.push(Front { x: fx, y: fy, r: g.step, id: *next_id, far: None, empty: 0 });
                 *next_id += 1;
             }
         }
@@ -161,7 +163,10 @@ fn has_unfilled_neighbour(g: &Grid, kind: &[u8], owner: &[u32], ci: usize) -> bo
 struct Grid {
     x0: f64,
     y0: f64,
+    /// Coverage-grid resolution (finer than a bead for clean fan meets/sampling).
     cell: f64,
+    /// Radial spacing between concentric arc rings (≈ one line width).
+    step: f64,
     nx: usize,
     ny: usize,
 }
@@ -220,17 +225,33 @@ fn draw_ring(f: &Front, region: &Polygons, g: &Grid, kind: &[u8], owner: &mut [u
         runs.push((pts, cells, has_new));
     }
 
-    // Mark the new runs' cells as this fan's, then pick a frontier point (a just-
-    // printed cell still bordering unfilled region) as the fan's next center.
+    // Claim each run's cells, then pick a frontier point (a just-printed cell still
+    // bordering unfilled region) as the fan's next center. Because the grid is finer
+    // than the ring spacing, claim the bead's full radial footprint (±half a ring
+    // spacing) so consecutive rings leave no unfilled cells between their centers.
+    let half = g.step * 0.5;
     let mut emitted: Vec<(Vec<Point>, Vec<usize>)> = Vec::new();
     for (p, c, new) in runs {
         if p.len() < 2 || !new {
             continue;
         }
-        for &ci in &c {
-            if owner[ci] == 0 {
-                owner[ci] = f.id;
-                *unfilled -= 1;
+        for pt in &p {
+            let (px, py) = (pt.x_mm(), pt.y_mm());
+            let (dx, dy) = (px - f.x, py - f.y);
+            let rr = (dx * dx + dy * dy).sqrt();
+            if rr < 1.0e-6 {
+                continue;
+            }
+            let (ux, uy) = (dx / rr, dy / rr);
+            let mut t = -half;
+            while t <= half + 1.0e-9 {
+                if let Some(ci) = g.index(px + ux * t, py + uy * t) {
+                    if kind[ci] == REGION && owner[ci] == 0 {
+                        owner[ci] = f.id;
+                        *unfilled -= 1;
+                    }
+                }
+                t += g.cell;
             }
         }
         emitted.push((p, c));
