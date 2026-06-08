@@ -111,6 +111,8 @@ struct App {
     drag_obj: Option<usize>,
     /// Offset (bed XY) between the dragged object's pos and the cursor at grab time.
     drag_grab: [f64; 2],
+    /// Screen rect of the transform overlay (so viewport input ignores clicks on it).
+    overlay_rect: Option<egui::Rect>,
 }
 
 impl App {
@@ -152,6 +154,7 @@ impl App {
             refit_camera: true,
             drag_obj: None,
             drag_grab: [0.0, 0.0],
+            overlay_rect: None,
         }
     }
 
@@ -411,40 +414,6 @@ impl eframe::App for App {
                 }
             }
 
-            // Transform controls for the selected object.
-            if let Some(i) = self.selected {
-                let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
-                let obj = &mut self.objects[i];
-                let mut changed = false;
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label("move");
-                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[0]).speed(0.5).prefix("X ")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[1]).speed(0.5).prefix("Y ")).changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("rot°");
-                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[0]).speed(1.0).prefix("X ")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[1]).speed(1.0).prefix("Y ")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[2]).speed(1.0).prefix("Z ")).changed();
-                });
-                changed |= ui.add(egui::Slider::new(&mut obj.scale, 0.1..=5.0).text("scale")).changed();
-                ui.horizontal(|ui| {
-                    if ui.button("Center").clicked() {
-                        obj.pos = [bx / 2.0, by / 2.0];
-                        changed = true;
-                    }
-                    if ui.button("Reset rot").clicked() {
-                        obj.rot_deg = [0.0; 3];
-                        changed = true;
-                    }
-                });
-                if changed {
-                    self.needs_rebuild = true;
-                    self.sliced = None;
-                    self.view_preview = false;
-                }
-            }
             ui.separator();
 
             let printers: Vec<String> = self.profiles.printer_names().iter().map(|s| s.to_string()).collect();
@@ -566,8 +535,14 @@ impl eframe::App for App {
             let aspect = rect.width() / rect.height().max(1.0);
             let vp = self.camera.view_proj(aspect);
 
+            // Ignore viewport input when the cursor is over the transform overlay.
+            let blocked = match (self.overlay_rect, ui.ctx().pointer_interact_pos()) {
+                (Some(r), Some(p)) => r.contains(p),
+                _ => false,
+            };
+
             // Left-press on an object grabs it for dragging; on empty space, orbits.
-            if response.drag_started_by(egui::PointerButton::Primary) {
+            if !blocked && response.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
@@ -597,22 +572,22 @@ impl eframe::App for App {
                         }
                     }
                     None => {
-                        let d = response.drag_delta();
-                        self.camera.orbit(d.x, d.y);
+                        if !blocked {
+                            let d = response.drag_delta();
+                            self.camera.orbit(d.x, d.y);
+                        }
                     }
                 }
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
             }
-            // A plain click (no drag) selects the object under the cursor.
-            if response.clicked() {
+            // A plain click selects the object under the cursor, or deselects on empty.
+            if !blocked && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
-                    if let Some(i) = self.pick(o, d) {
-                        self.selected = Some(i);
-                        self.needs_rebuild = true;
-                    }
+                    self.selected = self.pick(o, d);
+                    self.needs_rebuild = true;
                 }
             }
             if response.dragged_by(egui::PointerButton::Secondary) {
@@ -656,6 +631,54 @@ impl eframe::App for App {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+
+            // Floating translucent transform panel — only while an object is selected.
+            if let Some(i) = self.selected {
+                let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+                let mut changed = false;
+                let area = egui::Area::new(egui::Id::new("transform_overlay"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 205))
+                            .show(ui, |ui| {
+                                ui.set_max_width(210.0);
+                                let obj = &mut self.objects[i];
+                                ui.label(egui::RichText::new(obj.name.as_str()).strong());
+                                ui.horizontal(|ui| {
+                                    ui.label("move");
+                                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[0]).speed(0.5).prefix("X ")).changed();
+                                    changed |= ui.add(egui::DragValue::new(&mut obj.pos[1]).speed(0.5).prefix("Y ")).changed();
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("rot°");
+                                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[0]).speed(1.0).prefix("X ")).changed();
+                                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[1]).speed(1.0).prefix("Y ")).changed();
+                                    changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[2]).speed(1.0).prefix("Z ")).changed();
+                                });
+                                changed |= ui.add(egui::Slider::new(&mut obj.scale, 0.1..=5.0).text("scale")).changed();
+                                ui.horizontal(|ui| {
+                                    if ui.button("Center").clicked() {
+                                        obj.pos = [bx / 2.0, by / 2.0];
+                                        changed = true;
+                                    }
+                                    if ui.button("Reset rot").clicked() {
+                                        obj.rot_deg = [0.0; 3];
+                                        changed = true;
+                                    }
+                                });
+                            });
+                    });
+                self.overlay_rect = Some(area.response.rect);
+                if changed {
+                    self.needs_rebuild = true;
+                    self.sliced = None;
+                    self.view_preview = false;
+                }
+            } else {
+                self.overlay_rect = None;
+            }
         });
     }
 }
