@@ -157,7 +157,8 @@ pub struct Settings {
     /// Brick layering: stagger odd-indexed perimeters by half a layer height so
     /// adjacent wall rings interlock (the outer wall stays put).
     pub brick_layers: bool,
-    /// Extrusion-flow multiplier for the lifted brick perimeters (fuse the valley).
+    /// Extrusion-flow multiplier for the lifted brick perimeters — fills the diagonal
+    /// gaps between staggered beads so they mesh.
     pub brick_flow: f64,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
     pub infill_density: f64,

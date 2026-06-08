@@ -540,7 +540,7 @@ impl eframe::App for App {
                     ui.checkbox(&mut s.brick_layers, "brick layers")
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.");
                     ui.add_enabled(s.brick_layers, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
-                        .on_hover_text("Extra extrusion on the lifted brick perimeters so they fuse down into the valley.");
+                        .on_hover_text("Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
                 });
                 egui::CollapsingHeader::new("Infill").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))

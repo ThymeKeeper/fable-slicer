@@ -44,7 +44,7 @@ pub struct ToolPath {
     /// perimeters by half a layer). 0 for everything else.
     pub z_offset_mm: f64,
     /// Extrusion-flow multiplier for this path (brick layering bumps the lifted
-    /// perimeters so they fuse into the valley). 1.0 = normal.
+    /// perimeters to fill the diagonal gaps between staggered beads). 1.0 = normal.
     pub flow: f64,
 }
 
@@ -116,8 +116,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
             // Brick layering: lift odd-indexed perimeters by half a layer (outer
             // wall = index 0 stays put), so adjacent rings interlock like masonry;
-            // a flow bump fuses the lifted bead into the valley. Skip the first and
-            // last layers (base transition + top clamp).
+            // a flow bump fills the diagonal gaps between the staggered beads. Skip
+            // the first and last layers (base transition + top clamp).
             let brick = settings.brick_layers && w % 2 == 1 && layer.index > 0 && layer.index + 1 < n;
             let (z_offset_mm, flow) = if brick {
                 (0.5 * settings.layer_height_mm, settings.brick_flow)
