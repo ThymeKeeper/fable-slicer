@@ -265,7 +265,7 @@ impl Default for Settings {
             support_interface_layers: 2,
             max_bridge_span_mm: 6.0,
             max_arc_radius_mm: 40.0,
-            arc_seam_overlap_mm: 0.2,
+            arc_seam_overlap_mm: 0.1,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
