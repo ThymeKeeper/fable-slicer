@@ -419,12 +419,21 @@ fn order_layers(plans: &mut [LayerPlan]) {
         if let Some(last) = prime.last() {
             cur = path_end(last);
         }
-        let ordered = order_paths(rest, cur);
-        if let Some(last) = ordered.last() {
-            cur = path_end(last);
-        }
+        // Brick layering prints the on-plane (low) phase fully before the lifted
+        // (high) phase, so a travel never crosses a bead at a different Z. Without
+        // brick, `high` is empty and this is the usual single-pass ordering.
+        let (low, high): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| p.z_offset_mm == 0.0);
         let mut paths = prime;
-        paths.extend(ordered);
+        for group in [low, high] {
+            if group.is_empty() {
+                continue;
+            }
+            let ordered = order_paths(group, cur);
+            if let Some(last) = ordered.last() {
+                cur = path_end(last);
+            }
+            paths.extend(ordered);
+        }
         plan.paths = paths;
     }
 }
@@ -833,6 +842,22 @@ mod tests {
         assert!(lifted, "an odd inner perimeter should be brick-lifted");
         // First layer is a base transition — nothing lifted.
         assert!(layers[0].paths.iter().all(|p| p.z_offset_mm == 0.0), "base layer is flat");
+    }
+
+    #[test]
+    fn brick_orders_low_phase_first_and_hops() {
+        let m = Mesh::cube(20.0);
+        let mut s = Settings::default();
+        s.brick_layers = true;
+        s.wall_count = 4;
+        let layers = generate(&m, &s);
+        let mid = &layers[50];
+        let first_high = mid.paths.iter().position(|p| p.z_offset_mm > 0.0).expect("lifted perimeters");
+        // Low (on-plane) phase entirely precedes the contiguous high (lifted) phase.
+        assert!(mid.paths[..first_high].iter().all(|p| p.z_offset_mm == 0.0), "low phase first");
+        assert!(mid.paths[first_high..].iter().all(|p| p.z_offset_mm > 0.0), "high phase contiguous");
+        // The travel reaching the first lifted perimeter hops clear of the low beads.
+        assert!(mid.travels[first_high].hop, "phase-boundary travel hops");
     }
 
     #[test]

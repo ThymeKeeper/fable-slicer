@@ -308,8 +308,13 @@ impl App {
             return;
         };
         let layers = generate(&m, &self.settings);
-        let (verts, ends, joints, joint_ends) =
-            build_instances(&layers, self.settings.z_hop_mm as f32);
+        // Match the emitter's brick-aware hop height so preview travels line up.
+        let hop = if self.settings.brick_layers {
+            self.settings.z_hop_mm.max(self.settings.layer_height_mm + 0.25)
+        } else {
+            self.settings.z_hop_mm
+        };
+        let (verts, ends, joints, joint_ends) = build_instances(&layers, hop as f32);
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
         let n = layers.len();
