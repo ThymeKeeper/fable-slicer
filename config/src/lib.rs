@@ -197,6 +197,8 @@ pub struct Settings {
     pub print_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
     pub first_layer_speed_mm_s: f64,
+    /// Speed (mm/s) for bridges and arc overhangs — slow so each bead solidifies.
+    pub bridge_speed_mm_s: f64,
     /// Minimum time per layer (s); thin layers are slowed to allow cooling.
     pub min_layer_time_s: f64,
     /// Floor speed (mm/s) when slowing for min-layer-time.
@@ -247,6 +249,7 @@ impl Default for Settings {
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
             first_layer_speed_mm_s: 20.0,
+            bridge_speed_mm_s: 15.0,
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             start_gcode: GENERIC_START_GCODE.to_string(),

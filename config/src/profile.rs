@@ -74,6 +74,7 @@ pub struct ProcessProfile {
     pub max_arc_radius_mm: Option<f64>,
     pub print_speed_mm_s: Option<f64>,
     pub first_layer_speed_mm_s: Option<f64>,
+    pub bridge_speed_mm_s: Option<f64>,
     pub min_layer_time_s: Option<f64>,
     pub min_print_speed_mm_s: Option<f64>,
 }
@@ -122,7 +123,7 @@ impl Tier for ProcessProfile {
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, print_speed_mm_s, first_layer_speed_mm_s,
-            min_layer_time_s, min_print_speed_mm_s)
+            bridge_speed_mm_s, min_layer_time_s, min_print_speed_mm_s)
     }
 }
 
@@ -218,6 +219,7 @@ impl Profiles {
             print_speed_mm_s: pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s),
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
             first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
+            bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),

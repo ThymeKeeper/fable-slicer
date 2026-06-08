@@ -291,6 +291,9 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"));
                     ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"));
                     ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"));
+                    ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"));
+                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel mm/s²"));
+                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"));
                 });
                 egui::CollapsingHeader::new("Support").default_open(true).show(ui, |ui| {
                     support_combo(ui, &mut s.support_mode);
@@ -324,8 +327,6 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"));
                     ui.add(egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0).text("bed Y mm"));
                     ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"));
-                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel"));
-                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk"));
                 });
                 ui.add_space(6.0);
                 ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
