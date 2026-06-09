@@ -68,8 +68,13 @@ pub enum InfillPattern {
     Lines,
     /// Two perpendicular sets of lines.
     Grid,
+    /// Three sets of lines at 60° to each other.
+    Triangles,
     /// Loops following the region boundary inward.
     Concentric,
+    /// The gyroid minimal surface's level set — strong in every direction,
+    /// self-crossing-free per layer, and printable without retractions.
+    Gyroid,
 }
 
 impl InfillPattern {
@@ -77,7 +82,9 @@ impl InfillPattern {
         match s.to_ascii_lowercase().as_str() {
             "lines" | "line" | "rectilinear" => Some(Self::Lines),
             "grid" => Some(Self::Grid),
+            "triangles" | "triangle" => Some(Self::Triangles),
             "concentric" => Some(Self::Concentric),
+            "gyroid" => Some(Self::Gyroid),
             _ => None,
         }
     }
@@ -85,7 +92,9 @@ impl InfillPattern {
         match self {
             Self::Lines => "lines",
             Self::Grid => "grid",
+            Self::Triangles => "triangles",
             Self::Concentric => "concentric",
+            Self::Gyroid => "gyroid",
         }
     }
 }
@@ -166,6 +175,39 @@ pub struct Settings {
     pub sparse_pattern: InfillPattern,
     /// Pattern for solid (top/bottom) interior infill.
     pub solid_pattern: InfillPattern,
+    /// How far infill lines push into the innermost wall bead, as a fraction of
+    /// the line width (0..~0.5). A little overlap bonds infill to the walls.
+    pub infill_overlap: f64,
+    /// Print solid-fill lines in monotonic order (strict sweep across each
+    /// region) so top surfaces get an even sheen without overlap ridges.
+    pub monotonic_solid: bool,
+    /// Fill gaps too thin for normal infill (between/inside walls) with single
+    /// width-matched strokes.
+    pub gap_fill: bool,
+    /// Jitter external perimeters for a rough "fuzzy" surface texture.
+    pub fuzzy_skin: bool,
+    /// Total jitter band (mm) for fuzzy skin, centered on the wall line.
+    pub fuzzy_skin_thickness_mm: f64,
+    /// Approximate spacing (mm) between fuzzy-skin jitter points.
+    pub fuzzy_skin_point_dist_mm: f64,
+    /// Iron top surfaces: re-traverse them with a hot nozzle and a trickle of
+    /// flow to melt ridges flat.
+    pub ironing: bool,
+    /// Ironing extrusion as a fraction of a normal line's flow at that spacing.
+    pub ironing_flow: f64,
+    /// Spacing (mm) between ironing passes.
+    pub ironing_spacing_mm: f64,
+    /// Ironing speed (mm/s).
+    pub ironing_speed_mm_s: f64,
+    /// Shrink the first layer's outline inward by this much (mm) to counter
+    /// first-layer squish ("elephant foot"). 0 disables.
+    pub elephant_foot_mm: f64,
+    /// Grow (+) or shrink (−) every layer's outline by this much (mm) to dial in
+    /// dimensional accuracy. 0 disables.
+    pub xy_compensation_mm: f64,
+    /// Spiral-vase mode: one continuously rising outer wall, no infill or top
+    /// shells above the solid bottom. Forces 1 wall / 0% infill / no supports.
+    pub spiral_vase: bool,
     /// Number of skirt loops around the first layer (0 disables).
     pub skirt_loops: usize,
     /// Gap between the skirt and the model (mm).
@@ -216,12 +258,38 @@ pub struct Settings {
     pub print_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
     pub first_layer_speed_mm_s: f64,
+    /// Speed (mm/s) for the outermost wall — slow for surface quality.
+    pub external_perimeter_speed_mm_s: f64,
+    /// Speed (mm/s) for solid top/bottom fill.
+    pub solid_speed_mm_s: f64,
+    /// Speed (mm/s) for support structure.
+    pub support_speed_mm_s: f64,
+    /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
+    pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for bridges and arc overhangs — slow so each bead solidifies.
     pub bridge_speed_mm_s: f64,
     /// Minimum time per layer (s); thin layers are slowed to allow cooling.
     pub min_layer_time_s: f64,
     /// Floor speed (mm/s) when slowing for min-layer-time.
     pub min_print_speed_mm_s: f64,
+
+    // --- flow ---
+    /// Global extrusion multiplier (filament-specific flow tuning). 1.0 = nominal.
+    pub extrusion_multiplier: f64,
+    /// Flow multiplier for bridges and arc overhangs (slight under-extrusion can
+    /// tighten sagging strands). 1.0 = nominal.
+    pub bridge_flow: f64,
+    /// Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE after the start
+    /// g-code when > 0. 0 leaves the printer's configured value untouched.
+    pub pressure_advance: f64,
+
+    // --- cooling ---
+    /// Part-cooling fan duty for normal printing, 0.0..=1.0.
+    pub fan_speed: f64,
+    /// Fan duty while printing bridges / arc overhangs (usually maxed).
+    pub bridge_fan_speed: f64,
+    /// Keep the fan off for this many initial layers (adhesion).
+    pub fan_off_layers: usize,
 
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
@@ -253,6 +321,19 @@ impl Default for Settings {
             infill_density: 0.15,
             sparse_pattern: InfillPattern::default(),
             solid_pattern: InfillPattern::default(),
+            infill_overlap: 0.25,
+            monotonic_solid: true,
+            gap_fill: true,
+            fuzzy_skin: false,
+            fuzzy_skin_thickness_mm: 0.3,
+            fuzzy_skin_point_dist_mm: 0.8,
+            ironing: false,
+            ironing_flow: 0.15,
+            ironing_spacing_mm: 0.15,
+            ironing_speed_mm_s: 30.0,
+            elephant_foot_mm: 0.0,
+            xy_compensation_mm: 0.0,
+            spiral_vase: false,
             skirt_loops: 2,
             skirt_gap_mm: 3.0,
             brim_loops: 0,
@@ -275,9 +356,19 @@ impl Default for Settings {
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
             first_layer_speed_mm_s: 20.0,
+            external_perimeter_speed_mm_s: 25.0,
+            solid_speed_mm_s: 40.0,
+            support_speed_mm_s: 45.0,
+            gap_fill_speed_mm_s: 20.0,
             bridge_speed_mm_s: 15.0,
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
+            extrusion_multiplier: 1.0,
+            bridge_flow: 1.0,
+            pressure_advance: 0.0,
+            fan_speed: 1.0,
+            bridge_fan_speed: 1.0,
+            fan_off_layers: 1,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }

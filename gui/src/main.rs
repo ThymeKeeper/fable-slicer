@@ -529,6 +529,26 @@ impl eframe::App for App {
                         .on_hover_text("Emit curved toolpaths as G2/G3 arcs — smaller g-code, smoother motion. Needs firmware arc support (Klipper [gcode_arcs]).");
                     ui.add_enabled(s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2).text("arc tol mm"))
                         .on_hover_text("Max deviation a point may have from a fitted arc to be folded into it.");
+                    ui.add(egui::Slider::new(&mut s.elephant_foot_mm, 0.0..=0.5).text("elephant foot mm"))
+                        .on_hover_text("Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
+                    ui.add(egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5).text("XY comp mm"))
+                        .on_hover_text("Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
+                    ui.checkbox(&mut s.ironing, "ironing")
+                        .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.");
+                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5).text("ironing flow"))
+                        .on_hover_text("Ironing extrusion as a fraction of a normal line at that spacing.");
+                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5).text("ironing spacing mm"))
+                        .on_hover_text("Distance between ironing passes — finer is smoother and slower.");
+                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0).text("ironing mm/s"))
+                        .on_hover_text("Ironing pass speed.");
+                    ui.checkbox(&mut s.fuzzy_skin, "fuzzy skin")
+                        .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).");
+                    ui.add_enabled(s.fuzzy_skin, egui::Slider::new(&mut s.fuzzy_skin_thickness_mm, 0.05..=1.0).text("fuzzy thickness mm"))
+                        .on_hover_text("Total jitter band, centered on the wall line.");
+                    ui.add_enabled(s.fuzzy_skin, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0).text("fuzzy point dist mm"))
+                        .on_hover_text("Spacing between jittered points — smaller is noisier.");
+                    ui.checkbox(&mut s.spiral_vase, "spiral vase")
+                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports.");
                 });
                 egui::CollapsingHeader::new("Walls & top/bottom").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
@@ -537,6 +557,10 @@ impl eframe::App for App {
                         .on_hover_text("Number of solid layers on top surfaces.");
                     ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"))
                         .on_hover_text("Number of solid layers on bottom surfaces.");
+                    ui.checkbox(&mut s.gap_fill, "gap fill")
+                        .on_hover_text("Fill gaps too thin for walls/infill with single width-matched strokes.");
+                    ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
+                        .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
                     ui.checkbox(&mut s.brick_layers, "brick layers")
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.");
                     ui.add_enabled(s.brick_layers, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
@@ -551,10 +575,20 @@ impl eframe::App for App {
                     });
                     pattern_combo(ui, "solid fill", &mut s.solid_pattern)
                         .on_hover_text("Pattern for the solid top/bottom layers.");
+                    ui.add(egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5).text("wall overlap"))
+                        .on_hover_text("How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });
                 egui::CollapsingHeader::new("Speed").show(ui, |ui| {
                     ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"))
-                        .on_hover_text("Default printing speed for walls, infill, etc.");
+                        .on_hover_text("Default printing speed for inner walls and sparse infill.");
+                    ui.add(egui::Slider::new(&mut s.external_perimeter_speed_mm_s, 5.0..=200.0).text("outer wall mm/s"))
+                        .on_hover_text("Speed for the visible outermost wall — slower is cleaner.");
+                    ui.add(egui::Slider::new(&mut s.solid_speed_mm_s, 5.0..=200.0).text("solid mm/s"))
+                        .on_hover_text("Speed for solid top/bottom fill.");
+                    ui.add(egui::Slider::new(&mut s.support_speed_mm_s, 5.0..=200.0).text("support mm/s"))
+                        .on_hover_text("Speed for support structure.");
+                    ui.add(egui::Slider::new(&mut s.gap_fill_speed_mm_s, 5.0..=100.0).text("gap fill mm/s"))
+                        .on_hover_text("Speed for thin gap-fill strokes.");
                     ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"))
                         .on_hover_text("Speed for the first layer — slower improves bed adhesion.");
                     ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"))
@@ -601,8 +635,20 @@ impl eframe::App for App {
                         .on_hover_text("Hotend temperature.");
                     ui.add(egui::Slider::new(&mut s.bed_temp_c, 0..=120).text("bed °C"))
                         .on_hover_text("Heated bed temperature.");
+                    ui.add(egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2).text("flow ×"))
+                        .on_hover_text("Global extrusion multiplier — filament-specific flow tuning.");
+                    ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
+                        .on_hover_text("Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
+                    ui.add(egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2).text("pressure advance"))
+                        .on_hover_text("Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
                 });
                 egui::CollapsingHeader::new("Cooling").show(ui, |ui| {
+                    ui.add(egui::Slider::new(&mut s.fan_speed, 0.0..=1.0).text("fan"))
+                        .on_hover_text("Part-cooling fan duty while printing.");
+                    ui.add(egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0).text("bridge fan"))
+                        .on_hover_text("Fan duty on bridges and arc overhangs — usually maxed.");
+                    ui.add(egui::Slider::new(&mut s.fan_off_layers, 0..=5).text("fan off layers"))
+                        .on_hover_text("Keep the fan off for this many first layers (bed adhesion).");
                     ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
                         .on_hover_text("Minimum time per layer; thin layers slow down to allow cooling.");
                     ui.add_enabled(s.min_layer_time_s > 0.0, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
@@ -794,7 +840,9 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
         .show_ui(ui, |ui| {
             ui.selectable_value(current, Lines, "lines");
             ui.selectable_value(current, Grid, "grid");
+            ui.selectable_value(current, Triangles, "triangles");
             ui.selectable_value(current, Concentric, "concentric");
+            ui.selectable_value(current, Gyroid, "gyroid");
         })
         .response
 }
@@ -1003,8 +1051,8 @@ fn category_of(kind: engine::PathKind) -> f32 {
     use engine::PathKind::*;
     match kind {
         Skirt => CAT_SKIRT,
-        ExternalPerimeter | Perimeter => CAT_WALLS,
-        Solid => CAT_SOLID,
+        ExternalPerimeter | Perimeter | GapFill => CAT_WALLS,
+        Solid | Ironing => CAT_SOLID,
         Infill => CAT_INFILL,
         Support | Bridge => CAT_SUPPORT,
     }
@@ -1018,6 +1066,8 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Perimeter => [0.36, 0.80, 0.45],
         Solid => [0.94, 0.80, 0.24],
         Infill => [0.32, 0.62, 0.95],
+        GapFill => [0.95, 0.45, 0.55],
+        Ironing => [0.85, 0.85, 0.55],
         Support => [0.55, 0.40, 0.70],
         Bridge => [0.20, 0.85, 0.85],
     }

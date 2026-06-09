@@ -35,7 +35,7 @@ pub struct PrinterProfile {
     pub end_gcode: Option<String>,
 }
 
-/// Filament (material) tier: diameter and temperatures.
+/// Filament (material) tier: diameter, temperatures, flow, and cooling.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FilamentProfile {
@@ -44,6 +44,11 @@ pub struct FilamentProfile {
     pub density_g_cm3: Option<f64>,
     pub nozzle_temp_c: Option<u32>,
     pub bed_temp_c: Option<u32>,
+    pub extrusion_multiplier: Option<f64>,
+    pub pressure_advance: Option<f64>,
+    pub fan_speed: Option<f64>,
+    pub bridge_fan_speed: Option<f64>,
+    pub fan_off_layers: Option<usize>,
 }
 
 /// Process (print) tier: quality/geometry knobs.
@@ -83,6 +88,24 @@ pub struct ProcessProfile {
     pub bridge_speed_mm_s: Option<f64>,
     pub min_layer_time_s: Option<f64>,
     pub min_print_speed_mm_s: Option<f64>,
+    pub infill_overlap: Option<f64>,
+    pub monotonic_solid: Option<bool>,
+    pub gap_fill: Option<bool>,
+    pub fuzzy_skin: Option<bool>,
+    pub fuzzy_skin_thickness_mm: Option<f64>,
+    pub fuzzy_skin_point_dist_mm: Option<f64>,
+    pub ironing: Option<bool>,
+    pub ironing_flow: Option<f64>,
+    pub ironing_spacing_mm: Option<f64>,
+    pub ironing_speed_mm_s: Option<f64>,
+    pub elephant_foot_mm: Option<f64>,
+    pub xy_compensation_mm: Option<f64>,
+    pub spiral_vase: Option<bool>,
+    pub external_perimeter_speed_mm_s: Option<f64>,
+    pub solid_speed_mm_s: Option<f64>,
+    pub support_speed_mm_s: Option<f64>,
+    pub gap_fill_speed_mm_s: Option<f64>,
+    pub bridge_flow: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -115,7 +138,8 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, bed_temp_c)
+        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, bed_temp_c,
+            extrusion_multiplier, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers)
     }
 }
 
@@ -131,7 +155,13 @@ impl Tier for ProcessProfile {
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm, print_speed_mm_s, first_layer_speed_mm_s,
-            bridge_speed_mm_s, min_layer_time_s, min_print_speed_mm_s)
+            bridge_speed_mm_s, min_layer_time_s, min_print_speed_mm_s,
+            infill_overlap, monotonic_solid, gap_fill,
+            fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
+            ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
+            elephant_foot_mm, xy_compensation_mm, spiral_vase,
+            external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
+            gap_fill_speed_mm_s, bridge_flow)
     }
 }
 
@@ -186,6 +216,8 @@ impl Profiles {
         let fl = resolve_tier(&self.filaments, filament, "filament")?;
         let pc = resolve_tier(&self.processes, process, "process")?;
         let d = Settings::default();
+        // Printer speed (machine default) takes precedence over the process value.
+        let print_v = pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s);
         Ok(Settings {
             nozzle_diameter_mm: pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm),
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
@@ -209,6 +241,19 @@ impl Profiles {
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
+            infill_overlap: pc.infill_overlap.unwrap_or(d.infill_overlap),
+            monotonic_solid: pc.monotonic_solid.unwrap_or(d.monotonic_solid),
+            gap_fill: pc.gap_fill.unwrap_or(d.gap_fill),
+            fuzzy_skin: pc.fuzzy_skin.unwrap_or(d.fuzzy_skin),
+            fuzzy_skin_thickness_mm: pc.fuzzy_skin_thickness_mm.unwrap_or(d.fuzzy_skin_thickness_mm),
+            fuzzy_skin_point_dist_mm: pc.fuzzy_skin_point_dist_mm.unwrap_or(d.fuzzy_skin_point_dist_mm),
+            ironing: pc.ironing.unwrap_or(d.ironing),
+            ironing_flow: pc.ironing_flow.unwrap_or(d.ironing_flow),
+            ironing_spacing_mm: pc.ironing_spacing_mm.unwrap_or(d.ironing_spacing_mm),
+            ironing_speed_mm_s: pc.ironing_speed_mm_s.unwrap_or(d.ironing_speed_mm_s),
+            elephant_foot_mm: pc.elephant_foot_mm.unwrap_or(d.elephant_foot_mm),
+            xy_compensation_mm: pc.xy_compensation_mm.unwrap_or(d.xy_compensation_mm),
+            spiral_vase: pc.spiral_vase.unwrap_or(d.spiral_vase),
             skirt_loops: pc.skirt_loops.unwrap_or(d.skirt_loops),
             skirt_gap_mm: pc.skirt_gap_mm.unwrap_or(d.skirt_gap_mm),
             brim_loops: pc.brim_loops.unwrap_or(d.brim_loops),
@@ -230,13 +275,25 @@ impl Profiles {
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
-            // Printer speed (machine default) takes precedence over the process value.
-            print_speed_mm_s: pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s),
+            print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
             first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
+            // Per-feature speeds scale with the machine's print speed when the
+            // profile doesn't pin them (a Voron's outer wall shouldn't crawl at
+            // an Ender's pace just because the default table says 25).
+            external_perimeter_speed_mm_s: pc.external_perimeter_speed_mm_s.unwrap_or(print_v * 0.5),
+            solid_speed_mm_s: pc.solid_speed_mm_s.unwrap_or(print_v * 0.8),
+            support_speed_mm_s: pc.support_speed_mm_s.unwrap_or(print_v * 0.9),
+            gap_fill_speed_mm_s: pc.gap_fill_speed_mm_s.unwrap_or((print_v * 0.4).min(40.0)),
             bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
+            extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
+            bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
+            pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
+            fan_speed: fl.fan_speed.unwrap_or(d.fan_speed),
+            bridge_fan_speed: fl.bridge_fan_speed.unwrap_or(d.bridge_fan_speed),
+            fan_off_layers: fl.fan_off_layers.unwrap_or(d.fan_off_layers),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })

@@ -11,6 +11,7 @@
 
 mod arc;
 mod emit;
+mod fill;
 mod plan;
 mod slice;
 

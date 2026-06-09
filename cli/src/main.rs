@@ -58,15 +58,33 @@ struct Args {
     /// Seam placement: nearest | sharpest | random.
     #[arg(long)]
     seam: Option<String>,
-    /// Sparse infill pattern: lines | grid | concentric.
+    /// Sparse infill pattern: lines | grid | triangles | concentric | gyroid.
     #[arg(long)]
     sparse_infill: Option<String>,
-    /// Solid infill pattern: lines | grid | concentric.
+    /// Solid infill pattern: lines | grid | triangles | concentric | gyroid.
     #[arg(long)]
     solid_infill: Option<String>,
     /// Support mode: none | grid | arc.
     #[arg(long)]
     support: Option<String>,
+    /// Spiral vase mode: one continuously rising wall, no infill above the bottom.
+    #[arg(long)]
+    vase: bool,
+    /// Fuzzy skin: jitter the outer wall for a rough surface texture.
+    #[arg(long)]
+    fuzzy_skin: bool,
+    /// Iron top surfaces with a low-flow smoothing pass.
+    #[arg(long)]
+    ironing: bool,
+    /// Disable gap fill (thin-sliver strokes between walls).
+    #[arg(long)]
+    no_gap_fill: bool,
+    /// Shrink the first layer outline by this much (mm) to counter squish.
+    #[arg(long)]
+    elephant_foot: Option<f64>,
+    /// Grow (+) / shrink (−) every layer outline by this much (mm).
+    #[arg(long)]
+    xy_compensation: Option<f64>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
     #[arg(long)]
@@ -167,6 +185,24 @@ fn main() -> Result<()> {
     if args.arc_fitting {
         settings.arc_fitting = true;
     }
+    if args.vase {
+        settings.spiral_vase = true;
+    }
+    if args.fuzzy_skin {
+        settings.fuzzy_skin = true;
+    }
+    if args.ironing {
+        settings.ironing = true;
+    }
+    if args.no_gap_fill {
+        settings.gap_fill = false;
+    }
+    if let Some(v) = args.elephant_foot {
+        settings.elephant_foot_mm = v;
+    }
+    if let Some(v) = args.xy_compensation {
+        settings.xy_compensation_mm = v;
+    }
 
     println!(
         "Profiles: printer={} filament={} process={} | bed {}x{} mm, layer {}mm",
@@ -263,6 +299,8 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::Perimeter => "#5fa8e8",
             PathKind::Solid => "#2ca02c",
             PathKind::Infill => "#e08a2b",
+            PathKind::GapFill => "#d62728",
+            PathKind::Ironing => "#bcbd22",
             PathKind::Support => "#8c6bb1",
             PathKind::Bridge => "#17becf",
         };
