@@ -41,18 +41,11 @@ pub fn arc_fill(region: &Polygons, supported: &Polygons, lw: f64, rmax: f64, sea
 
     let mut kind = vec![OUT; nx * ny];
     let mut owner = vec![0u32; nx * ny];
-    let mut unfilled = 0usize;
-    for iy in 0..ny {
-        for ix in 0..nx {
-            let (x, y) = g.center(ix, iy);
-            if in_poly(region, x, y) {
-                kind[iy * nx + ix] = REGION;
-                unfilled += 1;
-            } else if in_poly(supported, x, y) {
-                kind[iy * nx + ix] = ANCHOR;
-            }
-        }
-    }
+    // Scanline-rasterize the region and the supported area onto the grid (a row
+    // at a time) instead of point-in-polygon per cell. Region wins where both.
+    rasterize(region, &g, &mut kind, REGION, &[OUT, ANCHOR]);
+    rasterize(supported, &g, &mut kind, ANCHOR, &[OUT]);
+    let mut unfilled = kind.iter().filter(|&&k| k == REGION).count();
     if unfilled == 0 {
         return Vec::new();
     }
@@ -322,6 +315,48 @@ fn snap_end(p: Point, f: &Front, dir: f64, region: &Polygons, wall_reach: f64, s
     }
     let (x, y) = rot(lo);
     Point::from_mm(x, y)
+}
+
+/// Mark every grid cell whose center is inside `polys` (even-odd) as `value`,
+/// but only where the cell currently holds one of `only_over`. One sorted
+/// crossing list per row — O(rows × edges) instead of O(cells × edges).
+fn rasterize(polys: &Polygons, g: &Grid, kind: &mut [u8], value: u8, only_over: &[u8]) {
+    let mut xs: Vec<f64> = Vec::new();
+    for iy in 0..g.ny {
+        let y = g.y0 + (iy as f64 + 0.5) * g.cell;
+        xs.clear();
+        for c in &polys.contours {
+            let m = c.points.len();
+            if m < 3 {
+                continue;
+            }
+            for j in 0..m {
+                let (ay, by) = (c.points[j].y_mm(), c.points[(j + 1) % m].y_mm());
+                // Half-open test so a vertex exactly on the row counts once.
+                if (ay <= y) != (by <= y) {
+                    let (ax, bx) = (c.points[j].x_mm(), c.points[(j + 1) % m].x_mm());
+                    let t = (y - ay) / (by - ay);
+                    xs.push(ax + t * (bx - ax));
+                }
+            }
+        }
+        xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut k = 0;
+        while k + 1 < xs.len() {
+            // Cells whose center x lies in (xs[k], xs[k+1]).
+            let lo = (((xs[k] - g.x0) / g.cell - 0.5).ceil().max(0.0)) as usize;
+            let hi = ((xs[k + 1] - g.x0) / g.cell - 0.5).floor();
+            if hi >= 0.0 {
+                for ix in lo..=(hi as usize).min(g.nx - 1) {
+                    let ci = iy * g.nx + ix;
+                    if only_over.contains(&kind[ci]) {
+                        kind[ci] = value;
+                    }
+                }
+            }
+            k += 2;
+        }
+    }
 }
 
 /// Even-odd point-in-polygon over a region (outer contours + holes).
