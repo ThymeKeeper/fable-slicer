@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use geo2d::{Contour, Point, Polygons};
 use mesh::{Mesh, Vec3};
+use rayon::prelude::*;
 
 /// Parameters controlling how the mesh is sliced.
 #[derive(Clone, Copy, Debug)]
@@ -36,12 +37,23 @@ pub struct Layer {
 /// Each layer is sampled at its vertical midpoint, which avoids landing on flat
 /// top/bottom facets. `print_z_mm` accumulates layer thicknesses with the model
 /// bottom resting on the bed (z = 0).
+///
+/// Triangles are bucketed by the layer range their z-span covers, so each layer
+/// only visits triangles that can actually cross it (instead of the whole mesh),
+/// and the layers are then sliced in parallel.
 pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
     let Some((zmin, zmax)) = mesh.z_bounds() else {
         return Vec::new();
     };
 
-    let mut layers = Vec::new();
+    // Sorted unique vertex z's — lets each layer nudge off coincident vertices
+    // with a binary search instead of scanning every vertex.
+    let mut vert_zs: Vec<f64> = mesh.vertices.iter().map(|v| v[2]).collect();
+    vert_zs.sort_unstable_by(f64::total_cmp);
+    vert_zs.dedup();
+
+    // Plan the layer z's first (cheap, sequential)…
+    let mut metas: Vec<Layer> = Vec::new();
     let mut i = 0usize;
     let mut bottom = zmin; // world-z of the current layer's bottom face
     loop {
@@ -50,30 +62,72 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         } else {
             params.layer_height_mm
         };
-        let z = bottom + h * 0.5;
+        let z = nudge_off_vertices(&vert_zs, bottom + h * 0.5);
         if z >= zmax {
             break;
         }
-        layers.push(Layer {
+        metas.push(Layer {
             index: i,
             z_mm: z,
             height_mm: h,
             print_z_mm: (bottom - zmin) + h,
-            polygons: slice_at(mesh, z),
+            polygons: Polygons::new(),
         });
         bottom += h;
         i += 1;
     }
-    layers
+    if metas.is_empty() {
+        return metas;
+    }
+
+    // …then bucket triangle indices by the band of layers their z-span crosses.
+    // `band` > 1 caps bucket memory when many triangles span many layers (tall
+    // thin meshes); each layer then filters its band's list by exact z-span.
+    let layer_zs: Vec<f64> = metas.iter().map(|m| m.z_mm).collect();
+    let tri_spans: Vec<(f64, f64)> = (0..mesh.triangles.len())
+        .map(|t| {
+            let [a, b, c] = mesh.triangle(t);
+            (a[2].min(b[2]).min(c[2]), a[2].max(b[2]).max(c[2]))
+        })
+        .collect();
+    let total_entries: usize = tri_spans
+        .iter()
+        .map(|&(lo, hi)| {
+            let a = layer_zs.partition_point(|&z| z < lo);
+            let b = layer_zs.partition_point(|&z| z <= hi);
+            b - a
+        })
+        .sum();
+    const ENTRY_CAP: usize = 8_000_000;
+    let band = (total_entries / ENTRY_CAP + 1).max(1);
+    let n_bands = metas.len().div_ceil(band);
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_bands];
+    for (t, &(lo, hi)) in tri_spans.iter().enumerate() {
+        let a = layer_zs.partition_point(|&z| z < lo);
+        let b = layer_zs.partition_point(|&z| z <= hi);
+        for bi in (a / band)..=((b.saturating_sub(1)) / band).min(n_bands - 1) {
+            if a < b {
+                buckets[bi].push(t as u32);
+            }
+        }
+    }
+
+    metas.par_iter_mut().for_each(|layer| {
+        let bucket = &buckets[layer.index / band];
+        layer.polygons = slice_at(mesh, &tri_spans, bucket, layer.z_mm);
+    });
+    metas
 }
 
-/// Intersect the whole mesh with one horizontal plane and stitch the result.
-fn slice_at(mesh: &Mesh, z: f64) -> Polygons {
-    let z = nudge_off_vertices(mesh, z);
-
+/// Intersect the bucketed triangles with one horizontal plane and stitch.
+fn slice_at(mesh: &Mesh, tri_spans: &[(f64, f64)], bucket: &[u32], z: f64) -> Polygons {
     let mut segments: Vec<(Point, Point)> = Vec::new();
-    for i in 0..mesh.triangles.len() {
-        let [a, b, c] = mesh.triangle(i);
+    for &t in bucket {
+        let (lo, hi) = tri_spans[t as usize];
+        if z < lo || z > hi {
+            continue; // in the band, but not crossing this layer
+        }
+        let [a, b, c] = mesh.triangle(t as usize);
         if let Some(seg) = intersect_triangle(a, b, c, z) {
             segments.push(seg);
         }
@@ -81,15 +135,24 @@ fn slice_at(mesh: &Mesh, z: f64) -> Polygons {
     stitch(segments)
 }
 
-/// Nudge the slice plane by a tiny amount if it coincides with any vertex, so no
+/// Nudge the slice plane by a tiny amount while it coincides with a vertex, so no
 /// triangle has a vertex *exactly* on the plane (which would make the
-/// above/below classification ambiguous).
-fn nudge_off_vertices(mesh: &Mesh, z: f64) -> f64 {
+/// above/below classification ambiguous). `vert_zs` is sorted and deduped.
+///
+/// Walks forward from the first candidate vertex (the index only ever advances,
+/// so float rounding in `v + EPS` can't re-trigger the same vertex and loop).
+fn nudge_off_vertices(vert_zs: &[f64], z: f64) -> f64 {
     const EPS: f64 = 1.0e-6;
-    for v in &mesh.vertices {
-        if (v[2] - z).abs() < EPS {
-            return z + EPS;
+    let mut z = z;
+    let mut i = vert_zs.partition_point(|&v| v < z - EPS);
+    while let Some(&v) = vert_zs.get(i) {
+        if v - z >= EPS {
+            break; // next vertex is clearly above the (possibly bumped) plane
         }
+        if (v - z).abs() < EPS {
+            z = v + EPS; // collide → move just past this vertex, keep walking
+        }
+        i += 1;
     }
     z
 }

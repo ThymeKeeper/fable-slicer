@@ -27,6 +27,7 @@ gcode = { path = "gcode" }
 config = { path = "config" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+rayon = "1"
 
 # Optimize geometry-heavy code even in dev so slicing big meshes stays usable.
 [profile.dev]

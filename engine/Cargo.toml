@@ -10,3 +10,4 @@ geo2d = { workspace = true }
 mesh = { workspace = true }
 config = { workspace = true }
 gcode = { workspace = true }
+rayon = { workspace = true }
