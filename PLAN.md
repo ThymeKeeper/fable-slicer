@@ -17,11 +17,12 @@ checkboxes and the status line as work lands. Architecture detail lives in
 
 | | |
 |---|---|
-| **Current milestone** | M5/M6 — bed layout + brick layering landed (atop M4 supports/arc/bridge) |
-| **Last updated** | 2026-06-08 |
-| **Builds / tests** | `cargo test` green (33 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | auto-orient (lay-flat), or M5 (variable layers, gyroid, 3MF, G2/G3) |
+| **Current milestone** | M5/M6 — perf pass (rayon + z-buckets, ~4× faster), gyroid/triangles, monotonic solid, gap fill, fuzzy skin, ironing, spiral vase, elephant-foot/XY comp, per-feature speeds, fan/bridge control, pressure advance, M73 |
+| **Last updated** | 2026-06-09 |
+| **Builds / tests** | `cargo test` green (49 tests). GUI verify = user screenshots (headless box) |
+| **Next action** | 3MF load, auto-orient (lay-flat), variable layers, or Arachne |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
+| **Perf (Benchy 225k tris)** | load 47ms · slice 29ms · plan ~190ms · g-code 66ms ≈ **0.33s** total (`cargo run --release -p engine --example bench`) |
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -42,8 +43,9 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] `cli`: STL → slice → per-layer SVG
 - [x] Cube acceptance test + SVG smoke output
 - [ ] Robustness pass: degenerate triangles, coplanar facets, open edges (don't panic; best-effort loops)
-- [ ] Per-layer parallelism with `rayon`
-- [x] Slice a real-world STL (3DBenchy, 225k tris) without panicking — 240 layers in ~0.4s
+- [x] Per-layer parallelism with `rayon` — slicing, wall/infill planning, travel combing, min-layer-time all layer-parallel
+- [x] Triangle **z-bucketing**: each layer visits only triangles whose span crosses it (banded buckets cap memory on tall spans); coincident-vertex nudge via sorted unique-z table. Benchy slice 0.8s → **29ms**
+- [x] Slice a real-world STL (3DBenchy, 225k tris) without panicking — full pipeline now ~0.33s (`engine --example bench`)
 - [ ] Golden-file test harness (snapshot SVG/loop output for a couple of fixtures)
 
 ### M1 — First printable cube
@@ -76,12 +78,15 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] **Benchy prints cleanly** (needs hardware)
 
 ### M3 — Quality pass (what separates "prints" from "looks good")
-- [x] Per-feature speeds (external perimeter slowed) + min-layer-time cooling: layers faster than `min_layer_time_s` slow to a floor speed (per-layer `speed_scale`)
+- [x] **Per-feature speeds as real settings** (`external_perimeter`/`solid`/`support`/`gap_fill` speeds; derived from the machine's print speed when a profile leaves them unset — external 50%, solid 80%, support 90%, gap 40% capped at 40) + min-layer-time cooling: layers faster than `min_layer_time_s` slow to a floor speed (per-layer `speed_scale`)
 - [x] Seam placement (nearest/rear · sharpest corner · random) — CLI `--seam` + GUI dropdown + GUI seam-highlight toggle
 - [x] Travel ordering (nearest-neighbour) + **combing**: travels are planned once (`emit::plan_travels`) and stored on each layer, so g-code and the GUI preview share one source of truth (preview renders the *actual* combed routes, not naive straight lines). A travel that would cross a wall is rerouted via a per-layer visibility graph over the layer outline, routing around holes; a travel with no in-region route (between separate islands, across a void) retracts and **z-hops** over the gap. Benchy: travel 67m→17m, retractions 5587→~400 (all z-hopped).
 - [x] Contour-resolution cleanup: merge sub-`max_resolution_mm` (0.05) mesh-facet noise after slicing — cleaner walls/preview, faster planning. Benchy g-code 236k→126k lines. (`dump_layer` example inspects a layer's raw contour roughness.)
-- [ ] Gap fill between colliding offsets
-- [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate; shown in GUI status + CLI
+- [x] **Gap fill** between colliding offsets (`gap_fill`, default on): per wall, the strip where material remains at the bead's outer edge but the wall didn't fit (plus open-dropped infill slivers) becomes single width-matched strokes along the sliver's principal axis (PCA), at `gap_fill_speed`. Hair-thin offset noise is filtered (morphological open + width ≥ 0.3·lw). Benchy's thin hull gains ~0.27m of previously-missing material
+- [x] **Infill⇄wall overlap** (`infill_overlap`, default 25% of line width): sparse/solid fill (and the solid boundary loop) push into the innermost wall bead so they bond — was exactly zero squish before
+- [x] **Monotonic solid fill** (`monotonic_solid`, default on): solid lines print in one strict boustrophedon sweep per island (`ToolPath::group` blocks survive travel ordering intact), so top surfaces get an even sheen
+- [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate (now honors per-path flow / bridge flow / extrusion multiplier); shown in GUI status + CLI
+- [x] **M73 progress** (time-based percent + minutes remaining per layer) and metadata header comments (estimated time, filament mm/g, layer count)
 - [ ] Coasting / wipe
 
 ### M4 — Supports & bridging
@@ -101,7 +106,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] **Categorized settings panel** (Orca-style): settings grouped into collapsible sections (Quality, Walls & top/bottom, Infill, Speed, Support, Bed adhesion, Material & temperature, Cooling, Retraction, Machine) in a scroll area, with Slice/Export/preview pinned above. Exposes ~all `Settings` fields (was ~8). `max_arc_radius_mm` (rMax) and `bridge_speed_mm_s` are now real settings; accel/jerk live in Speed and are **emitted as Klipper motion limits** (`M204 S`, `SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY`) right after PRINT_START, not just used for the time estimate. *Scales for the many more knobs to come; per-setting profile-override indicators + a Marlin g-code flavor (M205) still TODO.*
 - [~] **Multi-object scene / bed layout** (steps 1–2 done): import multiple STLs, duplicate/delete, object list with selection (selected object highlighted in 3D), auto grid-arrange, slice & render all objects together. Each object = shared `Arc<Mesh>` + an editable placement (Euler rotation, uniform scale, bed-plane position) that bakes to a `mesh::Transform` always resting on z=0; the combined scene is baked to one mesh in bed coords and the slicer's auto-centering is disabled (`Settings::auto_center_on_bed`). **Transforms:** panel controls (move/rotate XYZ/scale + center/reset) **and** viewport interaction — left-click to select, left-drag an object to move it on the bed (ray-pick + z=0 plane), drag empty space to orbit. **Next:** step 3 auto-orient (lay-flat onto a face); viewport rotate/scale gizmos still panel-only.
 - [ ] Variable / adaptive layer height
-- [x] Infill patterns: lines / grid / concentric for both sparse and solid (GUI + CLI picker, `sparse_infill`/`solid_infill` profile keys); gyroid still TODO
+- [x] Infill patterns: lines / grid / **triangles** / concentric / **gyroid** for both sparse and solid (GUI + CLI picker, `sparse_infill`/`solid_infill` profile keys). Gyroid = marching squares on the level set per layer (period 2×spacing, phase drifts with z so layers interlock), segments chained into polylines and clipped exactly to the region. Multi-direction patterns space each set wider (grid ×2, triangles ×3) so density matches `Lines`
 - [x] **G2/G3 arc fitting** (opt-in, `arc_fitting` + `arc_tolerance_mm`): the emitter folds runs of toolpath points that lie on a circle into a single G2/G3 (smaller g-code, smoother motion; pairs with arc overhangs). Greedy circle fit per run; a run only qualifies if every chord *hugs* the arc (sagitta ≤ tolerance), so concyclic polygon corners (e.g. a square) stay straight — only genuine curves/rounded-corners convert. Center refit on endpoints+midpoint for accurate I/J; arc-length E. GUI toggle + tol (Quality), CLI `--arc-fitting`. Needs firmware arc support (Klipper `[gcode_arcs]`). Verified: holeplate circles → G2/G3, cube walls stay G1 (only rounded skirt corners arc); unit test (circle yes, square no).
 - [ ] 3MF load (zip + XML): multi-object, transforms, embedded settings
 
@@ -110,7 +115,12 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] Tree / organic supports
 - [ ] Arachne-style variable-width walls
 - [ ] Multi-material / multi-color (sequencing, prime tower)
-- [ ] Ironing, fuzzy skin, scarf seams
+- [x] **Ironing** (`ironing` + flow/spacing/speed): surfaces with open air above get a final low-flow (15%) fine-spaced (0.15mm) boustrophedon pass at 45°, per island, always ordered after everything else on the layer — melts top ridges flat
+- [x] **Fuzzy skin** (`fuzzy_skin` + thickness/point-dist): external perimeters (not layer 0) resampled every ~0.8mm and jittered ±thickness/2 along the local outward normal (works on holes too); deterministic xorshift per layer so slicing is reproducible
+- [x] **Spiral vase** (`spiral_vase` / `--vase`): forces 1 wall / no infill / no shells above the solid bottom, then emits each layer's single loop with Z rising continuously along its length (`G1 X Y Z E`) — one seamless helix, no layer-change retractions; falls back to normal emission on layers that aren't a single loop
+- [x] **Elephant-foot compensation** (`elephant_foot_mm`) and **XY size compensation** (`xy_compensation_mm`) — first-layer shrink and global grow/shrink applied to the sliced outlines before planning
+- [x] **Cooling & flow control**: part-fan duty (`fan_speed`), fan off for first N layers, bridge fan override, bridge flow ratio, global extrusion multiplier (filament tier), Klipper `SET_PRESSURE_ADVANCE` emission (filament tier, opt-in)
+- [ ] Scarf seams
 - [ ] Network printing + monitoring
 
 ---
@@ -124,9 +134,11 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] Corpus of nasty meshes (non-manifold, self-intersecting, open) the slicer must survive
 
 **Performance** (defer until correct)
-- [ ] Bucket triangles by z-span (avoid O(layers × triangles))
-- [ ] `rayon` across layers; measure on a large model
-- [ ] Avoid needless allocation in the hot path
+- [x] Bucket triangles by z-span (avoid O(layers × triangles)) — banded buckets, ~28× faster slicing on Benchy
+- [x] `rayon` across layers — slicing, planning passes 1+2, support overhang precompute, travel combing (per-layer entry states derived sequentially first), min-layer-time
+- [x] Arc-overhang grid classification rasterized by scanline (was point-in-polygon per cell)
+- [x] G-code builder writes with `fmt::Write` into one pre-sized buffer (no per-line temporaries)
+- [ ] Avoid needless allocation in the hot path (further: stitch hash maps, clipper round-trips)
 
 **Robustness / mesh health**
 - [ ] Tolerant slicing (union overlapping contours per layer) over upfront repair
@@ -161,6 +173,20 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
   buffer for 3D). **eframe pinned to `=0.34.1`** — 0.34.3 requires `egui_glow 0.34.3`,
   which was never published. wgpu is 29.x. GUI can't be rendered on this headless
   box; verification is by the user's screenshots.
+- **Per-feature speeds derive from the machine's print speed** when a profile
+  doesn't pin them (external 50%, solid 80%, support 90%, gap fill 40% ≤ 40mm/s).
+  Absolute defaults would silently slow fast printers (a Voron at 150mm/s print
+  was getting a 25mm/s outer wall) — discovered via the Benchy time-estimate
+  regression, caught by histogramming extrusion length per feed rate.
+- **Monotonic fill is per-island.** A strict sweep across a whole *region* makes
+  travel ping-pong between disjoint islands on every scanline; sheen only needs
+  monotonic order per contiguous surface. `ToolPath::group` marks indivisible
+  blocks for the travel orderer; distinct islands stay independently orderable.
+- **Gap fill = chained-offset comparison + PCA strokes.** Per wall w, gap =
+  (material at depth w·lw) − (dilated wall-w centerlines); plus open-dropped
+  infill slivers. Filter hair ribbons (open by 0.15·lw, stroke width ≥ 0.3·lw),
+  then fill each island with single strokes along its principal axis, width
+  matched to 2·area/perimeter. Simple, robust, no medial axis needed (yet).
 
 ## Open questions
 - [ ] Real project name (current `slicer` is a placeholder).

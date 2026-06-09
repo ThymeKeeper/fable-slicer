@@ -41,7 +41,8 @@ the core testable and is what structurally keeps us independent of a monolith.
 10. **G-code** — emit moves, retraction, fan, arc fitting; simulate for time.
 11. **Preview** — feature-colored path rendering (GUI).
 
-Implemented today: steps 1–2 (+ SVG visualization in place of g-code).
+Implemented today: all eleven steps in v1 form (Arachne walls, tree supports,
+and mesh repair remain; see PLAN.md). Steps 2, 4–8 run layer-parallel on rayon.
 
 ## Coordinate system
 
@@ -59,12 +60,15 @@ in the source mesh doesn't matter.
 
 `engine::slice_mesh` samples each layer at its vertical **midpoint**
 (`z = zmin + h*(i + 0.5)`) to avoid landing on flat top/bottom facets; the plane
-is nudged by 1 µm if it still coincides with a vertex. For each straddling
-triangle, the lone vertex (alone on its side of the plane) defines the two
-crossing edges; we interpolate the two intersection points and snap them to the
-integer grid. All segments are stitched **undirected**: on a manifold mesh each
-cut point has degree two, so the segments form simple cycles we can walk
-directly. Direction is irrelevant because winding is fixed afterward.
+is walked off coincident vertices (1 µm bumps against a sorted unique-z table)
+so no triangle vertex sits exactly on it. Triangles are **bucketed by the band
+of layers their z-span crosses** — each layer visits only candidate triangles,
+not the whole mesh — and the layers are sliced **in parallel** (rayon). For each
+straddling triangle, the lone vertex (alone on its side of the plane) defines
+the two crossing edges; we interpolate the two intersection points and snap them
+to the integer grid. All segments are stitched **undirected**: on a manifold
+mesh each cut point has degree two, so the segments form simple cycles we can
+walk directly. Direction is irrelevant because winding is fixed afterward.
 
 This deliberately avoids a half-edge structure for now — integer snapping gives
 exact connectivity for clean meshes. Topology-aware stitching is a later
