@@ -107,6 +107,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let mut profiles = Profiles::builtin();
+    // User profiles (the ones the GUI saves) load automatically; a bad file in
+    // the config dir is reported but doesn't block slicing with built-ins.
+    if let Err(e) = profiles.load_user_profiles(None) {
+        eprintln!("warning: user profiles: {e}");
+    }
     if let Some(dir) = &args.profile_dir {
         profiles.load_dir(dir).map_err(|e| anyhow!(e))?;
     }

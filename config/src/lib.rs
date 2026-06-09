@@ -9,7 +9,7 @@
 use std::f64::consts::PI;
 
 mod profile;
-pub use profile::{FilamentProfile, PrinterProfile, ProcessProfile, Profiles};
+pub use profile::{tier_dirty, FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Tier, TierKind};
 
 /// Default start g-code (generic, heats + homes directly). `{placeholders}` are
 /// substituted by the emitter. Used when a printer profile sets no `start_gcode`.

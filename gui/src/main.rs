@@ -8,9 +8,16 @@ use camera::Camera;
 use eframe::egui;
 use render::Scene;
 
-use config::{Profiles, Settings};
+use config::{FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Settings, Tier, TierKind};
 use engine::generate;
 use std::sync::Arc;
+
+/// State of the save / delete profile dialog.
+struct ProfileDialog {
+    kind: TierKind,
+    name: String,
+    delete: bool,
+}
 
 /// One object placed on the bed: shared mesh geometry plus an editable placement
 /// (Euler rotation, uniform scale, and a bed-plane position for the footprint
@@ -83,6 +90,11 @@ struct App {
     filament: String,
     process: String,
     settings: Settings,
+    /// Settings as resolved from the selected profiles — panel edits are
+    /// compared against this for the per-tier "modified" indicators.
+    baseline: Settings,
+    /// Open save/delete-profile dialog, if any.
+    profile_dialog: Option<ProfileDialog>,
     objects: Vec<SceneObject>,
     selected: Option<usize>,
     scene: Scene,
@@ -124,22 +136,29 @@ impl App {
             .as_ref()
             .expect("a wgpu render state (run with the wgpu backend)");
         let scene = Scene::new(rs);
-        let profiles = Profiles::builtin();
+        let mut profiles = Profiles::builtin();
+        let mut status = "Open an STL to begin.".to_string();
+        if let Err(e) = profiles.load_user_profiles(None) {
+            status = format!("User profiles: {e}");
+        }
         let (printer, filament, process) =
             ("voron24".to_string(), "pla".to_string(), "standard".to_string());
         let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
+        let baseline = settings.clone();
         Self {
             profiles,
             printer,
             filament,
             process,
             settings,
+            baseline,
+            profile_dialog: None,
             objects: Vec::new(),
             selected: None,
             scene,
             camera: Camera::new(),
-            status: "Open an STL to begin.".to_string(),
+            status,
             sliced: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
@@ -219,11 +238,91 @@ impl App {
         if let Ok(s) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
             self.settings = s;
             self.settings.auto_center_on_bed = false;
+            self.baseline = self.settings.clone();
             self.sliced = None;
             self.view_preview = false;
             self.needs_rebuild = true;
             self.refit_camera = true;
         }
+    }
+
+    /// Re-resolve only the dirty baseline (after a save) — keeps the user's
+    /// current panel edits in other tiers intact.
+    fn refresh_baseline(&mut self) {
+        if let Ok(mut b) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
+            b.auto_center_on_bed = false;
+            self.baseline = b;
+        }
+    }
+
+    /// Save the current settings' diff as a user profile named `name` in `kind`.
+    ///
+    /// New name: the profile inherits the currently selected one and stores only
+    /// the changed fields. Same name (overwriting a user profile): the new diff
+    /// is merged over the stored fields and the original parent is kept.
+    fn save_profile(&mut self, kind: TierKind, name: &str) -> Result<(), String> {
+        match kind {
+            TierKind::Printer => {
+                let mut diff = PrinterProfile::diff(&self.settings, &self.baseline);
+                if name == self.printer && self.profiles.is_user(kind, name) {
+                    let existing = self.profiles.get_printer(name).cloned().unwrap_or_default();
+                    let parent = existing.parent().map(str::to_string);
+                    diff = diff.over(existing);
+                    diff.inherits = parent;
+                } else {
+                    diff.inherits = Some(self.printer.clone());
+                }
+                self.profiles.save_user_printer(name, diff)?;
+                self.printer = name.to_string();
+            }
+            TierKind::Filament => {
+                let mut diff = FilamentProfile::diff(&self.settings, &self.baseline);
+                if name == self.filament && self.profiles.is_user(kind, name) {
+                    let existing = self.profiles.get_filament(name).cloned().unwrap_or_default();
+                    let parent = existing.parent().map(str::to_string);
+                    diff = diff.over(existing);
+                    diff.inherits = parent;
+                } else {
+                    diff.inherits = Some(self.filament.clone());
+                }
+                self.profiles.save_user_filament(name, diff)?;
+                self.filament = name.to_string();
+            }
+            TierKind::Process => {
+                let mut diff = ProcessProfile::diff(&self.settings, &self.baseline);
+                if name == self.process && self.profiles.is_user(kind, name) {
+                    let existing = self.profiles.get_process(name).cloned().unwrap_or_default();
+                    let parent = existing.parent().map(str::to_string);
+                    diff = diff.over(existing);
+                    diff.inherits = parent;
+                } else {
+                    diff.inherits = Some(self.process.clone());
+                }
+                self.profiles.save_user_process(name, diff)?;
+                self.process = name.to_string();
+            }
+        }
+        self.refresh_baseline();
+        Ok(())
+    }
+
+    /// Delete a user profile; the selection falls back to a built-in default.
+    fn delete_profile(&mut self, kind: TierKind, name: &str) -> Result<(), String> {
+        self.profiles.delete_user(kind, name)?;
+        let sel = match kind {
+            TierKind::Printer => &mut self.printer,
+            TierKind::Filament => &mut self.filament,
+            TierKind::Process => &mut self.process,
+        };
+        if sel == name {
+            *sel = match kind {
+                TierKind::Printer => "generic".to_string(),
+                TierKind::Filament => "pla".to_string(),
+                TierKind::Process => "standard".to_string(),
+            };
+            self.refresh_baseline();
+        }
+        Ok(())
     }
 
     /// Load an STL and add it to the scene as a new object.
@@ -450,13 +549,56 @@ impl eframe::App for App {
             let printers: Vec<String> = self.profiles.printer_names().iter().map(|s| s.to_string()).collect();
             let filaments: Vec<String> = self.profiles.filament_names().iter().map(|s| s.to_string()).collect();
             let processes: Vec<String> = self.profiles.process_names().iter().map(|s| s.to_string()).collect();
+            let dirty = config::tier_dirty(&self.settings, &self.baseline);
             let mut changed = false;
-            changed |= combo(ui, "Printer", &mut self.printer, &printers,
-                "Machine profile — bed size, nozzle, motion limits, and start/end g-code.");
-            changed |= combo(ui, "Filament", &mut self.filament, &filaments,
-                "Material profile — hotend/bed temperatures, diameter, and density.");
-            changed |= combo(ui, "Process", &mut self.process, &processes,
-                "Print-quality profile (layer height, walls, speeds, supports…). Edits below override it until you switch profiles.");
+            let mut open_dialog: Option<ProfileDialog> = None;
+            {
+                let rows: [(TierKind, &mut String, &[String], bool, &str); 3] = [
+                    (TierKind::Printer, &mut self.printer, &printers, dirty[0],
+                        "Machine profile — bed size, nozzle, motion limits, and start/end g-code."),
+                    (TierKind::Filament, &mut self.filament, &filaments, dirty[1],
+                        "Material profile — hotend/bed temperatures, diameter, density, flow, cooling."),
+                    (TierKind::Process, &mut self.process, &processes, dirty[2],
+                        "Print-quality profile (layer height, walls, speeds, supports…). Edits below override it until you switch or save."),
+                ];
+                for (kind, sel, names, is_dirty, hover) in rows {
+                    ui.horizontal(|ui| {
+                        let label = match (kind, is_dirty) {
+                            (TierKind::Printer, false) => "Printer",
+                            (TierKind::Printer, true) => "Printer *",
+                            (TierKind::Filament, false) => "Filament",
+                            (TierKind::Filament, true) => "Filament *",
+                            (TierKind::Process, false) => "Process",
+                            (TierKind::Process, true) => "Process *",
+                        };
+                        let is_user = self.profiles.is_user(kind, sel);
+                        changed |= combo(ui, label, sel, names, hover);
+                        if ui
+                            .small_button("💾")
+                            .on_hover_text(if is_dirty {
+                                "Save the * changes as a user profile (only changed fields are written)."
+                            } else {
+                                "Save a copy as a user profile."
+                            })
+                            .clicked()
+                        {
+                            let name = if is_user { sel.clone() } else { format!("{sel}-custom") };
+                            open_dialog = Some(ProfileDialog { kind, name, delete: false });
+                        }
+                        if is_user
+                            && ui
+                                .small_button("🗑")
+                                .on_hover_text("Delete this user profile from disk.")
+                                .clicked()
+                        {
+                            open_dialog = Some(ProfileDialog { kind, name: sel.clone(), delete: true });
+                        }
+                    });
+                }
+            }
+            if let Some(d) = open_dialog {
+                self.profile_dialog = Some(d);
+            }
             if changed {
                 self.reresolve();
             }
@@ -878,6 +1020,72 @@ impl eframe::App for App {
                 self.overlay_rect = None;
             }
         });
+
+        // Save / delete profile dialog (floats over the viewport).
+        if let Some(mut dlg) = self.profile_dialog.take() {
+            let mut keep = true;
+            let mut act = false;
+            let title = if dlg.delete { "Delete profile" } else { "Save profile" };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+                .show(ui.ctx(), |ui| {
+                    if dlg.delete {
+                        ui.label(format!(
+                            "Delete the {} profile '{}' from disk?",
+                            dlg.kind.label(),
+                            dlg.name
+                        ));
+                    } else {
+                        ui.label(format!(
+                            "Save as a {} profile (inherits '{}', stores only changed fields):",
+                            dlg.kind.label(),
+                            match dlg.kind {
+                                TierKind::Printer => &self.printer,
+                                TierKind::Filament => &self.filament,
+                                TierKind::Process => &self.process,
+                            }
+                        ));
+                        ui.text_edit_singleline(&mut dlg.name);
+                    }
+                    ui.horizontal(|ui| {
+                        let verb = if dlg.delete { "Delete" } else { "Save" };
+                        if ui.button(verb).clicked() {
+                            act = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+            if act {
+                let result = if dlg.delete {
+                    self.delete_profile(dlg.kind, &dlg.name)
+                } else {
+                    self.save_profile(dlg.kind, &dlg.name)
+                };
+                match result {
+                    Ok(()) => {
+                        let verb = if dlg.delete { "Deleted" } else { "Saved" };
+                        let dir = self
+                            .profiles
+                            .user_dir()
+                            .map(|d| format!(" ({})", d.display()))
+                            .unwrap_or_default();
+                        self.status = format!("{verb} {} profile '{}'{dir}", dlg.kind.label(), dlg.name);
+                        keep = false;
+                    }
+                    Err(e) => {
+                        self.status = format!("Profile error: {e}");
+                        keep = !dlg.delete; // keep the save dialog open to fix the name
+                    }
+                }
+            }
+            if keep {
+                self.profile_dialog = Some(dlg);
+            }
+        }
     }
 }
 
