@@ -104,6 +104,8 @@ struct App {
     show_support: bool,
     show_travel: bool,
     show_seams: bool,
+    show_gap_fill: bool,
+    show_ironing: bool,
     needs_rebuild: bool,
     /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
     refit_camera: bool,
@@ -150,6 +152,8 @@ impl App {
             show_support: true,
             show_travel: false,
             show_seams: false,
+            show_gap_fill: true,
+            show_ironing: true,
             needs_rebuild: true,
             refit_camera: true,
             drag_obj: None,
@@ -201,6 +205,12 @@ impl App {
         }
         if self.show_support {
             m |= 1 << 6;
+        }
+        if self.show_gap_fill {
+            m |= 1 << 7;
+        }
+        if self.show_ironing {
+            m |= 1 << 8;
         }
         m
     }
@@ -503,6 +513,8 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
                     ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
                     ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
+                    ui.checkbox(&mut self.show_gap_fill, "gap fill").on_hover_text("Show thin gap-fill strokes between walls.");
+                    ui.checkbox(&mut self.show_ironing, "ironing").on_hover_text("Show the top-surface ironing pass.");
                     ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
                     ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
                     ui.checkbox(&mut self.show_travel, "travel").on_hover_text("Show non-printing travel moves.");
@@ -533,43 +545,53 @@ impl eframe::App for App {
                         .on_hover_text("Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
                     ui.add(egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5).text("XY comp mm"))
                         .on_hover_text("Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
-                    ui.checkbox(&mut s.ironing, "ironing")
-                        .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.");
-                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5).text("ironing flow"))
+                    let vase = s.spiral_vase;
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.ironing, "ironing"))
+                        .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5).text("ironing flow"))
                         .on_hover_text("Ironing extrusion as a fraction of a normal line at that spacing.");
-                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5).text("ironing spacing mm"))
+                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5).text("ironing spacing mm"))
                         .on_hover_text("Distance between ironing passes — finer is smoother and slower.");
-                    ui.add_enabled(s.ironing, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0).text("ironing mm/s"))
+                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0).text("ironing mm/s"))
                         .on_hover_text("Ironing pass speed.");
-                    ui.checkbox(&mut s.fuzzy_skin, "fuzzy skin")
-                        .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).");
-                    ui.add_enabled(s.fuzzy_skin, egui::Slider::new(&mut s.fuzzy_skin_thickness_mm, 0.05..=1.0).text("fuzzy thickness mm"))
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.fuzzy_skin, "fuzzy skin"))
+                        .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    ui.add_enabled(s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_thickness_mm, 0.05..=1.0).text("fuzzy thickness mm"))
                         .on_hover_text("Total jitter band, centered on the wall line.");
-                    ui.add_enabled(s.fuzzy_skin, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0).text("fuzzy point dist mm"))
+                    ui.add_enabled(s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0).text("fuzzy point dist mm"))
                         .on_hover_text("Spacing between jittered points — smaller is noisier.");
                     ui.checkbox(&mut s.spiral_vase, "spiral vase")
-                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports.");
+                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).");
                 });
                 egui::CollapsingHeader::new("Walls & top/bottom").show(ui, |ui| {
-                    ui.add(egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
-                        .on_hover_text("Number of perimeter loops (shell wall thickness).");
-                    ui.add(egui::Slider::new(&mut s.top_layers, 0..=10).text("top layers"))
-                        .on_hover_text("Number of solid layers on top surfaces.");
+                    let vase = s.spiral_vase;
+                    ui.add_enabled(!vase, egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
+                        .on_hover_text("Number of perimeter loops (shell wall thickness).")
+                        .on_disabled_hover_text("Spiral vase forces a single wall.");
+                    ui.add_enabled(!vase, egui::Slider::new(&mut s.top_layers, 0..=10).text("top layers"))
+                        .on_hover_text("Number of solid layers on top surfaces.")
+                        .on_disabled_hover_text("Spiral vase prints no top shells.");
                     ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"))
                         .on_hover_text("Number of solid layers on bottom surfaces.");
-                    ui.checkbox(&mut s.gap_fill, "gap fill")
-                        .on_hover_text("Fill gaps too thin for walls/infill with single width-matched strokes.");
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
+                        .on_hover_text("Fill gaps too thin for walls/infill with single width-matched strokes.")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
-                    ui.checkbox(&mut s.brick_layers, "brick layers")
-                        .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.");
-                    ui.add_enabled(s.brick_layers, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
+                        .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    ui.add_enabled(s.brick_layers && !vase, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
                         .on_hover_text("Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
                 });
                 egui::CollapsingHeader::new("Infill").show(ui, |ui| {
-                    ui.add(egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
-                        .on_hover_text("Sparse interior fill density (0 = hollow, 1 = solid).");
-                    ui.add_enabled_ui(s.infill_density > 0.0, |ui| {
+                    let vase = s.spiral_vase;
+                    ui.add_enabled(!vase, egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
+                        .on_hover_text("Sparse interior fill density (0 = hollow, 1 = solid).")
+                        .on_disabled_hover_text("Spiral vase prints no infill.");
+                    ui.add_enabled_ui(s.infill_density > 0.0 && !vase, |ui| {
                         pattern_combo(ui, "sparse fill", &mut s.sparse_pattern)
                             .on_hover_text("Pattern for the sparse interior infill.");
                     });
@@ -601,10 +623,14 @@ impl eframe::App for App {
                         .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
                 });
                 egui::CollapsingHeader::new("Support").default_open(true).show(ui, |ui| {
-                    support_combo(ui, &mut s.support_mode)
-                        .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.");
-                    let has_support = s.support_mode != config::SupportMode::None;
-                    let arc = s.support_mode == config::SupportMode::Arc;
+                    let vase = s.spiral_vase;
+                    ui.add_enabled_ui(!vase, |ui| {
+                        support_combo(ui, &mut s.support_mode)
+                            .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.")
+                            .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    });
+                    let has_support = s.support_mode != config::SupportMode::None && !vase;
+                    let arc = s.support_mode == config::SupportMode::Arc && !vase;
                     ui.add_enabled(has_support, egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0).text("overhang °"))
                         .on_hover_text("Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
                     ui.add_enabled(has_support, egui::Slider::new(&mut s.support_density, 0.0..=1.0).text("density"))
@@ -635,6 +661,10 @@ impl eframe::App for App {
                         .on_hover_text("Hotend temperature.");
                     ui.add(egui::Slider::new(&mut s.bed_temp_c, 0..=120).text("bed °C"))
                         .on_hover_text("Heated bed temperature.");
+                    ui.add(egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0).text("filament Ø mm"))
+                        .on_hover_text("Filament diameter (1.75 or 2.85). Drives the extrusion math.");
+                    ui.add(egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0).text("density g/cm³"))
+                        .on_hover_text("Filament density — used for the weight estimate.");
                     ui.add(egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2).text("flow ×"))
                         .on_hover_text("Global extrusion multiplier — filament-specific flow tuning.");
                     ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
@@ -671,6 +701,24 @@ impl eframe::App for App {
                         .on_hover_text("Maximum build height (Z).");
                     ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"))
                         .on_hover_text("Nozzle diameter.");
+                });
+                egui::CollapsingHeader::new("Custom g-code").show(ui, |ui| {
+                    ui.label("Start g-code").on_hover_text(
+                        "Emitted before the print. Placeholders: {nozzle_temp} {bed_temp} {bed_x} {bed_y} {bed_z} {layer_height} {first_layer_height} {nozzle_diameter}.",
+                    );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut s.start_gcode)
+                            .code_editor()
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label("End g-code").on_hover_text("Emitted after the print (cooldown, park, motors off).");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut s.end_gcode)
+                            .code_editor()
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
                 });
                 ui.add_space(6.0);
                 ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
@@ -938,6 +986,8 @@ const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 const CAT_SEAM: f32 = 5.0;
 const CAT_SUPPORT: f32 = 6.0;
+const CAT_GAPFILL: f32 = 7.0;
+const CAT_IRONING: f32 = 8.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
 /// plus joint blobs (one per extrusion vertex, to round ends and fill corners),
@@ -958,7 +1008,6 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
         let layer_id = (li + 1) as f32; // 1-based, matches preview_layer
         let z_top = layer.print_z_mm as f32;
         let h = layer.height_mm as f32;
-        let z_center = z_top - h * 0.5; // bead spans [z_top - h, z_top]
 
         for (pi, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
@@ -977,21 +1026,27 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
             let c = color_for(path.kind);
             let cat = category_of(path.kind);
             // Brick-layered perimeters render half a layer up (z_offset) and a touch
-            // fatter (flow), so the staggered, over-packed walls are visible.
-            let zc = z_center + path.z_offset_mm as f32;
-            let w = (path.width_mm * path.flow) as f32;
+            // fatter (flow > 1), so the staggered, over-packed walls are visible.
+            // Trickle-flow paths (ironing) render as a thin film at the layer top
+            // instead: full width, height scaled by flow.
+            let (w, bh) = if path.flow >= 1.0 {
+                ((path.width_mm * path.flow) as f32, h)
+            } else {
+                (path.width_mm as f32, (h * path.flow as f32).max(0.04))
+            };
+            let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
             for win in path.points.windows(2) {
-                push_inst(&mut inst, win[0], win[1], zc, w, h, c, layer_id, cat);
+                push_inst(&mut inst, win[0], win[1], zc, w, bh, c, layer_id, cat);
             }
             if path.closed {
                 let last = path.points[path.points.len() - 1];
-                push_inst(&mut inst, last, path.points[0], zc, w, h, c, layer_id, cat);
+                push_inst(&mut inst, last, path.points[0], zc, w, bh, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
             for p in &path.points {
                 joints.push([
                     p.x_mm() as f32, p.y_mm() as f32, zc,
-                    w, h,
+                    w, bh,
                     c[0], c[1], c[2],
                     layer_id, cat,
                 ]);
@@ -1051,9 +1106,11 @@ fn category_of(kind: engine::PathKind) -> f32 {
     use engine::PathKind::*;
     match kind {
         Skirt => CAT_SKIRT,
-        ExternalPerimeter | Perimeter | GapFill => CAT_WALLS,
-        Solid | Ironing => CAT_SOLID,
+        ExternalPerimeter | Perimeter => CAT_WALLS,
+        Solid => CAT_SOLID,
         Infill => CAT_INFILL,
+        GapFill => CAT_GAPFILL,
+        Ironing => CAT_IRONING,
         Support | Bridge => CAT_SUPPORT,
     }
 }
