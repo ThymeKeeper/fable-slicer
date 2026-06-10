@@ -438,12 +438,34 @@ fn fit_arc(pts: &[(f64, f64)], i: usize, tol: f64) -> Option<(usize, f64, f64, b
     if !hugs(pts[i], pts[i + 1]) || !hugs(pts[i + 1], pts[i + 2]) {
         return None;
     }
+    // The sweep about the center must be monotone (and under a full turn):
+    // a path that doubles back along the same circle stays within `tol` and
+    // keeps a consistent polyline turn, but the firmware draws only the
+    // start→end angular gap — the bead's full length would be squeezed into
+    // a short arc as an over-extruded blob (seen on seam-adjacent jitters).
+    let sweep = |a: (f64, f64), b: (f64, f64)| -> f64 {
+        let v0 = (a.0 - cx, a.1 - cy);
+        let v1 = (b.0 - cx, b.1 - cy);
+        (v0.0 * v1.1 - v0.1 * v1.0).atan2(v0.0 * v1.0 + v0.1 * v1.1)
+    };
+    let dir = if cw { -1.0 } else { 1.0 };
+    let s0 = sweep(pts[i], pts[i + 1]) * dir;
+    let s1 = sweep(pts[i + 1], pts[i + 2]) * dir;
+    if s0 <= 0.0 || s1 <= 0.0 {
+        return None;
+    }
+    let mut total = s0 + s1;
     let mut j = i + 2;
     while j + 1 < n {
         let p = pts[j + 1];
         if (pdist(p, (cx, cy)) - r).abs() > tol || turn_cw(pts[j - 1], pts[j], p) != cw || !hugs(pts[j], p) {
             break;
         }
+        let ds = sweep(pts[j], p) * dir;
+        if ds <= 0.0 || total + ds >= std::f64::consts::TAU - 0.05 {
+            break;
+        }
+        total += ds;
         j += 1;
     }
     if j + 1 - i < ARC_MIN_PTS {
@@ -998,6 +1020,41 @@ mod tests {
         // ...but a square's (concyclic) corners must NOT be rounded into an arc.
         let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
         assert!(fit_arc(&square, 0, 0.05).is_none(), "square is straight, not an arc");
+    }
+
+    #[test]
+    fn arc_fit_rejects_tangential_jitter() {
+        // Points that double back along the same circle stay within tolerance
+        // and keep a consistent polyline turn, but the swept angle is not
+        // monotone: emitting an arc would squeeze the whole back-and-forth
+        // bead into the short start→end angular gap (an over-extruded blob —
+        // found as 5 moves commanding up to 84 mm³/s on a real Benchy export).
+        let r = 6.0;
+        let angs = [0.0f64, 0.06, 0.12, 0.06, 0.01, 0.08, 0.14];
+        let wiggle: Vec<(f64, f64)> = angs.iter().map(|&a| (r * a.cos(), r * a.sin())).collect();
+        match fit_arc(&wiggle, 0, 0.05) {
+            None => {}
+            Some((j, cx, cy, _)) => {
+                // If a prefix fits, its emitted length must equal the polyline
+                // length over the same points (monotone sweep — no folding).
+                let run = &wiggle[0..=j];
+                let poly: f64 = run.windows(2).map(|w| (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1)).sum();
+                let arc = super::arc_span_len(run, cx, cy);
+                assert!((arc - poly).abs() < 0.05, "arc len {arc:.3} vs polyline {poly:.3}");
+            }
+        }
+        // A full circle plus overlap must not wrap past 360°.
+        let lap: Vec<(f64, f64)> = (0..80)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / 64.0; // 1.25 laps
+                (10.0 * a.cos(), 10.0 * a.sin())
+            })
+            .collect();
+        let (j, cx, cy, _) = fit_arc(&lap, 0, 0.05).expect("the first lap is a fine arc");
+        let run = &lap[0..=j];
+        let poly: f64 = run.windows(2).map(|w| (w[0].0 - w[1].0).hypot(w[0].1 - w[1].1)).sum();
+        let arc = super::arc_span_len(run, cx, cy);
+        assert!((arc - poly).abs() < 0.1, "wrapped arc: len {arc:.3} vs polyline {poly:.3}");
     }
 
     #[test]
