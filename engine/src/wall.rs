@@ -149,7 +149,7 @@ impl Field {
         for iy in 1..ny - 1 {
             for ix in 1..nx - 1 {
                 let c = iy * nx + ix;
-                if !inside[c] || d[c] < lw * 0.15 {
+                if !inside[c] || d[c] < lw * 0.3 {
                     continue;
                 }
                 let mut ridge = true;
@@ -172,6 +172,36 @@ impl Field {
         let mut t_hat = nearest_value(&skel, &d, nx, ny);
         for _ in 0..2 {
             t_hat = blur3(&t_hat, &inside, nx, ny);
+        }
+
+        // Prune skeleton spurs: boundary bumps grow short ridge branches whose
+        // own depth is well below the blurred local thickness — real band ends
+        // have d ≈ T̂. Iteratively strip such endpoint cells so center-bead
+        // tracing follows the true spine instead of shattering on whiskers.
+        let mut skel = skel;
+        for _ in 0..12 {
+            let mut removed = false;
+            for iy in 1..ny - 1 {
+                for ix in 1..nx - 1 {
+                    let c = iy * nx + ix;
+                    if !skel[c] || d[c] >= 0.7 * t_hat[c] {
+                        continue;
+                    }
+                    let mut nbs = 0;
+                    for (dx, dy) in [(-1i64, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                        if skel[((iy as i64 + dy) * nx as i64 + ix as i64 + dx) as usize] {
+                            nbs += 1;
+                        }
+                    }
+                    if nbs <= 1 {
+                        skel[c] = false;
+                        removed = true;
+                    }
+                }
+            }
+            if !removed {
+                break;
+            }
         }
 
         Some(Field { x0, y0, cell, nx, ny, inside, d, skel, t_hat })
@@ -221,6 +251,11 @@ impl Field {
             if remainder < sliver {
                 let n = 2 * cap;
                 Scheme { n, pitch: (t / n as f64).clamp(sp * 0.5, sp * 1.7), saturated: false }
+            } else if remainder < sliver + sp / 0.9 {
+                // About one more bead's worth: add a single center bead rather
+                // than handing solid fill a strip it can barely cover.
+                let n = 2 * cap + 1;
+                Scheme { n, pitch: (t / n as f64).clamp(sp * 0.5, sp * 1.7), saturated: false }
             } else {
                 Scheme { n: 2 * cap, pitch: sp, saturated: true }
             }
@@ -233,7 +268,7 @@ impl Field {
         let mut beads = Vec::new();
         let width_of = move |pitch: f64| (pitch + (lw - sp)).clamp(lw * 0.5, lw * 1.75);
 
-        for i in 0..cap {
+        for i in 0..=cap {
             let mut psi = vec![f64::INFINITY; self.nx * self.ny];
             let mut center_zone = vec![false; self.nx * self.ny];
             let mut any_center = false;
@@ -242,8 +277,8 @@ impl Field {
                     continue;
                 }
                 let s = self.scheme(c, sp, cap);
-                if i >= s.n {
-                    continue; // bead absent here
+                if i >= s.n || (s.saturated && i >= cap) {
+                    continue; // bead absent here (saturated zones cap the rings)
                 }
                 if !s.saturated && s.n % 2 == 1 && i == s.n / 2 {
                     center_zone[c] = true; // odd stretch zone: ridge bead
@@ -750,6 +785,11 @@ mod tests {
         assert!(!s.saturated, "sliver leftover must be absorbed");
         assert_eq!(s.n, 4);
         assert!(s.pitch > sp + 0.02, "rings widen: pitch {}", s.pitch);
+        // Absorb-2: cap=1, t = 1.6 → remainder 0.79 is ~one bead: 3 beads, no solid strip.
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.6), 0.45).unwrap();
+        let s = f.scheme(f.cell_at(20.0, 0.8).unwrap(), sp, 1);
+        assert!(!s.saturated);
+        assert_eq!(s.n, 3, "extra center bead");
         // Saturated: t = 2·2·sp + 1.2 → real room: nominal pitch, infill owns it.
         let f = Field::build(&rect(0.0, 0.0, 40.0, 2.83), 0.45).unwrap();
         let s = f.scheme(f.cell_at(20.0, 1.415).unwrap(), sp, 2);
