@@ -166,8 +166,13 @@ impl Field {
             }
         }
 
-        // T̂ = radius of the nearest skeleton cell.
-        let t_hat = nearest_value(&skel, &d, nx, ny);
+        // T̂ = radius of the nearest skeleton cell, box-blurred twice so the
+        // beading targets vary smoothly (raw nearest-cell values are blocky,
+        // which made the level sets — and the printed beads — wobble).
+        let mut t_hat = nearest_value(&skel, &d, nx, ny);
+        for _ in 0..2 {
+            t_hat = blur3(&t_hat, &inside, nx, ny);
+        }
 
         Some(Field { x0, y0, cell, nx, ny, inside, d, skel, t_hat })
     }
@@ -433,6 +438,9 @@ impl Field {
         if line.len() < 2 || len < sp * 1.5 {
             return None; // grid-noise crumb
         }
+        // Two Chaikin passes melt the grid staircase (ridge traces especially),
+        // then RDP drops the redundant points.
+        let line = chaikin(&chaikin(&line, closed), closed);
         let line = rdp(&line, self.cell * 0.45);
         let mut points = Vec::with_capacity(line.len());
         let mut widths = Vec::with_capacity(line.len());
@@ -449,6 +457,55 @@ impl Field {
         }
         Some(Bead { points, widths, closed })
     }
+}
+
+/// One Chaikin corner-cutting pass: each segment is replaced by its ¼ and ¾
+/// points (endpoints kept for open lines), smoothing grid staircases.
+fn chaikin(line: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
+    let n = line.len();
+    if n < 3 {
+        return line.to_vec();
+    }
+    let mut out = Vec::with_capacity(n * 2);
+    if !closed {
+        out.push(line[0]);
+    }
+    let segs = if closed { n } else { n - 1 };
+    for i in 0..segs {
+        let a = line[i];
+        let b = line[(i + 1) % n];
+        out.push((a.0 * 0.75 + b.0 * 0.25, a.1 * 0.75 + b.1 * 0.25));
+        out.push((a.0 * 0.25 + b.0 * 0.75, a.1 * 0.25 + b.1 * 0.75));
+    }
+    if !closed {
+        out.push(line[n - 1]);
+    }
+    out
+}
+
+/// 3×3 box blur over inside cells (outside values don't bleed in).
+fn blur3(src: &[f64], inside: &[bool], nx: usize, ny: usize) -> Vec<f64> {
+    let mut out = src.to_vec();
+    for iy in 1..ny - 1 {
+        for ix in 1..nx - 1 {
+            let c = iy * nx + ix;
+            if !inside[c] {
+                continue;
+            }
+            let (mut sum, mut cnt) = (0.0, 0.0);
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let nb = ((iy as i64 + dy) * nx as i64 + ix as i64 + dx) as usize;
+                    if inside[nb] {
+                        sum += src[nb];
+                        cnt += 1.0;
+                    }
+                }
+            }
+            out[c] = sum / cnt;
+        }
+    }
+    out
 }
 
 /// Ramer–Douglas–Peucker simplification (keeps endpoints).

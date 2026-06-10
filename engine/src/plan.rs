@@ -207,11 +207,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
             let arachne = settings.wall_mode == WallMode::Arachne;
+            // With half-height outer walls, interior geometry must stay inside
+            // *both* half contours (on a shallow slope the layer-midpoint
+            // outline is wider than the upper pass — inner walls based on it
+            // would poke outside the outer wall). The intersection is the safe
+            // core; without halves it's just the layer outline.
+            let interior_owned = halves.as_ref().map(|(lo, up)| intersection(lo, up));
+            let interior: &Polygons = interior_owned.as_ref().unwrap_or(&layer.polygons);
             let mut walls = Vec::new();
             let mut gaps = Polygons::new();
             // Material remaining at depth w·lw — eroded wall by wall to find
             // where the next wall failed to fit (the gap-fill regions).
-            let mut at_depth = if settings.gap_fill { layer.polygons.clone() } else { Polygons::new() };
+            let mut at_depth = if settings.gap_fill { interior.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
                 if arachne && w > 0 {
                     break; // inner walls come from the variable-width field
@@ -233,7 +240,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 } else {
                     (0.0, 1.0)
                 };
-                let centers = offset(&layer.polygons, inset);
+                // Outer wall (w == 0) hugs the true outline (or its halves);
+                // everything deeper offsets from the safe interior core.
+                let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
                 let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
@@ -287,7 +296,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
             // Variable-width (arachne) inner walls + thin-feature outer beads.
             if arachne && settings.wall_count > 0 {
-                let inner_region = offset(&layer.polygons, -lw);
+                let inner_region = offset(interior, -lw);
                 let vw = crate::wall::variable_walls(
                     &layer.polygons,
                     &inner_region,
@@ -324,7 +333,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 0 => 0.0,
                 wc => lw + (wc - 1) as f64 * sp,
             };
-            let inset = offset(&layer.polygons, -wall_depth);
+            let inset = offset(interior, -wall_depth);
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
             if settings.gap_fill {
                 // Plus the slivers the morphological open dropped from the
@@ -381,8 +390,28 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
 
             let solid_all = union(&solid_top, &solid_bottom);
-            let solid = difference(&solid_all, &arc_region);
-            let sparse = difference(&difference(inner, &solid_all), &arc_region);
+            let mut solid = difference(&solid_all, &arc_region);
+            let mut sparse = difference(&difference(inner, &solid_all), &arc_region);
+            // Tiny sparse pockets (post cores, thin ribs) would print as a few
+            // lonely 15% lines — fill them solid instead (Prusa's
+            // solid-infill-below-area behavior).
+            const SOLID_BELOW_AREA_MM2: f64 = 10.0;
+            if !sparse.is_empty() {
+                let mut keep = Polygons::new();
+                let mut promote = Polygons::new();
+                for island in islands(&sparse) {
+                    let target = if island.net_area_mm2() < SOLID_BELOW_AREA_MM2 {
+                        &mut promote
+                    } else {
+                        &mut keep
+                    };
+                    target.contours.extend(island.contours);
+                }
+                if !promote.contours.is_empty() {
+                    solid = union(&solid, &promote);
+                    sparse = keep;
+                }
+            }
 
             // Alternate fill direction per layer for cross-hatching.
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
@@ -1413,6 +1442,52 @@ mod tests {
     }
 
     #[test]
+    fn inner_walls_stay_inside_half_height_outer_on_shallow_slopes() {
+        // Shallow slope (rise 2 over run 5 per side): the layer-midpoint
+        // outline is wider than the upper half pass — interior geometry must
+        // derive from the intersection of the halves, or inner walls poke
+        // outside the outer wall (seen on the Benchy roof).
+        let m = frustum(20.0, 10.0, 2.0);
+        let mut s = Settings { skirt_loops: 0, ..Settings::default() };
+        s.half_height_outer_walls = true;
+        let layers = generate(&m, &s);
+        let span = |p: &ToolPath| {
+            let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
+            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        for layer in layers.iter().skip(1) {
+            let upper = layer
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::ExternalPerimeter && p.z_offset_mm == 0.0)
+                .map(|p| span(p))
+                .fold(f64::MIN, f64::max);
+            for p in layer.paths.iter().filter(|p| p.kind == PathKind::Perimeter) {
+                assert!(
+                    span(p) <= upper - 1.5 * sp,
+                    "layer {}: inner span {:.3} escapes upper outer span {:.3}",
+                    layer.index,
+                    span(p),
+                    upper
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_sparse_pockets_become_solid() {
+        // A 2.4 mm-wide bar: the interior pocket is ~4 mm² — far too small for
+        // meaningful 15% sparse fill, so it must be promoted to solid.
+        let m = box_mesh(2.4, 8.0, 5.0);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let layers = generate(&m, &s);
+        let mid = &layers[10];
+        assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
+        assert!(count(mid, PathKind::Solid) > 0, "pocket promoted to solid");
+    }
+
+    #[test]
     fn half_outer_walls_exclude_brick() {
         let m = Mesh::cube(20.0);
         let mut s = Settings { skirt_loops: 0, wall_count: 4, ..Settings::default() };
@@ -1432,8 +1507,10 @@ mod tests {
 
     #[test]
     fn walls_are_placed_at_stadium_spacing() {
+        // Classic mode: this pins the exact offset constants (arachne's
+        // grid-extracted rings match within a cell — covered in wall::tests).
         let m = Mesh::cube(20.0);
-        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Classic, ..Settings::default() };
         let layers = generate(&m, &s);
         let mid = &layers[50];
         let span = |kind: PathKind| {
