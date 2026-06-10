@@ -67,6 +67,9 @@ struct Args {
     /// Support mode: none | grid | arc.
     #[arg(long)]
     support: Option<String>,
+    /// Wall generation: arachne (variable width, default) | classic.
+    #[arg(long)]
+    wall_mode: Option<String>,
     /// Spiral vase mode: one continuously rising wall, no infill above the bottom.
     #[arg(long)]
     vase: bool,
@@ -173,6 +176,10 @@ fn main() -> Result<()> {
     if let Some(s) = &args.solid_infill {
         settings.solid_pattern = config::InfillPattern::parse(s)
             .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
+    }
+    if let Some(s) = &args.wall_mode {
+        settings.wall_mode = config::WallMode::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown wall mode '{s}' (use arachne | classic)"))?;
     }
     if let Some(s) = &args.support {
         settings.support_mode = config::SupportMode::parse(s)

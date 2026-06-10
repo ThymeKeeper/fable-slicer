@@ -896,6 +896,18 @@ impl eframe::App for App {
                 });
                 tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
+                    ui.add_enabled_ui(!vase && !s.brick_layers, |ui| {
+                        egui::ComboBox::from_id_salt("wall_mode")
+                            .selected_text(s.wall_mode.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Arachne, "arachne");
+                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Classic, "classic");
+                            })
+                            .response
+                            .on_hover_text("Arachne: inner walls vary their width with the local feature thickness (thin cores become tapered beads, no voids between walls). Classic: fixed-width concentric offsets.")
+                            .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
+                        ui.label("wall mode");
+                    });
                     ui.add_enabled(!vase, egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
                         .on_hover_text("Number of perimeter loops (shell wall thickness).")
                         .on_disabled_hover_text("Spiral vase forces a single wall.");
@@ -1459,18 +1471,29 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
                 (path.width_mm as f32, (base_h * path.flow as f32).max(0.04))
             };
             let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
-            for win in path.points.windows(2) {
-                push_inst(&mut inst, win[0], win[1], zc, w, bh, c, layer_id, cat);
+            // Variable-width (arachne) beads render their true per-segment width.
+            let seg_w = |k: usize| -> f32 {
+                match &path.widths {
+                    Some(ws) => (0.5 * (ws[k] + ws[(k + 1) % ws.len()])) as f32,
+                    None => w,
+                }
+            };
+            let n_pts = path.points.len();
+            for k in 0..n_pts - 1 {
+                push_inst(&mut inst, path.points[k], path.points[k + 1], zc, seg_w(k), bh, c, layer_id, cat);
             }
             if path.closed {
-                let last = path.points[path.points.len() - 1];
-                push_inst(&mut inst, last, path.points[0], zc, w, bh, c, layer_id, cat);
+                push_inst(&mut inst, path.points[n_pts - 1], path.points[0], zc, seg_w(n_pts - 1), bh, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
-            for p in &path.points {
+            for (k, p) in path.points.iter().enumerate() {
+                let jw = match &path.widths {
+                    Some(ws) => ws[k] as f32,
+                    None => w,
+                };
                 joints.push([
                     p.x_mm() as f32, p.y_mm() as f32, zc,
-                    w, bh,
+                    jw, bh,
                     c[0], c[1], c[2],
                     layer_id, cat,
                 ]);

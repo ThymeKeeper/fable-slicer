@@ -9,7 +9,7 @@
 //! the previous `bottom_layers` below; otherwise it is within a shell and printed
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
-use config::{InfillPattern, SeamMode, Settings, SupportMode};
+use config::{InfillPattern, SeamMode, Settings, SupportMode, WallMode};
 use geo2d::{difference, intersection, offset, simplify, to_units, union, Contour, Point, Polygons};
 use mesh::Mesh;
 use rayon::prelude::*;
@@ -60,11 +60,15 @@ pub struct ToolPath {
     /// Bead height as a fraction of the layer height (half-height outer walls
     /// print two 0.5 passes per layer). 1.0 = the full layer.
     pub height_scale: f64,
+    /// Per-vertex bead widths (mm), parallel to `points` — variable-width
+    /// (arachne) walls taper along the path. `None` = constant `width_mm`.
+    /// When set, `width_mm` holds the maximum (for the flow clamp).
+    pub widths: Option<Vec<f64>>,
 }
 
 impl ToolPath {
     fn new(kind: PathKind, closed: bool, width_mm: f64, points: Vec<Point>) -> Self {
-        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0 }
+        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0, widths: None }
     }
 }
 
@@ -101,29 +105,30 @@ pub struct LayerPlan {
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
     // above the solid bottom, nothing that would interrupt the continuous loop.
-    let norm_settings;
-    let settings = if settings.spiral_vase {
-        norm_settings = Settings {
-            wall_count: 1,
-            infill_density: 0.0,
-            top_layers: 0,
-            support_mode: SupportMode::None,
-            brick_layers: false,
-            half_height_outer_walls: false, // the spiral *is* the outer wall
-            ironing: false,
-            gap_fill: false,
-            fuzzy_skin: false,
-            ..settings.clone()
-        };
-        &norm_settings
-    } else if settings.half_height_outer_walls && settings.brick_layers {
+    let mut norm_settings = settings.clone();
+    if norm_settings.spiral_vase {
+        // Spiral vase rewrites the recipe: one wall, no sparse infill, no
+        // shells above the solid bottom, nothing interrupting the loop.
+        norm_settings.wall_count = 1;
+        norm_settings.infill_density = 0.0;
+        norm_settings.top_layers = 0;
+        norm_settings.support_mode = SupportMode::None;
+        norm_settings.brick_layers = false;
+        norm_settings.half_height_outer_walls = false; // the spiral *is* the outer wall
+        norm_settings.ironing = false;
+        norm_settings.gap_fill = false;
+        norm_settings.fuzzy_skin = false;
+    }
+    if norm_settings.half_height_outer_walls && norm_settings.brick_layers {
         // Mutually exclusive: their Z choreographies collide (the lower outer
         // pass would graze the previous layer's lifted brick beads).
-        norm_settings = Settings { brick_layers: false, ..settings.clone() };
-        &norm_settings
-    } else {
-        settings
-    };
+        norm_settings.brick_layers = false;
+    }
+    if norm_settings.brick_layers || norm_settings.spiral_vase {
+        // Brick masonry needs uniform rings; the vase loop is classic too.
+        norm_settings.wall_mode = WallMode::Classic;
+    }
+    let settings = &norm_settings;
 
     let mut layers = slice_mesh(
         mesh,
@@ -196,12 +201,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // Adjacent beads are placed at the stadium spacing: rounded
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
+            let arachne = settings.wall_mode == WallMode::Arachne;
             let mut walls = Vec::new();
             let mut gaps = Polygons::new();
             // Material remaining at depth w·lw — eroded wall by wall to find
             // where the next wall failed to fit (the gap-fill regions).
             let mut at_depth = if settings.gap_fill { layer.polygons.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
+                if arachne && w > 0 {
+                    break; // inner walls come from the variable-width field
+                }
                 let inset = -(lw * 0.5 + w as f64 * sp);
                 let kind = if w == 0 {
                     PathKind::ExternalPerimeter
@@ -243,6 +252,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 flow,
                                 group: None,
                                 height_scale: hscale,
+                                widths: None,
                             });
                         }
                     }
@@ -258,14 +268,47 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     }
                     _ => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
                 }
-                if settings.gap_fill {
+                if settings.gap_fill && !arachne {
                     // Where material remains at this wall's outer edge but the
                     // wall bead (and everything deeper) is missing, it's a gap.
+                    // (Arachne has no between-wall gaps: beads stretch instead.)
                     let covered = offset(&centers, lw * 0.5);
                     if w > 0 {
                         gaps = union(&gaps, &difference(&at_depth, &covered));
                     }
                     at_depth = offset(&centers, -lw * 0.5);
+                }
+            }
+
+            // Variable-width (arachne) inner walls + thin-feature outer beads.
+            if arachne && settings.wall_count > 0 {
+                let inner_region = offset(&layer.polygons, -lw);
+                let vw = crate::wall::variable_walls(
+                    &layer.polygons,
+                    &inner_region,
+                    lw,
+                    sp,
+                    settings.wall_count - 1,
+                );
+                let push_bead = |b: crate::wall::Bead, kind: PathKind, walls: &mut Vec<ToolPath>| {
+                    let max_w = b.widths.iter().cloned().fold(0.0f64, f64::max);
+                    walls.push(ToolPath {
+                        kind,
+                        closed: b.closed,
+                        width_mm: max_w,
+                        points: b.points,
+                        z_offset_mm: 0.0,
+                        flow: 1.0,
+                        group: None,
+                        height_scale: 1.0,
+                        widths: Some(b.widths),
+                    });
+                };
+                for b in vw.inner {
+                    push_bead(b, PathKind::Perimeter, &mut walls);
+                }
+                for b in vw.thin_outer {
+                    push_bead(b, PathKind::ExternalPerimeter, &mut walls);
                 }
             }
             // Inset to the infill region (the inner edge of the last wall bead),
@@ -281,7 +324,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             if settings.gap_fill {
                 // Plus the slivers the morphological open dropped from the
                 // infill region (thin necks between walls).
-                let base = if settings.wall_count > 0 { &at_depth } else { &inset };
+                let base = if !arachne && settings.wall_count > 0 { &at_depth } else { &inset };
                 gaps = union(&gaps, &difference(base, &opened));
             }
             (walls, opened, gaps)
@@ -1208,23 +1251,32 @@ mod tests {
     }
 
     #[test]
-    fn gap_fill_covers_thin_fin() {
-        // A 1.2mm-wide fin with lw=0.45 and 2 walls: only one wall pair fits
-        // (0.9mm); the 0.3mm core must be gap-filled with a thin stroke.
+    fn thin_fin_core_is_a_tapered_wall_not_a_bandaid() {
+        // A 1.2mm-wide fin with lw=0.45 and 2 walls: the 0.3mm core between the
+        // outer wall pair becomes a real variable-width Perimeter bead in
+        // arachne mode (no GapFill strokes), and a GapFill stroke in classic.
         let m = box_mesh(1.2, 20.0, 5.0);
         let s = Settings { wall_count: 2, skirt_loops: 0, ..Settings::default() };
-        let layers = generate(&m, &s);
+        let layers = generate(&m, &s); // wall_mode defaults to Arachne
         let mid = &layers[10];
-        let gaps = count(mid, PathKind::GapFill);
-        assert!(gaps > 0, "thin fin core should be gap-filled");
-        let g = mid.paths.iter().find(|p| p.kind == PathKind::GapFill).unwrap();
+        assert_eq!(count(mid, PathKind::GapFill), 0, "arachne: no gap-fill bandaids");
+        let bead = mid
+            .paths
+            .iter()
+            .find(|p| p.kind == PathKind::Perimeter && p.widths.is_some())
+            .expect("variable-width core bead");
+        let ws = bead.widths.as_ref().unwrap();
+        let mid_w = ws[ws.len() / 2];
         assert!(
-            g.width_mm > 0.1 && g.width_mm < s.line_width_mm,
-            "gap stroke width {} should be under a line width",
-            g.width_mm
+            (0.2..=0.45).contains(&mid_w),
+            "core bead width {mid_w} should match the ~0.3mm core"
         );
-        // No second wall fits, so the fin is outer walls + gap fill only.
         assert_eq!(count(mid, PathKind::Infill), 0, "no room for sparse infill");
+
+        // Classic mode keeps the old behavior: a GapFill stroke.
+        let s = Settings { wall_mode: config::WallMode::Classic, ..s };
+        let layers = generate(&m, &s);
+        assert!(count(&layers[10], PathKind::GapFill) > 0, "classic: gap-filled");
     }
 
     #[test]

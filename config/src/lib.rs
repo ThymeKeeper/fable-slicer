@@ -99,6 +99,34 @@ impl InfillPattern {
     }
 }
 
+/// How wall toolpaths are generated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WallMode {
+    /// Variable-width beading (Arachne-class): inner walls stretch, squeeze,
+    /// split and merge with the local feature thickness; thin features become
+    /// single tapered beads. The outer wall stays a fixed-width exact loop.
+    #[default]
+    Arachne,
+    /// Fixed-width concentric offsets everywhere (gaps go to gap fill).
+    Classic,
+}
+
+impl WallMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "arachne" | "variable" | "adaptive" => Some(Self::Arachne),
+            "classic" | "fixed" | "concentric" => Some(Self::Classic),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Arachne => "arachne",
+            Self::Classic => "classic",
+        }
+    }
+}
+
 /// How overhangs are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SupportMode {
@@ -161,6 +189,8 @@ pub struct Settings {
     /// Max deviation (mm) a point may have from a fitted arc to be folded into it.
     pub arc_tolerance_mm: f64,
     pub wall_count: usize,
+    /// Wall generation: variable-width (arachne) or fixed concentric (classic).
+    pub wall_mode: WallMode,
     pub top_layers: usize,
     pub bottom_layers: usize,
     /// Print the outer wall as two half-height passes per layer, each sliced at
@@ -324,6 +354,7 @@ impl Default for Settings {
             arc_fitting: false,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
+            wall_mode: WallMode::default(),
             half_height_outer_walls: false,
             brick_layers: false,
             brick_flow: 1.05,

@@ -173,7 +173,20 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            if s.arc_fitting {
+            if let Some(ws) = &path.widths {
+                // Variable-width bead: per-segment E from the mean of the two
+                // endpoint widths (no arc fitting — E varies along the path).
+                let n_pts = path.points.len();
+                let segs = if path.closed { n_pts } else { n_pts - 1 };
+                for k in 0..segs {
+                    let a = path.points[k];
+                    let b = path.points[(k + 1) % n_pts];
+                    let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
+                    let c = config::bead_area_mm2(w, layer.height_mm * path.height_scale) / area
+                        * flow_factor(path, s);
+                    g.extrude(b.x_mm(), b.y_mm(), dist_mm(a, b) * c, feed);
+                }
+            } else if s.arc_fitting {
                 emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
             } else {
                 let mut prev = start;
@@ -713,6 +726,18 @@ pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
     let mut volume = 0.0; // mm³
     for layer in layers {
         for path in &layer.paths {
+            if let Some(ws) = &path.widths {
+                let n_pts = path.points.len();
+                let segs = if path.closed { n_pts } else { n_pts.saturating_sub(1) };
+                for k in 0..segs {
+                    let d = dist_mm(path.points[k], path.points[(k + 1) % n_pts]);
+                    let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
+                    volume += d
+                        * config::bead_area_mm2(w, layer.height_mm * path.height_scale)
+                        * flow_factor(path, s);
+                }
+                continue;
+            }
             let mut len = 0.0;
             for w in path.points.windows(2) {
                 len += dist_mm(w[0], w[1]);

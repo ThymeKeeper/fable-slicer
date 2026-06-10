@@ -188,7 +188,7 @@ pub fn gyroid_lines(region: &Polygons, spacing_mm: f64, z_mm: f64) -> Vec<Vec<Po
 
 /// Chain a segment soup into polylines by joining endpoints that coincide within
 /// `tol` (marching squares emits exact shared edge points, so this is generous).
-fn chain_segments(segs: Vec<((f64, f64), (f64, f64))>, tol: f64) -> Vec<Vec<(f64, f64)>> {
+pub(crate) fn chain_segments(segs: Vec<((f64, f64), (f64, f64))>, tol: f64) -> Vec<Vec<(f64, f64)>> {
     use std::collections::HashMap;
     let q = 1.0 / tol.max(1.0e-6);
     let key = |p: (f64, f64)| ((p.0 * q).round() as i64, (p.1 * q).round() as i64);

@@ -14,6 +14,7 @@ mod emit;
 mod fill;
 mod plan;
 mod slice;
+mod wall;
 
 pub use emit::{
     audit_combing, audit_flow_clamps, estimate_filament, estimate_seconds, format_duration,
