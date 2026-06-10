@@ -889,6 +889,27 @@ mod tests {
     }
 
     #[test]
+    fn frame_band_keeps_beads_on_its_narrow_side() {
+        // The Benchy roof is a frame whose shallow side band narrows; inner
+        // beads must not vanish there.
+        let mut frame = Polygons::new();
+        frame.contours.extend(rect(0.0, 0.0, 20.0, 10.0).contours);
+        let mut hole = rect(2.0, 2.0, 19.2, 8.0); // right band only 0.8 mm
+        hole.contours[0].make_cw();
+        frame.contours.extend(hole.contours);
+        let f = Field::build(&frame, 0.45).unwrap();
+        let beads = f.beads(0.45, 0.407, 1);
+        for (k, b) in beads.iter().enumerate() {
+            let xs: Vec<f64> = b.points.iter().map(|p| p.x_mm()).collect();
+            let len: f64 = b.points.windows(2).map(|w| (w[0].x_mm()-w[1].x_mm()).hypot(w[0].y_mm()-w[1].y_mm())).sum();
+            eprintln!("bead {k}: closed={} len={len:.1} x=[{:.2},{:.2}]",
+                b.closed, xs.iter().cloned().fold(f64::MAX,f64::min), xs.iter().cloned().fold(f64::MIN,f64::max));
+        }
+        let max_x = beads.iter().flat_map(|b| b.points.iter()).map(|p| p.x_mm()).fold(f64::MIN, f64::max);
+        assert!(max_x > 19.3, "no bead in the narrow right band (max x {max_x:.2})");
+    }
+
+    #[test]
     fn thin_strip_gets_one_tapered_ridge_bead() {
         let f = Field::build(&rect(0.0, 0.0, 20.0, 0.3), 0.45).unwrap();
         let beads = f.thin_ridge_beads(0.45, 0.407);

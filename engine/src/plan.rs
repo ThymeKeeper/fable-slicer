@@ -1513,6 +1513,59 @@ mod tests {
         assert!(count(mid, PathKind::Solid) > 0, "pocket promoted to solid");
     }
 
+    /// Prism with one vertical side and one shallow slope (run 3 per rise 1),
+    /// like the Benchy roof: inner rings must not lose their shallow-side arc.
+    fn wedge() -> Mesh {
+        let v = |x: f64, y: f64, z: f64| [x, y, z];
+        let verts = vec![
+            v(0.0, 0.0, 0.0), v(20.0, 0.0, 0.0), v(20.0, 10.0, 0.0), v(0.0, 10.0, 0.0),
+            v(0.0, 0.0, 3.0), v(20.0, 0.0, 3.0), v(20.0, 1.0, 3.0), v(0.0, 1.0, 3.0),
+        ];
+        let quads = [
+            [0u32, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+            [3, 2, 1, 0], [4, 5, 6, 7],
+        ];
+        let mut tris = Vec::new();
+        for q in quads {
+            tris.push([q[0], q[1], q[2]]);
+            tris.push([q[0], q[2], q[3]]);
+        }
+        Mesh { vertices: verts, triangles: tris }
+    }
+
+    #[test]
+    fn arachne_inner_ring_covers_shallow_side() {
+        let mut s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Arachne, ..Settings::default() };
+        s.half_height_outer_walls = true;
+        let layers = generate(&m_wedge(), &s);
+        let mid = &layers[7];
+        for ph in [0.0, -0.5 * s.layer_height_mm] {
+            let outer_len: f64 = mid
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::ExternalPerimeter && (p.z_offset_mm - ph).abs() < 1e-9)
+                .flat_map(|p| p.points.windows(2))
+                .map(|w| pt_dist_mm(w[0], w[1]))
+                .sum();
+            let inner_len: f64 = mid
+                .paths
+                .iter()
+                .filter(|p| p.kind == PathKind::Perimeter && (p.z_offset_mm - ph).abs() < 1e-9)
+                .flat_map(|p| p.points.windows(2))
+                .map(|w| pt_dist_mm(w[0], w[1]))
+                .sum();
+            eprintln!("phase {ph}: outer {outer_len:.1} inner {inner_len:.1}");
+            assert!(
+                inner_len > 0.6 * outer_len,
+                "phase {ph}: inner ring covers only {inner_len:.1} of outer {outer_len:.1}"
+            );
+        }
+    }
+
+    fn m_wedge() -> Mesh {
+        wedge()
+    }
+
     #[test]
     fn half_outer_walls_exclude_brick() {
         let m = Mesh::cube(20.0);
