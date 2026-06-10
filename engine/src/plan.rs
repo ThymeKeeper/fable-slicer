@@ -271,16 +271,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         }
                     }
                 };
-                match (w, halves) {
-                    // Half-height outer wall: two passes, each on its own
-                    // sliced contour — the lower half drops the nozzle by h/2
-                    // (ordered first in the layer), the upper finishes at the
-                    // layer plane. Both extrude half-height beads.
-                    (0, Some((lower, upper))) => {
+                match halves {
+                    // Half-height walls: *every* wall prints as two passes, each
+                    // offset from its own sliced contour — the lower half drops
+                    // the nozzle by h/2 (ordered first), the upper finishes at
+                    // the layer plane. Inner walls follow the upper contour too,
+                    // so they never stand proud on shallow treads where the next
+                    // layer doesn't cover them.
+                    Some((lower, upper)) => {
                         emit_loops(&offset(lower, inset), -0.5 * layer.height_mm, 0.5, &mut walls);
                         emit_loops(&offset(upper, inset), 0.0, 0.5, &mut walls);
                     }
-                    _ => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
+                    None => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
                 }
                 if settings.gap_fill && !arachne {
                     // Where material remains at this wall's outer edge but the
@@ -296,33 +298,47 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
             // Variable-width (arachne) inner walls + thin-feature outer beads.
             if arachne && settings.wall_count > 0 {
-                let inner_region = offset(interior, -lw);
-                let vw = crate::wall::variable_walls(
-                    interior,
-                    &inner_region,
-                    lw,
-                    sp,
-                    settings.wall_count - 1,
-                );
-                let push_bead = |b: crate::wall::Bead, kind: PathKind, walls: &mut Vec<ToolPath>| {
+                let push_bead = |b: crate::wall::Bead, kind: PathKind, z_off: f64, hs: f64, walls: &mut Vec<ToolPath>| {
                     let max_w = b.widths.iter().cloned().fold(0.0f64, f64::max);
                     walls.push(ToolPath {
                         kind,
                         closed: b.closed,
                         width_mm: max_w,
                         points: b.points,
-                        z_offset_mm: 0.0,
+                        z_offset_mm: z_off,
                         flow: 1.0,
                         group: None,
-                        height_scale: 1.0,
+                        height_scale: hs,
                         widths: Some(b.widths),
                     });
                 };
-                for b in vw.inner {
-                    push_bead(b, PathKind::Perimeter, &mut walls);
-                }
-                for b in vw.thin_outer {
-                    push_bead(b, PathKind::ExternalPerimeter, &mut walls);
+                let cap = settings.wall_count - 1;
+                match halves {
+                    // Half-height walls: the adaptive field runs per half
+                    // contour, so inner beads track the surface like the outer
+                    // wall does (each pass contained in its own phase).
+                    Some((lower, upper)) => {
+                        let vw = crate::wall::variable_walls(interior, &offset(lower, -lw), lw, sp, cap);
+                        for b in vw.inner {
+                            push_bead(b, PathKind::Perimeter, -0.5 * layer.height_mm, 0.5, &mut walls);
+                        }
+                        for b in vw.thin_outer {
+                            push_bead(b, PathKind::ExternalPerimeter, 0.0, 1.0, &mut walls);
+                        }
+                        let vw = crate::wall::variable_walls(&Polygons::new(), &offset(upper, -lw), lw, sp, cap);
+                        for b in vw.inner {
+                            push_bead(b, PathKind::Perimeter, 0.0, 0.5, &mut walls);
+                        }
+                    }
+                    None => {
+                        let vw = crate::wall::variable_walls(interior, &offset(interior, -lw), lw, sp, cap);
+                        for b in vw.inner {
+                            push_bead(b, PathKind::Perimeter, 0.0, 1.0, &mut walls);
+                        }
+                        for b in vw.thin_outer {
+                            push_bead(b, PathKind::ExternalPerimeter, 0.0, 1.0, &mut walls);
+                        }
+                    }
                 }
             }
             // Inset to the infill region (the inner edge of the last wall bead),
@@ -1457,20 +1473,30 @@ mod tests {
         };
         let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
         for layer in layers.iter().skip(1) {
-            let upper = layer
-                .paths
-                .iter()
-                .filter(|p| p.kind == PathKind::ExternalPerimeter && p.z_offset_mm == 0.0)
-                .map(|p| span(p))
-                .fold(f64::MIN, f64::max);
-            for p in layer.paths.iter().filter(|p| p.kind == PathKind::Perimeter) {
-                assert!(
-                    span(p) <= upper - 1.5 * sp,
-                    "layer {}: inner span {:.3} escapes upper outer span {:.3}",
-                    layer.index,
-                    span(p),
-                    upper
-                );
+            for phase in [0.0, -0.5 * s.layer_height_mm] {
+                let outer = layer
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == PathKind::ExternalPerimeter && (p.z_offset_mm - phase).abs() < 1e-9)
+                    .map(|p| span(p))
+                    .fold(f64::MIN, f64::max);
+                for p in layer
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == PathKind::Perimeter && (p.z_offset_mm - phase).abs() < 1e-9)
+                {
+                    assert!(
+                        (p.height_scale - 0.5).abs() < 1e-9,
+                        "inner walls are half-height under this feature"
+                    );
+                    assert!(
+                        span(p) <= outer - 1.5 * sp,
+                        "layer {} phase {phase}: inner span {:.3} escapes outer span {:.3}",
+                        layer.index,
+                        span(p),
+                        outer
+                    );
+                }
             }
         }
     }
