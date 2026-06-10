@@ -32,6 +32,10 @@ pub enum PathKind {
     /// The first solid layer over sparse infill: beads span the open cells
     /// below, so they print like (short, well-anchored) bridges.
     InternalBridge,
+    /// Self-supporting concentric arc fill over a flat overhang (arc-overhang
+    /// technique) — each arc cantilevers sideways off the previous ring, so
+    /// it runs far slower than a straight, both-ends-anchored bridge.
+    ArcOverhang,
     /// Sparse interior fill.
     Infill,
     /// Single width-matched strokes in gaps too thin for normal fill.
@@ -40,7 +44,7 @@ pub enum PathKind {
     Ironing,
     /// Removable support structure under overhangs.
     Support,
-    /// Self-supporting arc fill over a flat overhang (arc-overhang technique).
+    /// Straight bridge lines spanning a gap, anchored on both sides.
     Bridge,
 }
 
@@ -436,8 +440,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         if !inner.is_empty() {
             // Arc-overhang mode: the flat unsupported part of this layer's interior
             // is filled with self-supporting arcs instead of normal fill.
+            // Without supports (None) the flat overhangs still need handling:
+            // spans anchored on both sides bridge with straight lines (like
+            // Orca's bridge detection); true cantilevers stay normal fill —
+            // nothing rescues those except supports or arc mode.
             let mut supported_below = Polygons::new();
-            let arc_region = if settings.support_mode == SupportMode::Arc && i > 0 {
+            let overhang_region = if i > 0
+                && matches!(settings.support_mode, SupportMode::Arc | SupportMode::None)
+            {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 supported_below = offset(&layers[i - 1].polygons, allowance);
@@ -448,9 +458,36 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 Polygons::new()
             };
 
+            // Decide per disjoint island: a gap supported on ≥2 sides bridges
+            // with straight lines; otherwise arc mode arc-fills, support-less
+            // mode leaves it to the normal fill flow. Only the islands that
+            // actually got covered are carved out of the solid/sparse split.
+            let mut bridged = Polygons::new();
+            for island in islands(&overhang_region) {
+                let segs = match try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm) {
+                    Some(segs) => segs
+                        .into_iter()
+                        .map(|seg| (PathKind::Bridge, seg))
+                        .collect::<Vec<_>>(),
+                    None if settings.support_mode == SupportMode::Arc => {
+                        crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm, settings.arc_seam_overlap_mm)
+                            .into_iter()
+                            .map(|seg| (PathKind::ArcOverhang, seg))
+                            .collect()
+                    }
+                    None => continue,
+                };
+                for (kind, seg) in segs {
+                    if seg.len() >= 2 {
+                        paths.push(ToolPath::new(kind, false, lw, seg));
+                    }
+                }
+                bridged.contours.extend(island.contours);
+            }
+
             let solid_all = &solid_all_per_layer[i];
-            let solid = difference(solid_all, &arc_region);
-            let sparse = difference(&difference(inner, solid_all), &arc_region);
+            let solid = difference(solid_all, &bridged);
+            let sparse = difference(&difference(inner, solid_all), &bridged);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
 
             // Alternate fill direction per layer for cross-hatching.
@@ -470,23 +507,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 Polygons::new()
             };
-
-            if !arc_region.is_empty() {
-                // Decide per disjoint island: a short two-sided gap bridges with
-                // straight lines even if a wider gap on the same layer needs arcs;
-                // everything else (wide bridge, cantilever) is arc-filled.
-                for island in islands(&arc_region) {
-                    let segs = try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm)
-                        .unwrap_or_else(|| {
-                            crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm, settings.arc_seam_overlap_mm)
-                        });
-                    for seg in segs {
-                        if seg.len() >= 2 {
-                            paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
-                        }
-                    }
-                }
-            }
 
             if !solid.is_empty() {
                 // A perimeter loop following the solid region's boundary (so where
@@ -1513,6 +1533,37 @@ mod tests {
         // Vertices are ~3mm apart on this prism; consecutive seams must stay
         // on the same vertex column, not flip to the twin across the rear.
         assert!(max_step < 1.5, "seam jumped {max_step:.2}mm between layers");
+    }
+
+    #[test]
+    fn anchored_spans_bridge_without_supports() {
+        // A table: slab across two legs with a 4mm air gap between them.
+        // With support off, the gap's first layer must print as straight
+        // Bridge lines (it's anchored on both sides); the unsupported span
+        // must not silently print as ordinary fill.
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [4.0, 10.0, 4.0]);
+        push_box(&mut tris, [8.0, 0.0, 0.0], [12.0, 10.0, 4.0]);
+        push_box(&mut tris, [0.0, 0.0, 4.0], [12.0, 10.0, 6.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        assert_eq!(s.support_mode, SupportMode::None);
+        let plans = generate(&m, &s);
+        let slab_first = plans.iter().find(|p| p.print_z_mm > 4.05).unwrap();
+        let bridges: Vec<&ToolPath> =
+            slab_first.paths.iter().filter(|p| p.kind == PathKind::Bridge).collect();
+        assert!(!bridges.is_empty(), "the anchored gap must bridge");
+        let (min_x, max_x) = bridges
+            .iter()
+            .flat_map(|b| b.points.iter())
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.x_mm()), hi.max(p.x_mm())));
+        // The model is centered on the bed; the gap is the middle third of a
+        // 12mm-wide part. Bridge lines must stay near it (≤ a couple mm of
+        // anchor overlap past each side).
+        assert!(max_x - min_x < 8.0, "bridge lines span {:.1}mm — leaked beyond the gap", max_x - min_x);
+        // And the layer above is fully supported: no bridges.
+        let above = plans.iter().find(|p| p.print_z_mm > slab_first.print_z_mm).unwrap();
+        assert_eq!(count(above, PathKind::Bridge), 0, "second slab layer re-bridged");
     }
 
     #[test]

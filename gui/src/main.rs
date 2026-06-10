@@ -1003,7 +1003,7 @@ impl eframe::App for App {
                         &mut pins.gap_fill_speed, config::derived_gap_fill_speed_mm_s(v),
                         "Speed for thin gap-fill strokes. Auto = 40% of print speed, capped at 40.");
                     ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"))
-                        .on_hover_text("Speed for bridges and arc overhangs — slow so beads solidify in air.");
+                        .on_hover_text("Speed for straight bridges (spans anchored on both sides). Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — arcs cantilever off the previous ring and need to set in place.");
                     auto_slider(ui, &mut s.overhang_speed_mm_s, 5.0..=100.0, "overhang mm/s",
                         &mut pins.overhang_speed, config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s),
                         "Speed for wall stretches hanging past the layer below (printed with bridge cooling). Auto = bridge speed — same physics, beads onto air.");
@@ -1616,7 +1616,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         Infill => CAT_INFILL,
         GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
-        Support | Bridge | InternalBridge => CAT_SUPPORT,
+        Support | Bridge | InternalBridge | ArcOverhang => CAT_SUPPORT,
     }
 }
 
@@ -1636,6 +1636,8 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Bridge => [0.20, 0.85, 0.85],
         // Deeper teal: solid-over-sparse spans (anchored every infill cell).
         InternalBridge => [0.12, 0.55, 0.75],
+        // Sea green: concentric arc fans growing over open air.
+        ArcOverhang => [0.25, 0.78, 0.55],
     }
 }
 

@@ -321,7 +321,9 @@ pub struct Settings {
     pub support_speed_mm_s: f64,
     /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
     pub gap_fill_speed_mm_s: f64,
-    /// Speed (mm/s) for bridges and arc overhangs — slow so each bead solidifies.
+    /// Speed (mm/s) for straight bridges (spans anchored on both sides).
+    /// Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — each arc
+    /// cantilevers off the previous ring, far more delicate than a bridge.
     pub bridge_speed_mm_s: f64,
     /// Speed (mm/s) for wall stretches that overhang the layer below by more
     /// than half a bead — slow so the unsupported side cools in place.
@@ -429,8 +431,8 @@ impl Default for Settings {
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
             gap_fill_speed_mm_s: 20.0,
-            bridge_speed_mm_s: 15.0,
-            overhang_speed_mm_s: derived_overhang_speed_mm_s(15.0),
+            bridge_speed_mm_s: 50.0,
+            overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             max_volumetric_speed_mm3_s: 15.0,

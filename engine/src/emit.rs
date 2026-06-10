@@ -161,8 +161,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             }
             // Bridges and overhanging walls want max cooling; everything else
             // the layer's normal duty.
-            let airborne =
-                matches!(path.kind, PathKind::Bridge | PathKind::InternalBridge | PathKind::OverhangWall);
+            let airborne = matches!(
+                path.kind,
+                PathKind::Bridge | PathKind::ArcOverhang | PathKind::InternalBridge | PathKind::OverhangWall
+            );
             let want_fan = if airborne && layer.index >= s.fan_off_layers {
                 fan_duty(s.bridge_fan_speed).max(normal_fan)
             } else {
@@ -345,8 +347,13 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
         PathKind::GapFill => s.gap_fill_speed_mm_s,
         PathKind::Ironing => s.ironing_speed_mm_s,
         PathKind::Support => s.support_speed_mm_s,
-        // Bridges/arc overhangs print into air — go slow so each bead solidifies.
+        // Bridges print into air anchored on both ends.
         PathKind::Bridge => s.bridge_speed_mm_s,
+        // Arc overhangs cantilever sideways off the previous ring while
+        // unsupported along their whole length — far more delicate than a
+        // bridge: ~30% of bridge speed, held in the 5–15 mm/s window the
+        // technique is known to work in.
+        PathKind::ArcOverhang => (s.bridge_speed_mm_s * 0.3).clamp(5.0, 15.0),
         // Internal bridges (solid over sparse) are anchored every infill cell:
         // the free span is spacing/density, not a real bridge's max span. Sag
         // scales with span, so scale the bridge speed by the span ratio —
@@ -367,7 +374,7 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
 /// (brick, ironing), per-kind flow (bridges), and the global multiplier.
 fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
-    let kind_flow = if path.kind == PathKind::Bridge { s.bridge_flow } else { 1.0 };
+    let kind_flow = if matches!(path.kind, PathKind::Bridge | PathKind::ArcOverhang) { s.bridge_flow } else { 1.0 };
     path.flow * kind_flow * s.extrusion_multiplier
 }
 
@@ -428,6 +435,7 @@ pub(crate) fn kind_label(kind: PathKind) -> &'static str {
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
         PathKind::InternalBridge => "internal bridge",
+        PathKind::ArcOverhang => "arc overhang",
     }
 }
 
@@ -444,7 +452,8 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::GapFill => "Gap infill",
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
-        PathKind::Bridge => "Bridge",
+        // Arc overhangs report as Bridge: viewers colour-code known names.
+        PathKind::Bridge | PathKind::ArcOverhang => "Bridge",
         PathKind::InternalBridge => "Internal Bridge",
     }
 }
