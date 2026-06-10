@@ -19,6 +19,17 @@ struct ProfileDialog {
     delete: bool,
 }
 
+/// A printer-host action requested from the controls panel; executed after
+/// the panel closure returns (it borrows the settings).
+enum HostOp {
+    Test,
+    Send { start: bool },
+    Pause,
+    Resume,
+    Cancel,
+    Status,
+}
+
 /// Which derivable settings the user has pinned to manual values. Unpinned
 /// fields recompute live from their master setting every frame (camera-style
 /// "priority mode": auto until touched, visible either way).
@@ -185,6 +196,9 @@ struct App {
     camera: Camera,
     status: String,
     sliced: Option<Vec<engine::LayerPlan>>,
+    /// In-flight printer-host operation: its final status message arrives
+    /// here from the worker thread (one op at a time; buttons disable).
+    host_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// Cumulative bead-instance count after each layer (for the layer slider).
     layer_ends: Vec<u32>,
     /// Cumulative joint-blob count after each layer.
@@ -265,6 +279,7 @@ impl App {
             camera: Camera::new(),
             status,
             sliced: None,
+            host_rx: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
@@ -673,6 +688,40 @@ impl App {
         };
     }
 
+    /// Upload filename: the first object's name with a .gcode extension.
+    fn upload_filename(&self) -> String {
+        let base = self
+            .objects
+            .first()
+            .map(|o| o.name.trim_end_matches(".stl").trim_end_matches(".STL").to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "print".into());
+        format!("{base}.gcode")
+    }
+
+    /// Run a printer-host operation on a worker thread; its result message
+    /// lands in the status line. One at a time — callers disable while busy.
+    fn spawn_host_op(
+        &mut self,
+        ctx: &egui::Context,
+        op: impl FnOnce(&printhost::Client) -> String + Send + 'static,
+    ) {
+        let host = self.settings.host_url.trim().to_string();
+        if host.is_empty() {
+            self.status = "No printer host configured (Connection section).".into();
+            return;
+        }
+        let client = printhost::Client::new(&host, &self.settings.api_key);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.host_rx = Some(rx);
+        self.status = "Contacting printer…".into();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(op(&client));
+            ctx.request_repaint();
+        });
+    }
+
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         let bx = self.settings.bed_size_x_mm as f32;
         let by = self.settings.bed_size_y_mm as f32;
@@ -717,6 +766,19 @@ impl eframe::App for App {
         self.apply_auto();
 
         // 320 wide fits the longest slider row (90 slider + value + 19-char
+        // A finished printer-host operation reports into the status line.
+        if let Some(rx) = &self.host_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.status = msg;
+                self.host_rx = None;
+            }
+        }
+        // Host actions requested from inside the panel closure (which borrows
+        // settings) run after it returns.
+        let mut host_op: Option<HostOp> = None;
+        let host_busy = self.host_rx.is_some();
+        let host_set = !self.settings.host_url.trim().is_empty();
+
         // label + auto badge ≈ 287). Content wider than the panel doesn't just
         // clip: egui reserves the overflowed width, pushing the central panel
         // right and leaving an unpainted band between the two (egui #4475) —
@@ -846,7 +908,49 @@ impl eframe::App for App {
                 {
                     self.export();
                 }
+                let can_send = self.sliced.is_some() && host_set && !host_busy;
+                if ui
+                    .add_enabled(can_send, egui::Button::new("Send"))
+                    .on_hover_text("Upload the g-code to the printer's storage (host under Connection).")
+                    .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
+                    .clicked()
+                {
+                    host_op = Some(HostOp::Send { start: false });
+                }
+                if ui
+                    .add_enabled(can_send, egui::Button::new("Send & print"))
+                    .on_hover_text("Upload the g-code and start printing it immediately.")
+                    .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
+                    .clicked()
+                {
+                    host_op = Some(HostOp::Send { start: true });
+                }
             });
+            if host_set {
+                ui.horizontal(|ui| {
+                    let live = !host_busy;
+                    if ui.add_enabled(live, egui::Button::new("⏸"))
+                        .on_hover_text("Pause the running print.").clicked()
+                    {
+                        host_op = Some(HostOp::Pause);
+                    }
+                    if ui.add_enabled(live, egui::Button::new("▶"))
+                        .on_hover_text("Resume a paused print.").clicked()
+                    {
+                        host_op = Some(HostOp::Resume);
+                    }
+                    if ui.add_enabled(live, egui::Button::new("✖"))
+                        .on_hover_text("Cancel the running print.").clicked()
+                    {
+                        host_op = Some(HostOp::Cancel);
+                    }
+                    if ui.add_enabled(live, egui::Button::new("status"))
+                        .on_hover_text("Ask the printer what it's doing.").clicked()
+                    {
+                        host_op = Some(HostOp::Status);
+                    }
+                });
+            }
             ui.label(&self.status);
             ui.separator();
 
@@ -1110,6 +1214,25 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"))
                         .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
                 });
+                tier_section(ui, "Connection", TierKind::Printer, false, |ui| {
+                    ui.label("printer host").on_hover_text(
+                        "The printer's Moonraker address — e.g. voron24.local or 192.168.1.50. \
+                         Plain HTTP is assumed without a scheme. Empty = no connection.",
+                    );
+                    ui.add(egui::TextEdit::singleline(&mut s.host_url).hint_text("voron24.local"));
+                    ui.label("API key").on_hover_text(
+                        "Only needed when Moonraker's [authorization] section requires one.",
+                    );
+                    ui.add(egui::TextEdit::singleline(&mut s.api_key).password(true));
+                    let testable = !s.host_url.trim().is_empty() && !host_busy;
+                    if ui
+                        .add_enabled(testable, egui::Button::new("Test connection"))
+                        .on_hover_text("Query /server/info and report the Klipper state.")
+                        .clicked()
+                    {
+                        host_op = Some(HostOp::Test);
+                    }
+                });
                 tier_section(ui, "Custom g-code", TierKind::Printer, false, |ui| {
                     ui.label("Start g-code").on_hover_text(
                         "Emitted before the print. Placeholders: {nozzle_temp} {bed_temp} {bed_x} {bed_y} {bed_z} {layer_height} {first_layer_height} {nozzle_diameter}.",
@@ -1132,6 +1255,49 @@ impl eframe::App for App {
                 ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
                 });
         });
+
+        // Execute any printer-host action requested above, on a worker thread.
+        if let Some(op) = host_op {
+            let ctx = ui.ctx().clone();
+            match op {
+                HostOp::Test => self.spawn_host_op(&ctx, |c| match c.server_info() {
+                    Ok(state) => format!("Printer reachable — Klipper is {state}."),
+                    Err(e) => format!("Connection failed: {e}"),
+                }),
+                HostOp::Send { start } => {
+                    if let Some(layers) = self.sliced.as_ref() {
+                        let gcode = engine::to_gcode(layers, &self.settings);
+                        let filename = self.upload_filename();
+                        self.spawn_host_op(&ctx, move |c| {
+                            match c.upload(&filename, gcode.as_bytes(), start) {
+                                Ok(()) if start => format!("Printing {filename}."),
+                                Ok(()) => format!("Uploaded {filename}."),
+                                Err(e) => format!("Upload failed: {e}"),
+                            }
+                        });
+                    }
+                }
+                HostOp::Pause => self.spawn_host_op(&ctx, |c| match c.pause() {
+                    Ok(()) => "Print paused.".into(),
+                    Err(e) => format!("Pause failed: {e}"),
+                }),
+                HostOp::Resume => self.spawn_host_op(&ctx, |c| match c.resume() {
+                    Ok(()) => "Print resumed.".into(),
+                    Err(e) => format!("Resume failed: {e}"),
+                }),
+                HostOp::Cancel => self.spawn_host_op(&ctx, |c| match c.cancel() {
+                    Ok(()) => "Print cancelled.".into(),
+                    Err(e) => format!("Cancel failed: {e}"),
+                }),
+                HostOp::Status => self.spawn_host_op(&ctx, |c| match c.print_status() {
+                    Ok(st) if st.filename.is_empty() => format!("Printer is {}.", st.state),
+                    Ok(st) => {
+                        format!("{} {} — {:.0}%", st.state, st.filename, st.progress * 100.0)
+                    }
+                    Err(e) => format!("Status failed: {e}"),
+                }),
+            }
+        }
 
         // Frameless: the viewport texture runs edge-to-edge against the panel
         // separator instead of sitting in an 8 pt dark mat.

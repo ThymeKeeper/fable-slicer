@@ -26,6 +26,17 @@ struct Args {
     #[arg(long)]
     svg: Option<PathBuf>,
 
+    /// Upload the g-code to the printer (Moonraker host from the printer
+    /// profile, or --host).
+    #[arg(long)]
+    upload: bool,
+    /// Upload and start printing immediately (implies --upload).
+    #[arg(long)]
+    start_print: bool,
+    /// Printer host override (e.g. voron24.local or http://192.168.1.50).
+    #[arg(long)]
+    host: Option<String>,
+
     // --- profiles ---
     #[arg(long, default_value = "generic")]
     printer: String,
@@ -264,6 +275,27 @@ fn main() -> Result<()> {
     std::fs::write(&args.output, &gcode)
         .with_context(|| format!("writing {}", args.output.display()))?;
     println!("Wrote {} ({} g-code lines)", args.output.display(), gcode.lines().count());
+
+    if args.upload || args.start_print {
+        let host = args.host.clone().unwrap_or_else(|| settings.host_url.clone());
+        if host.trim().is_empty() {
+            anyhow::bail!("no printer host: set host_url in the printer profile or pass --host");
+        }
+        let client = printhost::Client::new(&host, &settings.api_key);
+        let filename = args
+            .output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "print.gcode".into());
+        client
+            .upload(&filename, gcode.as_bytes(), args.start_print)
+            .map_err(|e| anyhow::anyhow!("upload to {host} failed: {e}"))?;
+        if args.start_print {
+            println!("Uploaded {filename} to {host} — printing.");
+        } else {
+            println!("Uploaded {filename} to {host}.");
+        }
+    }
 
     if let Some(dir) = &args.svg {
         write_svgs(&layers, dir)?;

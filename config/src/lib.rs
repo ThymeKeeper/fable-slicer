@@ -305,6 +305,13 @@ pub struct Settings {
     /// instead of blobbing the seam. 0 disables.
     pub wipe_mm: f64,
 
+    // --- printer connection (Moonraker/Klipper API server) ---
+    /// Printer address — `voron24.local`, an IP, or a full URL; empty = not
+    /// configured. Plain HTTP is assumed when no scheme is given (LAN norm).
+    pub host_url: String,
+    /// Moonraker API key, only when its `[authorization]` requires one.
+    pub api_key: String,
+
     // --- temperatures (°C) ---
     pub nozzle_temp_c: u32,
     pub bed_temp_c: u32,
@@ -422,6 +429,8 @@ impl Default for Settings {
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
             wipe_mm: 2.0,
+            host_url: String::new(),
+            api_key: String::new(),
             nozzle_temp_c: 200,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,

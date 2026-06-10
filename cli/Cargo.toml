@@ -14,5 +14,6 @@ geo2d = { workspace = true }
 mesh = { workspace = true }
 engine = { workspace = true }
 config = { workspace = true }
+printhost = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

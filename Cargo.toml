@@ -13,7 +13,7 @@
 # rename costs nothing.
 [workspace]
 resolver = "2"
-members = ["geo2d", "mesh", "engine", "gcode", "config", "cli", "gui"]
+members = ["geo2d", "mesh", "engine", "gcode", "config", "cli", "gui", "printhost"]
 # The GUI is the product: bare `cargo run` / `cargo build` target it.
 # NOTE: this also scopes bare `cargo test` — use `cargo test --workspace`.
 default-members = ["gui"]
@@ -29,6 +29,7 @@ mesh = { path = "mesh" }
 engine = { path = "engine" }
 gcode = { path = "gcode" }
 config = { path = "config" }
+printhost = { path = "printhost" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rayon = "1"

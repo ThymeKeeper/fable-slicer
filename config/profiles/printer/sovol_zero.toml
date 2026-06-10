@@ -25,6 +25,10 @@ first_layer_speed_mm_s = 55.0
 retract_len_mm = 0.5
 retract_speed_mm_s = 40.0
 
+# Printer connection (Moonraker): uncomment to enable Send / Send & print.
+# host_url = "sovol-zero.local"
+# api_key = ""
+
 start_gcode = """
 PRINT_START EXTRUDER={nozzle_temp} BED={bed_temp}
 """
