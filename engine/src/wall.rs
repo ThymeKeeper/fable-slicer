@@ -212,11 +212,15 @@ impl Field {
         if fit <= 2 * cap {
             Scheme { n: fit, pitch: (t / fit as f64).clamp(sp * 0.5, sp * 1.6), saturated: false }
         } else {
-            let lw_ish = sp / 0.9; // a hair over one bead — the sliver threshold
+            // Absorb window: up to ~1.3 line widths of remainder gets eaten by
+            // widening the rings (bead max ≈ 1.75·lw, the practical squish
+            // limit); anything wider is a real strip that solid/sparse fill
+            // covers — so there is no uncovered band in between.
+            let sliver = sp * 1.444; // ≈ 1.3 × line width
             let remainder = t - 2.0 * cap as f64 * sp;
-            if remainder < lw_ish {
+            if remainder < sliver {
                 let n = 2 * cap;
-                Scheme { n, pitch: (t / n as f64).clamp(sp * 0.5, sp * 1.6), saturated: false }
+                Scheme { n, pitch: (t / n as f64).clamp(sp * 0.5, sp * 1.7), saturated: false }
             } else {
                 Scheme { n: 2 * cap, pitch: sp, saturated: true }
             }
@@ -227,7 +231,7 @@ impl Field {
     /// center beads in odd stretch zones.
     fn beads(&self, lw: f64, sp: f64, cap: usize) -> Vec<Bead> {
         let mut beads = Vec::new();
-        let width_of = move |pitch: f64| (pitch + (lw - sp)).clamp(lw * 0.5, lw * 1.6);
+        let width_of = move |pitch: f64| (pitch + (lw - sp)).clamp(lw * 0.5, lw * 1.75);
 
         for i in 0..cap {
             let mut psi = vec![f64::INFINITY; self.nx * self.ny];
@@ -438,8 +442,9 @@ impl Field {
         if line.len() < 2 || len < sp * 1.5 {
             return None; // grid-noise crumb
         }
-        // Two Chaikin passes melt the grid staircase (ridge traces especially),
-        // then RDP drops the redundant points.
+        // Laplacian relaxation kills the ~1 mm thickness-field ripple, two
+        // Chaikin passes melt the grid staircase, then RDP drops the rest.
+        let line = laplacian(&laplacian(&line, closed), closed);
         let line = chaikin(&chaikin(&line, closed), closed);
         let line = rdp(&line, self.cell * 0.45);
         let mut points = Vec::with_capacity(line.len());
@@ -455,8 +460,42 @@ impl Field {
         if points.len() < 2 {
             return None;
         }
-        Some(Bead { points, widths, closed })
+        // Smooth widths along the bead (the field is blockier than the line).
+        let n = widths.len();
+        let smoothed: Vec<f64> = (0..n)
+            .map(|i| {
+                let take = |j: i64| -> f64 {
+                    if closed {
+                        widths[j.rem_euclid(n as i64) as usize]
+                    } else {
+                        widths[j.clamp(0, n as i64 - 1) as usize]
+                    }
+                };
+                (take(i as i64 - 2) + take(i as i64 - 1) + widths[i] + take(i as i64 + 1) + take(i as i64 + 2)) / 5.0
+            })
+            .collect();
+        Some(Bead { points, widths: smoothed, closed })
     }
+}
+
+/// One Laplacian relaxation pass: each point moves halfway toward the average
+/// of its neighbours (endpoints fixed on open lines, cyclic when closed).
+fn laplacian(line: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
+    let n = line.len();
+    if n < 3 {
+        return line.to_vec();
+    }
+    (0..n)
+        .map(|i| {
+            if !closed && (i == 0 || i == n - 1) {
+                return line[i];
+            }
+            let a = line[(i + n - 1) % n];
+            let b = line[(i + 1) % n];
+            let (mx, my) = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+            (line[i].0 * 0.5 + mx * 0.5, line[i].1 * 0.5 + my * 0.5)
+        })
+        .collect()
 }
 
 /// One Chaikin corner-cutting pass: each segment is replaced by its ¼ and ¾

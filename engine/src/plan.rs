@@ -298,7 +298,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             if arachne && settings.wall_count > 0 {
                 let inner_region = offset(interior, -lw);
                 let vw = crate::wall::variable_walls(
-                    &layer.polygons,
+                    interior,
                     &inner_region,
                     lw,
                     sp,
