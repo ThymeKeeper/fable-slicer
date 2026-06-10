@@ -146,13 +146,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     let per_layer: Vec<(Vec<ToolPath>, Polygons, Polygons)> = layers
         .par_iter()
         .map(|layer| {
+            // Adjacent beads are placed at the stadium spacing: rounded
+            // shoulders overlap just enough to fill the cusps between beads.
+            let sp = config::bead_spacing_mm(lw, layer.height_mm);
             let mut walls = Vec::new();
             let mut gaps = Polygons::new();
             // Material remaining at depth w·lw — eroded wall by wall to find
             // where the next wall failed to fit (the gap-fill regions).
             let mut at_depth = if settings.gap_fill { layer.polygons.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
-                let inset = -lw * (0.5 + w as f64);
+                let inset = -(lw * 0.5 + w as f64 * sp);
                 let kind = if w == 0 {
                     PathKind::ExternalPerimeter
                 } else {
@@ -196,10 +199,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     at_depth = offset(&centers, -lw * 0.5);
                 }
             }
-            // Inset to the infill region, then morphologically "open" it (erode then
-            // dilate by half a line width) to drop slivers narrower than a line —
-            // those only produce tiny, useless dabs of infill.
-            let inset = offset(&layer.polygons, -lw * settings.wall_count as f64);
+            // Inset to the infill region (the inner edge of the last wall bead),
+            // then morphologically "open" it (erode then dilate by half a line
+            // width) to drop slivers narrower than a line — those only produce
+            // tiny, useless dabs of infill.
+            let wall_depth = match settings.wall_count {
+                0 => 0.0,
+                wc => lw + (wc - 1) as f64 * sp,
+            };
+            let inset = offset(&layer.polygons, -wall_depth);
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
             if settings.gap_fill {
                 // Plus the slivers the morphological open dropped from the
@@ -227,6 +235,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         .map(|(i, (mut paths, gaps))| {
         let inner = &inner_per_layer[i];
         let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
+        let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
 
         if !inner.is_empty() {
             // Exposed to air above/below unless covered by the whole shell range.
@@ -292,16 +301,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
                     }
                 }
-                let solid_core = offset(&solid, -(lw - ov));
+                let solid_core = offset(&solid, -(0.5 * (lw + sp) - 0.5 * ov));
                 if !solid_core.is_empty() {
                     fill_region(
-                        &solid_core, settings.solid_pattern, lw, angle, lw, PathKind::Solid,
+                        &solid_core, settings.solid_pattern, sp, angle, lw, PathKind::Solid,
                         settings.seam_mode, i, layers[i].z_mm, settings.monotonic_solid, &mut paths,
                     );
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
-                let spacing = lw / settings.infill_density;
+                let spacing = sp / settings.infill_density;
                 let sparse_fill = if ov > 0.0 { offset(&sparse, ov) } else { sparse.clone() };
                 fill_region(
                     &sparse_fill, settings.sparse_pattern, spacing, angle, lw, PathKind::Infill,
@@ -445,7 +454,8 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
     // minus the part (+clearance). Where the part is, the column rests and stops.
     // A z-gap of `gap` empty layers under each overhang aids removal, and the top
     // `iface` support layers are printed solid for a smoother overhang underside.
-    let spacing = lw / settings.support_density.clamp(0.02, 1.0);
+    let sp = config::bead_spacing_mm(lw, settings.layer_height_mm);
+    let spacing = sp / settings.support_density.clamp(0.02, 1.0);
     let gap = settings.support_z_gap_layers;
     let iface = settings.support_interface_layers;
     let mut accum = Polygons::new();
@@ -467,7 +477,7 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
                     PathKind::Support, settings.seam_mode, i, layers[i].z_mm, false, &mut plans[i].paths);
             }
             if !iface_here.is_empty() {
-                fill_region(&iface_here, InfillPattern::Lines, lw, angle, lw,
+                fill_region(&iface_here, InfillPattern::Lines, sp, angle, lw,
                     PathKind::Support, settings.seam_mode, i, layers[i].z_mm, false, &mut plans[i].paths);
             }
         }
@@ -694,9 +704,10 @@ fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
 /// the outer wall — a brim for bed adhesion. (Rendered as the skirt feature.)
 fn brim_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
     let lw = settings.line_width_mm;
+    let sp = config::bead_spacing_mm(lw, settings.first_layer_height_mm);
     let mut paths = Vec::new();
     for k in 0..settings.brim_loops {
-        let delta = lw * (0.5 + k as f64);
+        let delta = lw * 0.5 + k as f64 * sp;
         for c in offset(first_layer, delta).contours {
             // Outer loops only — don't print brim loops inside the part's holes.
             if c.points.len() >= 3 && c.is_ccw() {
@@ -1197,6 +1208,58 @@ mod tests {
             Contour::new(p.points.clone()).area_mm2()
         };
         assert!(area(&grown[10]) > area(&base[10]) + 5.0, "XY comp should grow the outline");
+    }
+
+    #[test]
+    fn walls_are_placed_at_stadium_spacing() {
+        let m = Mesh::cube(20.0);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let layers = generate(&m, &s);
+        let mid = &layers[50];
+        let span = |kind: PathKind| {
+            let p = mid.paths.iter().find(|p| p.kind == kind).unwrap();
+            let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
+            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        // Outer wall centerline stays at lw/2 from the surface (dimensional
+        // accuracy); the inner wall sits one *stadium spacing* further in, so
+        // its span is smaller by 2·sp, not 2·lw.
+        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        let outer = span(PathKind::ExternalPerimeter);
+        let inner = span(PathKind::Perimeter);
+        assert!((outer - (20.0 - s.line_width_mm)).abs() < 0.02, "outer span {outer}");
+        assert!(
+            (outer - inner - 2.0 * sp).abs() < 0.02,
+            "wall gap should be sp={sp:.3}: outer {outer:.3} inner {inner:.3}"
+        );
+    }
+
+    #[test]
+    fn solid_lines_are_spaced_at_stadium_spacing() {
+        let m = Mesh::cube(20.0);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let layers = generate(&m, &s);
+        let solids: Vec<&ToolPath> = layers[1]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Solid && !p.closed)
+            .collect();
+        assert!(solids.len() > 10);
+        // Project line midpoints onto the scanline axis; consecutive monotonic
+        // lines must sit one stadium spacing apart.
+        let angle = 135.0_f64.to_radians();
+        let proj = |p: &ToolPath| {
+            let m = p.points[0];
+            -m.x_mm() * angle.sin() + m.y_mm() * angle.cos()
+        };
+        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        let mut gaps: Vec<f64> = solids.windows(2).map(|w| (proj(w[1]) - proj(w[0])).abs()).collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = gaps[gaps.len() / 2];
+        assert!(
+            (median - sp).abs() < 0.01,
+            "solid line spacing should be {sp:.3}, got {median:.3}"
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Turn planned toolpaths into G-code.
 //!
-//! Extrusion math: the deposited bead approximates a `width × height` rectangle,
-//! so a move of length `L` advances the filament by
-//! `E = L * width * height / filament_cross_section`.
+//! Extrusion math: the deposited bead is a **stadium** (flat core, semicircular
+//! shoulders — see `config::bead_area_mm2`), so a move of length `L` advances
+//! the filament by `E = L * bead_area / filament_cross_section`. Adjacent beads
+//! are *placed* at the stadium spacing by the planner, so the shoulders overlap
+//! and surfaces come out watertight without over-extrusion.
 //!
 //! Output targets Klipper: relative extrusion (`M83`) and a retraction before
 //! every travel between separate extrusions. The start/end g-code comes from the
@@ -117,7 +119,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         if s.spiral_vase && layer.index >= first_spiral {
             if let Some(path) = spiral_loop(layer) {
                 let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
-                let coeff = path.width_mm * layer.height_mm / area * flow_factor(path, s);
+                let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm) / area * flow_factor(path, s);
                 emit_spiral_layer(&mut g, layer, path, coeff, feed, travel_f, retract_f, s);
                 continue;
             }
@@ -144,7 +146,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // Brick-layered perimeters print half a layer up and over-extrude a touch.
             let z = layer.print_z_mm + path.z_offset_mm;
             let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
-            let coeff = path.width_mm * layer.height_mm / area * flow_factor(path, s);
+            let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm) / area * flow_factor(path, s);
             let start = path.points[0];
 
             // The travel (combed route, or a retracted/z-hopped hop over a void)
@@ -310,7 +312,7 @@ fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
 fn feed_for(path: &ToolPath, layer_index: usize, layer_height_mm: f64, s: &Settings) -> f64 {
     let mut v = nominal_speed_mm_s(path.kind, layer_index, s);
     if s.max_volumetric_speed_mm3_s > 0.0 {
-        let mm3_per_mm = path.width_mm * layer_height_mm * flow_factor(path, s);
+        let mm3_per_mm = config::bead_area_mm2(path.width_mm, layer_height_mm) * flow_factor(path, s);
         if mm3_per_mm > 1.0e-9 {
             v = v.min(s.max_volumetric_speed_mm3_s / mm3_per_mm);
         }
@@ -715,7 +717,7 @@ pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
             if path.closed && path.points.len() >= 2 {
                 len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
             }
-            volume += len * path.width_mm * layer.height_mm * flow_factor(path, s);
+            volume += len * config::bead_area_mm2(path.width_mm, layer.height_mm) * flow_factor(path, s);
         }
     }
     let length_mm = volume / s.filament_area_mm2();
@@ -1014,21 +1016,26 @@ mod tests {
         let mut s = Settings::default();
         s.print_speed_mm_s = 300.0; // 300 × 0.45 × 0.2 = 27 mm³/s, over any PLA
         s.solid_speed_mm_s = 240.0;
-        s.max_volumetric_speed_mm3_s = 9.0; // → cap = 9 / 0.09 = 100 mm/s
+        // Stadium bead 0.45 × 0.2 = 0.0814 mm² → cap = 9 / 0.0814 ≈ 110.5 mm/s.
+        s.max_volumetric_speed_mm3_s = 9.0;
         let layers = generate(&m, &s);
 
+        let cap = 9.0 / config::bead_area_mm2(0.45, 0.2);
         let clamps = crate::emit::audit_flow_clamps(&layers, &s);
         assert!(!clamps.is_empty(), "clamp should engage");
         for (_, nominal, clamped) in &clamps {
             assert!(clamped < nominal, "{clamped} should be below {nominal}");
-            assert!((*clamped - 100.0).abs() < 1.0, "cap ≈ 100 mm/s, got {clamped}");
+            assert!((*clamped - cap).abs() < 1.0, "cap ≈ {cap:.1} mm/s, got {clamped}");
         }
 
-        // The g-code announces it and actually uses the capped feed (F6000),
+        // The g-code announces it and actually uses the capped feed,
         // never the asked-for F18000.
         let g = to_gcode(&layers, &s);
         assert!(g.contains("; flow limit = 9.0 mm3/s"));
-        assert!(g.contains("; flow-limited: infill 300 -> 100 mm/s"), "header reports the clamp");
+        assert!(
+            g.contains(&format!("; flow-limited: infill 300 -> {cap:.0} mm/s")),
+            "header reports the clamp"
+        );
         assert!(!g.contains("F18000"), "unclamped feed must not appear");
 
         // And the time estimate reflects the slower reality. (The margin is

@@ -388,3 +388,44 @@ impl Settings {
         PI * r * r
     }
 }
+
+/// Cross-section area (mm²) of a deposited bead: a **stadium** — a flat core
+/// with semicircular caps on the smaller dimension (a circle when w == h).
+/// This is the physical bead shape; the rectangle model it replaces over-fed
+/// by the cap-corner area (~9.5% at 0.45 × 0.2).
+pub fn bead_area_mm2(width_mm: f64, height_mm: f64) -> f64 {
+    let a = width_mm.min(height_mm);
+    let b = width_mm.max(height_mm);
+    a * (b - a) + PI * a * a / 4.0
+}
+
+/// Centerline distance (mm) at which adjacent beads fuse into a watertight
+/// surface: the rounded shoulders overlap exactly enough to fill the cusps
+/// between them. Area-exact by construction (`area / spacing / height = 1`),
+/// which also makes `spacing / density` preserve density semantics for sparse
+/// fills. For the usual w ≥ h this is `w − h·(1 − π/4)`.
+pub fn bead_spacing_mm(width_mm: f64, height_mm: f64) -> f64 {
+    bead_area_mm2(width_mm, height_mm) / height_mm.max(1.0e-9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stadium_bead_math() {
+        // 0.45 × 0.2 bead: A = 0.2·0.25 + π·0.04/4 = 0.0814 mm²,
+        // spacing = 0.45 − 0.2·(1 − π/4) ≈ 0.4071 mm.
+        let a = bead_area_mm2(0.45, 0.2);
+        assert!((a - 0.081_416).abs() < 1.0e-5, "area {a}");
+        let sp = bead_spacing_mm(0.45, 0.2);
+        assert!((sp - 0.407_08).abs() < 1.0e-4, "spacing {sp}");
+        // Square bead degenerates to a circle; spacing stays positive.
+        let c = bead_area_mm2(0.2, 0.2);
+        assert!((c - PI * 0.01).abs() < 1.0e-9, "circle {c}");
+        // Solid surfaces are exactly dense: area / (spacing × height) = 1.
+        assert!((a / (sp * 0.2) - 1.0).abs() < 1.0e-12);
+        // Narrower-than-tall (gap-fill strokes) stays positive and sane.
+        assert!(bead_area_mm2(0.12, 0.2) > 0.0);
+    }
+}

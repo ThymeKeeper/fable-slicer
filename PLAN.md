@@ -56,7 +56,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Integrate **Clipper2** in `geo2d` (offset via `One` scaler, integer coords) — boolean ops deferred to M2
 - [x] Walls via inward offset (`line_width/2`, then concentric) — configurable `--walls`
 - [x] Simple line infill clipped to the wall interior (even-odd scanline, alternating 45°/135°)
-- [x] Extrusion math (`E = length * line_width * layer_height / filament_area`)
+- [x] Extrusion math — **stadium bead model** (2026-06-09): `E = length × bead_area / filament_area` with `bead_area = h·(w−h) + π·h²/4` (the physical cross-section; was a w×h rectangle that over-fed ~9.5% at defaults). Adjacent beads are *placed* at the stadium spacing `w − h·(1−π/4)` so shoulders overlap and fill the inter-bead cusps — walls, solid fill, sparse density, supports, and brim all use it; outer wall stays at lw/2 (dimensions unchanged)
 - [x] `gcode`: `GcodeBuilder` writer (G0/G1, temps, fan, home; absolute E)
 - [x] Start/end g-code (generic Marlin placeholder)
 - [x] CLI emits `.gcode` (cube verified; Benchy 240 layers / 190k lines in ~2s)
@@ -184,6 +184,15 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
   travel ping-pong between disjoint islands on every scanline; sheen only needs
   monotonic order per contiguous surface. `ToolPath::group` marks indivisible
   blocks for the travel orderer; distinct islands stay independently orderable.
+- **Stadium flow + spacing, locked in (no model knob).** The bead is physically
+  a stadium; flow and placement both derive from it in one place
+  (`config::bead_area_mm2` / `bead_spacing_mm`), keeping solid surfaces
+  area-exact (`A / spacing / h = 1`) and density semantics intact
+  (`spacing / density`). **Migration note:** vs. the old rectangle model,
+  single beads extrude ~9.5% less (Benchy −5.7% filament overall) — anyone who
+  had tuned `extrusion_multiplier` below 1.0 to compensate should re-tune
+  toward 1.0. Per the legibility rules there is deliberately no
+  rectangle/stadium toggle.
 - **Optimizer legibility rules** (agreed 2026-06-09, applies to all "smart"
   balancing features): (1) *physics is not a preference* — single-correct
   computations (bead cross-section model, flow math) are locked in, with the
