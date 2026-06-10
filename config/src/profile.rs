@@ -49,6 +49,8 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub z_hop_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub wipe_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_gcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_gcode: Option<String>,
@@ -220,7 +222,7 @@ impl Tier for PrinterProfile {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk,
-            retract_len_mm, retract_speed_mm_s, z_hop_mm, start_gcode, end_gcode)
+            retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, start_gcode, end_gcode)
     }
 }
 
@@ -288,6 +290,7 @@ impl PrinterProfile {
             retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
             retract_speed_mm_s: diff_field!(cur.retract_speed_mm_s, base.retract_speed_mm_s),
             z_hop_mm: diff_field!(cur.z_hop_mm, base.z_hop_mm),
+            wipe_mm: diff_field!(cur.wipe_mm, base.wipe_mm),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
             end_gcode: diff_field!(cur.end_gcode.clone(), base.end_gcode),
         }
@@ -699,6 +702,7 @@ impl Profiles {
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),
+            wipe_mm: pr.wipe_mm.unwrap_or(d.wipe_mm),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
             print_speed_mm_s: print_v,

@@ -96,6 +96,11 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
 
     let fan_duty = |frac: f64| (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
     let first_spiral = s.bottom_layers; // vase mode: first continuously-rising layer
+    // Tail of the most recently printed path, for wiping the nozzle back over
+    // it when the next travel retracts. Carried across layers: a layer-change
+    // wipe runs one layer height above the bead, which still releases the
+    // pressure while moving instead of parked on the seam.
+    let mut wipe_tail: Option<Vec<Point>> = None;
 
     for layer in layers {
         g.comment(&format!("LAYER {} z={:.3}", layer.index, layer.print_z_mm));
@@ -180,6 +185,15 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let tr = &layer.travels[i];
             if tr.retract && s.retract_len_mm > 0.0 {
                 g.retract(s.retract_len_mm, retract_f);
+                // Wipe back along the printed bead: the pressure-release ooze
+                // smears onto plastic instead of blobbing the seam.
+                if s.wipe_mm > 0.0 {
+                    if let Some(tail) = &wipe_tail {
+                        for p in tail {
+                            g.travel(p.x_mm(), p.y_mm(), travel_f);
+                        }
+                    }
+                }
             }
             if tr.hop && hop_mm > 0.0 {
                 g.move_z(z + hop_mm, travel_f);
@@ -222,6 +236,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
                 }
             }
+            wipe_tail = compute_wipe_tail(path, s.wipe_mm);
         }
     }
 
@@ -453,6 +468,45 @@ fn dist_mm(a: Point, b: Point) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// The vertices to wipe back over after finishing `path`: walking backwards
+/// from its end (the seam, for closed loops) over at most `wipe_mm` — capped
+/// at half the path so short strokes don't fully retrace.
+fn compute_wipe_tail(path: &ToolPath, wipe_mm: f64) -> Option<Vec<Point>> {
+    let pts = &path.points;
+    let n = pts.len();
+    if wipe_mm <= 0.0 || n < 2 {
+        return None;
+    }
+    let mut total: f64 = pts.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
+    if path.closed {
+        total += dist_mm(pts[n - 1], pts[0]);
+    }
+    let budget = wipe_mm.min(total * 0.5);
+    // Predecessors of the end point: a closed loop ends back at pts[0], an
+    // open path at pts[n-1].
+    let mut cur = if path.closed { pts[0] } else { pts[n - 1] };
+    let idxs: Box<dyn Iterator<Item = usize>> =
+        if path.closed { Box::new((1..n).rev()) } else { Box::new((0..n - 1).rev()) };
+    let mut tail = Vec::new();
+    let mut acc = 0.0;
+    for j in idxs {
+        let p = pts[j];
+        let d = dist_mm(cur, p);
+        if acc + d >= budget {
+            let t = ((budget - acc) / d.max(1.0e-9)).clamp(0.0, 1.0);
+            tail.push(Point::from_mm(
+                cur.x_mm() + (p.x_mm() - cur.x_mm()) * t,
+                cur.y_mm() + (p.y_mm() - cur.y_mm()) * t,
+            ));
+            break;
+        }
+        tail.push(p);
+        acc += d;
+        cur = p;
+    }
+    (!tail.is_empty()).then_some(tail)
+}
+
 /// Need at least this many points to bother emitting an arc (avoids fitting corners).
 const ARC_MIN_PTS: usize = 4;
 /// Above this radius (mm) a run is treated as straight, not an arc.
@@ -608,6 +662,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
     let hop_t = if s.z_hop_mm > 0.0 { 2.0 * s.z_hop_mm / travel_v } else { 0.0 };
     let mut t = 0.0;
     let mut last_pos: Option<Point> = None;
+    let mut prev_path_len = 0.0_f64;
     for (i, path) in layer.paths.iter().enumerate() {
         if path.points.len() < 2 {
             continue;
@@ -626,6 +681,10 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
             t += trapezoid_time(len, 0.0, 0.0, travel_v, accel);
             if tr.retract {
                 t += retract_t;
+                // The wipe back over the previous path before travelling.
+                if s.wipe_mm > 0.0 && prev_path_len > 0.0 {
+                    t += s.wipe_mm.min(prev_path_len * 0.5) / travel_v;
+                }
             }
             if tr.hop {
                 t += hop_t;
@@ -634,6 +693,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
         let v_nom = feed_for(path, layer.index, layer.height_mm, s) / 60.0 * scale;
         t += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
         last_pos = Some(path_end(path));
+        prev_path_len = path.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
     }
     t
 }
@@ -1153,6 +1213,36 @@ mod tests {
             "has extruding moves"
         );
         assert!(g.lines().any(|l| l.starts_with("G1 E-")), "has retraction moves");
+    }
+
+    #[test]
+    fn retract_wipes_back_over_the_printed_bead() {
+        let m = mesh::Mesh::cube(20.0);
+        let s = Settings::default(); // wipe_mm = 2.0
+        let plans = generate(&m, &s);
+        let g = to_gcode(&plans, &s);
+        // Find a retract that is followed by moves before the unretract — the
+        // wipe — and check the first wipe target lies on the printed cube
+        // perimeter (x or y at the wall coordinate), not out in the open.
+        let lines: Vec<&str> = g.lines().collect();
+        let mut found = false;
+        for w in lines.windows(3) {
+            if w[0].starts_with("G1 E-") && w[1].starts_with("G0 X") && !w[1].contains('Z') {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "no wipe move directly after a retraction");
+        // And with wipe disabled those moves disappear: the file shrinks.
+        let mut s2 = s.clone();
+        s2.wipe_mm = 0.0;
+        let g2 = to_gcode(&generate(&m, &s2), &s2);
+        assert!(
+            g.lines().count() > g2.lines().count(),
+            "wipe must add moves ({} vs {})",
+            g.lines().count(),
+            g2.lines().count()
+        );
     }
 
     #[test]

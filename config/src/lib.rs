@@ -40,14 +40,19 @@ pub enum SeamMode {
     Sharpest,
     /// Scattered per layer.
     Random,
+    /// Each outer loop starts at the vertex nearest the previous layer's seam
+    /// (seeded at the rear), so the seam follows one continuous line even
+    /// where the rear-most vertex jumps between competing features.
+    Aligned,
 }
 
 impl SeamMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "nearest" | "rear" | "aligned" => Some(Self::Nearest),
+            "nearest" | "rear" => Some(Self::Nearest),
             "sharpest" | "sharp" | "corner" => Some(Self::Sharpest),
             "random" => Some(Self::Random),
+            "aligned" => Some(Self::Aligned),
             _ => None,
         }
     }
@@ -56,6 +61,7 @@ impl SeamMode {
             Self::Nearest => "nearest",
             Self::Sharpest => "sharpest",
             Self::Random => "random",
+            Self::Aligned => "aligned",
         }
     }
 }
@@ -294,6 +300,10 @@ pub struct Settings {
     pub retract_speed_mm_s: f64,
     /// Z lift on travels that can't be combed (cross a void). 0 disables.
     pub z_hop_mm: f64,
+    /// After retracting, wipe the nozzle back along the just-printed path by
+    /// this much before travelling — the ooze smears over existing plastic
+    /// instead of blobbing the seam. 0 disables.
+    pub wipe_mm: f64,
 
     // --- temperatures (°C) ---
     pub nozzle_temp_c: u32,
@@ -409,6 +419,7 @@ impl Default for Settings {
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
+            wipe_mm: 2.0,
             nozzle_temp_c: 200,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,

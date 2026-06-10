@@ -639,6 +639,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     add_supports(&mut plans, &layers, settings);
     order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
+    if settings.seam_mode == SeamMode::Aligned {
+        align_seams(&mut plans);
+    }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
@@ -1328,9 +1331,54 @@ fn place_seam(mut points: Vec<Point>, mode: SeamMode, layer_index: usize) -> Vec
             .unwrap(),
         // Deterministic per-layer scatter.
         SeamMode::Random => layer_index.wrapping_mul(2_654_435_761).wrapping_add(40_503) % n,
+        // Aligned starts from the rear like Nearest; `align_seams` then walks
+        // the layers in order and snaps each loop to the previous layer's
+        // seam, so this is only the first layer's seed.
+        SeamMode::Aligned => (0..n)
+            .max_by_key(|&i| (points[i].y, points[i].x))
+            .unwrap(),
     };
     points.rotate_left(start);
     points
+}
+
+/// Aligned seams: walk the layers bottom-up, rotating every closed outer-wall
+/// loop to start at the vertex nearest the seam of the loop below it — the
+/// seam follows one continuous line up the print even where the rear-most
+/// vertex would jump between competing features. Loops with no seam within
+/// `SEAM_TRACK_RADIUS_MM` below them (new islands) seed a new track at their
+/// place_seam position. Runs before travel planning, so combing and lead-ins
+/// see the final start points.
+fn align_seams(plans: &mut [LayerPlan]) {
+    const SEAM_TRACK_RADIUS_MM: f64 = 10.0;
+    let mut tracks: Vec<Point> = Vec::new();
+    for plan in plans.iter_mut() {
+        for path in plan.paths.iter_mut() {
+            if path.kind != PathKind::ExternalPerimeter || !path.closed || path.points.len() < 3 {
+                continue;
+            }
+            // Nearest (track, vertex) pair for this loop.
+            let mut best: Option<(f64, usize, usize)> = None; // (dist, vertex, track)
+            for (ti, t) in tracks.iter().enumerate() {
+                for (vi, p) in path.points.iter().enumerate() {
+                    let d = pt_dist_mm(*p, *t);
+                    if best.map_or(true, |(bd, _, _)| d < bd) {
+                        best = Some((d, vi, ti));
+                    }
+                }
+            }
+            match best {
+                Some((d, vi, ti)) if d <= SEAM_TRACK_RADIUS_MM => {
+                    path.points.rotate_left(vi);
+                    if let Some(ws) = path.widths.as_mut() {
+                        ws.rotate_left(vi);
+                    }
+                    tracks[ti] = path.points[0];
+                }
+                _ => tracks.push(path.points[0]), // new island: seed where place_seam put it
+            }
+        }
+    }
 }
 
 /// Corner sharpness at vertex `i`: `1 - cos(turn)` (0 = straight, up to 2 = hairpin).
@@ -1418,6 +1466,53 @@ mod tests {
         // The layer above the cantilever's first is fully supported again.
         let next = plans.iter().find(|p| p.print_z_mm > first_slab.print_z_mm).unwrap();
         assert_eq!(count(next, PathKind::OverhangWall), 0, "supported layer must not slow");
+    }
+
+    #[test]
+    fn aligned_seams_follow_one_column() {
+        // A cylinder-ish prism: the rear-most vertex is ambiguous (two
+        // vertices straddle the rear), so per-layer placement can flip
+        // between them; aligned mode must hold one continuous column.
+        let mut tris = Vec::new();
+        let n_side = 16;
+        let (cx, cy, r, h) = (10.0, 10.0, 8.0, 6.0);
+        let ring = |z: f64| -> Vec<[f64; 3]> {
+            (0..n_side)
+                .map(|k| {
+                    // Half-step phase: no vertex exactly at the rear.
+                    let a = std::f64::consts::TAU * (k as f64 + 0.5) / n_side as f64;
+                    [cx + r * a.cos(), cy + r * a.sin(), z]
+                })
+                .collect()
+        };
+        let (b, t) = (ring(0.0), ring(h));
+        for k in 0..n_side {
+            let k2 = (k + 1) % n_side;
+            tris.push([b[k], b[k2], t[k2]]);
+            tris.push([b[k], t[k2], t[k]]);
+            tris.push([[cx, cy, 0.0], b[k2], b[k]]);
+            tris.push([[cx, cy, h], t[k], t[k2]]);
+        }
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, seam_mode: config::SeamMode::Aligned, ..Settings::default() };
+        let plans = generate(&m, &s);
+        let starts: Vec<Point> = plans
+            .iter()
+            .filter_map(|p| {
+                p.paths
+                    .iter()
+                    .find(|t| t.kind == PathKind::ExternalPerimeter && t.closed)
+                    .map(|t| t.points[0])
+            })
+            .collect();
+        assert!(starts.len() > 10, "need a stack of outer loops");
+        let max_step = starts
+            .windows(2)
+            .map(|w| pt_dist_mm(w[0], w[1]))
+            .fold(0.0f64, f64::max);
+        // Vertices are ~3mm apart on this prism; consecutive seams must stay
+        // on the same vertex column, not flip to the twin across the rear.
+        assert!(max_step < 1.5, "seam jumped {max_step:.2}mm between layers");
     }
 
     #[test]

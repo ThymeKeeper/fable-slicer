@@ -1081,6 +1081,8 @@ impl eframe::App for App {
                         .on_hover_text("How fast filament is retracted and recovered.");
                     ui.add(egui::Slider::new(&mut s.z_hop_mm, 0.0..=2.0).text("z-hop mm"))
                         .on_hover_text("Lift the nozzle on travels that cross a gap/void. 0 = off.");
+                    ui.add(egui::Slider::new(&mut s.wipe_mm, 0.0..=5.0).text("wipe mm"))
+                        .on_hover_text("After retracting, drag the nozzle back along the printed bead by this much before travelling — ooze smears onto plastic instead of blobbing the seam. 0 = off.");
                 });
                 tier_section(ui, "Machine & motion", TierKind::Printer, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"))
@@ -1423,6 +1425,7 @@ fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) -> egui::Respon
         .selected_text(current.label())
         .show_ui(ui, |ui| {
             ui.selectable_value(current, Nearest, "nearest");
+            ui.selectable_value(current, Aligned, "aligned");
             ui.selectable_value(current, Sharpest, "sharpest");
             ui.selectable_value(current, Random, "random");
         })
