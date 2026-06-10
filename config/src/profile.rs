@@ -37,6 +37,10 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_wall_accel: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_layer_accel: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub jerk: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retract_len_mm: Option<f64>,
@@ -149,6 +153,8 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub overhang_speed_mm_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_layer_time_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_print_speed_mm_s: Option<f64>,
@@ -212,7 +218,8 @@ impl Tier for PrinterProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
-            travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration, jerk,
+            travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
+            outer_wall_accel, first_layer_accel, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, start_gcode, end_gcode)
     }
 }
@@ -239,7 +246,7 @@ impl Tier for ProcessProfile {
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm, print_speed_mm_s, first_layer_speed_mm_s,
-            bridge_speed_mm_s, min_layer_time_s, min_print_speed_mm_s,
+            bridge_speed_mm_s, overhang_speed_mm_s, min_layer_time_s, min_print_speed_mm_s,
             infill_overlap, monotonic_solid, gap_fill,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
@@ -275,6 +282,8 @@ impl PrinterProfile {
             print_speed_mm_s: diff_field!(cur.print_speed_mm_s, base.print_speed_mm_s),
             first_layer_speed_mm_s: diff_field!(cur.first_layer_speed_mm_s, base.first_layer_speed_mm_s),
             acceleration: diff_field!(cur.acceleration_mm_s2, base.acceleration_mm_s2),
+            outer_wall_accel: diff_field!(cur.outer_wall_accel_mm_s2, base.outer_wall_accel_mm_s2),
+            first_layer_accel: diff_field!(cur.first_layer_accel_mm_s2, base.first_layer_accel_mm_s2),
             jerk: diff_field!(cur.jerk_mm_s, base.jerk_mm_s),
             retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
             retract_speed_mm_s: diff_field!(cur.retract_speed_mm_s, base.retract_speed_mm_s),
@@ -352,6 +361,7 @@ impl ProcessProfile {
             print_speed_mm_s: None,
             first_layer_speed_mm_s: None,
             bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
+            overhang_speed_mm_s: diff_field!(cur.overhang_speed_mm_s, base.overhang_speed_mm_s),
             min_layer_time_s: diff_field!(cur.min_layer_time_s, base.min_layer_time_s),
             min_print_speed_mm_s: diff_field!(cur.min_print_speed_mm_s, base.min_print_speed_mm_s),
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
@@ -632,6 +642,12 @@ impl Profiles {
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
             bed_size_z_mm: pr.bed_size_z_mm.unwrap_or(d.bed_size_z_mm),
             acceleration_mm_s2: pr.acceleration.unwrap_or(d.acceleration_mm_s2),
+            outer_wall_accel_mm_s2: pr.outer_wall_accel.unwrap_or_else(|| {
+                crate::derived_outer_wall_accel_mm_s2(pr.acceleration.unwrap_or(d.acceleration_mm_s2))
+            }),
+            first_layer_accel_mm_s2: pr.first_layer_accel.unwrap_or_else(|| {
+                crate::derived_first_layer_accel_mm_s2(pr.acceleration.unwrap_or(d.acceleration_mm_s2))
+            }),
             jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
@@ -702,6 +718,9 @@ impl Profiles {
                 .gap_fill_speed_mm_s
                 .unwrap_or_else(|| crate::derived_gap_fill_speed_mm_s(print_v)),
             bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
+            overhang_speed_mm_s: pc.overhang_speed_mm_s.unwrap_or_else(|| {
+                crate::derived_overhang_speed_mm_s(pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s))
+            }),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
             max_volumetric_speed_mm3_s: fl

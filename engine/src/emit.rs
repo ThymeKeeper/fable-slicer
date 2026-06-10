@@ -84,7 +84,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     emit_template(&mut g, &s.start_gcode, s);
     // Motion limits, set after PRINT_START so our values win. M204 S is understood
     // by Klipper and Marlin; SQUARE_CORNER_VELOCITY is Klipper's "jerk" equivalent.
-    g.raw(&format!("M204 S{:.0}", s.acceleration_mm_s2));
+    // Acceleration then follows the feature being printed (M204 per change).
+    let mut cur_accel = s.first_layer_accel_mm_s2;
+    g.raw(&format!("M204 S{cur_accel:.0}"));
     g.raw(&format!("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={:.1}", s.jerk_mm_s));
     if s.pressure_advance > 0.0 {
         g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}", s.pressure_advance));
@@ -121,6 +123,12 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
                 let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
                     * flow_factor(path, s);
+                g.raw(&format!(";TYPE:{}", type_label(path.kind)));
+                let accel = accel_for(path.kind, layer.index, s);
+                if (accel - cur_accel).abs() > 0.5 {
+                    g.raw(&format!("M204 S{accel:.0}"));
+                    cur_accel = accel;
+                }
                 emit_spiral_layer(&mut g, layer, path, coeff, feed, travel_f, retract_f, s);
                 continue;
             }
@@ -129,12 +137,27 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         g.move_z(layer.print_z_mm, travel_f);
         let mut cur_z = layer.print_z_mm;
 
+        let mut cur_type: Option<&'static str> = None;
         for (i, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
                 continue;
             }
-            // Bridges want max cooling; everything else the layer's normal duty.
-            let want_fan = if path.kind == PathKind::Bridge && layer.index >= s.fan_off_layers {
+            // Feature annotation + acceleration, on change. The accel is set
+            // before the lead-in travel so the whole block moves as one.
+            let t = type_label(path.kind);
+            if cur_type != Some(t) {
+                g.raw(&format!(";TYPE:{t}"));
+                cur_type = Some(t);
+            }
+            let accel = accel_for(path.kind, layer.index, s);
+            if (accel - cur_accel).abs() > 0.5 {
+                g.raw(&format!("M204 S{accel:.0}"));
+                cur_accel = accel;
+            }
+            // Bridges and overhanging walls want max cooling; everything else
+            // the layer's normal duty.
+            let airborne = matches!(path.kind, PathKind::Bridge | PathKind::OverhangWall);
+            let want_fan = if airborne && layer.index >= s.fan_off_layers {
                 fan_duty(s.bridge_fan_speed).max(normal_fan)
             } else {
                 normal_fan
@@ -308,6 +331,8 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
         PathKind::Support => s.support_speed_mm_s,
         // Bridges/arc overhangs print into air — go slow so each bead solidifies.
         PathKind::Bridge => s.bridge_speed_mm_s,
+        // Wall stretches past the layer below: same physics as bridges.
+        PathKind::OverhangWall => s.overhang_speed_mm_s,
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
         PathKind::Skirt | PathKind::Perimeter | PathKind::Infill => s.print_speed_mm_s,
     }
@@ -369,12 +394,43 @@ pub(crate) fn kind_label(kind: PathKind) -> &'static str {
         PathKind::Skirt => "skirt",
         PathKind::ExternalPerimeter => "outer wall",
         PathKind::Perimeter => "inner wall",
+        PathKind::OverhangWall => "overhang wall",
         PathKind::Solid => "solid",
         PathKind::Infill => "infill",
         PathKind::GapFill => "gap fill",
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
+    }
+}
+
+/// `;TYPE:` annotation per feature, in the names g-code viewers (Mainsail,
+/// Fluidd, OrcaSlicer's own) already colour-code.
+fn type_label(kind: PathKind) -> &'static str {
+    match kind {
+        PathKind::Skirt => "Skirt",
+        PathKind::ExternalPerimeter => "Outer wall",
+        PathKind::Perimeter => "Inner wall",
+        PathKind::OverhangWall => "Overhang wall",
+        PathKind::Solid => "Solid infill",
+        PathKind::Infill => "Sparse infill",
+        PathKind::GapFill => "Gap infill",
+        PathKind::Ironing => "Ironing",
+        PathKind::Support => "Support",
+        PathKind::Bridge => "Bridge",
+    }
+}
+
+/// Acceleration (mm/s²) for a feature: gentle on the first layer (adhesion)
+/// and the visible outer wall (ringing); everything else at the main limit.
+/// Used for both the emitted M204s and the time estimate.
+fn accel_for(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
+    if layer_index == 0 {
+        return s.first_layer_accel_mm_s2;
+    }
+    match kind {
+        PathKind::ExternalPerimeter | PathKind::OverhangWall => s.outer_wall_accel_mm_s2,
+        _ => s.acceleration_mm_s2,
     }
 }
 
@@ -526,9 +582,9 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
 }
 
 /// Extrusion + intra-layer travel time for one layer, at the given speed scale,
-/// using the planned travels.
+/// using the planned travels. Acceleration follows the per-feature M204s the
+/// emitter writes, so the estimate tracks what the printer is actually told.
 fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
-    let accel = s.acceleration_mm_s2.max(1.0);
     let jerk = s.jerk_mm_s.max(0.1);
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let retract_t = if s.retract_len_mm > 0.0 {
@@ -543,6 +599,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
         if path.points.len() < 2 {
             continue;
         }
+        let accel = accel_for(path.kind, layer.index, s).max(1.0);
         if let Some(tr) = layer.travels.get(i) {
             // Travel length: from the previous position through the route points.
             let mut len = 0.0;
@@ -1064,7 +1121,15 @@ mod tests {
         let g = to_gcode(&generate(&m, &s), &s);
 
         assert!(g.contains("M83"), "relative extrusion mode");
-        assert!(g.contains("M204 S3000"), "emits acceleration limit");
+        // Acceleration follows the feature: gentle first layer, gentle outer
+        // wall (auto = accel/2), the main limit for everything else.
+        assert!(g.contains("M204 S1000"), "first-layer acceleration");
+        assert!(g.contains("M204 S1500"), "outer-wall acceleration");
+        assert!(g.contains("M204 S3000"), "main acceleration");
+        // Feature annotations for g-code viewers and analysis tools.
+        for t in [";TYPE:Outer wall", ";TYPE:Inner wall", ";TYPE:Solid infill", ";TYPE:Skirt"] {
+            assert!(g.contains(t), "missing {t}");
+        }
         assert!(g.contains("SQUARE_CORNER_VELOCITY=10.0"), "emits Klipper square corner velocity");
         assert!(g.contains("G28"), "homes (generic start template)");
         assert!(g.contains("M104 S200"), "nozzle temp substituted");

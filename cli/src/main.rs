@@ -327,6 +327,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::Skirt => "#999999",
             PathKind::ExternalPerimeter => "#1b5fb0",
             PathKind::Perimeter => "#5fa8e8",
+            PathKind::OverhangWall => "#f59e16",
             PathKind::Solid => "#2ca02c",
             PathKind::Infill => "#e08a2b",
             PathKind::GapFill => "#d62728",

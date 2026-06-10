@@ -172,8 +172,16 @@ pub struct Settings {
     pub bed_size_y_mm: f64,
     /// Max build height (mm).
     pub bed_size_z_mm: f64,
-    /// Acceleration (mm/s²) used for the time estimate.
+    /// Acceleration (mm/s²) for everything not listed below — inner walls,
+    /// infill, solid fill, support, travel. Emitted as M204 and used by the
+    /// time estimate. (Klipper clamps to printer.cfg `max_accel`.)
     pub acceleration_mm_s2: f64,
+    /// Acceleration (mm/s²) for the outermost wall — lower hides ringing on
+    /// the visible surface. Auto-derives as half the main acceleration.
+    pub outer_wall_accel_mm_s2: f64,
+    /// Acceleration (mm/s²) for the whole first layer — gentle for adhesion.
+    /// Auto-derives as min(1000, main acceleration).
+    pub first_layer_accel_mm_s2: f64,
     /// Junction speed limit (mm/s) used for the time estimate.
     pub jerk_mm_s: f64,
 
@@ -305,6 +313,10 @@ pub struct Settings {
     pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for bridges and arc overhangs — slow so each bead solidifies.
     pub bridge_speed_mm_s: f64,
+    /// Speed (mm/s) for wall stretches that overhang the layer below by more
+    /// than half a bead — slow so the unsupported side cools in place.
+    /// Auto-derives from the bridge speed (same physics: printing onto air).
+    pub overhang_speed_mm_s: f64,
     /// Minimum time per layer (s); thin layers are slowed to allow cooling.
     pub min_layer_time_s: f64,
     /// Floor speed (mm/s) when slowing for min-layer-time.
@@ -348,6 +360,8 @@ impl Default for Settings {
             bed_size_y_mm: 220.0,
             bed_size_z_mm: 250.0,
             acceleration_mm_s2: 3000.0,
+            outer_wall_accel_mm_s2: derived_outer_wall_accel_mm_s2(3000.0),
+            first_layer_accel_mm_s2: derived_first_layer_accel_mm_s2(3000.0),
             jerk_mm_s: 10.0,
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
@@ -405,6 +419,7 @@ impl Default for Settings {
             support_speed_mm_s: 45.0,
             gap_fill_speed_mm_s: 20.0,
             bridge_speed_mm_s: 15.0,
+            overhang_speed_mm_s: derived_overhang_speed_mm_s(15.0),
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             max_volumetric_speed_mm3_s: 15.0,
@@ -458,6 +473,23 @@ pub fn derived_support_speed_mm_s(print_speed_mm_s: f64) -> f64 {
 /// corners where the head is always turning.
 pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64) -> f64 {
     (print_speed_mm_s * 0.4).min(40.0)
+}
+
+/// Auto overhang-wall speed: same as bridges — both lay beads onto air.
+pub fn derived_overhang_speed_mm_s(bridge_speed_mm_s: f64) -> f64 {
+    bridge_speed_mm_s
+}
+
+/// Auto outer-wall acceleration: half the main acceleration — gentle direction
+/// changes on the visible surface hide ringing.
+pub fn derived_outer_wall_accel_mm_s2(acceleration_mm_s2: f64) -> f64 {
+    (acceleration_mm_s2 * 0.5).max(500.0)
+}
+
+/// Auto first-layer acceleration: capped at 1000 mm/s² so the squished first
+/// beads aren't sheared off the bed.
+pub fn derived_first_layer_accel_mm_s2(acceleration_mm_s2: f64) -> f64 {
+    acceleration_mm_s2.min(1000.0)
 }
 
 /// Cross-section area (mm²) of a deposited bead: a **stadium** — a flat core

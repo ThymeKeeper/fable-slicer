@@ -29,6 +29,9 @@ struct Pins {
     solid_speed: bool,
     support_speed: bool,
     gap_fill_speed: bool,
+    overhang_speed: bool,
+    outer_wall_accel: bool,
+    first_layer_accel: bool,
 }
 
 /// A slider with an auto/pin badge: while unpinned it shows a weak "auto" tag
@@ -234,15 +237,18 @@ impl App {
         let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         let baseline = settings.clone();
-        let pins = match profiles.merged_process(&process) {
-            Ok(pc) => Pins {
+        let pins = match (profiles.merged_process(&process), profiles.merged_printer(&printer)) {
+            (Ok(pc), Ok(pr)) => Pins {
                 line_width: pc.line_width_mm.is_some(),
                 external_speed: pc.external_perimeter_speed_mm_s.is_some(),
                 solid_speed: pc.solid_speed_mm_s.is_some(),
                 support_speed: pc.support_speed_mm_s.is_some(),
                 gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
+                overhang_speed: pc.overhang_speed_mm_s.is_some(),
+                outer_wall_accel: pr.outer_wall_accel.is_some(),
+                first_layer_accel: pr.first_layer_accel.is_some(),
             },
-            Err(_) => Pins::default(),
+            _ => Pins::default(),
         };
         Self {
             profiles,
@@ -346,16 +352,21 @@ impl App {
         self.refresh_pins();
     }
 
-    /// Pin state comes from the selected profiles: a field the process chain
+    /// Pin state comes from the selected profiles: a field the profile chain
     /// sets explicitly is pinned; one it leaves unset follows auto.
     fn refresh_pins(&mut self) {
-        if let Ok(pc) = self.profiles.merged_process(&self.process) {
+        if let (Ok(pc), Ok(pr)) =
+            (self.profiles.merged_process(&self.process), self.profiles.merged_printer(&self.printer))
+        {
             self.pins = Pins {
                 line_width: pc.line_width_mm.is_some(),
                 external_speed: pc.external_perimeter_speed_mm_s.is_some(),
                 solid_speed: pc.solid_speed_mm_s.is_some(),
                 support_speed: pc.support_speed_mm_s.is_some(),
                 gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
+                overhang_speed: pc.overhang_speed_mm_s.is_some(),
+                outer_wall_accel: pr.outer_wall_accel.is_some(),
+                first_layer_accel: pr.first_layer_accel.is_some(),
             };
         }
     }
@@ -380,6 +391,15 @@ impl App {
         if !self.pins.gap_fill_speed {
             s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s);
         }
+        if !self.pins.overhang_speed {
+            s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
+        }
+        if !self.pins.outer_wall_accel {
+            s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
+        }
+        if !self.pins.first_layer_accel {
+            s.first_layer_accel_mm_s2 = config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2);
+        }
     }
 
     /// Strip unpinned auto fields from a process diff: auto values are derived,
@@ -400,11 +420,25 @@ impl App {
         if !self.pins.gap_fill_speed {
             pc.gap_fill_speed_mm_s = None;
         }
+        if !self.pins.overhang_speed {
+            pc.overhang_speed_mm_s = None;
+        }
+    }
+
+    /// Printer-tier counterpart of `mask_auto`.
+    fn mask_auto_printer(&self, pr: &mut PrinterProfile) {
+        if !self.pins.outer_wall_accel {
+            pr.outer_wall_accel = None;
+        }
+        if !self.pins.first_layer_accel {
+            pr.first_layer_accel = None;
+        }
     }
 
     /// Per-tier dirty flags vs. the baseline, ignoring unpinned auto fields.
     fn tier_dirty_masked(&self) -> [bool; 3] {
-        let pr = PrinterProfile::diff(&self.settings, &self.baseline);
+        let mut pr = PrinterProfile::diff(&self.settings, &self.baseline);
+        self.mask_auto_printer(&mut pr);
         let fl = FilamentProfile::diff(&self.settings, &self.baseline);
         let mut pc = ProcessProfile::diff(&self.settings, &self.baseline);
         self.mask_auto(&mut pc);
@@ -429,6 +463,7 @@ impl App {
         match kind {
             TierKind::Printer => {
                 let mut diff = PrinterProfile::diff(&self.settings, &self.baseline);
+                self.mask_auto_printer(&mut diff);
                 if name == self.printer && self.profiles.is_user(kind, name) {
                     let existing = self.profiles.get_printer(name).cloned().unwrap_or_default();
                     let parent = existing.parent().map(str::to_string);
@@ -969,6 +1004,9 @@ impl eframe::App for App {
                         "Speed for thin gap-fill strokes. Auto = 40% of print speed, capped at 40.");
                     ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"))
                         .on_hover_text("Speed for bridges and arc overhangs — slow so beads solidify in air.");
+                    auto_slider(ui, &mut s.overhang_speed_mm_s, 5.0..=100.0, "overhang mm/s",
+                        &mut pins.overhang_speed, config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s),
+                        "Speed for wall stretches hanging past the layer below (printed with bridge cooling). Auto = bridge speed — same physics, beads onto air.");
                     ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
                         .on_hover_text("Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
                     ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
@@ -1060,7 +1098,13 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"))
                         .on_hover_text("Speed for non-printing moves between features.");
                     ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel mm/s²"))
-                        .on_hover_text("Acceleration limit, emitted as M204. Higher = faster but more ringing.");
+                        .on_hover_text("Acceleration for inner walls, infill, solid, support, and travel — emitted as M204 per feature. Klipper clamps to printer.cfg max_accel. Higher = faster but more ringing.");
+                    auto_slider(ui, &mut s.outer_wall_accel_mm_s2, 100.0..=20000.0, "outer accel",
+                        &mut pins.outer_wall_accel, config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2),
+                        "Acceleration for the visible outermost wall — lower hides ringing. Auto = 50% of accel.");
+                    auto_slider(ui, &mut s.first_layer_accel_mm_s2, 100.0..=20000.0, "1st layer accel",
+                        &mut pins.first_layer_accel, config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2),
+                        "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
                     ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"))
                         .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
                 });
@@ -1564,7 +1608,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
     use engine::PathKind::*;
     match kind {
         Skirt => CAT_SKIRT,
-        ExternalPerimeter | Perimeter => CAT_WALLS,
+        ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
         Solid => CAT_SOLID,
         Infill => CAT_INFILL,
         GapFill => CAT_GAPFILL,
@@ -1579,6 +1623,8 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Skirt => [0.60, 0.60, 0.66],
         ExternalPerimeter => [0.92, 0.34, 0.22],
         Perimeter => [0.36, 0.80, 0.45],
+        // Hot amber: slowed wall stretches hanging past the layer below.
+        OverhangWall => [0.98, 0.62, 0.10],
         Solid => [0.94, 0.80, 0.24],
         Infill => [0.32, 0.62, 0.95],
         GapFill => [0.95, 0.45, 0.55],

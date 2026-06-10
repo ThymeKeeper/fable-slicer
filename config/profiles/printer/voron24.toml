@@ -8,9 +8,14 @@ bed_size_x_mm = 350.0
 bed_size_y_mm = 350.0
 bed_size_z_mm = 340.0
 
-# Stock Voron 2.4 motion limits (max_accel / max_velocity / square_corner_velocity).
-# Conservative pre-tuning defaults — raise once input shaping is dialed in.
-acceleration = 3000.0
+# Motion limits. Interior features (inner walls, infill, solid, travel) run at
+# `acceleration`; the visible outer wall is pinned to a gentle 3000 so ringing
+# never reaches the surface, and the first layer auto-derives to 1000 for
+# adhesion. Klipper additionally clamps every M204 to printer.cfg max_accel —
+# if your config still has the stock 3000, raise it (or lower this) so the
+# two agree.
+acceleration = 10000.0
+outer_wall_accel = 3000.0
 jerk = 10.0
 travel_speed_mm_s = 350.0
 print_speed_mm_s = 150.0

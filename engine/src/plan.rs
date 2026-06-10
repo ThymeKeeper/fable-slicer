@@ -24,6 +24,9 @@ pub enum PathKind {
     Skirt,
     ExternalPerimeter,
     Perimeter,
+    /// Wall stretch hanging more than half a bead past the layer below —
+    /// printed slow, with bridge-grade cooling, so it sets in place.
+    OverhangWall,
     /// Dense (100%) top/bottom shell fill.
     Solid,
     /// Sparse interior fill.
@@ -367,6 +370,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let base = if !arachne && settings.wall_count > 0 { &at_depth } else { &inset };
                 gaps = union(&gaps, &difference(base, &opened));
             }
+            // Wall stretches hanging past the layer below print slow with full
+            // cooling (the spiral loop must stay whole, so vase mode skips).
+            // The unsupported region is usually empty, making this free.
+            let walls = if layer.index > 0 && !settings.spiral_vase {
+                let below = offset(&layers[layer.index - 1].polygons, 0.05);
+                let unsupported = difference(&layer.polygons, &below);
+                if unsupported.is_empty() {
+                    walls
+                } else {
+                    slow_overhanging_walls(walls, &unsupported, lw)
+                }
+            } else {
+                walls
+            };
             (walls, opened, gaps)
         })
         .collect();
@@ -723,6 +740,127 @@ fn rebalance_solid_sparse(solid: Polygons, sparse: Polygons, lw: f64) -> (Polygo
         }
     }
     (solid, sparse)
+}
+
+/// Even-odd containment over a polygon set (outers + holes).
+fn in_polys(polys: &Polygons, p: Point) -> bool {
+    let mut inside = false;
+    for c in &polys.contours {
+        if c.contains(p) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Mark wall stretches inside `unsupported` (the part of this layer with no
+/// material below) as `OverhangWall`: a bead whose centerline is past the
+/// previous outline hangs by more than half its width, and prints badly at
+/// wall speed — it gets the overhang speed and bridge-grade cooling instead.
+/// Loops are split into consecutive open pieces (no travel in between), with
+/// runs shorter than ~2 line widths merged into their neighbour so the speed
+/// doesn't chatter at classification borders.
+fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64) -> Vec<ToolPath> {
+    let min_run_mm = lw * 2.0;
+    let mut out = Vec::with_capacity(walls.len());
+    for path in walls {
+        if !matches!(path.kind, PathKind::ExternalPerimeter | PathKind::Perimeter) || path.points.len() < 2 {
+            out.push(path);
+            continue;
+        }
+        let n = path.points.len();
+        let segs = if path.closed { n } else { n - 1 };
+        let class: Vec<bool> = (0..segs)
+            .map(|k| {
+                let a = path.points[k];
+                let b = path.points[(k + 1) % n];
+                in_polys(unsupported, Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
+            })
+            .collect();
+        if class.iter().all(|&c| !c) {
+            out.push(path);
+            continue;
+        }
+        if class.iter().all(|&c| c) {
+            let mut p = path;
+            p.kind = PathKind::OverhangWall;
+            out.push(p);
+            continue;
+        }
+        // Mixed: gather maximal runs (cyclic for loops), starting at a border.
+        let seg_len = |k: usize| pt_dist_mm(path.points[k], path.points[(k + 1) % n]);
+        let start = if path.closed {
+            (0..segs).find(|&k| class[(k + segs - 1) % segs] != class[k]).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut runs: Vec<(bool, Vec<usize>, f64)> = Vec::new();
+        for i in 0..segs {
+            let k = (start + i) % segs;
+            let len = seg_len(k);
+            match runs.last_mut() {
+                Some((c, idxs, l)) if *c == class[k] => {
+                    idxs.push(k);
+                    *l += len;
+                }
+                _ => runs.push((class[k], vec![k], len)),
+            }
+        }
+        // Dissolve sub-threshold runs into the previous one (the previous run
+        // is always sound: it either met the threshold or absorbed others).
+        let mut merged: Vec<(bool, Vec<usize>, f64)> = Vec::new();
+        for run in runs {
+            match merged.last_mut() {
+                Some((c, idxs, l)) if *c == run.0 || run.2 < min_run_mm => {
+                    idxs.extend(run.1);
+                    *l += run.2;
+                }
+                _ => merged.push(run),
+            }
+        }
+        // A short leading run may now belong with the trailing one (cyclic).
+        if path.closed && merged.len() > 1 && merged[0].2 < min_run_mm {
+            let first = merged.remove(0);
+            let last = merged.last_mut().unwrap();
+            last.1.extend(first.1);
+            last.2 += first.2;
+        }
+        if merged.len() == 1 {
+            let mut p = path;
+            if merged[0].0 {
+                p.kind = PathKind::OverhangWall;
+            }
+            out.push(p);
+            continue;
+        }
+        for (over, idxs, _) in merged {
+            // Segment indices are consecutive (mod n): the piece's points run
+            // from the first segment's start to the last segment's end.
+            let first = idxs[0];
+            let count = idxs.len();
+            let mut points = Vec::with_capacity(count + 1);
+            let mut widths = path.widths.as_ref().map(|_| Vec::with_capacity(count + 1));
+            for j in 0..=count {
+                let idx = (first + j) % n;
+                points.push(path.points[idx]);
+                if let (Some(ws), Some(src)) = (widths.as_mut(), path.widths.as_ref()) {
+                    ws.push(src[idx]);
+                }
+            }
+            out.push(ToolPath {
+                kind: if over { PathKind::OverhangWall } else { path.kind },
+                closed: false,
+                width_mm: path.width_mm,
+                points,
+                z_offset_mm: path.z_offset_mm,
+                flow: path.flow,
+                group: path.group,
+                height_scale: path.height_scale,
+                widths,
+            });
+        }
+    }
+    out
 }
 
 /// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
@@ -1175,6 +1313,64 @@ mod tests {
 
     fn count(layer: &LayerPlan, kind: PathKind) -> usize {
         layer.paths.iter().filter(|p| p.kind == kind).count()
+    }
+
+    /// Axis-aligned box as a triangle soup (outward winding, same pattern as
+    /// `Mesh::cube`).
+    fn push_box(tris: &mut Vec<[[f64; 3]; 3]>, lo: [f64; 3], hi: [f64; 3]) {
+        let v = [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
+        ];
+        for t in [
+            [0, 2, 1], [0, 3, 2],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [3, 6, 2], [3, 7, 6],
+            [0, 7, 3], [0, 4, 7],
+            [1, 2, 6], [1, 6, 5],
+        ] {
+            tris.push([v[t[0]], v[t[1]], v[t[2]]]);
+        }
+    }
+
+    #[test]
+    fn overhanging_walls_slow_down() {
+        // A 2mm base with a slab cantilevering 10mm past it: the slab's first
+        // layer walls over air must come out as OverhangWall (slow + cooled),
+        // while walls over the base stay normal.
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 20.0, 2.0]);
+        push_box(&mut tris, [0.0, 0.0, 2.0], [20.0, 30.0, 4.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let plans = generate(&m, &s);
+
+        // The slab's first layer is the one printed at z just above 2mm.
+        let first_slab = plans.iter().find(|p| p.print_z_mm > 2.0).unwrap();
+        let over: Vec<&ToolPath> =
+            first_slab.paths.iter().filter(|p| p.kind == PathKind::OverhangWall).collect();
+        assert!(!over.is_empty(), "cantilever walls must be marked overhanging");
+        // Overhanging stretches live in the cantilever (y > 20, with margin
+        // for the bead inset); supported walls remain.
+        for p in &over {
+            for pt in &p.points {
+                assert!(pt.y_mm() > 19.0, "overhang piece at supported y={:.1}", pt.y_mm());
+            }
+        }
+        assert!(
+            first_slab.paths.iter().any(|p| matches!(p.kind, PathKind::ExternalPerimeter | PathKind::Perimeter)),
+            "supported walls keep their kind"
+        );
+        // The layer above the cantilever's first is fully supported again.
+        let next = plans.iter().find(|p| p.print_z_mm > first_slab.print_z_mm).unwrap();
+        assert_eq!(count(next, PathKind::OverhangWall), 0, "supported layer must not slow");
     }
 
     #[test]
