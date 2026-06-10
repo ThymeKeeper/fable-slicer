@@ -416,28 +416,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
 
             let solid_all = union(&solid_top, &solid_bottom);
-            let mut solid = difference(&solid_all, &arc_region);
-            let mut sparse = difference(&difference(inner, &solid_all), &arc_region);
-            // Tiny sparse pockets (post cores, thin ribs) would print as a few
-            // lonely 15% lines — fill them solid instead (Prusa's
-            // solid-infill-below-area behavior).
-            const SOLID_BELOW_AREA_MM2: f64 = 10.0;
-            if !sparse.is_empty() {
-                let mut keep = Polygons::new();
-                let mut promote = Polygons::new();
-                for island in islands(&sparse) {
-                    let target = if island.net_area_mm2() < SOLID_BELOW_AREA_MM2 {
-                        &mut promote
-                    } else {
-                        &mut keep
-                    };
-                    target.contours.extend(island.contours);
-                }
-                if !promote.contours.is_empty() {
-                    solid = union(&solid, &promote);
-                    sparse = keep;
-                }
-            }
+            let solid = difference(&solid_all, &arc_region);
+            let sparse = difference(&difference(inner, &solid_all), &arc_region);
+            let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
 
             // Alternate fill direction per layer for cross-hatching.
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
@@ -468,10 +449,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // solid surfaces bond to the walls.
                 let solid_loop = offset(&solid, -(lw * 0.5 - ov * 0.5));
                 for c in solid_loop.contours {
-                    if c.points.len() >= 3 {
-                        let points = place_seam(c.points, settings.seam_mode, i);
-                        paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
+                    if c.points.len() < 3 {
+                        continue;
                     }
+                    // Offsetting a dumbbell-shaped region can pinch off
+                    // micro-rings the island rebalance couldn't see; a loop
+                    // shorter than ~4 beads is a dab, not a surface.
+                    let m = c.points.len();
+                    let perim: f64 =
+                        (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
+                    if perim < lw * 4.0 {
+                        continue;
+                    }
+                    let points = place_seam(c.points, settings.seam_mode, i);
+                    paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
                 }
                 let solid_core = offset(&solid, -(0.5 * (lw + sp) - 0.5 * ov));
                 if !solid_core.is_empty() {
@@ -523,7 +514,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 }
                 let gw = gw.min(lw * 1.2);
                 let along = crate::fill::principal_angle_deg(&island);
-                for seg in crate::fill::infill_lines(&island, along, gw, false) {
+                for seg in crate::fill::infill_lines(&island, along, gw, false, 0.5) {
                     paths.push(ToolPath::new(PathKind::GapFill, false, gw, seg));
                 }
             }
@@ -540,7 +531,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // Island by island, so the pass finishes one surface before
                 // gliding to the next (ironing skips travel ordering entirely).
                 for island in islands(&iron) {
-                    for seg in crate::fill::infill_lines(&island, 45.0, spacing, true) {
+                    for seg in crate::fill::infill_lines(&island, 45.0, spacing, true, 0.5) {
                         let mut p = ToolPath::new(PathKind::Ironing, false, spacing, seg);
                         p.flow = settings.ironing_flow.clamp(0.0, 1.0);
                         paths.push(p);
@@ -682,6 +673,58 @@ fn islands(polys: &Polygons) -> Vec<Polygons> {
         .collect()
 }
 
+/// Rebalance the solid/sparse split at the island level, in both directions:
+///
+/// - **Junk solid → sparse.** The top/bottom coverage booleans shed solid
+///   islands too small or too thin to print: the boundary loop degenerates to
+///   a micro hairpin dab, or fits nowhere at all and leaves a silent void.
+///   Their area joins the sparse region instead, so the space still belongs
+///   to a fill pass rather than vanishing.
+/// - **Tiny sparse pockets → solid** (Prusa's solid-infill-below-area
+///   behavior): a few lonely 15% lines print badly; pour the pocket solid.
+///
+/// "Junk" means smaller than ~2×2 beads or nowhere wider than one line width
+/// (Cura's skin-removal-width default is one line width too). The same floor
+/// exempts pockets from promotion, so a demoted crumb can't bounce straight
+/// back to solid — unless it merged into a bigger printable pocket, where
+/// pouring it solid is the right outcome anyway.
+fn rebalance_solid_sparse(solid: Polygons, sparse: Polygons, lw: f64) -> (Polygons, Polygons) {
+    const SOLID_BELOW_AREA_MM2: f64 = 10.0;
+    let junk =
+        |island: &Polygons| island.net_area_mm2() < 4.0 * lw * lw || offset(island, -lw * 0.5).is_empty();
+    let mut solid = solid;
+    let mut sparse = sparse;
+    if !solid.is_empty() {
+        let mut keep = Polygons::new();
+        let mut demote = Polygons::new();
+        for island in islands(&solid) {
+            let target = if junk(&island) { &mut demote } else { &mut keep };
+            target.contours.extend(island.contours);
+        }
+        if !demote.contours.is_empty() {
+            sparse = union(&sparse, &demote);
+            solid = keep;
+        }
+    }
+    if !sparse.is_empty() {
+        let mut keep = Polygons::new();
+        let mut promote = Polygons::new();
+        for island in islands(&sparse) {
+            let target = if island.net_area_mm2() < SOLID_BELOW_AREA_MM2 && !junk(&island) {
+                &mut promote
+            } else {
+                &mut keep
+            };
+            target.contours.extend(island.contours);
+        }
+        if !promote.contours.is_empty() {
+            solid = union(&solid, &promote);
+            sparse = keep;
+        }
+    }
+    (solid, sparse)
+}
+
 /// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
 /// with straight lines — return those lines (oriented across the shortest gap,
 /// solid spacing). Returns None for cantilevers or spans wider than `max_span`,
@@ -694,7 +737,7 @@ fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -
     let mut best: Option<(f64, f64)> = None; // (max line length, angle)
     for k in 0..12 {
         let angle = k as f64 * 15.0;
-        let segs = infill_lines(region, angle, lw, false);
+        let segs = infill_lines(region, angle, lw, false, 0.5);
         let (mut total, mut anchored, mut max_len) = (0usize, 0usize, 0.0f64);
         for seg in &segs {
             if seg.len() < 2 {
@@ -714,7 +757,7 @@ fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -
         }
     }
     let (_, angle) = best?;
-    Some(infill_lines(region, angle, lw, false))
+    Some(infill_lines(region, angle, lw, false, 0.5))
 }
 
 /// A bridge line is anchored if both ends, extended outward by a line width, land
@@ -980,18 +1023,24 @@ fn fill_region(
             out.push(p);
         }
     };
+    // Minuscule solid dashes are pure overhead: the solid boundary loop
+    // already covers the region's rim, so a sub-1.5-line-width row-end stub
+    // adds a travel (often a retraction) for material the loop deposited.
+    // Sparse and support lines keep the small default — their patterns rely
+    // on short links.
+    let min_len = if kind == PathKind::Solid { lw * 1.5 } else { 0.5 };
     // Scanline patterns sweep each island separately when monotonic.
     let scan = |sets: &[(f64, f64)], out: &mut Vec<ToolPath>| {
         if monotonic {
             for (gi, island) in islands(region).iter().enumerate() {
                 for (si, &(a, sp)) in sets.iter().enumerate() {
                     let group = Some((gi * sets.len() + si) as u32);
-                    push_lines(infill_lines(island, a, sp, true), group, out);
+                    push_lines(infill_lines(island, a, sp, true, min_len), group, out);
                 }
             }
         } else {
             for &(a, sp) in sets {
-                push_lines(infill_lines(region, a, sp, false), None, out);
+                push_lines(infill_lines(region, a, sp, false, min_len), None, out);
             }
         }
     };
@@ -1126,6 +1175,39 @@ mod tests {
 
     fn count(layer: &LayerPlan, kind: PathKind) -> usize {
         layer.paths.iter().filter(|p| p.kind == kind).count()
+    }
+
+    #[test]
+    fn rebalance_demotes_junk_solid_to_sparse() {
+        // A 0.3 mm solid band (staircase sliver): nowhere wide enough for a
+        // bead — its area must move to the sparse region, not print a micro
+        // hairpin or silently vanish.
+        let solid = rect(0.0, 0.0, 10.0, 0.3);
+        let sparse = rect(0.0, 0.3, 10.0, 5.0);
+        let (solid, sparse) = rebalance_solid_sparse(solid, sparse, 0.45);
+        assert!(solid.is_empty(), "junk band stayed solid");
+        assert!((sparse.net_area_mm2() - 50.0).abs() < 0.3, "area not reallocated: {}", sparse.net_area_mm2());
+    }
+
+    #[test]
+    fn rebalance_keeps_printable_solid_and_promotes_pockets() {
+        // A 2 mm band prints fine; a lonely 4 mm² sparse pocket pours solid
+        // (the established solid-infill-below-area behavior survives).
+        let solid = rect(0.0, 0.0, 10.0, 2.0);
+        let pocket = rect(20.0, 0.0, 22.0, 2.0);
+        let (solid, sparse) = rebalance_solid_sparse(solid, pocket, 0.45);
+        assert!((solid.net_area_mm2() - 24.0).abs() < 0.1, "solid area {}", solid.net_area_mm2());
+        assert!(sparse.is_empty());
+    }
+
+    #[test]
+    fn rebalance_isolated_crumb_does_not_bounce_back() {
+        // A 0.6×0.6 mm solid crumb: junk by area. The promotion pass must not
+        // hand it straight back to solid (the junk floor).
+        let crumb = rect(0.0, 0.0, 0.6, 0.6);
+        let (solid, sparse) = rebalance_solid_sparse(crumb, Polygons::new(), 0.45);
+        assert!(solid.is_empty(), "crumb returned to solid");
+        assert!((sparse.net_area_mm2() - 0.36).abs() < 0.05);
     }
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygons {

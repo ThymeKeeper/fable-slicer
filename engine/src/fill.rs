@@ -9,12 +9,20 @@ use geo2d::{Point, Polygons};
 
 /// Generate straight infill lines at `angle_deg`, spaced `spacing_mm` apart,
 /// clipped to `region` via an even-odd scanline. The region is rotated so infill
-/// lines become horizontal scanlines, then results are rotated back.
+/// lines become horizontal scanlines, then results are rotated back. Rows
+/// shorter than `min_len_mm` are dropped — they cost a travel (often with a
+/// retraction) for a dab of extrusion the neighbouring paths already cover.
 ///
 /// Scanlines come back bottom-to-top; with `boustrophedon` every other line is
 /// reversed so consecutive lines connect with short hops (and a monotonic
 /// printing order falls out of just keeping this order).
-pub fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, boustrophedon: bool) -> Vec<Vec<Point>> {
+pub fn infill_lines(
+    region: &Polygons,
+    angle_deg: f64,
+    spacing_mm: f64,
+    boustrophedon: bool,
+    min_len_mm: f64,
+) -> Vec<Vec<Point>> {
     let theta = angle_deg.to_radians();
     let (ct, st) = (theta.cos(), theta.sin());
     let rot = |x: f64, y: f64| (x * ct + y * st, -x * st + y * ct);
@@ -58,8 +66,7 @@ pub fn infill_lines(region: &Polygons, angle_deg: f64, spacing_mm: f64, boustrop
         let mut k = 0;
         while k + 1 < xs.len() {
             let (x0, x1) = (xs[k], xs[k + 1]);
-            // Skip dabs shorter than this — not worth extruding.
-            if x1 - x0 > 0.5 {
+            if x1 - x0 > min_len_mm {
                 let (px0, py0) = unrot(x0, y);
                 let (px1, py1) = unrot(x1, y);
                 let mut seg = vec![Point::from_mm(px0, py0), Point::from_mm(px1, py1)];
@@ -425,12 +432,34 @@ mod tests {
     #[test]
     fn boustrophedon_alternates() {
         let region = rect(0.0, 0.0, 10.0, 10.0);
-        let lines = infill_lines(&region, 0.0, 1.0, true);
+        let lines = infill_lines(&region, 0.0, 1.0, true, 0.5);
         assert!(lines.len() >= 8);
         // Consecutive rows start at opposite x ends.
         let x0 = lines[0][0].x_mm();
         let x1 = lines[1][0].x_mm();
         assert!((x0 - x1).abs() > 5.0, "rows should alternate direction");
+    }
+
+    #[test]
+    fn min_len_filters_short_rows() {
+        // A right triangle: scanline rows shrink toward the apex; the filter
+        // must drop exactly the rows shorter than the threshold.
+        let mut tri = Polygons::new();
+        tri.push(Contour::new(vec![
+            Point::from_mm(0.0, 0.0),
+            Point::from_mm(10.0, 0.0),
+            Point::from_mm(0.0, 10.0),
+        ]));
+        let strict = infill_lines(&tri, 0.0, 1.0, false, 2.0);
+        let loose = infill_lines(&tri, 0.0, 1.0, false, 0.5);
+        assert!(strict.len() < loose.len(), "threshold should drop apex rows");
+        for l in &strict {
+            let len: f64 = l
+                .windows(2)
+                .map(|w| (w[0].x_mm() - w[1].x_mm()).hypot(w[0].y_mm() - w[1].y_mm()))
+                .sum();
+            assert!(len > 2.0, "row of {len:.2}mm survived a 2mm threshold");
+        }
     }
 
     #[test]
