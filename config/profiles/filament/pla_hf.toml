@@ -1,0 +1,5 @@
+# PLA through a high-flow hotend (e.g. Sovol Zero, Revo HF, Rapido) — higher
+# melt ceiling and a touch more heat. Pair with high-speed printer profiles.
+inherits = "pla"
+nozzle_temp_c = 215
+max_volumetric_speed_mm3_s = 30.0

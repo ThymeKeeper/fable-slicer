@@ -474,6 +474,19 @@ impl App {
             fil_mm / 1000.0,
             grams
         );
+        // Loud, not silent: say exactly which features the flow ceiling slowed.
+        let clamps = engine::audit_flow_clamps(&layers, &self.settings);
+        if !clamps.is_empty() {
+            let list: Vec<String> = clamps
+                .iter()
+                .map(|(k, nom, cl)| format!("{k:?} {nom:.0}→{cl:.0}"))
+                .collect();
+            self.status += &format!(
+                " · ⚠ flow-limited ({:.0} mm³/s): {} mm/s",
+                self.settings.max_volumetric_speed_mm3_s,
+                list.join(", ")
+            );
+        }
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
         self.preview_layer = n.max(1);
@@ -845,6 +858,8 @@ impl eframe::App for App {
                         .on_hover_text("Filament diameter (1.75 or 2.85). Drives the extrusion math.");
                     ui.add(egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0).text("density g/cm³"))
                         .on_hover_text("Filament density — used for the weight estimate.");
+                    ui.add(egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0).text("max flow mm³/s"))
+                        .on_hover_text("The filament's melt-rate ceiling through the hotend. Speeds are clamped so width × height × speed never exceeds it — the status line reports anything that gets slowed. 0 = unlimited.");
                     ui.add(egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2).text("flow ×"))
                         .on_hover_text("Global extrusion multiplier — filament-specific flow tuning.");
                     ui.add(egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2).text("pressure advance"))

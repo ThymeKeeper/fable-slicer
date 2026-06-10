@@ -239,6 +239,12 @@ fn main() -> Result<()> {
     println!("Filament: {:.2} m, {:.1} g", fil_mm / 1000.0, grams);
     let (cross, combed, fb, fb_hole) = engine::audit_combing(&layers);
     println!("Combing: {cross} crossing travels — {combed} combed, {fb} straight ({fb_hole} cut a hole)");
+    for (kind, nominal, clamped) in engine::audit_flow_clamps(&layers, &settings) {
+        println!(
+            "Flow-limited: {kind:?} {nominal:.0} -> {clamped:.0} mm/s (filament ceiling {:.1} mm³/s)",
+            settings.max_volumetric_speed_mm3_s
+        );
+    }
 
     let gcode = to_gcode(&layers, &settings);
     std::fs::write(&args.output, &gcode)

@@ -85,6 +85,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] **Gap fill** between colliding offsets (`gap_fill`, default on): per wall, the strip where material remains at the bead's outer edge but the wall didn't fit (plus open-dropped infill slivers) becomes single width-matched strokes along the sliver's principal axis (PCA), at `gap_fill_speed`. Hair-thin offset noise is filtered (morphological open + width ≥ 0.3·lw). Benchy's thin hull gains ~0.27m of previously-missing material
 - [x] **Infill⇄wall overlap** (`infill_overlap`, default 25% of line width): sparse/solid fill (and the solid boundary loop) push into the innermost wall bead so they bond — was exactly zero squish before
 - [x] **Monotonic solid fill** (`monotonic_solid`, default on): solid lines print in one strict boustrophedon sweep per island (`ToolPath::group` blocks survive travel ordering intact), so top surfaces get an even sheen
+- [x] **Volumetric flow clamp** (`max_volumetric_speed_mm3_s`, filament tier; pla 15 / petg 11 / new `pla-hf` 30; 0 = off): every feed is clamped so `width × height × speed × flow` never exceeds the filament's melt ceiling — one function (`feed_for`) feeds g-code, the time estimate, and min-layer-time, so they always agree. **Loud, never silent**: the g-code header, CLI, and GUI status all report exactly what got slowed (`flow-limited: infill 250 → 167 mm/s`). Sovol Zero at 250 mm/s + generic PLA clamps (the announcement *is* the calibration prompt); pair it with `pla-hf` instead
 - [x] Print-time estimate via trapezoidal motion simulation (acceleration + jerk-based junction look-ahead) + filament length/weight estimate (now honors per-path flow / bridge flow / extrusion multiplier); shown in GUI status + CLI
 - [x] **M73 progress** (time-based percent + minutes remaining per layer) and metadata header comments (estimated time, filament mm/g, layer count)
 - [ ] Coasting / wipe
@@ -183,6 +184,19 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
   travel ping-pong between disjoint islands on every scanline; sheen only needs
   monotonic order per contiguous surface. `ToolPath::group` marks indivisible
   blocks for the travel orderer; distinct islands stay independently orderable.
+- **Optimizer legibility rules** (agreed 2026-06-09, applies to all "smart"
+  balancing features): (1) *physics is not a preference* — single-correct
+  computations (bead cross-section model, flow math) are locked in, with the
+  global calibration escape (`extrusion_multiplier`) preserved, never exposed
+  as a model-choice knob; (2) *limits act loudly* — safety rails like the
+  volumetric clamp default on, the user controls the limit value, and every
+  intervention is reported (g-code header, CLI, GUI status), never silent;
+  (3) *derivations are visible* — derived defaults (per-feature speeds, later
+  line-width-from-nozzle) display as "auto" with the live computed value and
+  pin to manual when touched; (4) *nothing rewrites saved profiles behind the
+  user's back* — diff-based saves guarantee un-pinned auto values are never
+  serialized. No global simple/expert mode switch; progressive disclosure via
+  the tier-colored collapsible sections instead.
 - **Gap fill = chained-offset comparison + PCA strokes.** Per wall w, gap =
   (material at depth w·lw) − (dilated wall-w centerlines); plus open-dropped
   infill slivers. Filter hair ribbons (open by 0.15·lw, stroke width ≥ 0.3·lw),

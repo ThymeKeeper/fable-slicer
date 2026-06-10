@@ -3,3 +3,5 @@ filament_diameter_mm = 1.75
 density_g_cm3 = 1.27
 nozzle_temp_c = 240
 bed_temp_c = 80
+# PETG melts slower than PLA.
+max_volumetric_speed_mm3_s = 11.0

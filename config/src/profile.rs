@@ -67,6 +67,8 @@ pub struct FilamentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extrusion_multiplier: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_volumetric_speed_mm3_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pressure_advance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_speed: Option<f64>,
@@ -217,7 +219,7 @@ impl Tier for FilamentProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, bed_temp_c,
-            extrusion_multiplier, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers)
+            extrusion_multiplier, max_volumetric_speed_mm3_s, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers)
     }
 }
 
@@ -294,6 +296,7 @@ impl FilamentProfile {
             nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
+            max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
@@ -425,6 +428,7 @@ impl Profiles {
         p.printers.insert("sovol-zero".into(), parse("printer/sovol_zero", include_str!("../profiles/printer/sovol_zero.toml")));
         p.filaments.insert("pla".into(), parse("filament/pla", include_str!("../profiles/filament/pla.toml")));
         p.filaments.insert("petg".into(), parse("filament/petg", include_str!("../profiles/filament/petg.toml")));
+        p.filaments.insert("pla-hf".into(), parse("filament/pla_hf", include_str!("../profiles/filament/pla_hf.toml")));
         p.processes.insert("standard".into(), parse("process/standard", include_str!("../profiles/process/standard.toml")));
         p.processes.insert("fine".into(), parse("process/fine", include_str!("../profiles/process/fine.toml")));
         p.processes.insert("draft".into(), parse("process/draft", include_str!("../profiles/process/draft.toml")));
@@ -671,6 +675,9 @@ impl Profiles {
             bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
+            max_volumetric_speed_mm3_s: fl
+                .max_volumetric_speed_mm3_s
+                .unwrap_or(d.max_volumetric_speed_mm3_s),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
             bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),

@@ -50,6 +50,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     g.comment(&format!("filament used [mm] = {fil_mm:.1}"));
     g.comment(&format!("filament used [g] = {fil_g:.1}"));
     g.comment(&format!("total layers = {}", layers.len()));
+    if s.max_volumetric_speed_mm3_s > 0.0 {
+        g.comment(&format!("flow limit = {:.1} mm3/s", s.max_volumetric_speed_mm3_s));
+        for (kind, nominal, clamped) in audit_flow_clamps(layers, s) {
+            g.comment(&format!(
+                "flow-limited: {} {:.0} -> {:.0} mm/s",
+                kind_label(kind),
+                nominal,
+                clamped
+            ));
+        }
+    }
     g.comment(&format!(
         "layer_h={} line_w={} walls={} top/bot={}/{} infill={} ({}) bed={}x{}",
         s.layer_height_mm,
@@ -105,8 +116,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         // continuously from the previous layer's top to this one's.
         if s.spiral_vase && layer.index >= first_spiral {
             if let Some(path) = spiral_loop(layer) {
-                let feed = feed_for(path.kind, layer.index, s) * layer.speed_scale;
-                let coeff = path.width_mm * layer.height_mm / area * path.flow * s.extrusion_multiplier;
+                let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
+                let coeff = path.width_mm * layer.height_mm / area * flow_factor(path, s);
                 emit_spiral_layer(&mut g, layer, path, coeff, feed, travel_f, retract_f, s);
                 continue;
             }
@@ -132,10 +143,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
 
             // Brick-layered perimeters print half a layer up and over-extrude a touch.
             let z = layer.print_z_mm + path.z_offset_mm;
-            let feed = feed_for(path.kind, layer.index, s) * layer.speed_scale;
-            let kind_flow = if path.kind == PathKind::Bridge { s.bridge_flow } else { 1.0 };
-            let coeff =
-                path.width_mm * layer.height_mm / area * path.flow * kind_flow * s.extrusion_multiplier;
+            let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
+            let coeff = path.width_mm * layer.height_mm / area * flow_factor(path, s);
             let start = path.points[0];
 
             // The travel (combed route, or a retracted/z-hopped hop over a void)
@@ -269,12 +278,12 @@ fn substitute(template: &str, s: &Settings) -> String {
         .replace("{nozzle_diameter}", &format!("{:.3}", s.nozzle_diameter_mm))
 }
 
-/// Feed rate (mm/min) per feature; the first layer is slow everywhere.
-fn feed_for(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
+/// The configured speed (mm/s) for a feature, before any limits.
+fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
     if layer_index == 0 {
-        return s.first_layer_speed_mm_s * 60.0;
+        return s.first_layer_speed_mm_s; // first layer is slow everywhere
     }
-    let v = match kind {
+    match kind {
         PathKind::ExternalPerimeter => s.external_perimeter_speed_mm_s,
         PathKind::Solid => s.solid_speed_mm_s,
         PathKind::GapFill => s.gap_fill_speed_mm_s,
@@ -284,8 +293,71 @@ fn feed_for(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
         PathKind::Bridge => s.bridge_speed_mm_s,
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
         PathKind::Skirt | PathKind::Perimeter | PathKind::Infill => s.print_speed_mm_s,
-    };
+    }
+}
+
+/// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
+/// (brick, ironing), per-kind flow (bridges), and the global multiplier.
+fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
+    let kind_flow = if path.kind == PathKind::Bridge { s.bridge_flow } else { 1.0 };
+    path.flow * kind_flow * s.extrusion_multiplier
+}
+
+/// Feed rate (mm/min) for a path: the per-feature speed, clamped so the
+/// volumetric flow `width × height × speed × flow` never exceeds the
+/// filament's melt-rate ceiling. One function feeds the g-code, the time
+/// estimate, and the min-layer-time pass, so they always agree.
+fn feed_for(path: &ToolPath, layer_index: usize, layer_height_mm: f64, s: &Settings) -> f64 {
+    let mut v = nominal_speed_mm_s(path.kind, layer_index, s);
+    if s.max_volumetric_speed_mm3_s > 0.0 {
+        let mm3_per_mm = path.width_mm * layer_height_mm * flow_factor(path, s);
+        if mm3_per_mm > 1.0e-9 {
+            v = v.min(s.max_volumetric_speed_mm3_s / mm3_per_mm);
+        }
+    }
     v * 60.0
+}
+
+/// Where the flow ceiling bites: per feature kind (skipping the first layer),
+/// the nominal speed and the worst (slowest) clamped speed, for kinds where
+/// the clamp actually engaged. Drives the loud reporting in the g-code
+/// header, the CLI summary, and the GUI status line.
+pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f64, f64)> {
+    use std::collections::BTreeMap;
+    let mut worst: BTreeMap<&'static str, (PathKind, f64, f64)> = BTreeMap::new();
+    for layer in layers {
+        if layer.index == 0 {
+            continue; // first layer is slowed anyway
+        }
+        for path in &layer.paths {
+            if path.points.len() < 2 {
+                continue;
+            }
+            let nominal = nominal_speed_mm_s(path.kind, layer.index, s);
+            let clamped = feed_for(path, layer.index, layer.height_mm, s) / 60.0;
+            if clamped < nominal - 1.0e-6 {
+                worst
+                    .entry(kind_label(path.kind))
+                    .and_modify(|e| e.2 = e.2.min(clamped))
+                    .or_insert((path.kind, nominal, clamped));
+            }
+        }
+    }
+    worst.into_values().collect()
+}
+
+pub(crate) fn kind_label(kind: PathKind) -> &'static str {
+    match kind {
+        PathKind::Skirt => "skirt",
+        PathKind::ExternalPerimeter => "outer wall",
+        PathKind::Perimeter => "inner wall",
+        PathKind::Solid => "solid",
+        PathKind::Infill => "infill",
+        PathKind::GapFill => "gap fill",
+        PathKind::Ironing => "ironing",
+        PathKind::Support => "support",
+        PathKind::Bridge => "bridge",
+    }
 }
 
 fn dist_mm(a: Point, b: Point) -> f64 {
@@ -449,7 +521,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
                 t += hop_t;
             }
         }
-        let v_nom = feed_for(path.kind, layer.index, s) / 60.0 * scale;
+        let v_nom = feed_for(path, layer.index, layer.height_mm, s) / 60.0 * scale;
         t += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
         last_pos = Some(path_end(path));
     }
@@ -643,11 +715,9 @@ pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
             if path.closed && path.points.len() >= 2 {
                 len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
             }
-            let kind_flow = if path.kind == PathKind::Bridge { s.bridge_flow } else { 1.0 };
-            volume += len * path.width_mm * layer.height_mm * path.flow * kind_flow;
+            volume += len * path.width_mm * layer.height_mm * flow_factor(path, s);
         }
     }
-    volume *= s.extrusion_multiplier;
     let length_mm = volume / s.filament_area_mm2();
     let grams = volume / 1000.0 * s.filament_density_g_cm3; // 1000 mm³ = 1 cm³
     (length_mm, grams)
@@ -936,6 +1006,49 @@ mod tests {
         let secs = estimate_seconds(&generate(&m, &s), &s);
         // A 20mm cube at these settings: minutes, not seconds or days.
         assert!(secs > 60.0 && secs < 86_400.0, "got {secs}s");
+    }
+
+    #[test]
+    fn volumetric_clamp_slows_and_reports() {
+        let m = mesh::Mesh::cube(20.0);
+        let mut s = Settings::default();
+        s.print_speed_mm_s = 300.0; // 300 × 0.45 × 0.2 = 27 mm³/s, over any PLA
+        s.solid_speed_mm_s = 240.0;
+        s.max_volumetric_speed_mm3_s = 9.0; // → cap = 9 / 0.09 = 100 mm/s
+        let layers = generate(&m, &s);
+
+        let clamps = crate::emit::audit_flow_clamps(&layers, &s);
+        assert!(!clamps.is_empty(), "clamp should engage");
+        for (_, nominal, clamped) in &clamps {
+            assert!(clamped < nominal, "{clamped} should be below {nominal}");
+            assert!((*clamped - 100.0).abs() < 1.0, "cap ≈ 100 mm/s, got {clamped}");
+        }
+
+        // The g-code announces it and actually uses the capped feed (F6000),
+        // never the asked-for F18000.
+        let g = to_gcode(&layers, &s);
+        assert!(g.contains("; flow limit = 9.0 mm3/s"));
+        assert!(g.contains("; flow-limited: infill 300 -> 100 mm/s"), "header reports the clamp");
+        assert!(!g.contains("F18000"), "unclamped feed must not appear");
+
+        // And the time estimate reflects the slower reality. (The margin is
+        // modest on a small cube: at 3000 mm/s² the head rarely reaches the
+        // nominal 300 mm/s before a corner anyway.)
+        let slow = estimate_seconds(&layers, &s);
+        s.max_volumetric_speed_mm3_s = 0.0; // unlimited
+        let layers_fast = generate(&m, &s);
+        let fast = estimate_seconds(&layers_fast, &s);
+        assert!(slow > fast * 1.02, "clamped print must take longer ({slow:.0}s vs {fast:.0}s)");
+        assert!(crate::emit::audit_flow_clamps(&layers_fast, &s).is_empty(), "0 = unlimited");
+    }
+
+    #[test]
+    fn default_speeds_are_not_clamped() {
+        // The stock profile combos must not trigger the limiter (15 mm³/s vs
+        // 50 mm/s × 0.45 × 0.2 = 4.5 mm³/s) — no behavior change by default.
+        let m = mesh::Mesh::cube(10.0);
+        let s = Settings::default();
+        assert!(crate::emit::audit_flow_clamps(&generate(&m, &s), &s).is_empty());
     }
 
     #[test]

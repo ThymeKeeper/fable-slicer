@@ -274,6 +274,11 @@ pub struct Settings {
     pub min_print_speed_mm_s: f64,
 
     // --- flow ---
+    /// Hard ceiling on volumetric flow (mm³/s) — the filament's melt rate
+    /// through the hotend. Per-feature speeds are clamped so
+    /// `width × height × speed × flow` never exceeds it (loudly: the g-code
+    /// header, CLI, and GUI all report what got clamped). ≤ 0 disables.
+    pub max_volumetric_speed_mm3_s: f64,
     /// Global extrusion multiplier (filament-specific flow tuning). 1.0 = nominal.
     pub extrusion_multiplier: f64,
     /// Flow multiplier for bridges and arc overhangs (slight under-extrusion can
@@ -363,6 +368,7 @@ impl Default for Settings {
             bridge_speed_mm_s: 15.0,
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
+            max_volumetric_speed_mm3_s: 15.0,
             extrusion_multiplier: 1.0,
             bridge_flow: 1.0,
             pressure_advance: 0.0,

@@ -5,7 +5,7 @@ Settings come from three **tiers**, each answering a different question:
 | tier | answers | owns (examples) |
 |---|---|---|
 | **printer** | what machine? | bed size, nozzle Ø, accel/jerk, retraction, z-hop, travel/print/first-layer speed, start/end g-code |
-| **filament** | what material? | diameter, density, temperatures, flow multiplier, pressure advance, fan/cooling |
+| **filament** | what material? | diameter, density, temperatures, flow multiplier, max volumetric speed, pressure advance, fan/cooling |
 | **process** | what quality? | layer height, walls, top/bottom, infill (density/pattern/overlap), supports, seams, fuzzy/ironing/vase, per-feature speeds |
 
 You always slice with one profile *selected per tier* — `(printer, filament,
