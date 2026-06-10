@@ -336,7 +336,7 @@ impl Field {
                 eprintln!("  i={i}: level {lvl_n}x {lvl_len:.1}mm | center {ctr_n}x {ctr_len:.1}mm | zone(skel) {zone_cells} of n-odd {n1_cells} cells");
             }
         }
-        beads
+        join_beads(beads, lw * 0.8)
     }
 
     /// The medial axis restricted to a zone: the precomputed thinned skeleton
@@ -710,6 +710,67 @@ fn blur_finite(src: &[f64], nx: usize, ny: usize) -> Vec<f64> {
                 out[c] = sum / cnt;
             }
         }
+    }
+    out
+}
+
+/// Join open beads whose endpoints lie within `tol` (level-set pieces and
+/// skeleton-traced center pieces come from different extractors and meet at
+/// zone borders with sub-bead gaps — the cause of occasionally broken rings).
+/// A bead whose own ends meet afterwards becomes a closed loop.
+fn join_beads(beads: Vec<Bead>, tol: f64) -> Vec<Bead> {
+    let mut open: Vec<Bead> = Vec::new();
+    let mut out: Vec<Bead> = Vec::new();
+    for b in beads {
+        if b.closed {
+            out.push(b);
+        } else {
+            open.push(b);
+        }
+    }
+    let d = |a: Point, b: Point| (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm());
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'outer: for i in 0..open.len() {
+            for j in (i + 1)..open.len() {
+                let (is, ie) = (open[i].points[0], *open[i].points.last().unwrap());
+                let (js, je) = (open[j].points[0], *open[j].points.last().unwrap());
+                let pick = [
+                    (d(ie, js), false, false),
+                    (d(ie, je), false, true),
+                    (d(is, js), true, false),
+                    (d(is, je), true, true),
+                ]
+                .into_iter()
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .unwrap();
+                if pick.0 > tol {
+                    continue;
+                }
+                let mut bj = open.swap_remove(j);
+                let mut bi = open.swap_remove(i);
+                if pick.1 {
+                    bi.points.reverse();
+                    bi.widths.reverse();
+                }
+                if pick.2 {
+                    bj.points.reverse();
+                    bj.widths.reverse();
+                }
+                bi.points.extend(bj.points);
+                bi.widths.extend(bj.widths);
+                open.push(bi);
+                merged = true;
+                break 'outer;
+            }
+        }
+    }
+    for mut b in open {
+        if b.points.len() > 3 && d(b.points[0], *b.points.last().unwrap()) <= tol {
+            b.closed = true;
+        }
+        out.push(b);
     }
     out
 }

@@ -349,7 +349,17 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 0 => 0.0,
                 wc => lw + (wc - 1) as f64 * sp,
             };
-            let inset = offset(interior, -wall_depth);
+            // Arachne's stretch/absorb regimes own everything thinner than the
+            // saturation threshold; the infill region must agree or solid fill
+            // collides with the widened beads. Morphological open at the same
+            // threshold keeps infill only where the scheme actually saturates.
+            let inset = if arachne && settings.wall_count > 0 {
+                let r = lw + (settings.wall_count - 1) as f64 * sp + 1.278 * sp;
+                let thick_enough = offset(&offset(interior, -r), r);
+                offset(&intersection(&thick_enough, interior), -wall_depth)
+            } else {
+                offset(interior, -wall_depth)
+            };
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
             if settings.gap_fill {
                 // Plus the slivers the morphological open dropped from the
@@ -1506,7 +1516,18 @@ mod tests {
         // A 2.4 mm-wide bar: the interior pocket is ~4 mm² — far too small for
         // meaningful 15% sparse fill, so it must be promoted to solid.
         let m = box_mesh(2.4, 8.0, 5.0);
+        // Arachne (default): the pocket is below saturation — beads own it,
+        // no fill of any kind.
         let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let layers = generate(&m, &s);
+        let mid = &layers[10];
+        assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
+        assert!(
+            mid.paths.iter().any(|p| p.kind == PathKind::Perimeter && p.widths.is_some()),
+            "arachne beads cover the pocket"
+        );
+        // Classic: the pocket is promoted to solid instead of 15% sparse.
+        let s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Classic, ..s };
         let layers = generate(&m, &s);
         let mid = &layers[10];
         assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
