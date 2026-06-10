@@ -1219,7 +1219,7 @@ impl eframe::App for App {
                         "The printer's Moonraker address — e.g. voron24.local or 192.168.1.50. \
                          Plain HTTP is assumed without a scheme. Empty = no connection.",
                     );
-                    ui.add(egui::TextEdit::singleline(&mut s.host_url).hint_text("voron24.local"));
+                    ui.add(egui::TextEdit::singleline(&mut s.host_url).hint_text("192.168.1.50 or printer.local"));
                     ui.label("API key").on_hover_text(
                         "Only needed when Moonraker's [authorization] section requires one.",
                     );
