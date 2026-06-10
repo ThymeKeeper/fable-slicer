@@ -346,6 +346,12 @@ impl Field {
                 if vs.iter().any(|v| !v.is_finite()) {
                     continue;
                 }
+                // Degenerate plateau: ψ ≈ 0 across the whole cell (the level
+                // grazes the ridge). MS would hatch noise here — the bead is
+                // owned by the ridge tracer instead.
+                if vs.iter().all(|v| v.abs() < self.cell * 0.6) {
+                    continue;
+                }
                 let p00 = self.center(ix, iy);
                 let p10 = self.center(ix + 1, iy);
                 let p01 = self.center(ix, iy + 1);
@@ -506,7 +512,7 @@ impl Field {
                         widths[j.clamp(0, n as i64 - 1) as usize]
                     }
                 };
-                (take(i as i64 - 2) + take(i as i64 - 1) + widths[i] + take(i as i64 + 1) + take(i as i64 + 2)) / 5.0
+                (-4i64..=4).map(|o| take(i as i64 + o)).sum::<f64>() / 9.0
             })
             .collect();
         Some(Bead { points, widths: smoothed, closed })
