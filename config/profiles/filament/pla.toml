@@ -3,6 +3,7 @@ filament_diameter_mm = 1.75
 density_g_cm3 = 1.24
 nozzle_temp_c = 200
 bed_temp_c = 60
-# Generic PLA melts ~15 mm³/s on a standard hotend; high-flow setups
-# should use the pla-hf profile (or save their own with a higher limit).
-max_volumetric_speed_mm3_s = 15.0
+# Melt ceiling for basic PLA on a modern standard hotend — matched to
+# OrcaSlicer's generic-PLA value so flow clamping compares like for like.
+# True high-flow hotends (Sovol Zero stock, Revo HF, Rapido) use pla-hf.
+max_volumetric_speed_mm3_s = 21.0

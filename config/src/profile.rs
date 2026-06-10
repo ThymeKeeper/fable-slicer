@@ -824,11 +824,11 @@ mod tests {
 
     #[test]
     fn sovol_zero_matches_orca_speed_profile() {
-        // The Sovol Zero numbers are matched to OrcaSlicer's high-speed
-        // profile (measured from its g-code) — pin them so a profile edit
-        // can't silently regress the pairing.
+        // The Sovol Zero + basic-pla numbers are matched to OrcaSlicer's
+        // high-speed profile (measured from its g-code) — pin them so a
+        // profile edit can't silently regress the pairing.
         let p = Profiles::builtin();
-        let s = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        let s = p.resolve("sovol-zero", "pla", "standard").unwrap();
         assert_eq!(s.acceleration_mm_s2, 40000.0); // Orca default/travel accel
         assert_eq!(s.outer_wall_accel_mm_s2, 10000.0); // Orca outer wall accel
         assert_eq!(s.first_layer_accel_mm_s2, 1000.0); // auto = Orca's initial layer
@@ -836,8 +836,10 @@ mod tests {
         assert_eq!(s.first_layer_speed_mm_s, 55.0); // Orca initial layer
         assert_eq!(s.travel_speed_mm_s, 1000.0); // Orca travel
         assert_eq!(s.jerk_mm_s, 5.0); // Orca square-corner velocity
-        // pla-hf's melt ceiling (≥ Orca's 21) is what actually limits speed.
-        assert_eq!(s.max_volumetric_speed_mm3_s, 30.0);
+        assert_eq!(s.max_volumetric_speed_mm3_s, 21.0); // Orca generic-PLA melt ceiling
+        // The stock hotend is high-flow: pla-hf raises only the ceiling.
+        let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        assert_eq!(hf.max_volumetric_speed_mm3_s, 30.0);
     }
 
     #[test]

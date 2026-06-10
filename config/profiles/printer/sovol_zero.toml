@@ -10,8 +10,9 @@ bed_size_z_mm = 152.5
 # its g-code): interior accel + travel 40000, outer wall 10000, first layer
 # auto-derives to Orca's 1000; inner walls 400 mm/s (Orca asks 500 for sparse
 # but the volumetric cap clamps both the same), first layer 55, travel 1000,
-# square-corner velocity 5. Pair with the pla-hf filament — the stock hotend
-# is high-flow, and the melt ceiling is what actually limits speed here.
+# square-corner velocity 5. Basic pla (21 mm³/s, = Orca's generic PLA) is the
+# like-for-like pairing; the stock hotend is high-flow, so pla-hf (30) is the
+# machine's real ceiling — the melt cap is what actually limits speed here.
 # (Our external-wall auto stays at 50% of print speed — quality-first — where
 # Orca asks 350; pin "external mm/s" in the GUI for Orca's number.)
 acceleration = 40000.0
