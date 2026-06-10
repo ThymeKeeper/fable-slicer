@@ -20,7 +20,7 @@ checkboxes and the status line as work lands. Architecture detail lives in
 | **Current milestone** | M5/M6 — perf pass (rayon + z-buckets, ~4× faster), gyroid/triangles, monotonic solid, gap fill, fuzzy skin, ironing, spiral vase, elephant-foot/XY comp, per-feature speeds, fan/bridge control, pressure advance, M73 |
 | **Last updated** | 2026-06-09 |
 | **Builds / tests** | `cargo test` green (49 tests). GUI verify = user screenshots (headless box) |
-| **Next action** | 3MF load, auto-orient (lay-flat), variable layers, or Arachne |
+| **Next action** | **Arachne graph walk** — see [docs/ARACHNE-GRAPH-WALK.md](docs/ARACHNE-GRAPH-WALK.md) (handoff: try `boostvoronoi` crate first; two open defects repro at Benchy layers ~218/~50). Then 3MF, auto-orient, variable layers. A real test print would beat all of it |
 | **Target printers** | Voron 2.4 = **350×350**, Sovol Zero = **152.4×152.4×152.5** (both confirmed). Klipper (relative E, PRINT_START). |
 | **Perf (Benchy 225k tris)** | load 47ms · slice 29ms · plan ~190ms · g-code 66ms ≈ **0.33s** total (`cargo run --release -p engine --example bench`) |
 
