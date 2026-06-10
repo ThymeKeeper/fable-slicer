@@ -4,15 +4,19 @@
 #   geo2d   - integer 2D geometry ("Clipper space"): points, contours, polygons
 #   mesh    - triangle mesh: STL I/O, indexed storage, primitives
 #   engine  - the slicer core: mesh -> layers -> walls -> infill -> toolpaths -> gcode
-#   gcode   - g-code AST, writer, motion-sim time estimate            (stub until M1)
-#   config  - printer/filament/process profile system                  (stub until M2)
-#   cli     - command-line front-end (binary: `slicer`)
+#   gcode   - g-code AST, writer, motion-sim time estimate
+#   config  - printer/filament/process profile system (built-in + user profiles)
+#   gui     - the primary front-end (binary: `slicer`) — bare `cargo run` runs this
+#   cli     - command-line front-end (binary: `slicer-cli`)
 #
 # Project name is a placeholder; crate names are intentionally brand-neutral so a
 # rename costs nothing.
 [workspace]
 resolver = "2"
 members = ["geo2d", "mesh", "engine", "gcode", "config", "cli", "gui"]
+# The GUI is the product: bare `cargo run` / `cargo build` target it.
+# NOTE: this also scopes bare `cargo test` — use `cargo test --workspace`.
+default-members = ["gui"]
 
 [workspace.package]
 version = "0.0.0"

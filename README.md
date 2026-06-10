@@ -18,27 +18,27 @@ in idiomatic Rust.
 ## Quick start
 
 ```sh
-# Run the test suite (includes a cube-slicing acceptance test).
-cargo test
+# The GUI is the product — bare `cargo run` launches it: import STLs, lay out
+# the bed, tune settings, slice, preview in 3D, save profiles, export g-code.
+cargo run --release
 
-# Generate the cube fixture, then slice it to g-code (+ optional toolpath SVGs).
+# Run the test suite (includes a cube-slicing acceptance test).
+cargo test --workspace
+
+# CLI: generate the cube fixture, then slice it to g-code (+ optional SVGs).
 cargo run -p mesh --example gen_cube
-cargo run --bin slicer -- fixtures/cube.stl --printer voron24 -o cube.gcode --svg svg/
+cargo run -p cli -- fixtures/cube.stl --printer voron24 -o cube.gcode --svg svg/
 # -> cube.gcode, plus svg/layer_*.svg to inspect walls / shells / infill.
 
-# Slice your own model:
-cargo run --bin slicer -- path/to/model.stl --printer voron24 -o out.gcode
-
-# Pick profiles (list them with --list-profiles); flags like --layer-height override:
-cargo run --bin slicer -- model.stl --printer voron24 --filament petg --process fine -o out.gcode
+# Pick profiles (list them with --list-profiles); flags like --layer-height
+# override. User profiles saved from the GUI are picked up automatically —
+# see docs/PROFILES.md for the tier/inheritance model.
+cargo run -p cli -- model.stl --printer voron24 --filament petg --process fine -o out.gcode
 
 # Feature flags: gyroid infill, fuzzy skin, ironing, spiral vase, arc overhangs…
-cargo run --bin slicer -- model.stl --sparse-infill gyroid --ironing -o out.gcode
-cargo run --bin slicer -- vase.stl --vase -o vase.gcode
-cargo run --bin slicer -- model.stl --support arc --arc-fitting -o out.gcode
-
-# Desktop GUI (3D viewport): load STLs, lay out the bed, slice, preview, export.
-cargo run -p gui   # or: cargo run --release --bin slicer-gui
+cargo run -p cli -- model.stl --sparse-infill gyroid --ironing -o out.gcode
+cargo run -p cli -- vase.stl --vase -o vase.gcode
+cargo run -p cli -- model.stl --support arc --arc-fitting -o out.gcode
 
 # Pipeline timing on a model (load / slice / plan / g-code):
 cargo run --release -p engine --example bench -- fixtures/benchy.stl
@@ -52,9 +52,9 @@ cargo run --release -p engine --example bench -- fixtures/benchy.stl
 | `mesh`   | triangle mesh + STL I/O |
 | `engine` | the slicer core (slicing, walls, solid/sparse infill, toolpaths, g-code) |
 | `gcode`  | low-level g-code emitter (relative E, retraction, temps/fan) |
-| `config` | tiered printer/filament/process profiles (TOML, inheritance) + resolved settings |
-| `cli`    | command-line front-end (binary: `slicer`) |
-| `gui`    | desktop GUI — egui + wgpu 3D viewport (binary: `slicer-gui`) |
+| `config` | printer/filament/process profiles: built-in + user, TOML, inheritance ([docs](docs/PROFILES.md)) |
+| `gui`    | **the primary front-end** — egui + wgpu 3D viewport (binary: `slicer`, default for `cargo run`) |
+| `cli`    | command-line front-end (binary: `slicer-cli`) |
 
 ## License
 

@@ -138,8 +138,15 @@ impl App {
         let scene = Scene::new(rs);
         let mut profiles = Profiles::builtin();
         let mut status = "Open an STL to begin.".to_string();
-        if let Err(e) = profiles.load_user_profiles(None) {
-            status = format!("User profiles: {e}");
+        match profiles.load_user_profiles(None) {
+            Ok(skipped) if !skipped.is_empty() => {
+                status = format!(
+                    "Skipped user profiles shadowing built-ins: {} (base on them with 'inherits' instead)",
+                    skipped.join(", ")
+                );
+            }
+            Err(e) => status = format!("User profiles: {e}"),
+            _ => {}
         }
         let (printer, filament, process) =
             ("voron24".to_string(), "pla".to_string(), "standard".to_string());

@@ -441,11 +441,12 @@ impl Profiles {
     }
 
     /// Load extra profiles from `<dir>/{printer,filament,process}/*.toml`,
-    /// overriding built-ins with the same file stem.
+    /// overriding built-ins with the same file stem (explicit power feature —
+    /// the auto-loaded user dir does *not* shadow; see `load_user_profiles`).
     pub fn load_dir(&mut self, dir: &Path) -> Result<(), String> {
-        load_tier(&mut self.printers, &dir.join("printer"))?;
-        load_tier(&mut self.filaments, &dir.join("filament"))?;
-        load_tier(&mut self.processes, &dir.join("process"))?;
+        load_tier(&mut self.printers, &dir.join("printer"), None)?;
+        load_tier(&mut self.filaments, &dir.join("filament"), None)?;
+        load_tier(&mut self.processes, &dir.join("process"), None)?;
         Ok(())
     }
 
@@ -466,13 +467,20 @@ impl Profiles {
 
     /// Load user profiles from `dir` (or the platform default) and remember it
     /// as the save destination. Missing directories are fine (nothing saved yet).
-    pub fn load_user_profiles(&mut self, dir: Option<std::path::PathBuf>) -> Result<(), String> {
+    ///
+    /// Unlike `load_dir`, files whose stem collides with a built-in profile are
+    /// **skipped** (returned for the caller to warn about) — built-ins stay
+    /// read-only; base a user profile on one via `inherits` instead.
+    pub fn load_user_profiles(&mut self, dir: Option<std::path::PathBuf>) -> Result<Vec<String>, String> {
         let Some(dir) = dir.or_else(Self::default_user_dir) else {
             return Err("no user config directory available".into());
         };
-        let result = self.load_dir(&dir);
+        let mut skipped = Vec::new();
+        skipped.extend(load_tier(&mut self.printers, &dir.join("printer"), Some((&self.builtin, "printer")))?);
+        skipped.extend(load_tier(&mut self.filaments, &dir.join("filament"), Some((&self.builtin, "filament")))?);
+        skipped.extend(load_tier(&mut self.processes, &dir.join("process"), Some((&self.builtin, "process")))?);
         self.user_dir = Some(dir);
-        result
+        Ok(skipped)
     }
 
     /// Where user profiles are saved, if a user dir has been established.
@@ -681,21 +689,35 @@ fn sorted_names<T>(map: &HashMap<String, T>) -> Vec<&str> {
     v
 }
 
-fn load_tier<T: for<'de> Deserialize<'de>>(map: &mut HashMap<String, T>, dir: &Path) -> Result<(), String> {
+/// Load one tier's directory into `map`. With `skip_builtin = Some((set, label))`,
+/// files whose stem matches a built-in name are skipped and returned as
+/// `"label/stem"` so the caller can warn.
+fn load_tier<T: for<'de> Deserialize<'de>>(
+    map: &mut HashMap<String, T>,
+    dir: &Path,
+    skip_builtin: Option<(&HashSet<(&'static str, String)>, &'static str)>,
+) -> Result<Vec<String>, String> {
+    let mut skipped = Vec::new();
     if !dir.is_dir() {
-        return Ok(());
+        return Ok(skipped);
     }
     for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("toml") {
             continue;
         }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if let Some((builtin, label)) = skip_builtin {
+            if builtin.contains(&(label, stem.clone())) {
+                skipped.push(format!("{label}/{stem}"));
+                continue;
+            }
+        }
         let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let profile: T = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         map.insert(stem, profile);
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Resolve a profile's `inherits` chain into a single merged profile.
@@ -812,6 +834,24 @@ mod tests {
         fresh.delete_user(TierKind::Filament, "my-petg").unwrap();
         assert!(!dir.join("filament/my-petg.toml").exists());
         assert!(fresh.resolve("generic", "my-petg", "standard").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_dir_cannot_shadow_builtins() {
+        let dir = std::env::temp_dir().join(format!("slicer_profiles_shadow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("process")).unwrap();
+        fs::write(dir.join("process/standard.toml"), "wall_count = 99\n").unwrap();
+        fs::write(dir.join("process/mine.toml"), "inherits = \"standard\"\nwall_count = 5\n").unwrap();
+
+        let mut p = Profiles::builtin();
+        let skipped = p.load_user_profiles(Some(dir.clone())).unwrap();
+        assert_eq!(skipped, vec!["process/standard".to_string()]);
+        // The built-in survives untouched; the legit user profile loads.
+        assert_ne!(p.resolve("generic", "pla", "standard").unwrap().wall_count, 99);
+        assert_eq!(p.resolve("generic", "pla", "mine").unwrap().wall_count, 5);
 
         let _ = fs::remove_dir_all(&dir);
     }

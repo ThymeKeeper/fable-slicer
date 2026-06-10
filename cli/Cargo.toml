@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "slicer"
+name = "slicer-cli"
 path = "src/main.rs"
 
 [dependencies]
