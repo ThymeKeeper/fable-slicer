@@ -188,16 +188,33 @@ impl Field {
         (ix < self.nx && iy < self.ny).then(|| iy * self.nx + ix)
     }
 
-    /// Beading scheme at a cell: thickness-shared pitch while the count is at
-    /// or under the cap; nominal pitch (plus infill remainder) above it.
+    /// Beading scheme at a cell. `cap` is the ring budget (wall count − 1
+    /// inner rings); a ring contributes a bead on *both* sides of the local
+    /// thickness, so up to `2·cap` beads fit across before saturation.
+    ///
+    /// - **Stretch** (≤ 2·cap beads across): all of the thickness is shared
+    ///   evenly — beads widen/narrow, no infill here.
+    /// - **Absorb**: thicker than the budget, but the leftover after `cap`
+    ///   nominal rings is a sub-bead sliver infill couldn't print — the rings
+    ///   widen slightly to swallow it (this is what makes gap fill obsolete
+    ///   in arachne mode).
+    /// - **Saturated**: real room left over → nominal pitch, remainder is
+    ///   infill territory (classic geometry).
     #[inline]
     fn scheme(&self, c: usize, sp: f64, cap: usize) -> Scheme {
         let t = 2.0 * self.t_hat[c];
         let fit = ((t / sp).round() as usize).max(1);
-        if fit > cap {
-            Scheme { n: cap, pitch: sp, saturated: true }
-        } else {
+        if fit <= 2 * cap {
             Scheme { n: fit, pitch: (t / fit as f64).clamp(sp * 0.5, sp * 1.6), saturated: false }
+        } else {
+            let lw_ish = sp / 0.9; // a hair over one bead — the sliver threshold
+            let remainder = t - 2.0 * cap as f64 * sp;
+            if remainder < lw_ish {
+                let n = 2 * cap;
+                Scheme { n, pitch: (t / n as f64).clamp(sp * 0.5, sp * 1.6), saturated: false }
+            } else {
+                Scheme { n: 2 * cap, pitch: sp, saturated: true }
+            }
         }
     }
 
@@ -619,6 +636,29 @@ mod tests {
         assert!(beads[0].closed, "strip ring should close");
         let w = beads[0].widths[beads[0].widths.len() / 2];
         assert!((0.45..0.65).contains(&w), "stretched width {w}");
+    }
+
+    #[test]
+    fn scheme_regimes_stretch_absorb_saturate() {
+        // A wide slab so T̂ is controlled by strip height; sp ≈ 0.407, cap = 2.
+        let sp = 0.407;
+        // Stretch: t = 1.4 → fit 3 ≤ 4: thickness shared (odd → center bead zone).
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.4), 0.45).unwrap();
+        let s = f.scheme(f.cell_at(20.0, 0.7).unwrap(), sp, 2);
+        assert!(!s.saturated);
+        assert_eq!(s.n, 3);
+        // Absorb: t = 2·2·sp + 0.3 ≈ 1.93 → leftover 0.3 is a sub-bead sliver;
+        // the 4 beads widen to swallow it instead of leaving a void.
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.93), 0.45).unwrap();
+        let s = f.scheme(f.cell_at(20.0, 0.965).unwrap(), sp, 2);
+        assert!(!s.saturated, "sliver leftover must be absorbed");
+        assert_eq!(s.n, 4);
+        assert!(s.pitch > sp + 0.02, "rings widen: pitch {}", s.pitch);
+        // Saturated: t = 2·2·sp + 1.2 → real room: nominal pitch, infill owns it.
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 2.83), 0.45).unwrap();
+        let s = f.scheme(f.cell_at(20.0, 1.415).unwrap(), sp, 2);
+        assert!(s.saturated);
+        assert!((s.pitch - sp).abs() < 1e-9);
     }
 
     #[test]

@@ -904,7 +904,7 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut s.wall_mode, config::WallMode::Classic, "classic");
                             })
                             .response
-                            .on_hover_text("Arachne: inner walls vary their width with the local feature thickness (thin cores become tapered beads, no voids between walls). Classic: fixed-width concentric offsets.")
+                            .on_hover_text("How gaps are handled is binary: arachne walls vary their width with the local thickness, absorbing every gap into the beads (thin cores become tapered walls). Classic uses fixed offsets and patches the leftovers with gap fill.")
                             .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
                         ui.label("wall mode");
                     });
@@ -916,9 +916,9 @@ impl eframe::App for App {
                         .on_disabled_hover_text("Spiral vase prints no top shells.");
                     ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"))
                         .on_hover_text("Number of solid layers on bottom surfaces.");
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
-                        .on_hover_text("Fill gaps too thin for walls/infill with single width-matched strokes.")
-                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    ui.add_enabled(!vase && s.wall_mode == config::WallMode::Classic, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
+                        .on_hover_text("Classic mode: fill gaps too thin for walls/infill with single width-matched strokes.")
+                        .on_disabled_hover_text("Arachne absorbs gaps into the walls themselves — gap fill only applies to classic mode (and is off in spiral vase).");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
                     ui.add_enabled(!vase && !s.brick_layers, egui::Checkbox::new(&mut s.half_height_outer_walls, "half-height outer wall"))

@@ -128,6 +128,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         // Brick masonry needs uniform rings; the vase loop is classic too.
         norm_settings.wall_mode = WallMode::Classic;
     }
+    if norm_settings.wall_mode == WallMode::Arachne {
+        // Binary model: arachne absorbs every gap into the walls (stretch /
+        // absorb regimes), so gap fill is a classic-mode companion only.
+        norm_settings.gap_fill = false;
+    }
     let settings = &norm_settings;
 
     let mut layers = slice_mesh(
