@@ -169,13 +169,13 @@ impl Field {
             }
         }
 
-        // T̂ = radius of the nearest skeleton cell, box-blurred twice so the
-        // beading targets vary smoothly (raw nearest-cell values are blocky,
-        // which made the level sets — and the printed beads — wobble).
-        let mut t_hat = nearest_value(&skel, &d, nx, ny);
-        for _ in 0..2 {
-            t_hat = blur3(&t_hat, &inside, nx, ny);
-        }
+        // T̂ = radius of the nearest skeleton cell, kept SHARP: each cell
+        // belongs to exactly one skeleton feature (a Voronoi partition), so a
+        // junction has one clean transition border. (Blurring here once
+        // created fans of intermediate bead-count slivers at junctions that
+        // shattered beads; smoothing now happens on the per-bead target field
+        // instead — Kuipers §6.2's transition ramp.)
+        let t_hat = nearest_value(&skel, &d, nx, ny);
 
         // Prune skeleton spurs: boundary bumps grow short ridge branches whose
         // own depth is well below the blurred local thickness — real band ends
@@ -276,8 +276,13 @@ impl Field {
         let mut beads = Vec::new();
         let width_of = move |pitch: f64| (pitch + (lw - sp)).clamp(lw * 0.5, lw * 1.75);
 
+        // Transition length (Kuipers et al. 2020 §6.2; Cura's
+        // wall_transition_length): targets ramp over ~one line width so beads
+        // flow through bead-count changes instead of jumping (which cut
+        // corners and fragmented walls at zone borders).
+        let blur_passes = ((lw / self.cell) as usize).clamp(2, 8);
         for i in 0..=cap {
-            let mut psi = vec![f64::INFINITY; self.nx * self.ny];
+            let mut target = vec![f64::INFINITY; self.nx * self.ny];
             let mut center_zone = vec![false; self.nx * self.ny];
             let mut any_center = false;
             for c in 0..self.nx * self.ny {
@@ -289,18 +294,35 @@ impl Field {
                     continue; // bead absent here (saturated zones cap the rings)
                 }
                 if !s.saturated && s.n % 2 == 1 && i == s.n / 2 {
-                    center_zone[c] = true; // odd stretch zone: ridge bead
-                    any_center = true;
+                    // Odd stretch zone: the center bead is the skeleton line
+                    // itself. Trace only skeleton cells — tracing the whole
+                    // zone area scribbles through 2D wedges at junctions.
+                    if self.skel[c] {
+                        center_zone[c] = true;
+                        any_center = true;
+                    }
                     continue;
                 }
-                let target = (i as f64 + 0.5) * s.pitch;
+                let tgt = (i as f64 + 0.5) * s.pitch;
                 // In stretch zones the folded depth field covers both sides:
                 // only emit levels on the near side of the ridge (the far-side
                 // mirror is the same physical bead).
-                if s.saturated || target <= self.t_hat[c] + 0.26 * s.pitch {
-                    psi[c] = self.d[c] - target;
+                if s.saturated || tgt <= self.t_hat[c] + 0.26 * s.pitch {
+                    target[c] = tgt;
                 }
             }
+            for _ in 0..blur_passes {
+                target = blur_finite(&target, self.nx, self.ny);
+            }
+            let psi: Vec<f64> = (0..self.nx * self.ny)
+                .map(|c| {
+                    if self.inside[c] && target[c].is_finite() {
+                        self.d[c] - target[c]
+                    } else {
+                        f64::INFINITY
+                    }
+                })
+                .collect();
             for poly in self.contour(&psi) {
                 if let Some(b) = self.polyline_to_bead(poly, sp, cap, &width_of) {
                     beads.push(b);
@@ -565,26 +587,32 @@ fn chaikin(line: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
     out
 }
 
-/// 3×3 box blur over inside cells (outside values don't bleed in).
-fn blur3(src: &[f64], inside: &[bool], nx: usize, ny: usize) -> Vec<f64> {
+/// 3×3 box blur over cells with finite values only — the bead-target ramp
+/// (absent zones stay absent; values diffuse along the bead's own domain).
+fn blur_finite(src: &[f64], nx: usize, ny: usize) -> Vec<f64> {
     let mut out = src.to_vec();
     for iy in 1..ny - 1 {
         for ix in 1..nx - 1 {
             let c = iy * nx + ix;
-            if !inside[c] {
-                continue;
-            }
             let (mut sum, mut cnt) = (0.0, 0.0);
             for dy in -1i64..=1 {
                 for dx in -1i64..=1 {
-                    let nb = ((iy as i64 + dy) * nx as i64 + ix as i64 + dx) as usize;
-                    if inside[nb] {
-                        sum += src[nb];
+                    let v = src[((iy as i64 + dy) * nx as i64 + ix as i64 + dx) as usize];
+                    if v.is_finite() {
+                        sum += v;
                         cnt += 1.0;
                     }
                 }
             }
-            out[c] = sum / cnt;
+            // Finite cells smooth; near-border absent cells join the domain
+            // (the bead extends into the transition — Kuipers' anchors — so
+            // neighbouring zones' beads overlap and chain instead of ending
+            // a cell apart).
+            if src[c].is_finite() {
+                out[c] = sum / cnt;
+            } else if cnt >= 3.0 {
+                out[c] = sum / cnt;
+            }
         }
     }
     out
@@ -803,6 +831,61 @@ mod tests {
         let s = f.scheme(f.cell_at(20.0, 1.415).unwrap(), sp, 2);
         assert!(s.saturated);
         assert!((s.pitch - sp).abs() < 1e-9);
+    }
+
+    fn circle(cx: f64, cy: f64, r: f64, ccw: bool) -> Contour {
+        let mut pts: Vec<Point> = (0..96)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / 96.0;
+                Point::from_mm(cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect();
+        if !ccw {
+            pts.reverse();
+        }
+        Contour::new(pts)
+    }
+
+    #[test]
+    fn curved_band_beads_are_contiguous() {
+        // The Benchy bow failure: a curved band must yield a handful of long
+        // closed rings, not dozens of pill fragments.
+        let mut annulus = Polygons::new();
+        annulus.push(circle(0.0, 0.0, 10.0, true));
+        annulus.push(circle(0.0, 0.0, 9.0, false)); // 1.0 mm band
+        let f = Field::build(&annulus, 0.45).unwrap();
+        let beads = f.beads(0.45, 0.407, 3);
+        assert!(!beads.is_empty());
+        assert!(beads.len() <= 4, "band fragmented into {} beads", beads.len());
+        let total: f64 = beads
+            .iter()
+            .flat_map(|b| b.points.windows(2))
+            .map(|w| (w[0].x_mm() - w[1].x_mm()).hypot(w[0].y_mm() - w[1].y_mm()))
+            .sum();
+        // Two rings ≈ 2·2π·9.5 ≈ 119 mm; demand most of it.
+        assert!(total > 90.0, "combined bead length only {total:.0} mm");
+    }
+
+    #[test]
+    fn transition_across_joined_zones_stays_connected() {
+        // The chimney-meets-rim failure: a disc joined to a band changes the
+        // local bead count; the transition ramp must keep beads flowing
+        // through the junction instead of cutting a chord.
+        let mut region = Polygons::new();
+        region.push(circle(0.0, 0.0, 2.0, true));
+        region.contours.extend(rect(1.0, -0.55, 12.0, 0.55).contours);
+        let merged = geo2d::union(&region, &Polygons::new());
+        let f = Field::build(&merged, 0.45).unwrap();
+        let beads = f.beads(0.45, 0.407, 3);
+        assert!(!beads.is_empty());
+        assert!(beads.len() <= 8, "junction shattered into {} beads", beads.len());
+        // Beads must reach well into the strip (past the junction).
+        let max_x = beads
+            .iter()
+            .flat_map(|b| b.points.iter())
+            .map(|p| p.x_mm())
+            .fold(f64::MIN, f64::max);
+        assert!(max_x > 9.0, "beads stop at x={max_x:.1}, before the strip end");
     }
 
     #[test]
