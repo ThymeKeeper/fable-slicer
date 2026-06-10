@@ -103,6 +103,8 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bottom_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub half_height_outer_walls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub brick_layers: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brick_flow: Option<f64>,
@@ -230,7 +232,7 @@ impl Tier for ProcessProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             max_resolution_mm, arc_fitting, arc_tolerance_mm, wall_count, top_layers, bottom_layers,
-            brick_layers, brick_flow,
+            half_height_outer_walls, brick_layers, brick_flow,
             infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
@@ -324,6 +326,7 @@ impl ProcessProfile {
             wall_count: diff_field!(cur.wall_count, base.wall_count),
             top_layers: diff_field!(cur.top_layers, base.top_layers),
             bottom_layers: diff_field!(cur.bottom_layers, base.bottom_layers),
+            half_height_outer_walls: diff_field!(cur.half_height_outer_walls, base.half_height_outer_walls),
             brick_layers: diff_field!(cur.brick_layers, base.brick_layers),
             brick_flow: diff_field!(cur.brick_flow, base.brick_flow),
             infill_density: diff_field!(cur.infill_density, base.infill_density),
@@ -636,6 +639,9 @@ impl Profiles {
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
+            half_height_outer_walls: pc
+                .half_height_outer_walls
+                .unwrap_or(d.half_height_outer_walls),
             brick_layers: pc.brick_layers.unwrap_or(d.brick_layers),
             brick_flow: pc.brick_flow.unwrap_or(d.brick_flow),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),

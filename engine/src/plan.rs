@@ -57,11 +57,14 @@ pub struct ToolPath {
     /// indivisible block in travel ordering (a strict sweep over one surface).
     /// Distinct groups (e.g. separate islands) are ordered independently.
     pub group: Option<u32>,
+    /// Bead height as a fraction of the layer height (half-height outer walls
+    /// print two 0.5 passes per layer). 1.0 = the full layer.
+    pub height_scale: f64,
 }
 
 impl ToolPath {
     fn new(kind: PathKind, closed: bool, width_mm: f64, points: Vec<Point>) -> Self {
-        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None }
+        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0 }
     }
 }
 
@@ -98,20 +101,26 @@ pub struct LayerPlan {
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
     // above the solid bottom, nothing that would interrupt the continuous loop.
-    let vase_settings;
+    let norm_settings;
     let settings = if settings.spiral_vase {
-        vase_settings = Settings {
+        norm_settings = Settings {
             wall_count: 1,
             infill_density: 0.0,
             top_layers: 0,
             support_mode: SupportMode::None,
             brick_layers: false,
+            half_height_outer_walls: false, // the spiral *is* the outer wall
             ironing: false,
             gap_fill: false,
             fuzzy_skin: false,
             ..settings.clone()
         };
-        &vase_settings
+        &norm_settings
+    } else if settings.half_height_outer_walls && settings.brick_layers {
+        // Mutually exclusive: their Z choreographies collide (the lower outer
+        // pass would graze the previous layer's lifted brick beads).
+        norm_settings = Settings { brick_layers: false, ..settings.clone() };
+        &norm_settings
     } else {
         settings
     };
@@ -141,11 +150,49 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     let lw = settings.line_width_mm;
     let n = layers.len();
 
+    // Half-height outer walls: slice two extra planes per layer (the quarter
+    // heights), so each half-pass follows its *own* contour — on slopes the two
+    // outlines differ, which is what halves the visible staircase. Layer 0
+    // stays one full-height pass (bed squish wants one fat bead).
+    let outer_halves: Vec<Option<(Polygons, Polygons)>> =
+        if settings.half_height_outer_walls && n > 1 {
+            let mut zs = Vec::with_capacity((n - 1) * 2);
+            for layer in layers.iter().skip(1) {
+                zs.push(layer.z_mm - 0.25 * layer.height_mm);
+                zs.push(layer.z_mm + 0.25 * layer.height_mm);
+            }
+            let sliced = crate::slice::slice_many(mesh, &zs);
+            let processed: Vec<Polygons> = sliced
+                .into_par_iter()
+                .map(|(_, mut p)| {
+                    if settings.max_resolution_mm > 0.0 {
+                        p = simplify(&p, settings.max_resolution_mm);
+                    }
+                    if settings.xy_compensation_mm != 0.0 {
+                        p = offset(&p, settings.xy_compensation_mm);
+                    }
+                    p
+                })
+                .collect();
+            let mut halves: Vec<Option<(Polygons, Polygons)>> = vec![None];
+            for (k, layer) in layers.iter().enumerate().skip(1) {
+                let pick = |q: Polygons| if q.is_empty() { layer.polygons.clone() } else { q };
+                halves.push(Some((
+                    pick(processed[(k - 1) * 2].clone()),
+                    pick(processed[(k - 1) * 2 + 1].clone()),
+                )));
+            }
+            halves
+        } else {
+            vec![None; n]
+        };
+
     // Pass 1: walls + the infill region (inside the innermost wall) per layer,
     // plus the gap regions too thin for any wall or infill to cover.
     let per_layer: Vec<(Vec<ToolPath>, Polygons, Polygons)> = layers
         .par_iter()
-        .map(|layer| {
+        .zip(outer_halves.par_iter())
+        .map(|(layer, halves)| {
             // Adjacent beads are placed at the stadium spacing: rounded
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
@@ -173,21 +220,43 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     (0.0, 1.0)
                 };
                 let centers = offset(&layer.polygons, inset);
-                for c in &centers.contours {
-                    if c.points.len() >= 3 {
-                        let mut points = place_seam(c.points.clone(), settings.seam_mode, layer.index);
-                        // Fuzzy skin: jitter the visible (outermost) wall — not on
-                        // the first layer, which must stay flat on the bed.
-                        if settings.fuzzy_skin && kind == PathKind::ExternalPerimeter && layer.index > 0 {
-                            points = fuzzy_loop(
-                                &points,
-                                settings.fuzzy_skin_thickness_mm,
-                                settings.fuzzy_skin_point_dist_mm,
-                                layer.index,
-                            );
+                let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
+                    for c in &src.contours {
+                        if c.points.len() >= 3 {
+                            let mut points = place_seam(c.points.clone(), settings.seam_mode, layer.index);
+                            // Fuzzy skin: jitter the visible (outermost) wall — not on
+                            // the first layer, which must stay flat on the bed.
+                            if settings.fuzzy_skin && kind == PathKind::ExternalPerimeter && layer.index > 0 {
+                                points = fuzzy_loop(
+                                    &points,
+                                    settings.fuzzy_skin_thickness_mm,
+                                    settings.fuzzy_skin_point_dist_mm,
+                                    layer.index,
+                                );
+                            }
+                            walls.push(ToolPath {
+                                kind,
+                                closed: true,
+                                width_mm: lw,
+                                points,
+                                z_offset_mm: z_off,
+                                flow,
+                                group: None,
+                                height_scale: hscale,
+                            });
                         }
-                        walls.push(ToolPath { kind, closed: true, width_mm: lw, points, z_offset_mm, flow, group: None });
                     }
+                };
+                match (w, halves) {
+                    // Half-height outer wall: two passes, each on its own
+                    // sliced contour — the lower half drops the nozzle by h/2
+                    // (ordered first in the layer), the upper finishes at the
+                    // layer plane. Both extrude half-height beads.
+                    (0, Some((lower, upper))) => {
+                        emit_loops(&offset(lower, inset), -0.5 * layer.height_mm, 0.5, &mut walls);
+                        emit_loops(&offset(upper, inset), 0.0, 0.5, &mut walls);
+                    }
+                    _ => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
                 }
                 if settings.gap_fill {
                     // Where material remains at this wall's outer edge but the
@@ -586,14 +655,19 @@ fn order_layers(plans: &mut [LayerPlan]) {
         if let Some(last) = prime.last() {
             cur = path_end(last);
         }
-        let (iron, rest): (Vec<_>, Vec<_>) =
+        let (iron, mut rest): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|p| p.kind == PathKind::Ironing);
-        // Brick layering prints the on-plane (low) phase fully before the lifted
-        // (high) phase, so a travel never crosses a bead at a different Z. Without
-        // brick, `high` is empty and this is the usual single-pass ordering.
-        let (low, high): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| p.z_offset_mm == 0.0);
+        // Print z-phases in ascending order — half-height lower outer walls
+        // (−h/2) first, then the layer plane, then brick-lifted (+h/2) — so the
+        // nozzle never descends into material already printed this layer.
+        let mut phases: Vec<f64> = rest.iter().map(|p| p.z_offset_mm).collect();
+        phases.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        phases.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
         let mut paths = prime;
-        for group in [low, high] {
+        for ph in phases {
+            let (group, remaining): (Vec<_>, Vec<_>) =
+                rest.into_iter().partition(|p| (p.z_offset_mm - ph).abs() < 1.0e-9);
+            rest = remaining;
             if group.is_empty() {
                 continue;
             }
@@ -1208,6 +1282,95 @@ mod tests {
             Contour::new(p.points.clone()).area_mm2()
         };
         assert!(area(&grown[10]) > area(&base[10]) + 5.0, "XY comp should grow the outline");
+    }
+
+    /// A square frustum: `base`-wide at z=0 tapering to `top` at height `h`
+    /// (45-degree slopes when (base-top)/2 == h). Sloped walls make the
+    /// half-height outer passes follow visibly different contours.
+    fn frustum(base: f64, top: f64, h: f64) -> Mesh {
+        let (b, t) = (base / 2.0, top / 2.0);
+        let v = |x: f64, y: f64, z: f64| [x, y, z];
+        let verts = vec![
+            v(-b, -b, 0.0), v(b, -b, 0.0), v(b, b, 0.0), v(-b, b, 0.0), // 0-3 base
+            v(-t, -t, h), v(t, -t, h), v(t, t, h), v(-t, t, h),          // 4-7 top
+        ];
+        let quads = [
+            [0u32, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7], // sides
+            [3, 2, 1, 0], // bottom
+            [4, 5, 6, 7], // top
+        ];
+        let mut tris = Vec::new();
+        for q in quads {
+            tris.push([q[0], q[1], q[2]]);
+            tris.push([q[0], q[2], q[3]]);
+        }
+        Mesh { vertices: verts, triangles: tris }
+    }
+
+    #[test]
+    fn half_height_outer_walls_follow_their_own_contours() {
+        // 45-degree slopes: the outline shrinks 1:1 with z, so the lower pass
+        // (sampled h/4 below the layer midpoint) spans ~h/2 wider per axis than
+        // the upper pass (h/4 above) -> span difference of ~h.
+        let m = frustum(20.0, 10.0, 5.0);
+        let mut s = Settings { skirt_loops: 0, ..Settings::default() };
+        s.half_height_outer_walls = true;
+        let layers = generate(&m, &s);
+        let mid = &layers[10];
+        let h = s.layer_height_mm;
+
+        let outers: Vec<&ToolPath> = mid
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::ExternalPerimeter)
+            .collect();
+        assert_eq!(outers.len(), 2, "two half passes per layer");
+        let lower = outers.iter().find(|p| p.z_offset_mm < 0.0).expect("lower pass");
+        let upper = outers.iter().find(|p| p.z_offset_mm == 0.0).expect("upper pass");
+        assert!((lower.z_offset_mm + 0.5 * h).abs() < 1e-9);
+        assert!((lower.height_scale - 0.5).abs() < 1e-9);
+        assert!((upper.height_scale - 0.5).abs() < 1e-9);
+
+        let span = |p: &ToolPath| {
+            let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
+            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let diff = span(lower) - span(upper);
+        assert!(
+            (diff - h).abs() < 0.06,
+            "45-degree slope: lower span should exceed upper by ~{h}, got {diff:.3}"
+        );
+
+        // The lower pass prints before everything else printable on the layer.
+        let first = mid.paths.iter().position(|p| p.points.len() >= 2).unwrap();
+        assert!(mid.paths[first].z_offset_mm < 0.0, "lower outer phase prints first");
+
+        // Layer 0 stays one full-height pass for bed squish.
+        let l0: Vec<&ToolPath> = layers[0]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::ExternalPerimeter)
+            .collect();
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l0[0].height_scale, 1.0);
+    }
+
+    #[test]
+    fn half_outer_walls_exclude_brick() {
+        let m = Mesh::cube(20.0);
+        let mut s = Settings { skirt_loops: 0, wall_count: 4, ..Settings::default() };
+        s.half_height_outer_walls = true;
+        s.brick_layers = true; // collides - brick must yield
+        let layers = generate(&m, &s);
+        let mid = &layers[50];
+        assert!(
+            mid.paths.iter().all(|p| p.z_offset_mm <= 0.0),
+            "no brick-lifted (positive offset) paths when half-outer is on"
+        );
+        assert!(
+            mid.paths.iter().any(|p| p.z_offset_mm < 0.0 && p.height_scale == 0.5),
+            "half-height lower pass present"
+        );
     }
 
     #[test]

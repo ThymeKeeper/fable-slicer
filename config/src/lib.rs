@@ -163,6 +163,11 @@ pub struct Settings {
     pub wall_count: usize,
     pub top_layers: usize,
     pub bottom_layers: usize,
+    /// Print the outer wall as two half-height passes per layer, each sliced at
+    /// its own plane — halves the visible Z staircase on sloped surfaces while
+    /// the interior keeps the full layer height. Mutually exclusive with brick
+    /// layering (their Z choreographies collide).
+    pub half_height_outer_walls: bool,
     /// Brick layering: stagger odd-indexed perimeters by half a layer height so
     /// adjacent wall rings interlock (the outer wall stays put).
     pub brick_layers: bool,
@@ -319,6 +324,7 @@ impl Default for Settings {
             arc_fitting: false,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
+            half_height_outer_walls: false,
             brick_layers: false,
             brick_flow: 1.05,
             top_layers: 4,

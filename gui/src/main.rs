@@ -909,9 +909,12 @@ impl eframe::App for App {
                         .on_disabled_hover_text("Forced off in spiral vase mode.");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
+                    ui.add_enabled(!vase && !s.brick_layers, egui::Checkbox::new(&mut s.half_height_outer_walls, "half-height outer wall"))
+                        .on_hover_text("Print the outer wall as two half-height passes, each sliced at its own plane — halves the visible Z staircase on slopes while the interior keeps full layer height. Costs roughly the outer-wall print time again.")
+                        .on_disabled_hover_text("Unavailable in spiral vase mode or with brick layers (their Z choreographies collide).");
+                    ui.add_enabled(!vase && !s.half_height_outer_walls, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.")
-                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                        .on_disabled_hover_text("Unavailable in spiral vase mode or with half-height outer walls.");
                     ui.add_enabled(s.brick_layers && !vase, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
                         .on_hover_text("Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
                 });
@@ -1449,10 +1452,11 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
             // fatter (flow > 1), so the staggered, over-packed walls are visible.
             // Trickle-flow paths (ironing) render as a thin film at the layer top
             // instead: full width, height scaled by flow.
+            let base_h = h * path.height_scale as f32; // half-height outer walls
             let (w, bh) = if path.flow >= 1.0 {
-                ((path.width_mm * path.flow) as f32, h)
+                ((path.width_mm * path.flow) as f32, base_h)
             } else {
-                (path.width_mm as f32, (h * path.flow as f32).max(0.04))
+                (path.width_mm as f32, (base_h * path.flow as f32).max(0.04))
             };
             let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
             for win in path.points.windows(2) {

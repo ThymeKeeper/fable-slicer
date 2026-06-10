@@ -98,6 +98,10 @@ struct Args {
     /// Brick layering: stagger odd perimeters by half a layer for wall interlocking.
     #[arg(long)]
     brick: bool,
+    /// Outer wall as two half-height passes (own slice planes) — halves the
+    /// visible Z staircase on slopes. Mutually exclusive with --brick.
+    #[arg(long)]
+    half_outer_walls: bool,
     /// Fit circular arcs to curved toolpaths and emit G2/G3 (needs firmware arc support).
     #[arg(long)]
     arc_fitting: bool,
@@ -191,6 +195,9 @@ fn main() -> Result<()> {
     }
     if args.brick {
         settings.brick_layers = true;
+    }
+    if args.half_outer_walls {
+        settings.half_height_outer_walls = true;
     }
     if args.arc_fitting {
         settings.arc_fitting = true;

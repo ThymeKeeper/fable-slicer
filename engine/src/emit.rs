@@ -119,7 +119,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         if s.spiral_vase && layer.index >= first_spiral {
             if let Some(path) = spiral_loop(layer) {
                 let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
-                let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm) / area * flow_factor(path, s);
+                let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
+                    * flow_factor(path, s);
                 emit_spiral_layer(&mut g, layer, path, coeff, feed, travel_f, retract_f, s);
                 continue;
             }
@@ -146,7 +147,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // Brick-layered perimeters print half a layer up and over-extrude a touch.
             let z = layer.print_z_mm + path.z_offset_mm;
             let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
-            let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm) / area * flow_factor(path, s);
+            let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
+                * flow_factor(path, s);
             let start = path.points[0];
 
             // The travel (combed route, or a retracted/z-hopped hop over a void)
@@ -312,7 +314,8 @@ fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
 fn feed_for(path: &ToolPath, layer_index: usize, layer_height_mm: f64, s: &Settings) -> f64 {
     let mut v = nominal_speed_mm_s(path.kind, layer_index, s);
     if s.max_volumetric_speed_mm3_s > 0.0 {
-        let mm3_per_mm = config::bead_area_mm2(path.width_mm, layer_height_mm) * flow_factor(path, s);
+        let mm3_per_mm =
+            config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s);
         if mm3_per_mm > 1.0e-9 {
             v = v.min(s.max_volumetric_speed_mm3_s / mm3_per_mm);
         }
@@ -717,7 +720,9 @@ pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
             if path.closed && path.points.len() >= 2 {
                 len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
             }
-            volume += len * config::bead_area_mm2(path.width_mm, layer.height_mm) * flow_factor(path, s);
+            volume += len
+                * config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale)
+                * flow_factor(path, s);
         }
     }
     let length_mm = volume / s.filament_area_mm2();

@@ -46,12 +46,6 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         return Vec::new();
     };
 
-    // Sorted unique vertex z's — lets each layer nudge off coincident vertices
-    // with a binary search instead of scanning every vertex.
-    let mut vert_zs: Vec<f64> = mesh.vertices.iter().map(|v| v[2]).collect();
-    vert_zs.sort_unstable_by(f64::total_cmp);
-    vert_zs.dedup();
-
     // Plan the layer z's first (cheap, sequential)…
     let mut metas: Vec<Layer> = Vec::new();
     let mut i = 0usize;
@@ -62,7 +56,7 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         } else {
             params.layer_height_mm
         };
-        let z = nudge_off_vertices(&vert_zs, bottom + h * 0.5);
+        let z = bottom + h * 0.5;
         if z >= zmax {
             break;
         }
@@ -76,14 +70,37 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         bottom += h;
         i += 1;
     }
-    if metas.is_empty() {
-        return metas;
+
+    // …then slice all the planes at once (bucketed + parallel).
+    let zs: Vec<f64> = metas.iter().map(|m| m.z_mm).collect();
+    for (layer, (z, polys)) in metas.iter_mut().zip(slice_many(mesh, &zs)) {
+        layer.z_mm = z; // the (possibly vertex-nudged) plane actually used
+        layer.polygons = polys;
+    }
+    metas
+}
+
+/// Slice the mesh at each plane in `zs` (must be ascending). Returns, per
+/// plane, the (possibly vertex-nudged) z actually used and the stitched
+/// polygons. Triangles are bucketed by the band of planes their z-span
+/// crosses, so each plane only visits candidate triangles, and the planes are
+/// sliced in parallel. Shared by normal layer slicing and the extra
+/// quarter-height planes of half-height outer walls.
+pub(crate) fn slice_many(mesh: &Mesh, zs: &[f64]) -> Vec<(f64, Polygons)> {
+    if zs.is_empty() || mesh.triangles.is_empty() {
+        return zs.iter().map(|&z| (z, Polygons::new())).collect();
     }
 
-    // …then bucket triangle indices by the band of layers their z-span crosses.
-    // `band` > 1 caps bucket memory when many triangles span many layers (tall
-    // thin meshes); each layer then filters its band's list by exact z-span.
-    let layer_zs: Vec<f64> = metas.iter().map(|m| m.z_mm).collect();
+    // Sorted unique vertex z's — lets each plane nudge off coincident vertices
+    // with a binary search instead of scanning every vertex.
+    let mut vert_zs: Vec<f64> = mesh.vertices.iter().map(|v| v[2]).collect();
+    vert_zs.sort_unstable_by(f64::total_cmp);
+    vert_zs.dedup();
+    let zs: Vec<f64> = zs.iter().map(|&z| nudge_off_vertices(&vert_zs, z)).collect();
+
+    // Bucket triangle indices by the band of planes their z-span crosses.
+    // `band` > 1 caps bucket memory when many triangles span many planes (tall
+    // thin meshes); each plane then filters its band's list by exact z-span.
     let tri_spans: Vec<(f64, f64)> = (0..mesh.triangles.len())
         .map(|t| {
             let [a, b, c] = mesh.triangle(t);
@@ -93,18 +110,18 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
     let total_entries: usize = tri_spans
         .iter()
         .map(|&(lo, hi)| {
-            let a = layer_zs.partition_point(|&z| z < lo);
-            let b = layer_zs.partition_point(|&z| z <= hi);
+            let a = zs.partition_point(|&z| z < lo);
+            let b = zs.partition_point(|&z| z <= hi);
             b - a
         })
         .sum();
     const ENTRY_CAP: usize = 8_000_000;
     let band = (total_entries / ENTRY_CAP + 1).max(1);
-    let n_bands = metas.len().div_ceil(band);
+    let n_bands = zs.len().div_ceil(band);
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_bands];
     for (t, &(lo, hi)) in tri_spans.iter().enumerate() {
-        let a = layer_zs.partition_point(|&z| z < lo);
-        let b = layer_zs.partition_point(|&z| z <= hi);
+        let a = zs.partition_point(|&z| z < lo);
+        let b = zs.partition_point(|&z| z <= hi);
         for bi in (a / band)..=((b.saturating_sub(1)) / band).min(n_bands - 1) {
             if a < b {
                 buckets[bi].push(t as u32);
@@ -112,11 +129,10 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         }
     }
 
-    metas.par_iter_mut().for_each(|layer| {
-        let bucket = &buckets[layer.index / band];
-        layer.polygons = slice_at(mesh, &tri_spans, bucket, layer.z_mm);
-    });
-    metas
+    zs.par_iter()
+        .enumerate()
+        .map(|(i, &z)| (z, slice_at(mesh, &tri_spans, &buckets[i / band], z)))
+        .collect()
 }
 
 /// Intersect the bucketed triangles with one horizontal plane and stitch.
