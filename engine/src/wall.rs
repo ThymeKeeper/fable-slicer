@@ -333,7 +333,7 @@ impl Field {
             if any_center {
                 let zone_ridge = self.zone_ridge(&center_zone);
                 for line in self.trace_ridges(&zone_ridge) {
-                    if let Some(b) = self.polyline_to_bead((line, false), sp, cap, &width_of) {
+                    if let Some(b) = self.ridge_to_bead(line, sp, cap, &width_of) {
                         ctr_len += b.points.windows(2).map(|w| (w[0].x_mm()-w[1].x_mm()).hypot(w[0].y_mm()-w[1].y_mm())).sum::<f64>();
                         ctr_n += 1;
                         beads.push(b);
@@ -427,7 +427,7 @@ impl Field {
         let width_of = move |pitch: f64| (pitch + (lw - sp)).clamp(lw * 0.4, lw * 1.2);
         self.trace_ridges(&zone)
             .into_iter()
-            .filter_map(|line| self.polyline_to_bead((line, false), sp, 1, &width_of))
+            .filter_map(|line| self.ridge_to_bead(line, sp, 1, &width_of))
             .collect()
     }
 
@@ -560,12 +560,56 @@ impl Field {
     }
 
     /// Chained polyline → Bead with per-vertex widths from the local scheme.
+    /// Snap a point to the local depth maximum along the given normal — the
+    /// true equidistant centerline. (The thinned zone mask wanders with the
+    /// bead-count classification borders; the material band does not.)
+    fn snap_to_ridge(&self, p: (f64, f64), normal: (f64, f64)) -> (f64, f64) {
+        let mut best = p;
+        let mut best_d = f64::MIN;
+        let mut k = -4i32;
+        while k <= 4 {
+            let s = k as f64 * 0.5 * self.cell;
+            let q = (p.0 + normal.0 * s, p.1 + normal.1 * s);
+            if let Some(c) = self.cell_at(q.0, q.1) {
+                if self.inside[c] && self.d[c] > best_d {
+                    best_d = self.d[c];
+                    best = q;
+                }
+            }
+            k += 1;
+        }
+        best
+    }
+
     fn polyline_to_bead(
         &self,
         (line, closed): (Vec<(f64, f64)>, bool),
         sp: f64,
         cap: usize,
         width_of: &dyn Fn(f64) -> f64,
+    ) -> Option<Bead> {
+        self.polyline_to_bead_inner((line, closed), sp, cap, width_of, false)
+    }
+
+    /// Ridge-traced variant: vertices snap to the equidistant centerline and
+    /// widths come from the measured local thickness.
+    fn ridge_to_bead(
+        &self,
+        line: Vec<(f64, f64)>,
+        sp: f64,
+        cap: usize,
+        width_of: &dyn Fn(f64) -> f64,
+    ) -> Option<Bead> {
+        self.polyline_to_bead_inner((line, false), sp, cap, width_of, true)
+    }
+
+    fn polyline_to_bead_inner(
+        &self,
+        (line, closed): (Vec<(f64, f64)>, bool),
+        sp: f64,
+        cap: usize,
+        width_of: &dyn Fn(f64) -> f64,
+        snap: bool,
     ) -> Option<Bead> {
         let mut line = line;
         if closed {
@@ -581,13 +625,37 @@ impl Field {
         // Laplacian relaxation kills the ~1 mm thickness-field ripple, two
         // Chaikin passes melt the grid staircase, then RDP drops the rest.
         let line = laplacian(&laplacian(&line, closed), closed);
+        let line = if snap {
+            // Snap to the depth ridge (perpendicular search per vertex), then
+            // relax once more to kill snap-quantization steps.
+            let n = line.len();
+            let snapped: Vec<(f64, f64)> = (0..n)
+                .map(|i| {
+                    let a = line[if i == 0 { 0 } else { i - 1 }];
+                    let b = line[(i + 1).min(n - 1)];
+                    let (tx, ty) = (b.0 - a.0, b.1 - a.1);
+                    let len = tx.hypot(ty).max(1e-9);
+                    self.snap_to_ridge(line[i], (-ty / len, tx / len))
+                })
+                .collect();
+            laplacian(&snapped, closed)
+        } else {
+            line
+        };
         let line = chaikin(&chaikin(&line, closed), closed);
         let line = rdp(&line, self.cell * 0.45);
         let mut points = Vec::with_capacity(line.len());
         let mut widths = Vec::with_capacity(line.len());
         for &(x, y) in &line {
             let w = match self.cell_at(x, y) {
-                Some(c) if self.inside[c] => width_of(self.scheme(c, sp, cap).pitch),
+                Some(c) if self.inside[c] => {
+                    if snap {
+                        // Center bead: width is the measured local thickness.
+                        width_of(2.0 * self.d[c])
+                    } else {
+                        width_of(self.scheme(c, sp, cap).pitch)
+                    }
+                }
                 _ => width_of(sp),
             };
             points.push(Point::from_mm(x, y));
