@@ -22,3 +22,27 @@ pub use emit::{
 };
 pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};
+
+/// Debug-only: run the variable-width wall field and return (length, closed,
+/// mid width) per bead. For the dbg_arachne example.
+pub fn dbg_variable_walls(
+    outer: &geo2d::Polygons,
+    inner: &geo2d::Polygons,
+    lw: f64,
+    sp: f64,
+    cap: usize,
+) -> Vec<(f64, bool, f64)> {
+    let vw = wall::variable_walls(outer, inner, lw, sp, cap);
+    vw.inner
+        .iter()
+        .chain(vw.thin_outer.iter())
+        .map(|b| {
+            let len: f64 = b
+                .points
+                .windows(2)
+                .map(|w| (w[0].x_mm() - w[1].x_mm()).hypot(w[0].y_mm() - w[1].y_mm()))
+                .sum();
+            (len, b.closed, b.widths[b.widths.len() / 2])
+        })
+        .collect()
+}

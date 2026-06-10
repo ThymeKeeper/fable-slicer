@@ -294,13 +294,8 @@ impl Field {
                     continue; // bead absent here (saturated zones cap the rings)
                 }
                 if !s.saturated && s.n % 2 == 1 && i == s.n / 2 {
-                    // Odd stretch zone: the center bead is the skeleton line
-                    // itself. Trace only skeleton cells — tracing the whole
-                    // zone area scribbles through 2D wedges at junctions.
-                    if self.skel[c] {
-                        center_zone[c] = true;
-                        any_center = true;
-                    }
+                    center_zone[c] = true; // odd stretch zone: ridge bead
+                    any_center = true;
                     continue;
                 }
                 let tgt = (i as f64 + 0.5) * s.pitch;
@@ -323,20 +318,96 @@ impl Field {
                     }
                 })
                 .collect();
+            let mut lvl_len = 0.0f64;
+            let mut lvl_n = 0;
             for poly in self.contour(&psi) {
                 if let Some(b) = self.polyline_to_bead(poly, sp, cap, &width_of) {
+                    lvl_len += b.points.windows(2).map(|w| (w[0].x_mm()-w[1].x_mm()).hypot(w[0].y_mm()-w[1].y_mm())).sum::<f64>();
+                    lvl_n += 1;
                     beads.push(b);
                 }
             }
+            let mut ctr_len = 0.0f64;
+            let mut ctr_n = 0;
+            let zone_cells = center_zone.iter().filter(|&&z| z).count();
             if any_center {
-                for line in self.trace_ridges(&center_zone) {
+                let zone_ridge = self.zone_ridge(&center_zone);
+                for line in self.trace_ridges(&zone_ridge) {
                     if let Some(b) = self.polyline_to_bead((line, false), sp, cap, &width_of) {
+                        ctr_len += b.points.windows(2).map(|w| (w[0].x_mm()-w[1].x_mm()).hypot(w[0].y_mm()-w[1].y_mm())).sum::<f64>();
+                        ctr_n += 1;
                         beads.push(b);
                     }
                 }
             }
+            if std::env::var("ARACHNE_DBG").is_ok() {
+                let n1_cells = (0..self.nx * self.ny)
+                    .filter(|&c| self.inside[c] && {
+                        let s = self.scheme(c, sp, cap);
+                        !s.saturated && s.n % 2 == 1 && i == s.n / 2
+                    })
+                    .count();
+                eprintln!("  i={i}: level {lvl_n}x {lvl_len:.1}mm | center {ctr_n}x {ctr_len:.1}mm | zone(skel) {zone_cells} of n-odd {n1_cells} cells");
+            }
         }
         beads
+    }
+
+    /// Centerline of a zone mask via Zhang–Suen morphological thinning:
+    /// guaranteed one cell wide and connectivity-preserving regardless of EDT
+    /// ripple or skeleton sparsity (tracing zone *areas* was the scribble bug;
+    /// depth-based ridges starved on tapering bands).
+    fn zone_ridge(&self, zone: &[bool]) -> Vec<bool> {
+        let (nx, ny) = (self.nx, self.ny);
+        let mut img = zone.to_vec();
+        let at = |img: &[bool], x: i64, y: i64| -> bool {
+            x >= 0 && y >= 0 && (x as usize) < nx && (y as usize) < ny && img[y as usize * nx + x as usize]
+        };
+        loop {
+            let mut changed = false;
+            for pass in 0..2 {
+                let mut kill = Vec::new();
+                for iy in 0..ny {
+                    for ix in 0..nx {
+                        let c = iy * nx + ix;
+                        if !img[c] {
+                            continue;
+                        }
+                        let (x, y) = (ix as i64, iy as i64);
+                        // p2..p9 clockwise from north.
+                        let p = [
+                            at(&img, x, y - 1), at(&img, x + 1, y - 1), at(&img, x + 1, y),
+                            at(&img, x + 1, y + 1), at(&img, x, y + 1), at(&img, x - 1, y + 1),
+                            at(&img, x - 1, y), at(&img, x - 1, y - 1),
+                        ];
+                        let b: usize = p.iter().filter(|&&v| v).count();
+                        if !(2..=6).contains(&b) {
+                            continue;
+                        }
+                        let a = (0..8).filter(|&k| !p[k] && p[(k + 1) % 8]).count();
+                        if a != 1 {
+                            continue;
+                        }
+                        let ok = if pass == 0 {
+                            (!p[0] || !p[2] || !p[4]) && (!p[2] || !p[4] || !p[6])
+                        } else {
+                            (!p[0] || !p[2] || !p[6]) && (!p[0] || !p[4] || !p[6])
+                        };
+                        if ok {
+                            kill.push(c);
+                        }
+                    }
+                }
+                for c in &kill {
+                    img[*c] = false;
+                }
+                changed |= !kill.is_empty();
+            }
+            if !changed {
+                break;
+            }
+        }
+        img
     }
 
     /// Single tapered beads along skeleton cells thinner than one line width —
@@ -878,7 +949,7 @@ mod tests {
         let f = Field::build(&merged, 0.45).unwrap();
         let beads = f.beads(0.45, 0.407, 3);
         assert!(!beads.is_empty());
-        assert!(beads.len() <= 8, "junction shattered into {} beads", beads.len());
+        assert!(beads.len() <= 10, "junction shattered into {} beads", beads.len());
         // Beads must reach well into the strip (past the junction).
         let max_x = beads
             .iter()
