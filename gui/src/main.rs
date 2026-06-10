@@ -19,6 +19,37 @@ struct ProfileDialog {
     delete: bool,
 }
 
+/// Accent color per profile tier — used on the selector rows and on every
+/// settings-section header, so it's visible at a glance which profile a
+/// setting is saved to.
+fn tier_color(kind: TierKind) -> egui::Color32 {
+    match kind {
+        TierKind::Printer => egui::Color32::from_rgb(110, 170, 255), // blue
+        TierKind::Filament => egui::Color32::from_rgb(255, 170, 90), // orange
+        TierKind::Process => egui::Color32::from_rgb(140, 210, 120), // green
+    }
+}
+
+/// A collapsible settings section owned by one profile tier: the header is
+/// tinted with the tier's color and explains the mapping on hover.
+fn tier_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    kind: TierKind,
+    default_open: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let header = egui::CollapsingHeader::new(
+        egui::RichText::new(title).color(tier_color(kind)).strong(),
+    )
+    .default_open(default_open)
+    .show(ui, add);
+    header.header_response.on_hover_text(format!(
+        "These settings are saved to the {} profile (color-matched in the selector above).",
+        kind.label()
+    ));
+}
+
 /// One object placed on the bed: shared mesh geometry plus an editable placement
 /// (Euler rotation, uniform scale, and a bed-plane position for the footprint
 /// center). The object always rests on z=0 — its baked transform drops it there.
@@ -570,16 +601,19 @@ impl eframe::App for App {
                 ];
                 for (kind, sel, names, is_dirty, hover) in rows {
                     ui.horizontal(|ui| {
-                        let label = match (kind, is_dirty) {
-                            (TierKind::Printer, false) => "Printer",
-                            (TierKind::Printer, true) => "Printer *",
-                            (TierKind::Filament, false) => "Filament",
-                            (TierKind::Filament, true) => "Filament *",
-                            (TierKind::Process, false) => "Process",
-                            (TierKind::Process, true) => "Process *",
+                        let title = match kind {
+                            TierKind::Printer => "Printer",
+                            TierKind::Filament => "Filament",
+                            TierKind::Process => "Process",
                         };
+                        let label = egui::RichText::new(format!(
+                            "{title}{}",
+                            if is_dirty { " *" } else { "" }
+                        ))
+                        .color(tier_color(kind))
+                        .strong();
                         let is_user = self.profiles.is_user(kind, sel);
-                        changed |= combo(ui, label, sel, names, hover);
+                        changed |= combo(ui, kind.label(), label, sel, names, hover);
                         if ui
                             .small_button("💾")
                             .on_hover_text(if is_dirty {
@@ -675,7 +709,7 @@ impl eframe::App for App {
             // Settings, grouped into collapsible categories (Orca-style) and scrolled.
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let s = &mut self.settings;
-                egui::CollapsingHeader::new("Quality").default_open(true).show(ui, |ui| {
+                tier_section(ui, "Quality", TierKind::Process, true, |ui| {
                     ui.add(egui::Slider::new(&mut s.layer_height_mm, 0.05..=0.4).text("layer mm"))
                         .on_hover_text("Height of each printed layer. Smaller = finer detail but slower.");
                     ui.add(egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4).text("first layer mm"))
@@ -714,7 +748,7 @@ impl eframe::App for App {
                     ui.checkbox(&mut s.spiral_vase, "spiral vase")
                         .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).");
                 });
-                egui::CollapsingHeader::new("Walls & top/bottom").show(ui, |ui| {
+                tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
                     ui.add_enabled(!vase, egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
                         .on_hover_text("Number of perimeter loops (shell wall thickness).")
@@ -735,7 +769,7 @@ impl eframe::App for App {
                     ui.add_enabled(s.brick_layers && !vase, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
                         .on_hover_text("Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
                 });
-                egui::CollapsingHeader::new("Infill").show(ui, |ui| {
+                tier_section(ui, "Infill", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
                     ui.add_enabled(!vase, egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
                         .on_hover_text("Sparse interior fill density (0 = hollow, 1 = solid).")
@@ -749,9 +783,7 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5).text("wall overlap"))
                         .on_hover_text("How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });
-                egui::CollapsingHeader::new("Speed").show(ui, |ui| {
-                    ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"))
-                        .on_hover_text("Default printing speed for inner walls and sparse infill.");
+                tier_section(ui, "Feature speeds", TierKind::Process, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.external_perimeter_speed_mm_s, 5.0..=200.0).text("outer wall mm/s"))
                         .on_hover_text("Speed for the visible outermost wall — slower is cleaner.");
                     ui.add(egui::Slider::new(&mut s.solid_speed_mm_s, 5.0..=200.0).text("solid mm/s"))
@@ -760,18 +792,17 @@ impl eframe::App for App {
                         .on_hover_text("Speed for support structure.");
                     ui.add(egui::Slider::new(&mut s.gap_fill_speed_mm_s, 5.0..=100.0).text("gap fill mm/s"))
                         .on_hover_text("Speed for thin gap-fill strokes.");
-                    ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"))
-                        .on_hover_text("Speed for the first layer — slower improves bed adhesion.");
-                    ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"))
-                        .on_hover_text("Speed for non-printing moves between features.");
                     ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"))
                         .on_hover_text("Speed for bridges and arc overhangs — slow so beads solidify in air.");
-                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel mm/s²"))
-                        .on_hover_text("Acceleration limit, emitted as M204. Higher = faster but more ringing.");
-                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"))
-                        .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
+                    ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
+                        .on_hover_text("Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
+                    ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
+                        .on_hover_text("Cooling slowdown: layers faster than this are slowed so they can solidify.");
+                    ui.add_enabled(s.min_layer_time_s > 0.0, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
+                        .on_hover_text("Floor speed when slowing down to hit the minimum layer time.");
+                    ui.weak("machine speed & accel live under Machine & motion");
                 });
-                egui::CollapsingHeader::new("Support").default_open(true).show(ui, |ui| {
+                tier_section(ui, "Support", TierKind::Process, true, |ui| {
                     let vase = s.spiral_vase;
                     ui.add_enabled_ui(!vase, |ui| {
                         support_combo(ui, &mut s.support_mode)
@@ -797,7 +828,7 @@ impl eframe::App for App {
                     ui.add_enabled(arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6).text("arc seam overlap mm"))
                         .on_hover_text("Arc mode: how far fans overlap where they meet (per fan). A little helps them mesh; too much over-extrudes the seam. 0 = butt.");
                 });
-                egui::CollapsingHeader::new("Bed adhesion").show(ui, |ui| {
+                tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.skirt_loops, 0..=5).text("skirt loops"))
                         .on_hover_text("Loops printed around the first layer to prime the nozzle. 0 = off.");
                     ui.add_enabled(s.skirt_loops > 0, egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0).text("skirt gap mm"))
@@ -805,7 +836,7 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.brim_loops, 0..=20).text("brim loops"))
                         .on_hover_text("Loops attached around the first layer for adhesion. 0 = off.");
                 });
-                egui::CollapsingHeader::new("Material & temperature").show(ui, |ui| {
+                tier_section(ui, "Material & temperature", TierKind::Filament, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.nozzle_temp_c, 150..=300).text("nozzle °C"))
                         .on_hover_text("Hotend temperature.");
                     ui.add(egui::Slider::new(&mut s.bed_temp_c, 0..=120).text("bed °C"))
@@ -816,24 +847,19 @@ impl eframe::App for App {
                         .on_hover_text("Filament density — used for the weight estimate.");
                     ui.add(egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2).text("flow ×"))
                         .on_hover_text("Global extrusion multiplier — filament-specific flow tuning.");
-                    ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
-                        .on_hover_text("Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
                     ui.add(egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2).text("pressure advance"))
                         .on_hover_text("Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
                 });
-                egui::CollapsingHeader::new("Cooling").show(ui, |ui| {
+                tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.fan_speed, 0.0..=1.0).text("fan"))
                         .on_hover_text("Part-cooling fan duty while printing.");
                     ui.add(egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0).text("bridge fan"))
                         .on_hover_text("Fan duty on bridges and arc overhangs — usually maxed.");
                     ui.add(egui::Slider::new(&mut s.fan_off_layers, 0..=5).text("fan off layers"))
                         .on_hover_text("Keep the fan off for this many first layers (bed adhesion).");
-                    ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
-                        .on_hover_text("Minimum time per layer; thin layers slow down to allow cooling.");
-                    ui.add_enabled(s.min_layer_time_s > 0.0, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
-                        .on_hover_text("Floor speed when slowing down to hit the minimum layer time.");
+                    ui.weak("min-layer-time slowdown lives under Feature speeds");
                 });
-                egui::CollapsingHeader::new("Retraction").show(ui, |ui| {
+                tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0).text("length mm"))
                         .on_hover_text("Filament pulled back on travels to prevent oozing/stringing.");
                     ui.add(egui::Slider::new(&mut s.retract_speed_mm_s, 5.0..=100.0).text("speed mm/s"))
@@ -841,7 +867,7 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut s.z_hop_mm, 0.0..=2.0).text("z-hop mm"))
                         .on_hover_text("Lift the nozzle on travels that cross a gap/void. 0 = off.");
                 });
-                egui::CollapsingHeader::new("Machine").show(ui, |ui| {
+                tier_section(ui, "Machine & motion", TierKind::Printer, false, |ui| {
                     ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"))
                         .on_hover_text("Bed width (X).");
                     ui.add(egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0).text("bed Y mm"))
@@ -850,8 +876,18 @@ impl eframe::App for App {
                         .on_hover_text("Maximum build height (Z).");
                     ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"))
                         .on_hover_text("Nozzle diameter.");
+                    ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"))
+                        .on_hover_text("The machine's nominal print speed (inner walls, sparse infill). Per-feature speeds derive from it when a profile leaves them unset. Lives here because the printer profile owns it.");
+                    ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"))
+                        .on_hover_text("Speed for the first layer — slower improves bed adhesion.");
+                    ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"))
+                        .on_hover_text("Speed for non-printing moves between features.");
+                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel mm/s²"))
+                        .on_hover_text("Acceleration limit, emitted as M204. Higher = faster but more ringing.");
+                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"))
+                        .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
                 });
-                egui::CollapsingHeader::new("Custom g-code").show(ui, |ui| {
+                tier_section(ui, "Custom g-code", TierKind::Printer, false, |ui| {
                     ui.label("Start g-code").on_hover_text(
                         "Emitted before the print. Placeholders: {nozzle_temp} {bed_temp} {bed_x} {bed_y} {bed_z} {layer_height} {first_layer_height} {nozzle_diameter}.",
                     );
@@ -1038,22 +1074,28 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
                 .show(ui.ctx(), |ui| {
+                    let tier = egui::RichText::new(dlg.kind.label())
+                        .color(tier_color(dlg.kind))
+                        .strong();
                     if dlg.delete {
-                        ui.label(format!(
-                            "Delete the {} profile '{}' from disk?",
-                            dlg.kind.label(),
-                            dlg.name
-                        ));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Delete the");
+                            ui.label(tier);
+                            ui.label(format!("profile '{}' from disk?", dlg.name));
+                        });
                     } else {
-                        ui.label(format!(
-                            "Save as a {} profile (inherits '{}', stores only changed fields):",
-                            dlg.kind.label(),
-                            match dlg.kind {
-                                TierKind::Printer => &self.printer,
-                                TierKind::Filament => &self.filament,
-                                TierKind::Process => &self.process,
-                            }
-                        ));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Save as a");
+                            ui.label(tier);
+                            ui.label(format!(
+                                "profile (inherits '{}', stores only changed fields):",
+                                match dlg.kind {
+                                    TierKind::Printer => &self.printer,
+                                    TierKind::Filament => &self.filament,
+                                    TierKind::Process => &self.process,
+                                }
+                            ));
+                        });
                         ui.text_edit_singleline(&mut dlg.name);
                     }
                     ui.horizontal(|ui| {
@@ -1176,9 +1218,18 @@ fn support_combo(ui: &mut egui::Ui, current: &mut config::SupportMode) -> egui::
         .response
 }
 
-fn combo(ui: &mut egui::Ui, label: &str, current: &mut String, options: &[String], hover: &str) -> bool {
+/// Profile picker: a combo with a stable id (the colored label text changes
+/// with the dirty `*`, so it can't double as the widget id).
+fn combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: egui::RichText,
+    current: &mut String,
+    options: &[String],
+    hover: &str,
+) -> bool {
     let mut changed = false;
-    let r = egui::ComboBox::from_label(label)
+    let r = egui::ComboBox::from_id_salt(id)
         .selected_text(current.clone())
         .show_ui(ui, |ui| {
             for opt in options {
@@ -1188,6 +1239,7 @@ fn combo(ui: &mut egui::Ui, label: &str, current: &mut String, options: &[String
             }
         });
     r.response.on_hover_text(hover);
+    ui.label(label).on_hover_text(hover);
     changed
 }
 
