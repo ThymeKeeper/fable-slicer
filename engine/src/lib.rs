@@ -13,6 +13,7 @@ mod arc;
 mod emit;
 mod fill;
 mod plan;
+mod skeletal;
 mod slice;
 mod wall;
 
@@ -22,6 +23,28 @@ pub use emit::{
 };
 pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};
+
+/// Debug-only: full bead geometry (points mm, widths, closed) for probes.
+pub fn dbg_variable_walls_full(
+    outer: &geo2d::Polygons,
+    inner: &geo2d::Polygons,
+    lw: f64,
+    sp: f64,
+    cap: usize,
+) -> Vec<(Vec<(f64, f64)>, Vec<f64>, bool)> {
+    let vw = wall::variable_walls(outer, inner, lw, sp, cap);
+    vw.inner
+        .iter()
+        .chain(vw.thin_outer.iter())
+        .map(|b| {
+            (
+                b.points.iter().map(|p| (p.x_mm(), p.y_mm())).collect(),
+                b.widths.clone(),
+                b.closed,
+            )
+        })
+        .collect()
+}
 
 /// Debug-only: run the variable-width wall field and return (length, closed,
 /// mid width) per bead. For the dbg_arachne example.

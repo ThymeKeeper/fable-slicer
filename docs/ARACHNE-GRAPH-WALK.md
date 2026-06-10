@@ -1,5 +1,10 @@
 # Handoff: Arachne graph walk (exact skeletal trapezoidation)
 
+> **STATUS: IMPLEMENTED 2026-06-10** — `engine/src/skeletal.rs`. Both defect
+> classes fixed; see the completion report at the bottom of this file. The
+> grid extractor survives as the automatic fallback for degenerate input
+> (`ARACHNE_GRID=1` forces it for A/B).
+
 Resume artifact, written 2026-06-10 at the end of the grid-arachne hardening
 session. Goal: replace the grid extractor's *piecewise extraction + reassembly*
 with the paper's graph walk, which produces rings as rings and junctions as
@@ -104,3 +109,62 @@ Everything downstream is already done and tested:
   tell the story.
 - User priorities: GUI is the primary binary; optimizer legibility rules in
   PLAN decision log; nothing has been test-printed yet.
+
+---
+
+## Completion report (2026-06-10)
+
+Implemented as planned in `engine/src/skeletal.rs` (~1700 lines), a clean
+reimplementation of CuraEngine's `SkeletalTrapezoidation` adapted to the
+wall.rs scheme. Step-by-step outcome against the plan above:
+
+1. **Voronoi**: `boostvoronoi 0.12` worked as hoped — integer µm input
+   (nm/1000), `Builder::<i64>::with_segments`. Two input-hygiene passes were
+   required at µm scale: merge points closer than 5µm (micro-segments starve
+   the cell walk) and strip *exactly-collinear* vertices (boost emits the
+   shared endpoint's cell as two infinite secondary edges — no finite vertex
+   exists for the cell-range walk to terminate on; Cura never sees this
+   because its input mending strips them first).
+2. **Graph**: index-arena half-edge port of constructFromPolygons /
+   transferEdge / discretize (parabolas + point-point bisectors, 0.8mm step,
+   marking points) / makeRib / separatePointyQuadEndNodes /
+   collapseSmallEdges. Structural validation (unpaired half-edges) plus
+   `catch_unwind` guarantee the path can only ever *fall back*, never take
+   the rayon pool down.
+3. **Beading**: wall.rs scheme verbatim behind Cura's strategy interface
+   (optimal count / transition thickness / compute / transition length 1·lw /
+   anchor / nonlinear thicknesses = the saturation kink, pinned by an extra
+   rib).
+4. **Transitions**: full §6.2 port (mids → filtering/dissolving → ends →
+   `insert_node` anchor ribs). One parameter departed from Cura: the central
+   marking angle is the **paper's 45°** (δmax = 135°), not Cura's 10°
+   default. Measured on the Benchy chimney (layer 218): legitimate
+   count-transition climbs have local slopes 0.10–0.13 (polygonization
+   concentrates the medial-axis climb at vertices) vs. true corner ribs at
+   0.99; sin(5°) = 0.087 cuts *into* the first population and shattered the
+   ring; sin(22.5°) = 0.38 splits the two with margin on both sides.
+5. **Extraction**: junctions per upward edge from the top node's beading;
+   beading propagation up/down with the 1·lw merge ramp; quad/domain walk
+   with odd-bead dedup and 3-way handling; local-maxima dots;
+   `join_beads(0.8·lw)` as the stitcher. Thin features (< 1·lw) come from
+   central chains with R < lw/2 on the outer region — Voronoi handles them,
+   as predicted; Zhang–Suen stays grid-only.
+
+**Acceptance**: 76 workspace tests green (new fixtures: annulus all-closed,
+L-junction no-pileup, strip ring, thin taper, scheme parity). Defect 1
+(layer 218 C-ring): one closed 13.8mm ring (was 3 fragments + a dot).
+Defect 2 (layer 50 corner blobs): 4 closed beads, max width 0.56 (grid: 12
+beads, 8 open width-capped dabs). Whole-model census: open beads 574 → 131,
+open length 9.3% → 4.8%. Layer 93 coverage 98.0%, all closed. Layer 195's
+"83%" was a *metric artifact*: its chimney band leaves a 0.4mm channel whose
+classic reference is two loops 0.036mm apart (double-counted, massively
+overextruded); the walk's single centered 0.44mm bead is the correct cover —
+99.4% against the honest reference. **Perf: full Benchy 0.55s vs 2.3s
+grid-arachne (4×), classic 0.31s.** One Benchy layer in 268 falls back to
+grid (near-tangent hole/notch pinch at the bow after the outer-wall inset —
+the intended fallback class).
+
+Not done / future: delete the grid path + `blur_finite` once the fallback
+proves unnecessary in the field; gate the thin-feature voronoi pass on a
+cheap thinness test (it runs on every layer's full outline); user preview
+check on real prints.

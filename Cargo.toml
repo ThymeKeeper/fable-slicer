@@ -32,6 +32,9 @@ config = { path = "config" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
+# Segment Voronoi diagram (eadf's Rust port of boost::polygon::voronoi — the
+# exact library CuraEngine uses for its skeletal trapezoidation).
+boostvoronoi = "0.12"
 
 # Optimize geometry-heavy code even in dev so slicing big meshes stays usable.
 [profile.dev]

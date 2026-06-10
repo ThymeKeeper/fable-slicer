@@ -38,7 +38,31 @@ const CELLS_CAP: usize = 4_000_000;
 /// Generate variable-width walls. `outer` is the full layer region (for thin-
 /// feature beads where even the fixed outer loop can't fit); `inner` is the
 /// region inside the outer wall (gets up to `max_inner` adaptive beads).
+///
+/// The exact skeletal-trapezoidation graph walk (`skeletal.rs`) is the
+/// primary path; the grid field below remains as the fallback for degenerate
+/// input the Voronoi construction rejects (and behind `ARACHNE_GRID=1` for
+/// A/B comparison).
 pub(crate) fn variable_walls(
+    outer: &Polygons,
+    inner: &Polygons,
+    lw: f64,
+    sp: f64,
+    max_inner: usize,
+) -> VariableWalls {
+    if std::env::var("ARACHNE_GRID").is_err() {
+        if let Some(vw) = crate::skeletal::variable_walls_exact(outer, inner, lw, sp, max_inner) {
+            return vw;
+        }
+        if std::env::var("ARACHNE_DBG").is_ok() {
+            eprintln!("  skeletal: voronoi path bailed, grid fallback");
+        }
+    }
+    variable_walls_grid(outer, inner, lw, sp, max_inner)
+}
+
+/// The distance-field fallback (see module docs above).
+fn variable_walls_grid(
     outer: &Polygons,
     inner: &Polygons,
     lw: f64,
@@ -717,8 +741,9 @@ fn blur_finite(src: &[f64], nx: usize, ny: usize) -> Vec<f64> {
 /// Join open beads whose endpoints lie within `tol` (level-set pieces and
 /// skeleton-traced center pieces come from different extractors and meet at
 /// zone borders with sub-bead gaps — the cause of occasionally broken rings).
-/// A bead whose own ends meet afterwards becomes a closed loop.
-fn join_beads(beads: Vec<Bead>, tol: f64) -> Vec<Bead> {
+/// A bead whose own ends meet afterwards becomes a closed loop. The graph
+/// walk reuses this as its stitcher (Cura stitches its quad chains too).
+pub(crate) fn join_beads(beads: Vec<Bead>, tol: f64) -> Vec<Bead> {
     let mut open: Vec<Bead> = Vec::new();
     let mut out: Vec<Bead> = Vec::new();
     for b in beads {
