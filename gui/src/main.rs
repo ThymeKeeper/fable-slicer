@@ -681,7 +681,13 @@ impl eframe::App for App {
         // anything (incl. the Slice button) reads them.
         self.apply_auto();
 
-        egui::Panel::left("controls").resizable(false).exact_size(270.0).show_inside(ui, |ui| {
+        // 320 wide fits the longest slider row (90 slider + value + 19-char
+        // label + auto badge ≈ 287). Content wider than the panel doesn't just
+        // clip: egui reserves the overflowed width, pushing the central panel
+        // right and leaving an unpainted band between the two (egui #4475) —
+        // if a future row overflows, that band is the symptom to look for.
+        egui::Panel::left("controls").resizable(false).exact_size(320.0).show_inside(ui, |ui| {
+            ui.spacing_mut().slider_width = 90.0;
             ui.heading("slicer");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -813,7 +819,10 @@ impl eframe::App for App {
             let n_layers = self.sliced.as_ref().map(|l| l.len()).unwrap_or(0);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let bw = (ui.available_width() - 6.0) / 2.0;
+                // Split the row exactly: two buttons plus the spacing between
+                // them must not exceed the row (a 2 pt overflow here widens
+                // the whole panel — see the note at Panel::left above).
+                let bw = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                 if ui
                     .add_sized([bw, 28.0], egui::Button::selectable(!self.view_preview, "Model"))
                     .on_hover_text("Show the 3D model(s) on the bed.")
@@ -1075,10 +1084,12 @@ impl eframe::App for App {
                 });
                 ui.add_space(6.0);
                 ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
-            });
+                });
         });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        // Frameless: the viewport texture runs edge-to-edge against the panel
+        // separator instead of sitting in an 8 pt dark mat.
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             let aspect = rect.width() / rect.height().max(1.0);
             let vp = self.camera.view_proj(aspect);
