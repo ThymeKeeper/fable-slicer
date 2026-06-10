@@ -1,7 +1,6 @@
 # 0.20mm standard quality.
 layer_height_mm = 0.2
 first_layer_height_mm = 0.2
-line_width_mm = 0.45
 max_resolution_mm = 0.05
 wall_count = 2
 top_layers = 4

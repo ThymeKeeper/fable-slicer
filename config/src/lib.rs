@@ -389,6 +389,38 @@ impl Settings {
     }
 }
 
+// --- auto-derived defaults ---------------------------------------------------
+// One source of truth for the "auto" values: `Profiles::resolve` uses these
+// when a profile leaves the field unset, and the GUI recomputes them live for
+// unpinned fields (so dragging the master visibly moves its dependents).
+
+/// Auto line width: 112.5% of the nozzle bore — wide enough to squeeze a solid
+/// bead, narrow enough to hold detail (0.4 mm nozzle → 0.45 mm).
+pub fn derived_line_width_mm(nozzle_diameter_mm: f64) -> f64 {
+    nozzle_diameter_mm * 1.125
+}
+
+/// Auto outer-wall speed: half the machine's print speed, for surface quality.
+pub fn derived_external_perimeter_speed_mm_s(print_speed_mm_s: f64) -> f64 {
+    print_speed_mm_s * 0.5
+}
+
+/// Auto solid-fill speed: 80% of print speed.
+pub fn derived_solid_speed_mm_s(print_speed_mm_s: f64) -> f64 {
+    print_speed_mm_s * 0.8
+}
+
+/// Auto support speed: 90% of print speed (surface quality doesn't matter).
+pub fn derived_support_speed_mm_s(print_speed_mm_s: f64) -> f64 {
+    print_speed_mm_s * 0.9
+}
+
+/// Auto gap-fill speed: 40% of print speed, capped — gap strokes live in tight
+/// corners where the head is always turning.
+pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.4).min(40.0)
+}
+
 /// Cross-section area (mm²) of a deposited bead: a **stadium** — a flat core
 /// with semicircular caps on the smaller dimension (a circle when w == h).
 /// This is the physical bead shape; the rectangle model it replaces over-fed

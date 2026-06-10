@@ -507,6 +507,18 @@ impl Profiles {
         exists && !self.is_builtin(kind, name)
     }
 
+    /// The fully-merged (inherits-resolved) profile of one tier — lets the GUI
+    /// see which fields the profile chain actually pins vs. leaves on auto.
+    pub fn merged_printer(&self, name: &str) -> Result<PrinterProfile, String> {
+        resolve_tier(&self.printers, name, "printer")
+    }
+    pub fn merged_filament(&self, name: &str) -> Result<FilamentProfile, String> {
+        resolve_tier(&self.filaments, name, "filament")
+    }
+    pub fn merged_process(&self, name: &str) -> Result<ProcessProfile, String> {
+        resolve_tier(&self.processes, name, "process")
+    }
+
     pub fn get_printer(&self, name: &str) -> Option<&PrinterProfile> {
         self.printers.get(name)
     }
@@ -605,8 +617,9 @@ impl Profiles {
         let d = Settings::default();
         // Printer speed (machine default) takes precedence over the process value.
         let print_v = pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s);
+        let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
         Ok(Settings {
-            nozzle_diameter_mm: pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm),
+            nozzle_diameter_mm: nozzle,
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
             filament_density_g_cm3: fl.density_g_cm3.unwrap_or(d.filament_density_g_cm3),
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
@@ -616,7 +629,7 @@ impl Profiles {
             jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
             layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
-            line_width_mm: pc.line_width_mm.unwrap_or(d.line_width_mm),
+            line_width_mm: pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle)),
             max_resolution_mm: pc.max_resolution_mm.unwrap_or(d.max_resolution_mm),
             arc_fitting: pc.arc_fitting.unwrap_or(d.arc_fitting),
             arc_tolerance_mm: pc.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
@@ -668,10 +681,16 @@ impl Profiles {
             // Per-feature speeds scale with the machine's print speed when the
             // profile doesn't pin them (a Voron's outer wall shouldn't crawl at
             // an Ender's pace just because the default table says 25).
-            external_perimeter_speed_mm_s: pc.external_perimeter_speed_mm_s.unwrap_or(print_v * 0.5),
-            solid_speed_mm_s: pc.solid_speed_mm_s.unwrap_or(print_v * 0.8),
-            support_speed_mm_s: pc.support_speed_mm_s.unwrap_or(print_v * 0.9),
-            gap_fill_speed_mm_s: pc.gap_fill_speed_mm_s.unwrap_or((print_v * 0.4).min(40.0)),
+            external_perimeter_speed_mm_s: pc
+                .external_perimeter_speed_mm_s
+                .unwrap_or_else(|| crate::derived_external_perimeter_speed_mm_s(print_v)),
+            solid_speed_mm_s: pc.solid_speed_mm_s.unwrap_or_else(|| crate::derived_solid_speed_mm_s(print_v)),
+            support_speed_mm_s: pc
+                .support_speed_mm_s
+                .unwrap_or_else(|| crate::derived_support_speed_mm_s(print_v)),
+            gap_fill_speed_mm_s: pc
+                .gap_fill_speed_mm_s
+                .unwrap_or_else(|| crate::derived_gap_fill_speed_mm_s(print_v)),
             bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
@@ -778,6 +797,30 @@ mod tests {
     fn unknown_profile_errors() {
         let p = Profiles::builtin();
         assert!(p.resolve("nope", "pla", "standard").is_err());
+    }
+
+    #[test]
+    fn line_width_derives_from_nozzle_when_unset() {
+        let dir = std::env::temp_dir().join(format!("slicer_profiles_auto_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut p = Profiles::builtin();
+        p.load_user_profiles(Some(dir.clone())).unwrap();
+        // A 0.6 mm nozzle printer with no pinned line width -> auto 0.675.
+        let pr = PrinterProfile {
+            inherits: Some("generic".into()),
+            nozzle_diameter_mm: Some(0.6),
+            ..Default::default()
+        };
+        p.save_user_printer("fat-nozzle", pr).unwrap();
+        let s = p.resolve("fat-nozzle", "pla", "standard").unwrap();
+        assert!((s.line_width_mm - 0.675).abs() < 1e-9, "auto lw {}", s.line_width_mm);
+        // `draft` pins 0.5 explicitly - pin wins over auto.
+        let s = p.resolve("fat-nozzle", "pla", "draft").unwrap();
+        assert!((s.line_width_mm - 0.5).abs() < 1e-9);
+        // Provenance is visible to the GUI: standard leaves it unset, draft pins.
+        assert!(p.merged_process("standard").unwrap().line_width_mm.is_none());
+        assert!(p.merged_process("draft").unwrap().line_width_mm.is_some());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

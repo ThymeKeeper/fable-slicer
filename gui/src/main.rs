@@ -19,6 +19,54 @@ struct ProfileDialog {
     delete: bool,
 }
 
+/// Which derivable settings the user has pinned to manual values. Unpinned
+/// fields recompute live from their master setting every frame (camera-style
+/// "priority mode": auto until touched, visible either way).
+#[derive(Default, Clone, Copy)]
+struct Pins {
+    line_width: bool,
+    external_speed: bool,
+    solid_speed: bool,
+    support_speed: bool,
+    gap_fill_speed: bool,
+}
+
+/// A slider with an auto/pin badge: while unpinned it shows a weak "auto" tag
+/// and tracks `derived` (the caller recomputes it each frame); dragging pins
+/// it, and the ⟲ button returns it to auto.
+fn auto_slider(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    label: &str,
+    pinned: &mut bool,
+    derived: f64,
+    hover: &str,
+) {
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::Slider::new(value, range).text(label));
+        if r.changed() {
+            *pinned = true;
+        }
+        r.on_hover_text(hover);
+        if *pinned {
+            if ui
+                .small_button("⟲")
+                .on_hover_text(format!(
+                    "Pinned manually. Click to return to auto ({derived:.2}) and follow the master setting again."
+                ))
+                .clicked()
+            {
+                *pinned = false;
+                *value = derived;
+            }
+        } else {
+            ui.label(egui::RichText::new("auto").small().weak())
+                .on_hover_text("Following its master setting — drag the slider to pin a manual value.");
+        }
+    });
+}
+
 /// Accent color per profile tier — used on the selector rows and on every
 /// settings-section header, so it's visible at a glance which profile a
 /// setting is saved to.
@@ -126,6 +174,8 @@ struct App {
     baseline: Settings,
     /// Open save/delete-profile dialog, if any.
     profile_dialog: Option<ProfileDialog>,
+    /// Auto/pinned state of the derivable settings.
+    pins: Pins,
     objects: Vec<SceneObject>,
     selected: Option<usize>,
     scene: Scene,
@@ -184,6 +234,16 @@ impl App {
         let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         let baseline = settings.clone();
+        let pins = match profiles.merged_process(&process) {
+            Ok(pc) => Pins {
+                line_width: pc.line_width_mm.is_some(),
+                external_speed: pc.external_perimeter_speed_mm_s.is_some(),
+                solid_speed: pc.solid_speed_mm_s.is_some(),
+                support_speed: pc.support_speed_mm_s.is_some(),
+                gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
+            },
+            Err(_) => Pins::default(),
+        };
         Self {
             profiles,
             printer,
@@ -192,6 +252,7 @@ impl App {
             settings,
             baseline,
             profile_dialog: None,
+            pins,
             objects: Vec::new(),
             selected: None,
             scene,
@@ -282,6 +343,72 @@ impl App {
             self.needs_rebuild = true;
             self.refit_camera = true;
         }
+        self.refresh_pins();
+    }
+
+    /// Pin state comes from the selected profiles: a field the process chain
+    /// sets explicitly is pinned; one it leaves unset follows auto.
+    fn refresh_pins(&mut self) {
+        if let Ok(pc) = self.profiles.merged_process(&self.process) {
+            self.pins = Pins {
+                line_width: pc.line_width_mm.is_some(),
+                external_speed: pc.external_perimeter_speed_mm_s.is_some(),
+                solid_speed: pc.solid_speed_mm_s.is_some(),
+                support_speed: pc.support_speed_mm_s.is_some(),
+                gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
+            };
+        }
+    }
+
+    /// Recompute every unpinned derivable setting from its master, so dragging
+    /// print speed (or changing the nozzle) visibly moves its dependents.
+    fn apply_auto(&mut self) {
+        let s = &mut self.settings;
+        if !self.pins.line_width {
+            s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
+        }
+        if !self.pins.external_speed {
+            s.external_perimeter_speed_mm_s =
+                config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s);
+        }
+        if !self.pins.solid_speed {
+            s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s);
+        }
+        if !self.pins.support_speed {
+            s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s);
+        }
+        if !self.pins.gap_fill_speed {
+            s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s);
+        }
+    }
+
+    /// Strip unpinned auto fields from a process diff: auto values are derived,
+    /// not chosen, so they're never saved (and never count as dirty).
+    fn mask_auto(&self, pc: &mut ProcessProfile) {
+        if !self.pins.line_width {
+            pc.line_width_mm = None;
+        }
+        if !self.pins.external_speed {
+            pc.external_perimeter_speed_mm_s = None;
+        }
+        if !self.pins.solid_speed {
+            pc.solid_speed_mm_s = None;
+        }
+        if !self.pins.support_speed {
+            pc.support_speed_mm_s = None;
+        }
+        if !self.pins.gap_fill_speed {
+            pc.gap_fill_speed_mm_s = None;
+        }
+    }
+
+    /// Per-tier dirty flags vs. the baseline, ignoring unpinned auto fields.
+    fn tier_dirty_masked(&self) -> [bool; 3] {
+        let pr = PrinterProfile::diff(&self.settings, &self.baseline);
+        let fl = FilamentProfile::diff(&self.settings, &self.baseline);
+        let mut pc = ProcessProfile::diff(&self.settings, &self.baseline);
+        self.mask_auto(&mut pc);
+        [!pr.is_empty(), !fl.is_empty(), !pc.is_empty()]
     }
 
     /// Re-resolve only the dirty baseline (after a save) — keeps the user's
@@ -328,6 +455,7 @@ impl App {
             }
             TierKind::Process => {
                 let mut diff = ProcessProfile::diff(&self.settings, &self.baseline);
+                self.mask_auto(&mut diff);
                 if name == self.process && self.profiles.is_user(kind, name) {
                     let existing = self.profiles.get_process(name).cloned().unwrap_or_default();
                     let parent = existing.parent().map(str::to_string);
@@ -549,6 +677,9 @@ impl eframe::App for App {
             self.rebuild_scene(&rs);
             self.needs_rebuild = false;
         }
+        // Unpinned auto settings track their masters every frame, before
+        // anything (incl. the Slice button) reads them.
+        self.apply_auto();
 
         egui::Panel::left("controls").resizable(false).exact_size(270.0).show_inside(ui, |ui| {
             ui.heading("slicer");
@@ -600,7 +731,7 @@ impl eframe::App for App {
             let printers: Vec<String> = self.profiles.printer_names().iter().map(|s| s.to_string()).collect();
             let filaments: Vec<String> = self.profiles.filament_names().iter().map(|s| s.to_string()).collect();
             let processes: Vec<String> = self.profiles.process_names().iter().map(|s| s.to_string()).collect();
-            let dirty = config::tier_dirty(&self.settings, &self.baseline);
+            let dirty = self.tier_dirty_masked();
             let mut changed = false;
             let mut open_dialog: Option<ProfileDialog> = None;
             {
@@ -722,13 +853,15 @@ impl eframe::App for App {
             // Settings, grouped into collapsible categories (Orca-style) and scrolled.
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let s = &mut self.settings;
+                let pins = &mut self.pins;
                 tier_section(ui, "Quality", TierKind::Process, true, |ui| {
                     ui.add(egui::Slider::new(&mut s.layer_height_mm, 0.05..=0.4).text("layer mm"))
                         .on_hover_text("Height of each printed layer. Smaller = finer detail but slower.");
                     ui.add(egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4).text("first layer mm"))
                         .on_hover_text("Thickness of the first layer — often thicker for bed adhesion.");
-                    ui.add(egui::Slider::new(&mut s.line_width_mm, 0.2..=1.0).text("line width mm"))
-                        .on_hover_text("Width of one extruded line. Usually ≈ nozzle diameter.");
+                    let d_lw = config::derived_line_width_mm(s.nozzle_diameter_mm);
+                    auto_slider(ui, &mut s.line_width_mm, 0.2..=1.0, "line width mm", &mut pins.line_width, d_lw,
+                        "Width of one extruded line. Auto = 112.5% of the nozzle, so it follows nozzle changes.");
                     ui.add(egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5).text("resolution mm"))
                         .on_hover_text("Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
@@ -797,14 +930,19 @@ impl eframe::App for App {
                         .on_hover_text("How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });
                 tier_section(ui, "Feature speeds", TierKind::Process, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.external_perimeter_speed_mm_s, 5.0..=200.0).text("outer wall mm/s"))
-                        .on_hover_text("Speed for the visible outermost wall — slower is cleaner.");
-                    ui.add(egui::Slider::new(&mut s.solid_speed_mm_s, 5.0..=200.0).text("solid mm/s"))
-                        .on_hover_text("Speed for solid top/bottom fill.");
-                    ui.add(egui::Slider::new(&mut s.support_speed_mm_s, 5.0..=200.0).text("support mm/s"))
-                        .on_hover_text("Speed for support structure.");
-                    ui.add(egui::Slider::new(&mut s.gap_fill_speed_mm_s, 5.0..=100.0).text("gap fill mm/s"))
-                        .on_hover_text("Speed for thin gap-fill strokes.");
+                    let v = s.print_speed_mm_s;
+                    auto_slider(ui, &mut s.external_perimeter_speed_mm_s, 5.0..=200.0, "outer wall mm/s",
+                        &mut pins.external_speed, config::derived_external_perimeter_speed_mm_s(v),
+                        "Speed for the visible outermost wall — slower is cleaner. Auto = 50% of print speed.");
+                    auto_slider(ui, &mut s.solid_speed_mm_s, 5.0..=200.0, "solid mm/s",
+                        &mut pins.solid_speed, config::derived_solid_speed_mm_s(v),
+                        "Speed for solid top/bottom fill. Auto = 80% of print speed.");
+                    auto_slider(ui, &mut s.support_speed_mm_s, 5.0..=200.0, "support mm/s",
+                        &mut pins.support_speed, config::derived_support_speed_mm_s(v),
+                        "Speed for support structure. Auto = 90% of print speed.");
+                    auto_slider(ui, &mut s.gap_fill_speed_mm_s, 5.0..=100.0, "gap fill mm/s",
+                        &mut pins.gap_fill_speed, config::derived_gap_fill_speed_mm_s(v),
+                        "Speed for thin gap-fill strokes. Auto = 40% of print speed, capped at 40.");
                     ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"))
                         .on_hover_text("Speed for bridges and arc overhangs — slow so beads solidify in air.");
                     ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
