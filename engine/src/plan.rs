@@ -1306,8 +1306,8 @@ mod tests {
         // outer wall pair becomes a real variable-width Perimeter bead in
         // arachne mode (no GapFill strokes), and a GapFill stroke in classic.
         let m = box_mesh(1.2, 20.0, 5.0);
-        let s = Settings { wall_count: 2, skirt_loops: 0, ..Settings::default() };
-        let layers = generate(&m, &s); // wall_mode defaults to Arachne
+        let s = Settings { wall_count: 2, skirt_loops: 0, wall_mode: config::WallMode::Arachne, ..Settings::default() };
+        let layers = generate(&m, &s);
         let mid = &layers[10];
         assert_eq!(count(mid, PathKind::GapFill), 0, "arachne: no gap-fill bandaids");
         let bead = mid

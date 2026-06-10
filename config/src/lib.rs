@@ -102,12 +102,14 @@ impl InfillPattern {
 /// How wall toolpaths are generated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WallMode {
-    /// Variable-width beading (Arachne-class): inner walls stretch, squeeze,
-    /// split and merge with the local feature thickness; thin features become
-    /// single tapered beads. The outer wall stays a fixed-width exact loop.
-    #[default]
+    /// Variable-width beading (Arachne-class, **experimental**): inner walls
+    /// stretch, squeeze, split and merge with the local feature thickness;
+    /// thin features become single tapered beads. The outer wall stays a
+    /// fixed-width exact loop. Grid-based; promote to default once the exact
+    /// skeleton lands and it survives real prints.
     Arachne,
     /// Fixed-width concentric offsets everywhere (gaps go to gap fill).
+    #[default]
     Classic,
 }
 

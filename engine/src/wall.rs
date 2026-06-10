@@ -87,6 +87,9 @@ struct Scheme {
 
 impl Field {
     fn build(region: &Polygons, lw: f64) -> Option<Field> {
+        // Mesh-facet scallops on the input contour grow spur forests in the
+        // skeleton (the roof-band scribble); smooth them below ridge scale.
+        let region = &geo2d::simplify(region, lw * 0.25);
         let bb = region.bounds()?;
         let pad = lw;
         let (x0, y0) = (bb.min.x_mm() - pad, bb.min.y_mm() - pad);
@@ -179,7 +182,12 @@ impl Field {
         // have d ≈ T̂. Iteratively strip such endpoint cells so center-bead
         // tracing follows the true spine instead of shattering on whiskers.
         let mut skel = skel;
-        for _ in 0..12 {
+        for c in 0..nx * ny {
+            if skel[c] && d[c] < 0.35 * t_hat[c] {
+                skel[c] = false; // noise ridge: far shallower than the local thickness
+            }
+        }
+        for _ in 0..64 {
             let mut removed = false;
             for iy in 1..ny - 1 {
                 for ix in 1..nx - 1 {
@@ -344,12 +352,6 @@ impl Field {
                 let (c10, c01, c11) = (c00 + 1, c00 + self.nx, c00 + self.nx + 1);
                 let vs = [psi[c00], psi[c10], psi[c11], psi[c01]];
                 if vs.iter().any(|v| !v.is_finite()) {
-                    continue;
-                }
-                // Degenerate plateau: ψ ≈ 0 across the whole cell (the level
-                // grazes the ridge). MS would hatch noise here — the bead is
-                // owned by the ridge tracer instead.
-                if vs.iter().all(|v| v.abs() < self.cell * 0.6) {
                     continue;
                 }
                 let p00 = self.center(ix, iy);
