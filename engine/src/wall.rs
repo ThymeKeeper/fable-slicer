@@ -47,11 +47,11 @@ pub(crate) fn variable_walls(
 ) -> VariableWalls {
     let mut out = VariableWalls { inner: Vec::new(), thin_outer: Vec::new() };
     if max_inner > 0 {
-        if let Some(f) = Field::build(inner, lw) {
+        if let Some(f) = Field::build(inner, lw, sp, max_inner) {
             out.inner = f.beads(lw, sp, max_inner);
         }
     }
-    if let Some(f) = Field::build(outer, lw) {
+    if let Some(f) = Field::build(outer, lw, sp, 1) {
         out.thin_outer = f.thin_ridge_beads(lw, sp);
     }
     out
@@ -86,7 +86,7 @@ struct Scheme {
 }
 
 impl Field {
-    fn build(region: &Polygons, lw: f64) -> Option<Field> {
+    fn build(region: &Polygons, lw: f64, sp: f64, cap: usize) -> Option<Field> {
         // Mesh-facet scallops on the input contour grow spur forests in the
         // skeleton (the roof-band scribble); smooth them below ridge scale.
         let region = &geo2d::simplify(region, lw * 0.25);
@@ -146,28 +146,14 @@ impl Field {
         let d2 = edt(&inside, nx, ny);
         let d: Vec<f64> = d2.iter().map(|&q| ((q.sqrt() - 0.5) * cell).max(0.0)).collect();
 
-        // Skeleton: ridge cells — no neighbour is clearly deeper. The small
-        // depth floor keeps single-cell boundary noise out.
-        let mut skel = vec![false; nx * ny];
-        for iy in 1..ny - 1 {
-            for ix in 1..nx - 1 {
-                let c = iy * nx + ix;
-                if !inside[c] || d[c] < lw * 0.3 {
-                    continue;
-                }
-                let mut ridge = true;
-                for (dx, dy) in [(-1i64, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
-                    let nb = ((iy as i64 + dy) * nx as i64 + ix as i64 + dx) as usize;
-                    if d[nb] > d[c] + cell * 0.7 {
-                        ridge = false;
-                        break;
-                    }
-                }
-                if ridge {
-                    skel[c] = true;
-                }
-            }
-        }
+        // Skeleton = the medial axis of the material mask itself, via partial
+        // Zhang–Suen thinning: connected, one cell wide, and centered in the
+        // band by construction (EDT-ridge detection was sparse on tapering
+        // bands and noisy on scalloped contours). Peeling stops just past the
+        // wall band; deeper saturated cores stay as blobs, which only ever
+        // classify as saturated — never traced.
+        let iters = (((cap as f64 + 2.0) * sp) / cell).ceil() as usize + 4;
+        let skel = thin_mask(&inside, nx, ny, iters);
 
         // T̂ = radius of the nearest skeleton cell, kept SHARP: each cell
         // belongs to exactly one skeleton feature (a Voronoi partition), so a
@@ -353,61 +339,32 @@ impl Field {
         beads
     }
 
-    /// Centerline of a zone mask via Zhang–Suen morphological thinning:
-    /// guaranteed one cell wide and connectivity-preserving regardless of EDT
-    /// ripple or skeleton sparsity (tracing zone *areas* was the scribble bug;
-    /// depth-based ridges starved on tapering bands).
+    /// The medial axis restricted to a zone: the precomputed thinned skeleton
+    /// is centered in the band by construction, so center beads follow the
+    /// walls instead of the zone classification's wandering borders.
     fn zone_ridge(&self, zone: &[bool]) -> Vec<bool> {
-        let (nx, ny) = (self.nx, self.ny);
-        let mut img = zone.to_vec();
-        let at = |img: &[bool], x: i64, y: i64| -> bool {
-            x >= 0 && y >= 0 && (x as usize) < nx && (y as usize) < ny && img[y as usize * nx + x as usize]
-        };
-        loop {
-            let mut changed = false;
-            for pass in 0..2 {
-                let mut kill = Vec::new();
-                for iy in 0..ny {
-                    for ix in 0..nx {
-                        let c = iy * nx + ix;
-                        if !img[c] {
-                            continue;
-                        }
-                        let (x, y) = (ix as i64, iy as i64);
-                        // p2..p9 clockwise from north.
-                        let p = [
-                            at(&img, x, y - 1), at(&img, x + 1, y - 1), at(&img, x + 1, y),
-                            at(&img, x + 1, y + 1), at(&img, x, y + 1), at(&img, x - 1, y + 1),
-                            at(&img, x - 1, y), at(&img, x - 1, y - 1),
-                        ];
-                        let b: usize = p.iter().filter(|&&v| v).count();
-                        if !(2..=6).contains(&b) {
-                            continue;
-                        }
-                        let a = (0..8).filter(|&k| !p[k] && p[(k + 1) % 8]).count();
-                        if a != 1 {
-                            continue;
-                        }
-                        let ok = if pass == 0 {
-                            (!p[0] || !p[2] || !p[4]) && (!p[2] || !p[4] || !p[6])
-                        } else {
-                            (!p[0] || !p[2] || !p[6]) && (!p[0] || !p[4] || !p[6])
-                        };
-                        if ok {
-                            kill.push(c);
+        // Dilate the zone a couple of cells first: the medial axis can run
+        // just outside the classification border, and strict intersection
+        // would punch gaps into the center bead there.
+        let mut z = zone.to_vec();
+        for _ in 0..2 {
+            let prev = z.clone();
+            for iy in 1..self.ny - 1 {
+                for ix in 1..self.nx - 1 {
+                    let c = iy * self.nx + ix;
+                    if prev[c] {
+                        continue;
+                    }
+                    for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                        if prev[((iy as i64 + dy) * self.nx as i64 + ix as i64 + dx) as usize] {
+                            z[c] = true;
+                            break;
                         }
                     }
                 }
-                for c in &kill {
-                    img[*c] = false;
-                }
-                changed |= !kill.is_empty();
-            }
-            if !changed {
-                break;
             }
         }
-        img
+        (0..self.nx * self.ny).map(|c| z[c] && self.skel[c]).collect()
     }
 
     /// Single tapered beads along skeleton cells thinner than one line width —
@@ -757,6 +714,60 @@ fn blur_finite(src: &[f64], nx: usize, ny: usize) -> Vec<f64> {
     out
 }
 
+/// Partial Zhang–Suen thinning of a mask: peels up to `max_iter` boundary
+/// layers while preserving connectivity, yielding the (one-cell-wide) medial
+/// axis of everything thinner than ~2·max_iter cells.
+fn thin_mask(mask: &[bool], nx: usize, ny: usize, max_iter: usize) -> Vec<bool> {
+    let mut img = mask.to_vec();
+    let at = |img: &[bool], x: i64, y: i64| -> bool {
+        x >= 0 && y >= 0 && (x as usize) < nx && (y as usize) < ny && img[y as usize * nx + x as usize]
+    };
+    for _ in 0..max_iter {
+        let mut changed = false;
+        for pass in 0..2 {
+            let mut kill = Vec::new();
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let c = iy * nx + ix;
+                    if !img[c] {
+                        continue;
+                    }
+                    let (x, y) = (ix as i64, iy as i64);
+                    let p = [
+                        at(&img, x, y - 1), at(&img, x + 1, y - 1), at(&img, x + 1, y),
+                        at(&img, x + 1, y + 1), at(&img, x, y + 1), at(&img, x - 1, y + 1),
+                        at(&img, x - 1, y), at(&img, x - 1, y - 1),
+                    ];
+                    let b: usize = p.iter().filter(|&&v| v).count();
+                    if !(2..=6).contains(&b) {
+                        continue;
+                    }
+                    let a = (0..8).filter(|&k| !p[k] && p[(k + 1) % 8]).count();
+                    if a != 1 {
+                        continue;
+                    }
+                    let ok = if pass == 0 {
+                        (!p[0] || !p[2] || !p[4]) && (!p[2] || !p[4] || !p[6])
+                    } else {
+                        (!p[0] || !p[2] || !p[6]) && (!p[0] || !p[4] || !p[6])
+                    };
+                    if ok {
+                        kill.push(c);
+                    }
+                }
+            }
+            for c in &kill {
+                img[*c] = false;
+            }
+            changed |= !kill.is_empty();
+        }
+        if !changed {
+            break;
+        }
+    }
+    img
+}
+
 /// Ramer–Douglas–Peucker simplification (keeps endpoints).
 fn rdp(line: &[(f64, f64)], eps: f64) -> Vec<(f64, f64)> {
     if line.len() <= 2 {
@@ -920,7 +931,7 @@ mod tests {
     #[test]
     fn edt_center_of_strip() {
         // A 2 mm tall strip: depth at mid-height ≈ 1 mm; skeleton along the middle.
-        let f = Field::build(&rect(0.0, 0.0, 30.0, 2.0), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 30.0, 2.0), 0.45, 0.407, 3).unwrap();
         let mid = f.cell_at(15.0, 1.0).unwrap();
         assert!((f.d[mid] - 1.0).abs() < 0.15, "depth {}", f.d[mid]);
         assert!((f.t_hat[mid] - 1.0).abs() < 0.2, "t_hat {}", f.t_hat[mid]);
@@ -929,7 +940,7 @@ mod tests {
     #[test]
     fn stretch_zone_shares_thickness() {
         // 1.0 mm strip with sp≈0.407: fit = round(1.0/0.407) = 2 beads at pitch 0.5.
-        let f = Field::build(&rect(0.0, 0.0, 30.0, 1.0), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 30.0, 1.0), 0.45, 0.407, 3).unwrap();
         let c = f.cell_at(15.0, 0.5).unwrap();
         let s = f.scheme(c, 0.407, 3);
         assert_eq!(s.n, 2);
@@ -949,24 +960,24 @@ mod tests {
         // A wide slab so T̂ is controlled by strip height; sp ≈ 0.407, cap = 2.
         let sp = 0.407;
         // Stretch: t = 1.4 → fit 3 ≤ 4: thickness shared (odd → center bead zone).
-        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.4), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.4), 0.45, 0.407, 3).unwrap();
         let s = f.scheme(f.cell_at(20.0, 0.7).unwrap(), sp, 2);
         assert!(!s.saturated);
         assert_eq!(s.n, 3);
         // Absorb: t = 2·2·sp + 0.3 ≈ 1.93 → leftover 0.3 is a sub-bead sliver;
         // the 4 beads widen to swallow it instead of leaving a void.
-        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.93), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.93), 0.45, 0.407, 3).unwrap();
         let s = f.scheme(f.cell_at(20.0, 0.965).unwrap(), sp, 2);
         assert!(!s.saturated, "sliver leftover must be absorbed");
         assert_eq!(s.n, 4);
         assert!(s.pitch > sp + 0.02, "rings widen: pitch {}", s.pitch);
         // Absorb-2: cap=1, t = 1.6 → remainder 0.79 is ~one bead: 3 beads, no solid strip.
-        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.6), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 1.6), 0.45, 0.407, 3).unwrap();
         let s = f.scheme(f.cell_at(20.0, 0.8).unwrap(), sp, 1);
         assert!(!s.saturated);
         assert_eq!(s.n, 3, "extra center bead");
         // Saturated: t = 2·2·sp + 1.2 → real room: nominal pitch, infill owns it.
-        let f = Field::build(&rect(0.0, 0.0, 40.0, 2.83), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 40.0, 2.83), 0.45, 0.407, 3).unwrap();
         let s = f.scheme(f.cell_at(20.0, 1.415).unwrap(), sp, 2);
         assert!(s.saturated);
         assert!((s.pitch - sp).abs() < 1e-9);
@@ -992,7 +1003,7 @@ mod tests {
         let mut annulus = Polygons::new();
         annulus.push(circle(0.0, 0.0, 10.0, true));
         annulus.push(circle(0.0, 0.0, 9.0, false)); // 1.0 mm band
-        let f = Field::build(&annulus, 0.45).unwrap();
+        let f = Field::build(&annulus, 0.45, 0.407, 3).unwrap();
         let beads = f.beads(0.45, 0.407, 3);
         assert!(!beads.is_empty());
         assert!(beads.len() <= 4, "band fragmented into {} beads", beads.len());
@@ -1014,7 +1025,7 @@ mod tests {
         region.push(circle(0.0, 0.0, 2.0, true));
         region.contours.extend(rect(1.0, -0.55, 12.0, 0.55).contours);
         let merged = geo2d::union(&region, &Polygons::new());
-        let f = Field::build(&merged, 0.45).unwrap();
+        let f = Field::build(&merged, 0.45, 0.407, 3).unwrap();
         let beads = f.beads(0.45, 0.407, 3);
         assert!(!beads.is_empty());
         assert!(beads.len() <= 10, "junction shattered into {} beads", beads.len());
@@ -1036,7 +1047,7 @@ mod tests {
         let mut hole = rect(2.0, 2.0, 19.2, 8.0); // right band only 0.8 mm
         hole.contours[0].make_cw();
         frame.contours.extend(hole.contours);
-        let f = Field::build(&frame, 0.45).unwrap();
+        let f = Field::build(&frame, 0.45, 0.407, 3).unwrap();
         let beads = f.beads(0.45, 0.407, 1);
         for (k, b) in beads.iter().enumerate() {
             let xs: Vec<f64> = b.points.iter().map(|p| p.x_mm()).collect();
@@ -1050,7 +1061,7 @@ mod tests {
 
     #[test]
     fn thin_strip_gets_one_tapered_ridge_bead() {
-        let f = Field::build(&rect(0.0, 0.0, 20.0, 0.3), 0.45).unwrap();
+        let f = Field::build(&rect(0.0, 0.0, 20.0, 0.3), 0.45, 0.407, 3).unwrap();
         let beads = f.thin_ridge_beads(0.45, 0.407);
         assert_eq!(beads.len(), 1, "one centerline bead");
         let b = &beads[0];
