@@ -29,6 +29,9 @@ pub enum PathKind {
     OverhangWall,
     /// Dense (100%) top/bottom shell fill.
     Solid,
+    /// The first solid layer over sparse infill: beads span the open cells
+    /// below, so they print like (short, well-anchored) bridges.
+    InternalBridge,
     /// Sparse interior fill.
     Infill,
     /// Single width-matched strokes in gaps too thin for normal fill.
@@ -396,6 +399,30 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         gaps_per_layer.push(g);
     }
 
+    // Solid shells per layer (exposed to air above/below unless covered by the
+    // whole shell range). Precomputed so each layer can also see the layer
+    // below's split — the first solid layer over sparse infill bridges it.
+    let solid_all_per_layer: Vec<Polygons> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let inner = &inner_per_layer[i];
+            if inner.is_empty() {
+                return Polygons::new();
+            }
+            let solid_top = if settings.top_layers > 0 {
+                difference(inner, &coverage(&inner_per_layer, i, 1, settings.top_layers, n))
+            } else {
+                Polygons::new()
+            };
+            let solid_bottom = if settings.bottom_layers > 0 {
+                difference(inner, &coverage(&inner_per_layer, i, -1, settings.bottom_layers, n))
+            } else {
+                Polygons::new()
+            };
+            union(&solid_top, &solid_bottom)
+        })
+        .collect();
+
     // Pass 2: assemble layers, splitting infill into solid shells + sparse core.
     let mut plans: Vec<LayerPlan> = walls_per_layer
         .into_par_iter()
@@ -407,17 +434,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
 
         if !inner.is_empty() {
-            // Exposed to air above/below unless covered by the whole shell range.
-            let solid_top = if settings.top_layers > 0 {
-                difference(inner, &coverage(&inner_per_layer, i, 1, settings.top_layers, n))
-            } else {
-                Polygons::new()
-            };
-            let solid_bottom = if settings.bottom_layers > 0 {
-                difference(inner, &coverage(&inner_per_layer, i, -1, settings.bottom_layers, n))
-            } else {
-                Polygons::new()
-            };
             // Arc-overhang mode: the flat unsupported part of this layer's interior
             // is filled with self-supporting arcs instead of normal fill.
             let mut supported_below = Polygons::new();
@@ -432,13 +448,28 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 Polygons::new()
             };
 
-            let solid_all = union(&solid_top, &solid_bottom);
-            let solid = difference(&solid_all, &arc_region);
-            let sparse = difference(&difference(inner, &solid_all), &arc_region);
+            let solid_all = &solid_all_per_layer[i];
+            let solid = difference(solid_all, &arc_region);
+            let sparse = difference(&difference(inner, solid_all), &arc_region);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
 
             // Alternate fill direction per layer for cross-hatching.
             let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
+
+            // Internal bridges: where this layer's solid sits on sparse infill
+            // (the first shell layer over the core), the beads span open cells
+            // — print them as bridges, oriented across the sparse lines below
+            // (span = one line spacing), before the rest of the solid fill.
+            let internal_bridge = if i > 0 && settings.infill_density > 0.0 && !solid.is_empty() {
+                let sparse_below =
+                    difference(&inner_per_layer[i - 1], &solid_all_per_layer[i - 1]);
+                let ib = intersection(&solid, &sparse_below);
+                // Open: a band thinner than a line is covered by the solid
+                // loop's bead anyway, and micro-islands aren't worth a pass.
+                offset(&offset(&ib, -lw * 0.5), lw * 0.5)
+            } else {
+                Polygons::new()
+            };
 
             if !arc_region.is_empty() {
                 // Decide per disjoint island: a short two-sided gap bridges with
@@ -482,9 +513,25 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
                 }
                 let solid_core = offset(&solid, -(0.5 * (lw + sp) - 0.5 * ov));
-                if !solid_core.is_empty() {
+                if !internal_bridge.is_empty() {
+                    // Bridge lines run perpendicular to the sparse lines below
+                    // (each free span = one line spacing) and extend half a
+                    // bead into the supported solid around them to anchor.
+                    let below_angle = if (i - 1) % 2 == 0 { 45.0 } else { 135.0 };
+                    let lines_region =
+                        intersection(&offset(&internal_bridge, lw * 0.5), &solid_core);
+                    for seg in infill_lines(&lines_region, below_angle + 90.0, sp, false, 0.5) {
+                        paths.push(ToolPath::new(PathKind::InternalBridge, false, lw, seg));
+                    }
+                }
+                let solid_fill = if internal_bridge.is_empty() {
+                    solid_core.clone()
+                } else {
+                    difference(&solid_core, &internal_bridge)
+                };
+                if !solid_fill.is_empty() {
                     fill_region(
-                        &solid_core, settings.solid_pattern, sp, angle, lw, PathKind::Solid,
+                        &solid_fill, settings.solid_pattern, sp, angle, lw, PathKind::Solid,
                         settings.seam_mode, i, layers[i].z_mm, settings.monotonic_solid, &mut paths,
                     );
                 }
@@ -1371,6 +1418,41 @@ mod tests {
         // The layer above the cantilever's first is fully supported again.
         let next = plans.iter().find(|p| p.print_z_mm > first_slab.print_z_mm).unwrap();
         assert_eq!(count(next, PathKind::OverhangWall), 0, "supported layer must not slow");
+    }
+
+    #[test]
+    fn first_solid_layer_over_sparse_bridges() {
+        // In a cube, the first top-shell layer sits on 15% sparse infill: its
+        // interior must print as InternalBridge spans (perpendicular to the
+        // sparse lines below), while the layers above it — supported by that
+        // now-solid layer — must not.
+        let m = mesh::Mesh::cube(20.0);
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let plans = generate(&m, &s);
+        let n = plans.len();
+        let first_top = plans
+            .iter()
+            .position(|p| count(p, PathKind::InternalBridge) > 0)
+            .expect("some layer bridges over the sparse core");
+        assert_eq!(first_top, n - s.top_layers, "bridges start at the first top-shell layer");
+        for p in &plans[first_top + 1..] {
+            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} re-bridges", p.index);
+        }
+        // The bottom shells sit on the bed / each other — never bridged.
+        for p in &plans[..first_top] {
+            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} bridges early", p.index);
+        }
+        // The bridged layer still has its solid loop and the bridges carry
+        // real length.
+        let ib_len: f64 = plans[first_top]
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::InternalBridge)
+            .flat_map(|p| p.points.windows(2))
+            .map(|w| pt_dist_mm(w[0], w[1]))
+            .sum();
+        assert!(ib_len > 50.0, "internal bridge length {ib_len:.0}mm");
+        assert!(count(&plans[first_top], PathKind::Solid) > 0, "anchor loop survives");
     }
 
     #[test]

@@ -811,6 +811,29 @@ mod tests {
         assert_eq!(s.nozzle_temp_c, 200); // from pla
         assert_eq!(s.layer_height_mm, 0.2); // from standard
         assert!(s.start_gcode.contains("PRINT_START"));
+        // Per-feature acceleration: voron24 pins a gentle outer wall under a
+        // fast interior; the first layer auto-derives to the adhesion cap.
+        assert_eq!(s.acceleration_mm_s2, 10000.0);
+        assert_eq!(s.outer_wall_accel_mm_s2, 3000.0);
+        assert_eq!(s.first_layer_accel_mm_s2, 1000.0);
+    }
+
+    #[test]
+    fn sovol_zero_matches_orca_speed_profile() {
+        // The Sovol Zero numbers are matched to OrcaSlicer's high-speed
+        // profile (measured from its g-code) — pin them so a profile edit
+        // can't silently regress the pairing.
+        let p = Profiles::builtin();
+        let s = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        assert_eq!(s.acceleration_mm_s2, 40000.0); // Orca default/travel accel
+        assert_eq!(s.outer_wall_accel_mm_s2, 10000.0); // Orca outer wall accel
+        assert_eq!(s.first_layer_accel_mm_s2, 1000.0); // auto = Orca's initial layer
+        assert_eq!(s.print_speed_mm_s, 400.0); // Orca inner wall
+        assert_eq!(s.first_layer_speed_mm_s, 55.0); // Orca initial layer
+        assert_eq!(s.travel_speed_mm_s, 1000.0); // Orca travel
+        assert_eq!(s.jerk_mm_s, 5.0); // Orca square-corner velocity
+        // pla-hf's melt ceiling (≥ Orca's 21) is what actually limits speed.
+        assert_eq!(s.max_volumetric_speed_mm3_s, 30.0);
     }
 
     #[test]

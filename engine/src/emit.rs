@@ -156,7 +156,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             }
             // Bridges and overhanging walls want max cooling; everything else
             // the layer's normal duty.
-            let airborne = matches!(path.kind, PathKind::Bridge | PathKind::OverhangWall);
+            let airborne =
+                matches!(path.kind, PathKind::Bridge | PathKind::InternalBridge | PathKind::OverhangWall);
             let want_fan = if airborne && layer.index >= s.fan_off_layers {
                 fan_duty(s.bridge_fan_speed).max(normal_fan)
             } else {
@@ -331,6 +332,16 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
         PathKind::Support => s.support_speed_mm_s,
         // Bridges/arc overhangs print into air — go slow so each bead solidifies.
         PathKind::Bridge => s.bridge_speed_mm_s,
+        // Internal bridges (solid over sparse) are anchored every infill cell:
+        // the free span is spacing/density, not a real bridge's max span. Sag
+        // scales with span, so scale the bridge speed by the span ratio —
+        // never slower than a bridge, never faster than solid fill.
+        PathKind::InternalBridge => {
+            let spacing = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+            let cell = if s.infill_density > 0.0 { spacing / s.infill_density } else { f64::MAX };
+            let ratio = (s.max_bridge_span_mm / cell).max(1.0);
+            (s.bridge_speed_mm_s * ratio).min(s.solid_speed_mm_s)
+        }
         // Wall stretches past the layer below: same physics as bridges.
         PathKind::OverhangWall => s.overhang_speed_mm_s,
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
@@ -401,6 +412,7 @@ pub(crate) fn kind_label(kind: PathKind) -> &'static str {
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
+        PathKind::InternalBridge => "internal bridge",
     }
 }
 
@@ -418,6 +430,7 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
         PathKind::Bridge => "Bridge",
+        PathKind::InternalBridge => "Internal Bridge",
     }
 }
 

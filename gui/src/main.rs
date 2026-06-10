@@ -1613,7 +1613,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         Infill => CAT_INFILL,
         GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
-        Support | Bridge => CAT_SUPPORT,
+        Support | Bridge | InternalBridge => CAT_SUPPORT,
     }
 }
 
@@ -1631,6 +1631,8 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         Ironing => [0.85, 0.85, 0.55],
         Support => [0.55, 0.40, 0.70],
         Bridge => [0.20, 0.85, 0.85],
+        // Deeper teal: solid-over-sparse spans (anchored every infill cell).
+        InternalBridge => [0.12, 0.55, 0.75],
     }
 }
 

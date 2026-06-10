@@ -334,6 +334,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::Ironing => "#bcbd22",
             PathKind::Support => "#8c6bb1",
             PathKind::Bridge => "#17becf",
+            PathKind::InternalBridge => "#1f8bb8",
         };
         let mut d = String::from("M");
         for (i, &p) in path.points.iter().enumerate() {

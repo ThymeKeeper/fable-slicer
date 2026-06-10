@@ -5,13 +5,21 @@ bed_size_x_mm = 152.4
 bed_size_y_mm = 152.4
 bed_size_z_mm = 152.5
 
-# High-speed CoreXY: rated 1200 mm/s / 40000 mm/s², ~50 mm³/s flow. The compact
-# bed rarely reaches top speed; these are sane high-speed slicing feedrates.
+# High-speed CoreXY: rated 1200 mm/s / 40000 mm/s², ~50 mm³/s flow hotend.
+# Motion numbers matched to OrcaSlicer's high-speed profile (measured from
+# its g-code): interior accel + travel 40000, outer wall 10000, first layer
+# auto-derives to Orca's 1000; inner walls 400 mm/s (Orca asks 500 for sparse
+# but the volumetric cap clamps both the same), first layer 55, travel 1000,
+# square-corner velocity 5. Pair with the pla-hf filament — the stock hotend
+# is high-flow, and the melt ceiling is what actually limits speed here.
+# (Our external-wall auto stays at 50% of print speed — quality-first — where
+# Orca asks 350; pin "external mm/s" in the GUI for Orca's number.)
 acceleration = 40000.0
-jerk = 10.0
-travel_speed_mm_s = 500.0
-print_speed_mm_s = 250.0
-first_layer_speed_mm_s = 50.0
+outer_wall_accel = 10000.0
+jerk = 5.0
+travel_speed_mm_s = 1000.0
+print_speed_mm_s = 400.0
+first_layer_speed_mm_s = 55.0
 
 retract_len_mm = 0.5
 retract_speed_mm_s = 40.0
