@@ -218,6 +218,11 @@ fn clamp_source_hint(name: &str) -> &'static str {
     }
 }
 
+/// Fixed bounds of the heat-load color scale (mW/mm², log) — constant so any
+/// two slices are visually comparable regardless of data or settings.
+const HEAT_SCALE_LO_MW: f64 = 1.0;
+const HEAT_SCALE_HI_MW: f64 = 40.0;
+
 /// Blue → green → yellow → red ramp for the preview heat maps (u in 0..=1).
 fn heat_ramp(u: f32) -> [f32; 3] {
     const STOPS: [[f32; 3]; 4] = [
@@ -329,9 +334,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
-/// What the last slice produced — rendered as a structured block in the left
-/// panel. The one-line `status` stays for transient messages (imports,
-/// exports, printer ops).
+/// What the last slice produced — rendered, together with the one-line
+/// `status` (imports, exports, printer ops), in the dismissable messages
+/// pane floated over the viewport.
 struct SliceSummary {
     layers: usize,
     toolpaths: usize,
@@ -342,6 +347,9 @@ struct SliceSummary {
     flow_cap: f64,
     /// Features the ceiling slowed: (name, asked mm/s, clamped-to mm/s).
     clamps: Vec<(&'static str, f64, f64)>,
+    /// The heat target in force at slice time (mW/mm²) — the slider in cap
+    /// mode, the computed level in even mode.
+    heat_target_mw: f64,
     /// Thermal-governor interventions (empty when off or nothing ran hot).
     governor: Vec<engine::GovernorRow>,
     /// Temperature-shaping zones (empty when off or nothing to shape).
@@ -362,6 +370,9 @@ struct App {
     /// Thermal calibration runs heaters and motion — the button arms this
     /// confirmation dialog instead of firing directly.
     confirm_calibration: bool,
+    /// A profile switch requested while settings carry unsaved (*) edits —
+    /// held here until the user confirms discarding them.
+    pending_switch: Option<(String, String, String)>,
     /// Auto/pinned state of the derivable settings.
     pins: Pins,
     objects: Vec<SceneObject>,
@@ -382,7 +393,8 @@ struct App {
     /// worker thread (one op at a time; buttons disable).
     host_rx: Option<std::sync::mpsc::Receiver<HostReply>>,
     /// True once a file has been sent this session — reveals the live-print
-    /// overlay on the viewport.
+    /// card on the viewport. The card's ✖ clears it (which also stops the
+    /// quiet status polls) until the next send.
     sent_to_printer: bool,
     /// Latest polled printer state (None until the first poll lands).
     printer_status: Option<Result<printhost::PrintStatus, String>>,
@@ -410,12 +422,29 @@ struct App {
     needs_rebuild: bool,
     /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
     refit_camera: bool,
+    /// Move the orbit pivot to the bed center next frame — set on printer
+    /// profile switches and bed-size edits. Runs after any refit, so the
+    /// pivot wins; zoom and view angle stay put.
+    recenter_camera: bool,
+    /// Bed XY (mm) the scene and camera last saw — a change (bed sliders,
+    /// printer switch, profile delete fallback) is detected by comparison
+    /// each frame, wherever it came from.
+    last_bed: (f64, f64),
     /// Object being dragged in the viewport (None = orbiting the camera).
     drag_obj: Option<usize>,
     /// Offset (bed XY) between the dragged object's pos and the cursor at grab time.
     drag_grab: [f64; 2],
     /// Screen rect of the transform overlay (so viewport input ignores clicks on it).
     overlay_rect: Option<egui::Rect>,
+    /// Screen rect of the messages pane (same input-blocking purpose).
+    msgs_overlay_rect: Option<egui::Rect>,
+    /// Set when the messages pane is dismissed: the (status, slice generation)
+    /// it was showing. The pane stays hidden while both still match — any new
+    /// message or a fresh slice brings it back.
+    msgs_dismissed: Option<(String, u64)>,
+    /// Bumped on every slice so a re-slice re-shows a dismissed messages pane
+    /// even when the visible text happens to be identical.
+    slice_gen: u64,
 }
 
 impl App {
@@ -455,6 +484,7 @@ impl App {
             },
             _ => Pins::default(),
         };
+        let last_bed = (settings.bed_size_x_mm, settings.bed_size_y_mm);
         Self {
             profiles,
             printer,
@@ -464,6 +494,7 @@ impl App {
             baseline,
             profile_dialog: None,
             confirm_calibration: false,
+            pending_switch: None,
             pins,
             objects: Vec::new(),
             selected: None,
@@ -495,9 +526,14 @@ impl App {
             show_ironing: true,
             needs_rebuild: true,
             refit_camera: true,
+            recenter_camera: false,
+            last_bed,
             drag_obj: None,
             drag_grab: [0.0, 0.0],
             overlay_rect: None,
+            msgs_overlay_rect: None,
+            msgs_dismissed: None,
+            slice_gen: 0,
         }
     }
 
@@ -941,10 +977,12 @@ impl App {
             grams,
             flow_cap: self.settings.max_volumetric_speed_mm3_s,
             clamps,
+            heat_target_mw: engine::effective_heat_target(&layers, &self.settings) * 1e3,
             governor: engine::audit_governor(&layers, &self.settings),
             shaping: engine::audit_temp_shaping(&layers, &self.settings),
         });
         self.status.clear();
+        self.slice_gen += 1;
         self.layer_stats = engine::per_layer_stats(&layers, &self.settings);
         self.layer_islands = engine::per_layer_islands(&layers, &self.settings);
         self.sliced = Some(layers);
@@ -1024,42 +1062,14 @@ impl App {
                 if self.layer_islands.len() != layers.len() {
                     return None;
                 }
-                // Log-normalize over every island that actually got plastic.
-                let mut lo = f64::INFINITY;
-                let mut hi = f64::NEG_INFINITY;
-                for (li, l) in self.layer_islands.iter().enumerate() {
-                    for isl in &l.islands {
-                        if isl.joules > 0.0 {
-                            let v = self.island_heat(li, isl).max(1e-12).ln();
-                            lo = lo.min(v);
-                            hi = hi.max(v);
-                        }
-                    }
-                }
-                let span = (hi - lo).max(1e-12);
-                // With the governor on, anchor the ramp to its target: the
-                // yellow→red boundary sits exactly at the target, so red
-                // strictly means "still over" — governing visibly drains it.
-                // (A purely relative ramp re-stretches to the new max and the
-                // before/after look deceptively similar.)
-                // Anchor whenever a thermal target is in force — governor OR
-                // shaping — so their effects read as absolute level changes
-                // instead of being re-normalized away by a relative ramp.
-                let anchor = ((self.settings.thermal_governor || self.settings.temp_shaping)
-                    && self.settings.governor_max_heat_mw_mm2 > 0.0)
-                    .then(|| (self.settings.governor_max_heat_mw_mm2 * 1e-3).max(1e-12).ln());
-                let u_of = |v: f64| -> f32 {
-                    match anchor {
-                        Some(t) if v <= t => {
-                            ((v - lo) / (t - lo).max(1e-12)).clamp(0.0, 1.0) as f32 * (2.0 / 3.0)
-                        }
-                        Some(t) => {
-                            2.0 / 3.0
-                                + ((v - t) / (hi - t).max(1e-12)).clamp(0.0, 1.0) as f32 * (1.0 / 3.0)
-                        }
-                        None => (((v - lo) / span).clamp(0.0, 1.0)) as f32,
-                    }
-                };
+                // FIXED absolute log scale: colors mean the same thing in
+                // every slice regardless of settings, so before/after slider
+                // comparisons are honest. (Both the relative and the
+                // target-anchored ramps re-stretched with the data/settings —
+                // two screenshots of different configs were incomparable,
+                // which misled real tuning.)
+                let lo = HEAT_SCALE_LO_MW.ln();
+                let span = HEAT_SCALE_HI_MW.ln() - lo;
                 Some(
                     self.layer_islands
                         .iter()
@@ -1068,8 +1078,8 @@ impl App {
                             l.path_island
                                 .iter()
                                 .map(|&k| {
-                                    let v = self.island_heat(li, &l.islands[k]).max(1e-12).ln();
-                                    heat_ramp(u_of(v))
+                                    let q = (self.island_heat(li, &l.islands[k]) * 1e3).max(1e-6).ln();
+                                    heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32)
                                 })
                                 .collect()
                         })
@@ -1085,6 +1095,199 @@ impl App {
     /// elsewhere) and its own footprint.
     fn island_heat(&self, li: usize, isl: &engine::IslandStats) -> f64 {
         isl.joules / (self.layer_stats[li].secs.max(1e-9) * isl.footprint_mm2.max(1e-9))
+    }
+
+    /// The one-line status plus the last slice's summary — the body of the
+    /// dismissable messages pane floated over the viewport.
+    fn slice_messages(&self, ui: &mut egui::Ui) {
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+        if let Some(sum) = &self.slice_summary {
+            ui.label(format!("Sliced: {} layers, {} toolpaths", sum.layers, sum.toolpaths))
+                .on_hover_text("Toolpaths = individual extrusion paths (walls, infill, …) across all layers.");
+            ui.label(format!(
+                "~{} · {:.2} m / {:.0} g filament",
+                engine::format_duration(sum.secs),
+                sum.filament_m,
+                sum.grams
+            ))
+            .on_hover_text("Estimated print time and filament length / weight.");
+            if !sum.clamps.is_empty() {
+                let warn = ui.visuals().warn_fg_color;
+                let r = egui::CollapsingHeader::new(
+                    egui::RichText::new(format!(
+                        "⚠ {} feature{} slowed to fit max flow ({:.0} mm³/s)",
+                        sum.clamps.len(),
+                        if sum.clamps.len() == 1 { "" } else { "s" },
+                        sum.flow_cap
+                    ))
+                    .color(warn),
+                )
+                .id_salt("flow_rows")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("flow_clamp_rows").spacing([10.0, 2.0]).show(ui, |ui| {
+                        for (name, asked, got) in &sum.clamps {
+                            ui.label(*name).on_hover_text(clamp_source_hint(name));
+                            ui.weak(format!("{asked:.0}"));
+                            ui.label(format!("-> {got:.0} mm/s"));
+                            ui.end_row();
+                        }
+                    });
+                });
+                r.header_response.on_hover_text(
+                    "Flow = line width × layer height × speed. The filament profile caps it at \
+                     what the hotend can melt per second ('max flow' under Material & temperature) — \
+                     printing faster than it can melt would under-extrude. These features asked for \
+                     more speed and were slowed to fit; quality is unaffected, the print just takes \
+                     longer.",
+                );
+            }
+            if !sum.shaping.is_empty() {
+                let r = egui::CollapsingHeader::new(format!(
+                    "Temperature shaping — {} zone{}",
+                    sum.shaping.len(),
+                    if sum.shaping.len() == 1 { "" } else { "s" }
+                ))
+                .id_salt("shaping_rows")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("shaping_grid").spacing([10.0, 2.0]).show(ui, |ui| {
+                        for z in &sum.shaping {
+                            ui.label(if z.first_layer == z.last_layer {
+                                format!("layer {}", z.first_layer)
+                            } else {
+                                format!("layers {}-{}", z.first_layer, z.last_layer)
+                            });
+                            let delta = z.temp_c - self.settings.nozzle_temp_c as f64;
+                            ui.label(format!("-> {:.0} °C ({delta:+.0}°)", z.temp_c));
+                            ui.end_row();
+                        }
+                    });
+                });
+                r.header_response.on_hover_text(
+                    "Scheduled M104s baked into the g-code (Feature speeds → temperature \
+                     shaping): cooler through hot ranges, warmer through cold bands, ramps \
+                     started early per the printer's measured rates. The 'nozzle °C' preview \
+                     shows the schedule.",
+                );
+            }
+            if !sum.governor.is_empty() {
+                let warn = ui.visuals().warn_fg_color;
+                let floored = sum.governor.iter().filter(|r| r.floor_hit).count();
+                let title = if floored > 0 {
+                    format!(
+                        "⚠ Governor slowed {} range{} — {} hot at cap",
+                        sum.governor.len(),
+                        if sum.governor.len() == 1 { "" } else { "s" },
+                        floored
+                    )
+                } else {
+                    format!(
+                        "Governor slowed {} range{}",
+                        sum.governor.len(),
+                        if sum.governor.len() == 1 { "" } else { "s" }
+                    )
+                };
+                let r = egui::CollapsingHeader::new(egui::RichText::new(title).color(warn))
+                    .id_salt("governor_rows")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::Grid::new("governor_grid").spacing([10.0, 2.0]).show(ui, |ui| {
+                            for r in &sum.governor {
+                                ui.label(if r.first_layer == r.last_layer {
+                                    format!("layer {}", r.first_layer)
+                                } else {
+                                    format!("layers {}-{}", r.first_layer, r.last_layer)
+                                });
+                                ui.label(if r.dwell_s > 0.05 {
+                                    format!("-> {:.0}% speed + {:.1}s dwell", r.worst_scale * 100.0, r.dwell_s)
+                                } else {
+                                    format!("-> {:.0}% speed", r.worst_scale * 100.0)
+                                })
+                                .on_hover_text(
+                                    "Dwell = park-and-wait cooling: when an island is over the heat \
+                                     target with every path already at min print speed, the missing \
+                                     seconds are spent retracted and lifted clear of the part.",
+                                );
+                                if r.floor_hit {
+                                    ui.colored_label(ui.visuals().error_fg_color, "hot at cap")
+                                        .on_hover_text(
+                                            "Still over the target even with the speed floor and the \
+                                             20 s/layer dwell cap spent — this region needs more part \
+                                             cooling or a lower temperature.",
+                                        );
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                r.header_response.on_hover_text(
+                    "The thermal governor (Feature speeds) slowed islands whose heat load \
+                     exceeded the target. The previews, time estimate, and g-code all show the \
+                     governed result; toggling it off restores your speeds exactly.",
+                );
+            }
+            if self.settings.thermal_governor || self.settings.temp_shaping {
+                match self.settings.heat_mode {
+                    config::HeatMode::Level => {
+                        ui.weak(format!(
+                            "heat level: {:.1} mW/mm² (leveled to the coldest region)",
+                            sum.heat_target_mw
+                        ))
+                        .on_hover_text(
+                            "Level mode: every layer is aimed at this value — the coldest \
+                             region's heat load, the highest the whole print can share — using \
+                             temperature, per-island slowing, and dwells together. The heat-load \
+                             map should flatten to one band.",
+                        );
+                    }
+                    config::HeatMode::Smooth => {
+                        ui.weak(format!(
+                            "heat smoothing: ≤ {:.1}%/layer change (cap {:.0} mW/mm²)",
+                            self.settings.heat_slew_pct_per_layer,
+                            self.settings.governor_max_heat_mw_mm2
+                        ))
+                        .on_hover_text(
+                            "Smooth mode: each layer gets its own target so the heat load never \
+                             changes faster than this between neighbors — warm layers ramp into \
+                             cold dips instead of cliffing at them. Kills banding at transitions \
+                             for a fraction of level mode's cost.",
+                        );
+                    }
+                    config::HeatMode::Cap => {}
+                }
+            }
+            // Armed but idle is easy to misread as broken — say it.
+            if (self.settings.thermal_governor || self.settings.temp_shaping)
+                && sum.governor.is_empty()
+            {
+                let mut hottest = 0.0_f64;
+                for (li, l) in self.layer_islands.iter().enumerate() {
+                    for isl in &l.islands {
+                        if isl.joules > 0.0 {
+                            hottest = hottest.max(self.island_heat(li, isl));
+                        }
+                    }
+                }
+                if hottest > 0.0 && hottest * 1e3 <= sum.heat_target_mw {
+                    ui.weak(format!(
+                        "thermal: nothing over the {:.0} mW/mm² target (hottest island ≈ {:.0})",
+                        sum.heat_target_mw,
+                        hottest * 1e3
+                    ))
+                    .on_hover_text(
+                        "Both thermal features are armed, but every island already sits under \
+                         the heat target — nothing to slow, and shaping only nudges toward the \
+                         target. If you expected intervention, the target ('max heat' under \
+                         Feature speeds) is set above this print's hottest region.",
+                    );
+                }
+            }
+        }
     }
 
     fn export(&mut self) {
@@ -1176,9 +1379,25 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let rs = frame.wgpu_render_state().expect("wgpu render state").clone();
 
+        // A bed-size change — slider edit, printer switch, profile delete
+        // fallback — refreshes the bed mesh and re-pivots the view on the new
+        // plate, whatever path it arrived by.
+        let bed = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+        if bed != self.last_bed {
+            self.last_bed = bed;
+            self.needs_rebuild = true;
+            self.recenter_camera = true;
+        }
         if self.needs_rebuild {
             self.rebuild_scene(&rs);
             self.needs_rebuild = false;
+        }
+        // After any refit so the plate-center pivot wins; distance and angles
+        // are untouched (it's a pivot move, not a re-frame).
+        if self.recenter_camera {
+            self.recenter_camera = false;
+            self.camera.target =
+                glam::Vec3::new((bed.0 / 2.0) as f32, (bed.1 / 2.0) as f32, 0.0);
         }
         // Unpinned auto settings track their masters every frame, before
         // anything (incl. the Slice button) reads them.
@@ -1306,6 +1525,7 @@ impl eframe::App for App {
             let dirty = self.tier_dirty_masked();
             let mut changed = false;
             let mut open_dialog: Option<ProfileDialog> = None;
+            let prev_sel = (self.printer.clone(), self.filament.clone(), self.process.clone());
             {
                 let rows: [(TierKind, &mut String, &[String], bool, &str); 3] = [
                     (TierKind::Printer, &mut self.printer, &printers, dirty[0],
@@ -1357,7 +1577,24 @@ impl eframe::App for App {
                 self.profile_dialog = Some(d);
             }
             if changed {
-                self.reresolve();
+                if dirty.iter().any(|&d| d) {
+                    // Switching re-resolves settings from disk and would
+                    // silently wipe the unsaved (*) edits — park the switch
+                    // behind a confirmation instead.
+                    self.pending_switch =
+                        Some((self.printer.clone(), self.filament.clone(), self.process.clone()));
+                    self.printer = prev_sel.0.clone();
+                    self.filament = prev_sel.1.clone();
+                    self.process = prev_sel.2.clone();
+                } else {
+                    // A new printer means a new plate — re-pivot even when its
+                    // dimensions happen to match (the bed-size check at the
+                    // top of `ui` only catches actual changes).
+                    if self.printer != prev_sel.0 {
+                        self.recenter_camera = true;
+                    }
+                    self.reresolve();
+                }
             }
             ui.separator();
 
@@ -1418,138 +1655,6 @@ impl eframe::App for App {
                     host_op = Some(HostOp::Send { start: true });
                 }
             });
-            if !self.status.is_empty() {
-                ui.label(&self.status);
-            }
-            if let Some(sum) = &self.slice_summary {
-                ui.label(format!("Sliced: {} layers, {} toolpaths", sum.layers, sum.toolpaths))
-                    .on_hover_text("Toolpaths = individual extrusion paths (walls, infill, …) across all layers.");
-                ui.label(format!(
-                    "~{} · {:.2} m / {:.0} g filament",
-                    engine::format_duration(sum.secs),
-                    sum.filament_m,
-                    sum.grams
-                ))
-                .on_hover_text("Estimated print time and filament length / weight.");
-                if !sum.clamps.is_empty() {
-                    let warn = ui.visuals().warn_fg_color;
-                    let r = egui::CollapsingHeader::new(
-                        egui::RichText::new(format!(
-                            "⚠ {} feature{} slowed to fit max flow ({:.0} mm³/s)",
-                            sum.clamps.len(),
-                            if sum.clamps.len() == 1 { "" } else { "s" },
-                            sum.flow_cap
-                        ))
-                        .color(warn),
-                    )
-                    .id_salt("flow_rows")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::Grid::new("flow_clamp_rows").spacing([10.0, 2.0]).show(ui, |ui| {
-                            for (name, asked, got) in &sum.clamps {
-                                ui.label(*name).on_hover_text(clamp_source_hint(name));
-                                ui.weak(format!("{asked:.0}"));
-                                ui.label(format!("-> {got:.0} mm/s"));
-                                ui.end_row();
-                            }
-                        });
-                    });
-                    r.header_response.on_hover_text(
-                        "Flow = line width × layer height × speed. The filament profile caps it at \
-                         what the hotend can melt per second ('max flow' under Material & temperature) — \
-                         printing faster than it can melt would under-extrude. These features asked for \
-                         more speed and were slowed to fit; quality is unaffected, the print just takes \
-                         longer.",
-                    );
-                }
-                if !sum.shaping.is_empty() {
-                    let r = egui::CollapsingHeader::new(format!(
-                        "Temperature shaping — {} zone{}",
-                        sum.shaping.len(),
-                        if sum.shaping.len() == 1 { "" } else { "s" }
-                    ))
-                    .id_salt("shaping_rows")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::Grid::new("shaping_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                            for z in &sum.shaping {
-                                ui.label(if z.first_layer == z.last_layer {
-                                    format!("layer {}", z.first_layer)
-                                } else {
-                                    format!("layers {}-{}", z.first_layer, z.last_layer)
-                                });
-                                let delta = z.temp_c - self.settings.nozzle_temp_c as f64;
-                                ui.label(format!("-> {:.0} °C ({delta:+.0}°)", z.temp_c));
-                                ui.end_row();
-                            }
-                        });
-                    });
-                    r.header_response.on_hover_text(
-                        "Scheduled M104s baked into the g-code (Feature speeds → temperature \
-                         shaping): cooler through hot ranges, warmer through cold bands, ramps \
-                         started early per the printer's measured rates. The 'nozzle °C' preview \
-                         shows the schedule.",
-                    );
-                }
-                if !sum.governor.is_empty() {
-                    let warn = ui.visuals().warn_fg_color;
-                    let floored = sum.governor.iter().filter(|r| r.floor_hit).count();
-                    let title = if floored > 0 {
-                        format!(
-                            "⚠ Governor slowed {} range{} — {} hot at cap",
-                            sum.governor.len(),
-                            if sum.governor.len() == 1 { "" } else { "s" },
-                            floored
-                        )
-                    } else {
-                        format!(
-                            "Governor slowed {} range{}",
-                            sum.governor.len(),
-                            if sum.governor.len() == 1 { "" } else { "s" }
-                        )
-                    };
-                    let r = egui::CollapsingHeader::new(egui::RichText::new(title).color(warn))
-                        .id_salt("governor_rows")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::Grid::new("governor_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                                for r in &sum.governor {
-                                    ui.label(if r.first_layer == r.last_layer {
-                                        format!("layer {}", r.first_layer)
-                                    } else {
-                                        format!("layers {}-{}", r.first_layer, r.last_layer)
-                                    });
-                                    ui.label(if r.dwell_s > 0.05 {
-                                        format!("-> {:.0}% speed + {:.1}s dwell", r.worst_scale * 100.0, r.dwell_s)
-                                    } else {
-                                        format!("-> {:.0}% speed", r.worst_scale * 100.0)
-                                    })
-                                    .on_hover_text(
-                                        "Dwell = park-and-wait cooling: when an island is over the heat \
-                                         target with every path already at min print speed, the missing \
-                                         seconds are spent retracted and lifted clear of the part.",
-                                    );
-                                    if r.floor_hit {
-                                        ui.colored_label(ui.visuals().error_fg_color, "hot at cap")
-                                            .on_hover_text(
-                                                "Still over the target even with the speed floor and the \
-                                                 20 s/layer dwell cap spent — this region needs more part \
-                                                 cooling or a lower temperature.",
-                                            );
-                                    } else {
-                                        ui.label("");
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                        });
-                    r.header_response.on_hover_text(
-                        "The thermal governor (Feature speeds) slowed islands whose heat load \
-                         exceeded the target. The previews, time estimate, and g-code all show the \
-                         governed result; toggling it off restores your speeds exactly.",
-                    );
-                }
-            }
             ui.separator();
 
             // Prominent Model / Preview toggle (Preview enabled once sliced).
@@ -1673,26 +1778,31 @@ impl eframe::App for App {
                         }
                         _ => {
                             let governor_note = if anchored {
+                                let target_mw = self
+                                    .slice_summary
+                                    .as_ref()
+                                    .map(|s| s.heat_target_mw)
+                                    .unwrap_or(self.settings.governor_max_heat_mw_mm2);
                                 format!(
-                                    " The white tick is the heat target ({:.0} mW/mm², the 'max heat' \
-                                     slider) — the ramp is anchored to it, so red strictly means still \
-                                     over the target after governing/shaping.",
-                                    self.settings.governor_max_heat_mw_mm2
+                                    " The white tick marks the heat target in force ({target_mw:.1} \
+                                     mW/mm² — the computed level in even mode) at its true position \
+                                     on the scale.",
                                 )
                             } else {
                                 String::new()
                             };
                             (
-                                format!("{:.1}", lo * 1000.0),
-                                format!("{:.1} mW/mm²", hi * 1000.0),
+                                format!("{HEAT_SCALE_LO_MW:.0}"),
+                                format!("{HEAT_SCALE_HI_MW:.0} mW/mm²"),
                                 format!(
-                                    "Heat load per island, log scale: each disconnected region of a layer is \
-                                     scored on its own — island energy ÷ (layer time × island footprint) — so a \
-                                     skinny chimney can't hide inside a big layer's average. The time stays the \
-                                     whole layer's, because an island keeps cooling while the nozzle works \
-                                     elsewhere (that's why lone towers overheat and shared ones don't). Energy = \
-                                     bead volume × density × specific heat × (nozzle − ambient). Red = hot \
-                                     plastic delivered quickly to a small footprint.{governor_note}"
+                                    "Heat load per island on a FIXED log scale ({HEAT_SCALE_LO_MW:.0}–{HEAT_SCALE_HI_MW:.0} mW/mm²) — \
+                                     colors mean the same thing in every slice, so before/after \
+                                     comparisons of settings are honest. Each disconnected region is \
+                                     scored on its own: island energy ÷ (layer time × island footprint); \
+                                     the cooling window stays the whole layer's, which is why lone \
+                                     towers overheat and shared ones don't. A uniform band sitting at \
+                                     the tick is the governor holding everything exactly at the \
+                                     target — that's success, not a hot spot.{governor_note}"
                                 ),
                             )
                         }
@@ -1717,8 +1827,18 @@ impl eframe::App for App {
                                 );
                             }
                             if anchored {
-                                // Target tick: the yellow→red boundary of the anchored ramp.
-                                let x = rect.min.x + rect.width() * (2.0 / 3.0);
+                                // The heat target at its true position on the fixed
+                                // scale — the computed level in even mode.
+                                let target_mw = self
+                                    .slice_summary
+                                    .as_ref()
+                                    .map(|s| s.heat_target_mw)
+                                    .unwrap_or(self.settings.governor_max_heat_mw_mm2);
+                                let lo = HEAT_SCALE_LO_MW.ln();
+                                let fr = ((target_mw.max(1e-6).ln() - lo)
+                                    / (HEAT_SCALE_HI_MW.ln() - lo))
+                                    .clamp(0.0, 1.0) as f32;
+                                let x = rect.min.x + rect.width() * fr;
                                 ui.painter().line_segment(
                                     [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)],
                                     egui::Stroke::new(1.5, egui::Color32::WHITE),
@@ -1896,7 +2016,26 @@ impl eframe::App for App {
                              ranges — the governor stays the fast per-island lever.",
                         );
                     hslider(ui, s.temp_shaping, egui::Slider::new(&mut s.temp_shaping_swing_c, 2.0..=30.0), "max swing °C",
-                        "Largest excursion shaping may schedule from the nozzle temperature — cooling may use all of it, warming at most 40%. Each layer is aimed exactly at the heat target (deposited power scales with °C above ambient), then clipped to this rail and the filament window; temperature only has ~0.5%/°C of authority, so hot and cold extremes sit pegged at the rails by design.");
+                        "Largest excursion shaping may schedule from the nozzle temperature, in both directions — always clipped by the filament's min/max window. Each layer is aimed exactly at the heat target (deposited power scales with °C above ambient), then clipped to these rails; temperature only has ~0.5%/°C of authority on the heat metric, so extremes peg the rails — but warming cold layers is free in print time and directly improves their layer bonding and gloss match.");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("heat_mode")
+                            .selected_text(s.heat_mode.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Cap, "cap");
+                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Smooth, "smooth");
+                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Level, "level");
+                            });
+                        ui.label("heat goal").on_hover_text(
+                            "What the thermal levers aim at. Cap: a ceiling — nothing exceeds max \
+                             heat, everything below is untouched (cheapest). Smooth: the heat load \
+                             may change at most the %/layer below between neighbors — warm layers \
+                             ramp into cold dips instead of cliffing, killing banding at transitions \
+                             for minutes, not hours. Level: the whole print is flattened to the \
+                             coldest reachable heat load — maximal uniformity, maximal time.",
+                        );
+                    });
+                    hslider(ui, s.heat_mode == config::HeatMode::Smooth, egui::Slider::new(&mut s.heat_slew_pct_per_layer, 1.0..=25.0), "max change %/layer",
+                        "Smooth mode's gradient limit: the largest heat-load change allowed between adjacent layers. Lower = gentler transitions over more layers (slower); higher = sharper allowed steps.");
                     ui.weak("machine speed & accel live under Machine & motion");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
@@ -2100,7 +2239,9 @@ impl eframe::App for App {
             // Ignore viewport input when the cursor is over a floating overlay.
             let pointer = ui.ctx().pointer_interact_pos();
             let over = |r: Option<egui::Rect>| matches!((r, pointer), (Some(r), Some(p)) if r.contains(p));
-            let blocked = over(self.overlay_rect) || over(self.print_overlay_rect);
+            let blocked = over(self.overlay_rect)
+                || over(self.print_overlay_rect)
+                || over(self.msgs_overlay_rect);
 
             // Left-press on an object grabs it for dragging; on empty space, orbits.
             if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
@@ -2156,7 +2297,7 @@ impl eframe::App for App {
                 let d = response.drag_delta();
                 self.camera.pan(d.x, d.y);
             }
-            if response.hovered() {
+            if response.hovered() && !blocked {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll != 0.0 {
                     self.camera.zoom(scroll);
@@ -2246,7 +2387,8 @@ impl eframe::App for App {
 
             // Live-print card: translucent, top-right of the viewport, shown
             // once a file has been sent. The state refreshes itself on a timer
-            // (quiet polls), so there's no manual status button.
+            // (quiet polls), so there's no manual status button. Its ✖ hides
+            // the card (and stops the polls) until the next send.
             if self.sent_to_printer && host_set {
                 let state = self
                     .printer_status
@@ -2254,6 +2396,7 @@ impl eframe::App for App {
                     .and_then(|r| r.as_ref().ok())
                     .map(|st| st.state.as_str())
                     .unwrap_or("");
+                let mut hide_card = false;
                 let area = egui::Area::new(egui::Id::new("print_overlay"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(rect.right() - 240.0, rect.top() + 10.0))
@@ -2262,18 +2405,33 @@ impl eframe::App for App {
                             .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
                             .show(ui, |ui| {
                                 ui.set_width(220.0);
+                                // Header: title left, dismiss ✖ pinned right
+                                // (the title truncates, never pushing it off).
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button("✖")
+                                        .on_hover_text("Hide this card. Sending to the printer again brings it back.")
+                                        .clicked()
+                                    {
+                                        hide_card = true;
+                                    }
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        let title = match &self.printer_status {
+                                            Some(Ok(st)) if !st.filename.is_empty() => st.filename.as_str(),
+                                            Some(Ok(_)) => "(no file)",
+                                            _ => "Printer",
+                                        };
+                                        ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+                                    });
+                                });
                                 match &self.printer_status {
                                     None => {
-                                        ui.label(egui::RichText::new("Printer").strong());
                                         ui.weak("checking…");
                                     }
                                     Some(Err(e)) => {
-                                        ui.label(egui::RichText::new("Printer").strong());
                                         ui.colored_label(ui.visuals().error_fg_color, e);
                                     }
                                     Some(Ok(st)) => {
-                                        let name = if st.filename.is_empty() { "(no file)" } else { st.filename.as_str() };
-                                        ui.label(egui::RichText::new(name).strong());
                                         if st.state == "printing" || st.state == "paused" {
                                             ui.add(egui::ProgressBar::new(st.progress as f32).show_percentage());
                                         }
@@ -2309,11 +2467,117 @@ impl eframe::App for App {
                                 });
                             });
                     });
-                self.print_overlay_rect = Some(area.response.rect);
+                if hide_card {
+                    // Dismissed: drop the card and the polling behind it; the
+                    // next send re-arms both.
+                    self.sent_to_printer = false;
+                    self.printer_status = None;
+                    self.print_overlay_rect = None;
+                } else {
+                    self.print_overlay_rect = Some(area.response.rect);
+                }
             } else {
                 self.print_overlay_rect = None;
             }
+
+            // Messages pane: the one-line status plus the last slice's
+            // summary, translucent, bottom-left of the viewport. ✖ hides it;
+            // any new message or a fresh slice brings it back.
+            let show_msgs = (!self.status.is_empty() || self.slice_summary.is_some())
+                && self
+                    .msgs_dismissed
+                    .as_ref()
+                    .map_or(true, |(s, g)| *s != self.status || *g != self.slice_gen);
+            if show_msgs {
+                let mut dismiss = false;
+                let area = egui::Area::new(egui::Id::new("messages_overlay"))
+                    .order(egui::Order::Foreground)
+                    .pivot(egui::Align2::LEFT_BOTTOM)
+                    .fixed_pos(rect.left_bottom() + egui::vec2(10.0, -10.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
+                            .show(ui, |ui| {
+                                ui.horizontal_top(|ui| {
+                                    // The content inherits this row's
+                                    // left-to-right layout unless re-rooted in
+                                    // a vertical column — labels would render
+                                    // over each other on one line.
+                                    //
+                                    // No ScrollArea (or anything else sized by
+                                    // available height) in here: a bottom-
+                                    // pivoted Area hands its content last
+                                    // frame's height as the available space,
+                                    // so height-adaptive content locks the
+                                    // pane at its collapsed size instead of
+                                    // growing when a section expands. Natural
+                                    // sizing measures true height and the
+                                    // pivot re-anchors; if it ever outgrows
+                                    // the window, the Area clamps to the top
+                                    // and the collapsibles default closed.
+                                    ui.vertical(|ui| {
+                                        ui.set_width(290.0);
+                                        self.slice_messages(ui);
+                                    });
+                                    if ui
+                                        .small_button("✖")
+                                        .on_hover_text(
+                                            "Hide these messages. The next slice or status message brings them back.",
+                                        )
+                                        .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                });
+                            });
+                    });
+                self.msgs_overlay_rect = Some(area.response.rect);
+                if dismiss {
+                    self.msgs_dismissed = Some((self.status.clone(), self.slice_gen));
+                }
+            } else {
+                self.msgs_overlay_rect = None;
+            }
         });
+
+        // A profile switch while edits are unsaved: confirm the discard.
+        if let Some((p, f, pr)) = self.pending_switch.clone() {
+            let mut act = false;
+            let mut open = true;
+            egui::Window::new("Discard unsaved changes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(
+                        "Switching profiles re-reads settings from disk — the edits marked \
+                         with * would be lost.",
+                    );
+                    ui.label("Save them first (💾 next to the tier), or discard and switch.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard & switch").clicked() {
+                            act = true;
+                            open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            if act {
+                if p != self.printer {
+                    self.recenter_camera = true;
+                }
+                self.printer = p;
+                self.filament = f;
+                self.process = pr;
+                self.reresolve();
+            }
+            if !open {
+                self.pending_switch = None;
+            }
+        }
 
         // Thermal calibration runs heaters and motion — describe exactly what
         // is about to happen and ask before doing any of it.
