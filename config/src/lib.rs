@@ -318,7 +318,19 @@ pub struct Settings {
     /// heats to this ({first_layer_nozzle_temp}); the emitter drops to
     /// `nozzle_temp_c` at layer 2. Profiles leaving it unset follow the nozzle temp.
     pub first_layer_nozzle_temp_c: u32,
+    /// Coldest this filament prints acceptably (°C) — temperature shaping
+    /// never schedules below it. Auto: nozzle − 15 when the profile is silent.
+    pub nozzle_temp_min_c: u32,
+    /// Hottest acceptable (°C) — shaping never schedules above it. Auto: nozzle + 15.
+    pub nozzle_temp_max_c: u32,
     pub bed_temp_c: u32,
+    /// Hotend heating rate near printing temps (°C/s) — sets how early
+    /// temperature shaping must issue warming M104s. Conservatively low until
+    /// measured (a Moonraker calibration routine will fill it in).
+    pub heat_rate_c_s: f64,
+    /// Passive cooling rate near printing temps (°C/s) — far slower than
+    /// heating; sets the long lead times for cooling into a zone.
+    pub cool_rate_c_s: f64,
 
     // --- speeds (mm/s) ---
     pub print_speed_mm_s: f64,
@@ -351,6 +363,11 @@ pub struct Settings {
     /// `width × height × speed × flow` never exceeds it (loudly: the g-code
     /// header, CLI, and GUI all report what got clamped). ≤ 0 disables.
     pub max_volumetric_speed_mm3_s: f64,
+    /// How much of that ceiling is lost per °C below `nozzle_temp_c`
+    /// (mm³/s/°C): when temperature shaping cools a zone, its flow cap — and
+    /// therefore its clamped speeds — derate by this. Never raised on warmer
+    /// layers (the profile cap is the calibrated number).
+    pub max_flow_derate_per_c: f64,
     /// Global extrusion multiplier (filament-specific flow tuning). 1.0 = nominal.
     pub extrusion_multiplier: f64,
     /// Flow multiplier for bridges and arc overhangs (slight under-extrusion can
@@ -385,8 +402,20 @@ pub struct Settings {
     /// Speeds never drop below `min_print_speed_mm_s`; islands still hot at
     /// that floor are reported loudly instead.
     pub thermal_governor: bool,
-    /// The governor's per-island heat-load ceiling (mW/mm²).
+    /// The governor's per-island heat-load ceiling (mW/mm²) — also the
+    /// reference level temperature shaping evens layers toward.
     pub governor_max_heat_mw_mm2: f64,
+    /// Temperature shaping (temp lever): bake scheduled M104s into the g-code
+    /// — cooler through chronically hot layer ranges, gently warmer through
+    /// cold bands — with ramps started early per the printer's heat/cool
+    /// rates so the nozzle *arrives* at each zone's temperature. Planned
+    /// entirely at slice time from the thermal profile; no live feedback.
+    /// Bounded by the filament's min/max °C; cooled layers derate the flow
+    /// ceiling via `max_flow_derate_per_c`.
+    pub temp_shaping: bool,
+    /// Largest excursion shaping may schedule from the nozzle temp (°C).
+    /// Cooling uses up to all of it; warming at most 40% of it.
+    pub temp_shaping_swing_c: f64,
 
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
@@ -457,6 +486,10 @@ impl Default for Settings {
             api_key: String::new(),
             nozzle_temp_c: 200,
             first_layer_nozzle_temp_c: 200,
+            nozzle_temp_min_c: 185,
+            nozzle_temp_max_c: 215,
+            heat_rate_c_s: 2.0,
+            cool_rate_c_s: 0.7,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
@@ -470,6 +503,7 @@ impl Default for Settings {
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             max_volumetric_speed_mm3_s: 15.0,
+            max_flow_derate_per_c: 0.3,
             extrusion_multiplier: 1.0,
             bridge_flow: 1.0,
             pressure_advance: 0.0,
@@ -484,6 +518,8 @@ impl Default for Settings {
             // Calibrated on the Benchy: lone towers / chimneys / arch pillars
             // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
             governor_max_heat_mw_mm2: 15.0,
+            temp_shaping: false,
+            temp_shaping_swing_c: 15.0,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }

@@ -63,6 +63,14 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             ));
         }
     }
+    if s.temp_shaping {
+        for z in audit_temp_shaping(layers, s) {
+            g.comment(&format!(
+                "temp shaping: layers {}-{} -> {:.0}C",
+                z.first_layer, z.last_layer, z.temp_c
+            ));
+        }
+    }
     if s.thermal_governor {
         for r in audit_governor(layers, s) {
             g.comment(&format!(
@@ -135,9 +143,12 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 ((total_secs - done) / 60.0).ceil()
             ));
         }
-        // Start g-code heated to the first-layer temp; drop to the printing
-        // temp once the first layer is down (M104: set without waiting).
-        if layer.index == 1 && s.first_layer_nozzle_temp_c != s.nozzle_temp_c {
+        // Temperature: shaping's scheduled setpoints win; otherwise the
+        // one-shot drop from first-layer temp to printing temp. M104 either
+        // way — set without waiting, the schedule already planned the leads.
+        if let Some(t) = layer.temp_command_c {
+            g.raw(&format!("M104 S{t:.0}"));
+        } else if layer.index == 1 && s.first_layer_nozzle_temp_c != s.nozzle_temp_c {
             g.raw(&format!("M104 S{}", s.nozzle_temp_c));
         }
         // Part cooling: off for the first `fan_off_layers`, then the normal duty;
@@ -159,7 +170,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         // continuously from the previous layer's top to this one's.
         if s.spiral_vase && layer.index >= first_spiral {
             if let Some(path) = spiral_loop(layer) {
-                let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
+                let feed = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
+                    * layer.speed_scale;
                 let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
                     * flow_factor(path, s);
                 g.raw(&format!(";TYPE:{}", type_label(path.kind)));
@@ -212,7 +224,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // Brick-layered perimeters print half a layer up and over-extrude a touch.
             let z = layer.print_z_mm + path.z_offset_mm;
             let feed =
-                feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale * path_scale(layer, i);
+                feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
+                    * layer.speed_scale
+                    * path_scale(layer, i);
             let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
                 * flow_factor(path, s);
             let start = path.points[0];
@@ -422,17 +436,52 @@ fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
     path.flow * kind_flow * s.extrusion_multiplier
 }
 
+/// The nozzle temperature planned for a layer: temperature shaping's schedule
+/// when present, else the first-layer / profile temperature.
+fn layer_nozzle_c(layer: &LayerPlan, s: &Settings) -> f64 {
+    layer.planned_temp_c.unwrap_or(if layer.index == 0 {
+        s.first_layer_nozzle_temp_c as f64
+    } else {
+        s.nozzle_temp_c as f64
+    })
+}
+
+/// The melt ceiling in force on a layer (mm³/s; 0 = unlimited): the profile
+/// cap at the profile temperature, derated linearly when temperature shaping
+/// runs the layer cooler. Never raised on warmer layers — the profile cap is
+/// the calibrated number.
+fn layer_flow_cap_mm3_s(layer: &LayerPlan, s: &Settings) -> f64 {
+    let cap = s.max_volumetric_speed_mm3_s;
+    if cap <= 0.0 {
+        return 0.0;
+    }
+    let below = s.nozzle_temp_c as f64 - layer_nozzle_c(layer, s);
+    if below > 0.0 {
+        (cap - s.max_flow_derate_per_c.max(0.0) * below).max(1.0)
+    } else {
+        cap
+    }
+}
+
 /// Feed rate (mm/min) for a path: the per-feature speed, clamped so the
-/// volumetric flow `width × height × speed × flow` never exceeds the
-/// filament's melt-rate ceiling. One function feeds the g-code, the time
-/// estimate, and the min-layer-time pass, so they always agree.
-fn feed_for(path: &ToolPath, layer_index: usize, layer_height_mm: f64, s: &Settings) -> f64 {
+/// volumetric flow `width × height × speed × flow` never exceeds the layer's
+/// melt-rate ceiling (`flow_cap_mm3_s`, 0 = unlimited — pass
+/// `layer_flow_cap_mm3_s` so temperature shaping's derate applies). One
+/// function feeds the g-code, the time estimate, and the min-layer-time pass,
+/// so they always agree.
+fn feed_for(
+    path: &ToolPath,
+    layer_index: usize,
+    layer_height_mm: f64,
+    flow_cap_mm3_s: f64,
+    s: &Settings,
+) -> f64 {
     let mut v = nominal_speed_mm_s(path.kind, layer_index, s);
-    if s.max_volumetric_speed_mm3_s > 0.0 {
+    if flow_cap_mm3_s > 0.0 {
         let mm3_per_mm =
             config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s);
         if mm3_per_mm > 1.0e-9 {
-            v = v.min(s.max_volumetric_speed_mm3_s / mm3_per_mm);
+            v = v.min(flow_cap_mm3_s / mm3_per_mm);
         }
     }
     v * 60.0
@@ -454,7 +503,7 @@ pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f
                 continue;
             }
             let nominal = nominal_speed_mm_s(path.kind, layer.index, s);
-            let clamped = feed_for(path, layer.index, layer.height_mm, s) / 60.0;
+            let clamped = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0;
             if clamped < nominal - 1.0e-6 {
                 worst
                     .entry(kind_label(path.kind))
@@ -972,7 +1021,7 @@ fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale
         return 0.0;
     }
     let accel = accel_for(path.kind, layer.index, s).max(1.0);
-    let v = feed_for(path, layer.index, layer.height_mm, s) / 60.0 * total_scale;
+    let v = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0 * total_scale;
     polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1))
 }
 
@@ -1018,7 +1067,7 @@ pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
         secs += layer_print_seconds(layer, s, layer.speed_scale);
 
         let volume = layer_volume_mm3(layer, s);
-        let nozzle_c = if layer.index == 0 { s.first_layer_nozzle_temp_c } else { s.nozzle_temp_c };
+        let nozzle_c = layer_nozzle_c(layer, s);
         let joules = volume * s.filament_density_g_cm3 * 1e-3 // g/cm³ → g/mm³
             * CP_J_PER_G_K
             * (nozzle_c as f64 - AMBIENT_C).max(0.0);
@@ -1099,7 +1148,7 @@ fn islands_of(layer: &LayerPlan, s: &Settings) -> LayerIslands {
             for isl in &mut islands {
                 isl.footprint_mm2 = isl.footprint_mm2.max(MIN_ISLAND_FOOTPRINT_MM2);
             }
-            let nozzle_c = if layer.index == 0 { s.first_layer_nozzle_temp_c } else { s.nozzle_temp_c };
+            let nozzle_c = layer_nozzle_c(layer, s);
             let j_per_mm3 = s.filament_density_g_cm3 * 1e-3 // g/cm³ → g/mm³
                 * CP_J_PER_G_K
                 * (nozzle_c as f64 - AMBIENT_C).max(0.0);
@@ -1124,6 +1173,136 @@ fn islands_of(layer: &LayerPlan, s: &Settings) -> LayerIslands {
             LayerIslands { path_island, islands }
         }
     }
+}
+
+/// Temperature shaping (v2, temp lever): bake a nozzle-temperature schedule
+/// into the plan — cooler through chronically hot layer ranges, gently warmer
+/// through cold bands — so deposition conditions even out toward the heat
+/// target. Everything is decided *here, at slice time*, from the printer's
+/// profiled ramp rates: ramps start early enough (backward anticipation pass)
+/// that the nozzle arrives at each zone's temperature, and the emitted g-code
+/// carries plain asynchronous `M104`s. There is no live feedback.
+///
+/// Honors the filament's printable window; cooled layers also derate the flow
+/// ceiling (see [`layer_flow_cap_mm3_s`]). Temperature is a slow, global
+/// actuator, so zones are layer *ranges* — the per-island speed governor
+/// remains the fast spatial lever, and runs after this so it sees the shaped
+/// energy and caps.
+pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
+    if !s.temp_shaping || layers.len() < 3 {
+        return;
+    }
+    let base = s.nozzle_temp_c as f64;
+    let tmin = (s.nozzle_temp_min_c as f64).min(base);
+    let tmax = (s.nozzle_temp_max_c as f64).max(base);
+    let swing = s.temp_shaping_swing_c.max(0.0);
+    let target = s.governor_max_heat_mw_mm2 * 1e-3; // the thermal reference level
+    if target <= 0.0 || swing <= 0.0 {
+        return;
+    }
+    let n = layers.len();
+    // 1. Raw demand from each layer's hottest island.
+    let mut demand = vec![base; n];
+    let mut secs = vec![0.05_f64; n];
+    for (i, layer) in layers.iter().enumerate() {
+        secs[i] = layer_print_seconds(layer, s, layer.speed_scale).max(0.05);
+        if i == 0 {
+            continue; // the first layer owns its own (adhesion) temperature
+        }
+        let li = islands_of(layer, s);
+        let qmax = li
+            .islands
+            .iter()
+            .filter(|isl| isl.joules > 0.0)
+            .map(|isl| isl.joules / (secs[i] * isl.footprint_mm2.max(1e-9)))
+            .fold(0.0_f64, f64::max);
+        if qmax > target {
+            // Hot: cool proportionally — the full swing at 2× over target.
+            let sev = (qmax / target - 1.0).clamp(0.0, 1.0);
+            demand[i] = (base - swing * sev).max(tmin);
+        } else if qmax > 0.0 && qmax < 0.6 * target {
+            // Cold band: warm gently toward even deposition (≤ 40% of swing).
+            let sev = (1.0 - qmax / (0.6 * target)).clamp(0.0, 1.0);
+            demand[i] = (base + 0.4 * swing * sev).min(tmax);
+        }
+    }
+    // 2. Suppress zones the hotend can't meaningfully follow (< ~20 s): short
+    //    runs of a new value adopt their predecessor's temperature.
+    const MIN_ZONE_S: f64 = 20.0;
+    let mut i = 1;
+    while i < n {
+        let mut j = i;
+        while j < n && demand[j].round() == demand[i].round() {
+            j += 1;
+        }
+        let dur: f64 = secs[i..j].iter().sum();
+        if dur < MIN_ZONE_S && demand[i].round() != demand[i - 1].round() {
+            let prev = demand[i - 1];
+            for d in &mut demand[i..j] {
+                *d = prev;
+            }
+        }
+        i = j;
+    }
+    // 3. Anticipation (backward): to *arrive* at a zone's temperature, earlier
+    //    layers must already be partway there — cooling is the slow direction,
+    //    so cool zones pull a long lead. Then a forward pass re-anchors on the
+    //    fixed first-layer temperature (leads that don't fit arrive late).
+    let heat = s.heat_rate_c_s.max(0.1);
+    let cool = s.cool_rate_c_s.max(0.05);
+    for i in (0..n - 1).rev() {
+        let reach_dn = cool * secs[i + 1];
+        let reach_up = heat * secs[i + 1];
+        demand[i] = demand[i].clamp(demand[i + 1] - reach_up, demand[i + 1] + reach_dn);
+    }
+    demand[0] = base; // never shape the first layer
+    for i in 1..n {
+        let reach_dn = cool * secs[i];
+        let reach_up = heat * secs[i];
+        demand[i] = demand[i].clamp(demand[i - 1] - reach_dn, demand[i - 1] + reach_up);
+    }
+    // 4. Quantize to whole °C and write the plan: the trajectory (for the
+    //    energy model and flow caps) plus an M104 staircase at change points.
+    let mut cur_cmd = base.round();
+    for (i, layer) in layers.iter_mut().enumerate().skip(1) {
+        let t = demand[i].round();
+        layer.planned_temp_c = if (t - base).abs() >= 1.0 { Some(t) } else { None };
+        if t != cur_cmd {
+            layer.temp_command_c = Some(t);
+            cur_cmd = t;
+        }
+    }
+}
+
+/// One contiguous shaped stretch, for the reports. `temp_c` is the range's
+/// farthest-from-base temperature (the zone's plateau).
+pub struct TempZone {
+    pub first_layer: usize,
+    pub last_layer: usize,
+    pub temp_c: f64,
+}
+
+/// Where temperature shaping moved the nozzle — read back from the plan.
+pub fn audit_temp_shaping(layers: &[LayerPlan], s: &Settings) -> Vec<TempZone> {
+    let base = s.nozzle_temp_c as f64;
+    let mut rows: Vec<TempZone> = Vec::new();
+    for layer in layers {
+        let Some(t) = layer.planned_temp_c else { continue };
+        match rows.last_mut() {
+            Some(r) if r.last_layer + 1 == layer.index => {
+                r.last_layer = layer.index;
+                if (t - base).abs() > (r.temp_c - base).abs() {
+                    r.temp_c = t;
+                }
+            }
+            _ => rows.push(TempZone {
+                first_layer: layer.index,
+                last_layer: layer.index,
+                temp_c: t,
+            }),
+        }
+    }
+    rows
 }
 
 /// Thermal governor (v1, speed lever): for every island whose heat load —
@@ -1158,7 +1337,9 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
                 if layer.paths[i].points.len() < 2 {
                     return f64::INFINITY;
                 }
-                feed_for(&layer.paths[i], layer.index, layer.height_mm, s) / 60.0 * layer.speed_scale
+                feed_for(&layer.paths[i], layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
+                    / 60.0
+                    * layer.speed_scale
             })
             .collect();
         // Effective scale of path i under island factor `f`: the floor binds
@@ -1779,6 +1960,48 @@ mod tests {
         assert!(q <= 6.0e-3 * 1.06 || floored, "governed heat {q} still over target");
         // Slowing costs time, and the estimator reports it honestly.
         assert!(estimate_seconds(&governed, &s) > estimate_seconds(&plain, &s));
+    }
+
+    #[test]
+    fn temp_shaping_schedules_cool_zone_with_lead() {
+        // The same hot 5×5×30 mm tower, shaped instead of governed: its layers
+        // must plan a cooler nozzle (within the filament window), the M104
+        // staircase must start at/before the zone, the g-code must carry the
+        // schedule, and cooled layers must derate the flow ceiling.
+        let c = mesh::Mesh::cube(5.0);
+        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
+        for i in 0..c.triangles.len() {
+            let t = c.triangle(i);
+            soup.push(t.map(|v| [v[0], v[1], v[2] * 6.0]));
+        }
+        let m = mesh::Mesh::from_triangle_soup(&soup);
+        let mut s = Settings::default();
+        s.min_layer_time_s = 0.0;
+        s.temp_shaping = true;
+        s.governor_max_heat_mw_mm2 = 6.0; // reference level the tower exceeds
+        let layers = generate(&m, &s);
+        let mid = layers.len() / 2;
+        let planned = layers[mid].planned_temp_c.expect("hot tower gets a cooler plan");
+        assert!(planned < s.nozzle_temp_c as f64, "cooler than base, got {planned}");
+        assert!(planned >= s.nozzle_temp_min_c as f64, "inside the filament window");
+        // The staircase starts no later than the first shaped layer (the lead).
+        let first_shaped = layers.iter().position(|l| l.planned_temp_c.is_some()).unwrap();
+        let first_cmd = layers.iter().position(|l| l.temp_command_c.is_some()).unwrap();
+        assert!(first_cmd <= first_shaped, "command {first_cmd} after zone {first_shaped}");
+        // Schedule is baked into the g-code, header included — no live feedback.
+        let g = to_gcode(&layers, &s);
+        assert!(g.contains("temp shaping: layers"), "header reports the zones");
+        assert!(
+            g.matches("M104 S").count() >= 2,
+            "scheduled setpoints present in the body"
+        );
+        // Cooler layer ⇒ derated flow cap (default 0.3 mm³/s per °C).
+        let drop = s.nozzle_temp_c as f64 - planned;
+        let cap = super::layer_flow_cap_mm3_s(&layers[mid], &s);
+        assert!(
+            (cap - (s.max_volumetric_speed_mm3_s - 0.3 * drop)).abs() < 1e-9,
+            "cap {cap} vs drop {drop}"
+        );
     }
 
     #[test]

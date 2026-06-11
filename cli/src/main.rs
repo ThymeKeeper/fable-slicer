@@ -279,6 +279,12 @@ fn main() -> Result<()> {
             settings.max_volumetric_speed_mm3_s
         );
     }
+    for z in engine::audit_temp_shaping(&layers, &settings) {
+        println!(
+            "Temp shaping: layers {}-{} -> {:.0}C",
+            z.first_layer, z.last_layer, z.temp_c
+        );
+    }
     for r in engine::audit_governor(&layers, &settings) {
         println!(
             "Thermal governor: layers {}-{} slowed to {:.0}%{}",

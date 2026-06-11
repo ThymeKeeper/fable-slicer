@@ -55,6 +55,10 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_rate_c_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cool_rate_c_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aux_fan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaust_fan: Option<bool>,
@@ -79,6 +83,10 @@ pub struct FilamentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_layer_nozzle_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_temp_min_c: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_temp_max_c: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bed_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extrusion_multiplier: Option<f64>,
@@ -90,6 +98,8 @@ pub struct FilamentProfile {
     pub fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_fan_speed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_flow_derate_per_c: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_off_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +224,10 @@ pub struct ProcessProfile {
     pub thermal_governor: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub governor_max_heat_mw_mm2: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_shaping: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_shaping_swing_c: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -241,7 +255,7 @@ impl Tier for PrinterProfile {
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
-            aux_fan, exhaust_fan, start_gcode, end_gcode)
+            heat_rate_c_s, cool_rate_c_s, aux_fan, exhaust_fan, start_gcode, end_gcode)
     }
 }
 
@@ -250,9 +264,10 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, first_layer_nozzle_temp_c, bed_temp_c,
-            extrusion_multiplier, max_volumetric_speed_mm3_s, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers,
-            aux_fan_speed, exhaust_fan_speed)
+        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, first_layer_nozzle_temp_c,
+            nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_c,
+            extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c, pressure_advance,
+            fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed)
     }
 }
 
@@ -274,7 +289,8 @@ impl Tier for ProcessProfile {
             ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
             external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
-            gap_fill_speed_mm_s, bridge_flow, thermal_governor, governor_max_heat_mw_mm2)
+            gap_fill_speed_mm_s, bridge_flow, thermal_governor, governor_max_heat_mw_mm2,
+            temp_shaping, temp_shaping_swing_c)
     }
 }
 
@@ -313,6 +329,8 @@ impl PrinterProfile {
             wipe_mm: diff_field!(cur.wipe_mm, base.wipe_mm),
             host_url: diff_field!(cur.host_url.clone(), base.host_url),
             api_key: diff_field!(cur.api_key.clone(), base.api_key),
+            heat_rate_c_s: diff_field!(cur.heat_rate_c_s, base.heat_rate_c_s),
+            cool_rate_c_s: diff_field!(cur.cool_rate_c_s, base.cool_rate_c_s),
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
@@ -335,9 +353,12 @@ impl FilamentProfile {
             density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
             nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
             first_layer_nozzle_temp_c: diff_field!(cur.first_layer_nozzle_temp_c, base.first_layer_nozzle_temp_c),
+            nozzle_temp_min_c: diff_field!(cur.nozzle_temp_min_c, base.nozzle_temp_min_c),
+            nozzle_temp_max_c: diff_field!(cur.nozzle_temp_max_c, base.nozzle_temp_max_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
+            max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
@@ -414,6 +435,8 @@ impl ProcessProfile {
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
             thermal_governor: diff_field!(cur.thermal_governor, base.thermal_governor),
             governor_max_heat_mw_mm2: diff_field!(cur.governor_max_heat_mw_mm2, base.governor_max_heat_mw_mm2),
+            temp_shaping: diff_field!(cur.temp_shaping, base.temp_shaping),
+            temp_shaping_swing_c: diff_field!(cur.temp_shaping_swing_c, base.temp_shaping_swing_c),
         }
     }
 
@@ -666,6 +689,7 @@ impl Profiles {
         // Printer speed (machine default) takes precedence over the process value.
         let print_v = pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s);
         let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
+        let nozzle_temp = fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c);
         // The flow triangle: speed × bead area (line width × layer height) must
         // fit the filament's melt ceiling, so derived speeds balance against it.
         let line_w = pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle));
@@ -740,12 +764,15 @@ impl Profiles {
             wipe_mm: pr.wipe_mm.unwrap_or(d.wipe_mm),
             host_url: pr.host_url.unwrap_or(d.host_url),
             api_key: pr.api_key.unwrap_or(d.api_key),
-            nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
+            nozzle_temp_c: nozzle_temp,
             // Auto: an unset first-layer temp follows the nozzle temp.
-            first_layer_nozzle_temp_c: fl
-                .first_layer_nozzle_temp_c
-                .unwrap_or_else(|| fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c)),
+            first_layer_nozzle_temp_c: fl.first_layer_nozzle_temp_c.unwrap_or(nozzle_temp),
+            // Auto: a ±15 °C printable window around the nozzle temp.
+            nozzle_temp_min_c: fl.nozzle_temp_min_c.unwrap_or_else(|| nozzle_temp.saturating_sub(15)),
+            nozzle_temp_max_c: fl.nozzle_temp_max_c.unwrap_or(nozzle_temp + 15),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
+            heat_rate_c_s: pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s),
+            cool_rate_c_s: pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s),
             print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
             first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
@@ -771,12 +798,15 @@ impl Profiles {
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
             max_volumetric_speed_mm3_s: max_flow,
+            max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or(d.max_flow_derate_per_c),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
             bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
             thermal_governor: pc.thermal_governor.unwrap_or(d.thermal_governor),
             governor_max_heat_mw_mm2: pc
                 .governor_max_heat_mw_mm2
                 .unwrap_or(d.governor_max_heat_mw_mm2),
+            temp_shaping: pc.temp_shaping.unwrap_or(d.temp_shaping),
+            temp_shaping_swing_c: pc.temp_shaping_swing_c.unwrap_or(d.temp_shaping_swing_c),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
             fan_speed: fl.fan_speed.unwrap_or(d.fan_speed),
             bridge_fan_speed: fl.bridge_fan_speed.unwrap_or(d.bridge_fan_speed),

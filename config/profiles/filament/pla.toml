@@ -8,6 +8,11 @@ nozzle_temp_c = 210
 first_layer_nozzle_temp_c = 230
 bed_temp_c = 65
 pressure_advance = 0.032
+# Printable window (Orca's PLA range) and how the melt ceiling shrinks per °C
+# below the nozzle temp when temperature shaping cools a zone.
+nozzle_temp_min_c = 190
+nozzle_temp_max_c = 250
+max_flow_derate_per_c = 0.3
 # Melt ceiling for basic PLA on a modern standard hotend — matched to
 # OrcaSlicer's generic-PLA value so flow clamping compares like for like.
 # True high-flow hotends (Sovol Zero stock, Revo HF, Rapido) use pla-hf.

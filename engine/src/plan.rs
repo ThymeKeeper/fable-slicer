@@ -112,6 +112,13 @@ pub struct LayerPlan {
     /// Per-path speed multipliers (≤1) from the thermal governor, parallel to
     /// `paths`; empty = all 1.0. Multiplies on top of `speed_scale`.
     pub path_speed_scale: Vec<f64>,
+    /// Nozzle °C temperature shaping plans for this layer (None = the profile
+    /// temperature). Drives the deposited-energy model and the flow ceiling.
+    pub planned_temp_c: Option<f64>,
+    /// Emit `M104 S<this>` at the layer's start — shaping's scheduled,
+    /// lead-adjusted setpoint staircase. Asynchronous by design: planned at
+    /// slice time from the printer's ramp rates, no live feedback.
+    pub temp_command_c: Option<f64>,
 }
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
@@ -639,6 +646,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
             path_speed_scale: Vec::new(),
+            planned_temp_c: None,
+            temp_command_c: None,
         }
         })
         .collect();
@@ -668,7 +677,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
-    // After min-layer-time so the governor sees (and stacks on) its pacing.
+    // Temperature shaping first (it lowers deposited energy and flow caps in
+    // the zones it cools), then the speed governor mops up what remains —
+    // both stack on the min-layer-time pacing.
+    crate::emit::apply_temp_shaping(&mut plans, settings);
     crate::emit::apply_thermal_governor(&mut plans, settings);
     plans
 }
