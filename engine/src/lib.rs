@@ -18,9 +18,9 @@ mod slice;
 mod wall;
 
 pub use emit::{
-    audit_combing, audit_flow_clamps, audit_governor, audit_temp_shaping, effective_heat_target,
+    audit_combing, audit_flow_clamps, audit_heat_control_speed, audit_heat_control_temp, effective_heat_target,
     estimate_filament, estimate_seconds, format_duration, kind_label, per_layer_islands,
-    per_layer_stats, to_gcode, GovernorRow, IslandStats, LayerIslands, LayerStats, TempZone,
+    per_layer_stats, to_gcode, SlowdownRange, IslandStats, LayerIslands, LayerStats, TempZone,
 };
 pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};

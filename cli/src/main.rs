@@ -279,7 +279,7 @@ fn main() -> Result<()> {
             settings.max_volumetric_speed_mm3_s
         );
     }
-    if settings.thermal_governor || settings.temp_shaping {
+    if settings.heat_control_speed || settings.heat_control_temp {
         match settings.heat_mode {
             config::HeatMode::Level => println!(
                 "Heat level: {:.1} mW/mm2 (leveled to the coldest region)",
@@ -287,21 +287,21 @@ fn main() -> Result<()> {
             ),
             config::HeatMode::Smooth => println!(
                 "Heat smoothing: change limited to {:.1}%/layer (cap {:.0} mW/mm2)",
-                settings.heat_slew_pct_per_layer, settings.governor_max_heat_mw_mm2
+                settings.heat_slew_pct_per_layer, settings.max_heat_mw_mm2
             ),
             config::HeatMode::Cap => {}
         }
     }
-    for z in engine::audit_temp_shaping(&layers, &settings) {
+    for z in engine::audit_heat_control_temp(&layers, &settings) {
         println!(
-            "Temp shaping: layers {}-{} -> {:.0}C",
+            "Heat control (temp): layers {}-{} -> {:.0}C",
             z.first_layer, z.last_layer, z.temp_c
         );
     }
-    for r in engine::audit_governor(&layers, &settings) {
+    for r in engine::audit_heat_control_speed(&layers, &settings) {
         let dwell = if r.dwell_s > 0.05 { format!(" + {:.1}s dwell", r.dwell_s) } else { String::new() };
         println!(
-            "Thermal governor: layers {}-{} slowed to {:.0}%{dwell}{}",
+            "Heat control (speed): layers {}-{} slowed to {:.0}%{dwell}{}",
             r.first_layer,
             r.last_layer,
             r.worst_scale * 100.0,

@@ -30,7 +30,7 @@ G1 Z5 F600
 G90
 M84";
 
-/// What the thermal system (governor + temperature shaping) aims its
+/// What heat control (its speed and temperature levers) aims its
 /// per-layer heat targets at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum HeatMode {
@@ -354,14 +354,14 @@ pub struct Settings {
     /// heats to this ({first_layer_nozzle_temp}); the emitter drops to
     /// `nozzle_temp_c` at layer 2. Profiles leaving it unset follow the nozzle temp.
     pub first_layer_nozzle_temp_c: u32,
-    /// Coldest this filament prints acceptably (°C) — temperature shaping
-    /// never schedules below it. Auto: nozzle − 15 when the profile is silent.
+    /// Coldest this filament prints acceptably (°C) — the temp schedule
+    /// never goes below it. Auto: nozzle − 15 when the profile is silent.
     pub nozzle_temp_min_c: u32,
-    /// Hottest acceptable (°C) — shaping never schedules above it. Auto: nozzle + 15.
+    /// Hottest acceptable (°C) — the temp schedule never goes above it. Auto: nozzle + 15.
     pub nozzle_temp_max_c: u32,
     pub bed_temp_c: u32,
     /// Hotend heating rate near printing temps (°C/s) — sets how early
-    /// temperature shaping must issue warming M104s. Conservatively low until
+    /// the temp schedule must issue warming M104s. Conservatively low until
     /// measured (a Moonraker calibration routine will fill it in).
     pub heat_rate_c_s: f64,
     /// Passive cooling rate near printing temps (°C/s) — far slower than
@@ -369,7 +369,7 @@ pub struct Settings {
     pub cool_rate_c_s: f64,
     /// Heating rate with the part fan at 100% (°C/s) — fan spillover steals
     /// heater power, so this is ≤ `heat_rate_c_s`. Auto: follows the fan-off
-    /// rate until measured. The shaping scheduler interpolates between the
+    /// rate until measured. The temp scheduler interpolates between the
     /// off/on pairs by the filament's fan duty.
     pub heat_rate_fan_c_s: f64,
     /// Cooling rate with the part fan at 100% (°C/s) — the realistic in-print
@@ -408,7 +408,7 @@ pub struct Settings {
     /// header, CLI, and GUI all report what got clamped). ≤ 0 disables.
     pub max_volumetric_speed_mm3_s: f64,
     /// How much of that ceiling is lost per °C below `nozzle_temp_c`
-    /// (mm³/s/°C): when temperature shaping cools a zone, its flow cap — and
+    /// (mm³/s/°C): when heat control cools a zone, its flow cap — and
     /// therefore its clamped speeds — derate by this. Never raised on warmer
     /// layers (the profile cap is the calibrated number).
     pub max_flow_derate_per_c: f64,
@@ -439,31 +439,31 @@ pub struct Settings {
     /// Exhaust duty 0.0..=1.0 for the whole print — vents chamber heat
     /// (PLA wants it high, ABS low or zero). 0 = off.
     pub exhaust_fan_speed: f64,
-    /// Thermal governor (speed lever): slow each island (disconnected region
-    /// of a layer) whose heat load — deposited energy ÷ (layer time × island
-    /// footprint) — exceeds `governor_max_heat_mw_mm2`, until it fits. Derived
-    /// at slice time on top of the user's speeds; off restores them exactly.
-    /// Speeds never drop below `min_print_speed_mm_s`; islands still hot at
-    /// that floor are reported loudly instead.
-    pub thermal_governor: bool,
-    /// The governor's per-island heat-load ceiling (mW/mm²) — also the
-    /// reference level temperature shaping evens layers toward.
-    pub governor_max_heat_mw_mm2: f64,
-    /// Temperature shaping (temp lever): bake scheduled M104s into the g-code
-    /// — cooler through chronically hot layer ranges, gently warmer through
-    /// cold bands — with ramps started early per the printer's heat/cool
-    /// rates so the nozzle *arrives* at each zone's temperature. Planned
-    /// entirely at slice time from the thermal profile; no live feedback.
-    /// Bounded by the filament's min/max °C; cooled layers derate the flow
-    /// ceiling via `max_flow_derate_per_c`.
-    pub temp_shaping: bool,
-    /// Largest excursion shaping may schedule from the nozzle temp (°C),
-    /// symmetric — both rails sit `swing` from the printing temperature,
-    /// always clipped by the filament's min/max window. Warming is free in
-    /// print time; its only cost is hotter-deposition side effects (gloss,
-    /// possible stringing on travel-heavy layers).
-    pub temp_shaping_swing_c: f64,
-    /// What the thermal system aims at — see [`HeatMode`].
+    /// Heat control, speed lever ("slow hot zones"): slow each island
+    /// (disconnected region of a layer) whose heat load — deposited energy ÷
+    /// (layer time × island footprint) — exceeds `max_heat_mw_mm2`, until it
+    /// fits. Derived at slice time on top of the user's speeds; off restores
+    /// them exactly. Speeds never drop below `min_print_speed_mm_s`; islands
+    /// still hot at that floor are reported loudly instead.
+    pub heat_control_speed: bool,
+    /// Heat control's per-island heat-load ceiling (mW/mm²) — the target both
+    /// levers work toward.
+    pub max_heat_mw_mm2: f64,
+    /// Heat control, temperature lever ("schedule nozzle temp"): bake
+    /// scheduled M104s into the g-code — cooler through chronically hot layer
+    /// ranges, gently warmer through cold bands — with ramps started early
+    /// per the printer's heat/cool rates so the nozzle *arrives* at each
+    /// zone's temperature. Planned entirely at slice time from the thermal
+    /// profile; no live feedback. Bounded by the filament's min/max °C;
+    /// cooled layers derate the flow ceiling via `max_flow_derate_per_c`.
+    pub heat_control_temp: bool,
+    /// Largest excursion the temp schedule may take from the nozzle temp
+    /// (°C), symmetric — both rails sit `swing` from the printing
+    /// temperature, always clipped by the filament's min/max window. Warming
+    /// is free in print time; its only cost is hotter-deposition side effects
+    /// (gloss, possible stringing on travel-heavy layers).
+    pub temp_swing_c: f64,
+    /// What heat control aims at — see [`HeatMode`].
     pub heat_mode: HeatMode,
     /// Smooth mode: largest allowed heat-load change between adjacent layers
     /// (% per layer). Transitions get ramped over enough layers to respect it.
@@ -568,14 +568,14 @@ impl Default for Settings {
             aux_fan_speed: 0.0,
             has_exhaust_fan: false,
             exhaust_fan_speed: 0.0,
-            thermal_governor: false,
+            heat_control_speed: false,
             // Calibrated on the Benchy: lone towers / chimneys / arch pillars
             // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
-            governor_max_heat_mw_mm2: 15.0,
-            temp_shaping: false,
+            max_heat_mw_mm2: 15.0,
+            heat_control_temp: false,
             // 20 °C of cooling reaches a typical PLA's lower window edge —
             // the deepest rail the schedule can use on chronically hot zones.
-            temp_shaping_swing_c: 20.0,
+            temp_swing_c: 20.0,
             heat_mode: HeatMode::Cap,
             heat_slew_pct_per_layer: 5.0,
             start_gcode: GENERIC_START_GCODE.to_string(),

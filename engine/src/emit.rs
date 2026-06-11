@@ -63,7 +63,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             ));
         }
     }
-    if s.thermal_governor || s.temp_shaping {
+    if s.heat_control_speed || s.heat_control_temp {
         let t = effective_heat_target(layers, s) * 1e3;
         let mode = match s.heat_mode {
             config::HeatMode::Cap => "",
@@ -72,19 +72,19 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         };
         g.comment(&format!("heat target = {t:.1} mW/mm2{mode}"));
     }
-    if s.temp_shaping {
-        for z in audit_temp_shaping(layers, s) {
+    if s.heat_control_temp {
+        for z in audit_heat_control_temp(layers, s) {
             g.comment(&format!(
-                "temp shaping: layers {}-{} -> {:.0}C",
+                "heat control (temp): layers {}-{} -> {:.0}C",
                 z.first_layer, z.last_layer, z.temp_c
             ));
         }
     }
-    if s.thermal_governor {
-        for r in audit_governor(layers, s) {
+    if s.heat_control_speed {
+        for r in audit_heat_control_speed(layers, s) {
             let dwell = if r.dwell_s > 0.05 { format!(" + {:.1}s dwell", r.dwell_s) } else { String::new() };
             g.comment(&format!(
-                "thermal governor: layers {}-{} slowed to {:.0}%{dwell}{}",
+                "heat control (speed): layers {}-{} slowed to {:.0}%{dwell}{}",
                 r.first_layer,
                 r.last_layer,
                 r.worst_scale * 100.0,
@@ -153,7 +153,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 ((total_secs - done) / 60.0).ceil()
             ));
         }
-        // Temperature: shaping's scheduled setpoints win; otherwise the
+        // Temperature: the temp schedule's setpoints win; otherwise the
         // one-shot drop from first-layer temp to printing temp. M104 either
         // way — set without waiting, the schedule already planned the leads.
         if let Some(t) = layer.temp_command_c {
@@ -300,7 +300,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             wipe_tail = compute_wipe_tail(path, s.wipe_mm);
         }
 
-        // Park-and-wait cooling dwell: the governor banked seconds here when
+        // Park-and-wait cooling dwell: the speed lever banked seconds here when
         // an island was over the heat target with every path already at the
         // speed floor. Spend them retracted and lifted clear of the part so
         // the hot block doesn't cook what it just printed.
@@ -462,7 +462,7 @@ fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
     path.flow * kind_flow * s.extrusion_multiplier
 }
 
-/// The nozzle temperature planned for a layer: temperature shaping's schedule
+/// The nozzle temperature planned for a layer: the temp schedule
 /// when present, else the first-layer / profile temperature.
 fn layer_nozzle_c(layer: &LayerPlan, s: &Settings) -> f64 {
     layer.planned_temp_c.unwrap_or(if layer.index == 0 {
@@ -473,7 +473,7 @@ fn layer_nozzle_c(layer: &LayerPlan, s: &Settings) -> f64 {
 }
 
 /// The melt ceiling in force on a layer (mm³/s; 0 = unlimited): the profile
-/// cap at the profile temperature, derated linearly when temperature shaping
+/// cap at the profile temperature, derated linearly when the temp schedule
 /// runs the layer cooler. Never raised on warmer layers — the profile cap is
 /// the calibrated number.
 fn layer_flow_cap_mm3_s(layer: &LayerPlan, s: &Settings) -> f64 {
@@ -492,7 +492,7 @@ fn layer_flow_cap_mm3_s(layer: &LayerPlan, s: &Settings) -> f64 {
 /// Feed rate (mm/min) for a path: the per-feature speed, clamped so the
 /// volumetric flow `width × height × speed × flow` never exceeds the layer's
 /// melt-rate ceiling (`flow_cap_mm3_s`, 0 = unlimited — pass
-/// `layer_flow_cap_mm3_s` so temperature shaping's derate applies). One
+/// `layer_flow_cap_mm3_s` so the temp schedule's derate applies). One
 /// function feeds the g-code, the time estimate, and the min-layer-time pass,
 /// so they always agree.
 fn feed_for(
@@ -1035,14 +1035,14 @@ fn layer_volume_mm3(layer: &LayerPlan, s: &Settings) -> f64 {
     layer.paths.iter().map(|p| path_volume_mm3(p, layer.height_mm, s)).sum()
 }
 
-/// The thermal governor's per-path speed multiplier (1.0 when ungoverned).
+/// Heat control's per-path speed multiplier (1.0 when unslowed).
 fn path_scale(layer: &LayerPlan, i: usize) -> f64 {
     layer.path_speed_scale.get(i).copied().unwrap_or(1.0)
 }
 
 /// Extrusion-only seconds for one path at a total speed multiplier — the
-/// trapezoid simulation the layer estimate uses, exposed so the thermal
-/// governor budgets with the same numbers.
+/// trapezoid simulation the layer estimate uses, exposed so heat
+/// control budgets with the same numbers.
 fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale: f64) -> f64 {
     let path = &layer.paths[i];
     if path.points.len() < 2 {
@@ -1217,21 +1217,21 @@ pub fn effective_heat_target(layers: &[LayerPlan], s: &Settings) -> f64 {
     if let Some(t) = layers.iter().find_map(|l| l.planned_heat_target) {
         return t;
     }
-    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    let cap = s.max_heat_mw_mm2 * 1e-3;
     match s.heat_mode {
         config::HeatMode::Level => level_to_coldest(layers, s, cap),
         _ => cap,
     }
 }
 
-/// Per-layer heat targets (W/mm²), pinned onto the plan before shaping and
-/// governing run. Cap: the slider everywhere. Level: one number the whole
+/// Per-layer heat targets (W/mm²), pinned onto the plan before either
+/// heat-control lever runs. Cap: the slider everywhere. Level: one number the whole
 /// print can share. Smooth: the natural heat curve clipped by the cap, then
 /// min-propagated outward from every cold dip at the slew rate — warm
 /// neighbors ramp into dips instead of cliffing at them, so a transition
 /// costs a couple dozen ramp layers instead of the whole print.
 pub fn plan_heat_targets(layers: &[LayerPlan], s: &Settings) -> Vec<f64> {
-    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    let cap = s.max_heat_mw_mm2 * 1e-3;
     let n = layers.len();
     match s.heat_mode {
         config::HeatMode::Cap => vec![cap; n],
@@ -1270,7 +1270,7 @@ pub fn plan_heat_targets(layers: &[LayerPlan], s: &Settings) -> Vec<f64> {
 /// The level-mode target: the highest heat load every layer can reach.
 fn level_to_coldest(layers: &[LayerPlan], s: &Settings, cap: f64) -> f64 {
     let base = s.nozzle_temp_c as f64;
-    let swing = s.temp_shaping_swing_c.max(0.0);
+    let swing = s.temp_swing_c.max(0.0);
     let tmin = (s.nozzle_temp_min_c as f64).min(base);
     let warm_gain = ((base + swing).min(s.nozzle_temp_max_c as f64) - AMBIENT_C)
         / (base - AMBIENT_C).max(1.0);
@@ -1319,7 +1319,7 @@ fn level_to_coldest(layers: &[LayerPlan], s: &Settings, cap: f64) -> f64 {
     (coldest * warm_gain).max(hardest).clamp(0.2e-3, cap)
 }
 
-/// Temperature shaping (v2, temp lever): bake a nozzle-temperature schedule
+/// Heat control's temperature lever (v2): bake a nozzle-temperature schedule
 /// into the plan — cooler through chronically hot layer ranges, gently warmer
 /// through cold bands — so deposition conditions even out toward the heat
 /// target. Everything is decided *here, at slice time*, from the printer's
@@ -1329,18 +1329,18 @@ fn level_to_coldest(layers: &[LayerPlan], s: &Settings, cap: f64) -> f64 {
 ///
 /// Honors the filament's printable window; cooled layers also derate the flow
 /// ceiling (see [`layer_flow_cap_mm3_s`]). Temperature is a slow, global
-/// actuator, so zones are layer *ranges* — the per-island speed governor
-/// remains the fast spatial lever, and runs after this so it sees the shaped
+/// actuator, so zones are layer *ranges* — the per-island speed lever
+/// remains the fast spatial one, and runs after this so it sees the shaped
 /// energy and caps.
-pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
-    if !s.temp_shaping || layers.len() < 3 {
+pub fn apply_heat_control_temp(layers: &mut [LayerPlan], s: &Settings) {
+    if !s.heat_control_temp || layers.len() < 3 {
         return;
     }
     let base = s.nozzle_temp_c as f64;
     let tmin = (s.nozzle_temp_min_c as f64).min(base);
     let tmax = (s.nozzle_temp_max_c as f64).max(base);
-    let swing = s.temp_shaping_swing_c.max(0.0);
-    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    let swing = s.temp_swing_c.max(0.0);
+    let cap = s.max_heat_mw_mm2 * 1e-3;
     if cap <= 0.0 || swing <= 0.0 {
         return;
     }
@@ -1379,7 +1379,7 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
         // Temperature has only ~0.5%/°C of authority while q varies several
         // fold, so most layers rightly sit pegged at a rail — the bands in
         // the nozzle-°C view are actuator saturation, not timidity. What the
-        // rails can't reach, the speed governor and the fan still can.
+        // rails can't reach, the speed lever and the fan still can.
         let q_eff = if q_hot > target { q_hot } else { jsum / (secs[i] * asum) };
         if q_eff <= 0.0 {
             continue;
@@ -1410,7 +1410,7 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
     //    so cool zones pull a long lead. Then a forward pass re-anchors on the
     //    fixed first-layer temperature (leads that don't fit arrive late).
     // The fan changes both rates (spillover cools the block), and it runs for
-    // essentially every layer shaping touches — interpolate the profiled
+    // essentially every layer the schedule touches — interpolate the profiled
     // off/on pairs by the filament's fan duty. (Flow cooling isn't captured
     // by the static profile; leads stay slightly conservative because of it.)
     let duty = s.fan_speed.clamp(0.0, 1.0);
@@ -1448,8 +1448,8 @@ pub struct TempZone {
     pub temp_c: f64,
 }
 
-/// Where temperature shaping moved the nozzle — read back from the plan.
-pub fn audit_temp_shaping(layers: &[LayerPlan], s: &Settings) -> Vec<TempZone> {
+/// Where the temp schedule moved the nozzle — read back from the plan.
+pub fn audit_heat_control_temp(layers: &[LayerPlan], s: &Settings) -> Vec<TempZone> {
     let base = s.nozzle_temp_c as f64;
     let mut rows: Vec<TempZone> = Vec::new();
     for layer in layers {
@@ -1476,17 +1476,17 @@ pub fn audit_temp_shaping(layers: &[LayerPlan], s: &Settings) -> Vec<TempZone> {
     rows
 }
 
-/// Thermal governor (v1, speed lever): for every island whose heat load —
+/// Heat control's speed lever (v1): for every island whose heat load —
 /// deposited joules ÷ (layer seconds × island footprint) — exceeds the
 /// target, scale that island's print speeds down until it fits. Slowing one
 /// island lengthens the whole layer, which also cools the others, so islands
 /// are handled worst-first against the updated layer time. Speeds never drop
 /// below `min_print_speed_mm_s`; islands still hot at that floor are left
-/// there and surface via [`audit_governor`] — slowing alone can't fix them.
+/// there and surface via [`audit_heat_control_speed`] — slowing alone can't fix them.
 /// Derived at slice time and stored only on the plan: toggling off returns
 /// exactly the user's speeds.
-pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
-    if !s.thermal_governor || s.governor_max_heat_mw_mm2 <= 0.0 {
+pub fn apply_heat_control_speed(layers: &mut [LayerPlan], s: &Settings) {
+    if !s.heat_control_speed || s.max_heat_mw_mm2 <= 0.0 {
         return;
     }
     // Spiral vase is one continuous loop — per-island pacing can't apply
@@ -1495,7 +1495,7 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
         return;
     }
     let floor_v = s.min_print_speed_mm_s.max(1.0);
-    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    let cap = s.max_heat_mw_mm2 * 1e-3;
     for layer in layers.iter_mut() {
         // Each layer chases its own pinned target (per-layer in smooth mode).
         let target = layer.planned_heat_target.unwrap_or(cap);
@@ -1622,7 +1622,7 @@ fn max_dwell_s(s: &Settings) -> f64 {
 const DWELL_LIFT_MM: f64 = 5.0;
 
 /// One contiguous run of governed layers, for the reports.
-pub struct GovernorRow {
+pub struct SlowdownRange {
     pub first_layer: usize,
     pub last_layer: usize,
     /// The strongest slowdown in the range (0.38 = slowed to 38% speed).
@@ -1634,17 +1634,17 @@ pub struct GovernorRow {
     pub floor_hit: bool,
 }
 
-/// Where the thermal governor intervened — read back from the plan the same
+/// Where the speed lever intervened — read back from the plan the same
 /// way the g-code is generated, so the report can't drift from reality.
-pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
-    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
-    let mut rows: Vec<GovernorRow> = Vec::new();
+pub fn audit_heat_control_speed(layers: &[LayerPlan], s: &Settings) -> Vec<SlowdownRange> {
+    let cap = s.max_heat_mw_mm2 * 1e-3;
+    let mut rows: Vec<SlowdownRange> = Vec::new();
     for layer in layers {
         if layer.path_speed_scale.iter().all(|&fk| fk >= 0.999) && layer.dwell_s <= 0.0 {
-            continue; // empty (ungoverned) vecs land here too
+            continue; // empty (unslowed) vecs land here too
         }
         let worst = layer.path_speed_scale.iter().copied().fold(1.0, f64::min);
-        // Post-governor heat check against the layer's own pinned target:
+        // Post-slowdown heat check against the layer's own pinned target:
         // anything still hot ran out of floor and dwell.
         let target = layer.planned_heat_target.unwrap_or(cap);
         let li = islands_of(layer, s);
@@ -1660,7 +1660,7 @@ pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
                 r.dwell_s += layer.dwell_s;
                 r.floor_hit |= floor;
             }
-            _ => rows.push(GovernorRow {
+            _ => rows.push(SlowdownRange {
                 first_layer: layer.index,
                 last_layer: layer.index,
                 worst_scale: worst,
@@ -1915,7 +1915,7 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 mod tests {
     use super::{fit_arc, ARC_MIN_PTS, AMBIENT_C, CP_J_PER_G_K};
     use crate::{
-        audit_governor, effective_heat_target, estimate_filament, estimate_seconds, generate,
+        audit_heat_control_speed, effective_heat_target, estimate_filament, estimate_seconds, generate,
         per_layer_islands, per_layer_stats, to_gcode,
     };
     use config::Settings;
@@ -2138,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn thermal_governor_slows_hot_tower() {
+    fn heat_control_speed_slows_hot_tower() {
         // A 5×5×30 mm tower: tiny island, quick layers → hot. Governed, its
         // layers must slow until the heat load fits (or the floor binds); off,
         // the plan is untouched.
@@ -2150,27 +2150,27 @@ mod tests {
         }
         let m = mesh::Mesh::from_triangle_soup(&soup);
         let mut s = Settings::default();
-        s.min_layer_time_s = 0.0; // isolate the governor from the layer-time pacing
+        s.min_layer_time_s = 0.0; // isolate heat control from the layer-time pacing
         let plain = generate(&m, &s);
         assert!(plain.iter().all(|l| l.path_speed_scale.is_empty()), "off = untouched");
 
-        s.thermal_governor = true;
-        s.governor_max_heat_mw_mm2 = 6.0;
+        s.heat_control_speed = true;
+        s.max_heat_mw_mm2 = 6.0;
         let governed = generate(&m, &s);
         let mid = governed.len() / 2;
         assert!(
             governed[mid].path_speed_scale.iter().any(|&f| f < 0.999),
             "tower layers slowed"
         );
-        let rows = audit_governor(&governed, &s);
+        let rows = audit_heat_control_speed(&governed, &s);
         assert!(!rows.is_empty(), "intervention reported");
-        // Post-governor heat sits at/under the target, unless the row says the
+        // Post-slowdown heat sits at/under the target, unless the row says the
         // min-speed floor bound first.
         let stats = per_layer_stats(&governed, &s);
         let isl = per_layer_islands(&governed, &s);
         let q = isl[mid].islands[0].joules
             / (stats[mid].secs.max(1e-9) * isl[mid].islands[0].footprint_mm2.max(1e-9));
-        // With park-and-wait completing the governor, the target is reachable
+        // With park-and-wait completing the slowdown, the target is reachable
         // outright (the 20 s/layer dwell cap is far above what a tower needs).
         assert!(q <= 6.0e-3 * 1.06, "governed heat {q} still over target");
         let dwelled: f64 = governed.iter().map(|l| l.dwell_s).sum();
@@ -2201,13 +2201,13 @@ mod tests {
         let m = mesh::Mesh::from_triangle_soup(&soup);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0;
-        s.thermal_governor = true;
-        s.temp_shaping = true;
+        s.heat_control_speed = true;
+        s.heat_control_temp = true;
         s.heat_mode = config::HeatMode::Level;
         let layers = generate(&m, &s);
         let eff = effective_heat_target(&layers, &s);
         assert!(
-            eff < s.governor_max_heat_mw_mm2 * 1e-3,
+            eff < s.max_heat_mw_mm2 * 1e-3,
             "the level sits below the cap"
         );
         // Every island in the print sits at or under the level.
@@ -2241,8 +2241,8 @@ mod tests {
         let m = mesh::Mesh::from_triangle_soup(&soup);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0;
-        s.thermal_governor = true;
-        s.temp_shaping = true;
+        s.heat_control_speed = true;
+        s.heat_control_temp = true;
         s.heat_mode = config::HeatMode::Smooth;
         s.heat_slew_pct_per_layer = 5.0;
         let layers = generate(&m, &s);
@@ -2273,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn temp_shaping_schedules_cool_zone_with_lead() {
+    fn heat_control_temp_schedules_cool_zone_with_lead() {
         // The same hot 5×5×30 mm tower, shaped instead of governed: its layers
         // must plan a cooler nozzle (within the filament window), the M104
         // staircase must start at/before the zone, the g-code must carry the
@@ -2287,8 +2287,8 @@ mod tests {
         let m = mesh::Mesh::from_triangle_soup(&soup);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0;
-        s.temp_shaping = true;
-        s.governor_max_heat_mw_mm2 = 6.0; // reference level the tower exceeds
+        s.heat_control_temp = true;
+        s.max_heat_mw_mm2 = 6.0; // reference level the tower exceeds
         let layers = generate(&m, &s);
         let mid = layers.len() / 2;
         let planned = layers[mid].planned_temp_c.expect("hot tower gets a cooler plan");
@@ -2300,7 +2300,7 @@ mod tests {
         assert!(first_cmd <= first_shaped, "command {first_cmd} after zone {first_shaped}");
         // Schedule is baked into the g-code, header included — no live feedback.
         let g = to_gcode(&layers, &s);
-        assert!(g.contains("temp shaping: layers"), "header reports the zones");
+        assert!(g.contains("heat control (temp): layers"), "header reports the zones");
         assert!(
             g.matches("M104 S").count() >= 2,
             "scheduled setpoints present in the body"

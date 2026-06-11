@@ -227,14 +227,17 @@ pub struct ProcessProfile {
     pub gap_fill_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_flow: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thermal_governor: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub governor_max_heat_mw_mm2: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temp_shaping: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temp_shaping_swing_c: Option<f64>,
+    // The four heat-control keys carry aliases from before the rename
+    // ("thermal governor" / "temperature shaping") so profiles saved back
+    // then keep loading; saving writes the new names.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "thermal_governor")]
+    pub heat_control_speed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "governor_max_heat_mw_mm2")]
+    pub max_heat_mw_mm2: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "temp_shaping")]
+    pub heat_control_temp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "temp_shaping_swing_c")]
+    pub temp_swing_c: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heat_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,8 +304,8 @@ impl Tier for ProcessProfile {
             ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
             external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
-            gap_fill_speed_mm_s, bridge_flow, thermal_governor, governor_max_heat_mw_mm2,
-            temp_shaping, temp_shaping_swing_c, heat_mode, heat_slew_pct_per_layer)
+            gap_fill_speed_mm_s, bridge_flow, heat_control_speed, max_heat_mw_mm2,
+            heat_control_temp, temp_swing_c, heat_mode, heat_slew_pct_per_layer)
     }
 }
 
@@ -447,10 +450,10 @@ impl ProcessProfile {
             support_speed_mm_s: diff_field!(cur.support_speed_mm_s, base.support_speed_mm_s),
             gap_fill_speed_mm_s: diff_field!(cur.gap_fill_speed_mm_s, base.gap_fill_speed_mm_s),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
-            thermal_governor: diff_field!(cur.thermal_governor, base.thermal_governor),
-            governor_max_heat_mw_mm2: diff_field!(cur.governor_max_heat_mw_mm2, base.governor_max_heat_mw_mm2),
-            temp_shaping: diff_field!(cur.temp_shaping, base.temp_shaping),
-            temp_shaping_swing_c: diff_field!(cur.temp_shaping_swing_c, base.temp_shaping_swing_c),
+            heat_control_speed: diff_field!(cur.heat_control_speed, base.heat_control_speed),
+            max_heat_mw_mm2: diff_field!(cur.max_heat_mw_mm2, base.max_heat_mw_mm2),
+            heat_control_temp: diff_field!(cur.heat_control_temp, base.heat_control_temp),
+            temp_swing_c: diff_field!(cur.temp_swing_c, base.temp_swing_c),
             heat_mode: diff_field!(cur.heat_mode.label().to_string(), base.heat_mode.label().to_string()),
             heat_slew_pct_per_layer: diff_field!(cur.heat_slew_pct_per_layer, base.heat_slew_pct_per_layer),
         }
@@ -824,12 +827,12 @@ impl Profiles {
             max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or(d.max_flow_derate_per_c),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
             bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
-            thermal_governor: pc.thermal_governor.unwrap_or(d.thermal_governor),
-            governor_max_heat_mw_mm2: pc
-                .governor_max_heat_mw_mm2
-                .unwrap_or(d.governor_max_heat_mw_mm2),
-            temp_shaping: pc.temp_shaping.unwrap_or(d.temp_shaping),
-            temp_shaping_swing_c: pc.temp_shaping_swing_c.unwrap_or(d.temp_shaping_swing_c),
+            heat_control_speed: pc.heat_control_speed.unwrap_or(d.heat_control_speed),
+            max_heat_mw_mm2: pc
+                .max_heat_mw_mm2
+                .unwrap_or(d.max_heat_mw_mm2),
+            heat_control_temp: pc.heat_control_temp.unwrap_or(d.heat_control_temp),
+            temp_swing_c: pc.temp_swing_c.unwrap_or(d.temp_swing_c),
             heat_mode: pc.heat_mode.as_deref().and_then(HeatMode::parse).unwrap_or(d.heat_mode),
             heat_slew_pct_per_layer: pc
                 .heat_slew_pct_per_layer
@@ -928,6 +931,40 @@ mod tests {
         assert_eq!(s.acceleration_mm_s2, 10000.0);
         assert_eq!(s.outer_wall_accel_mm_s2, 3000.0);
         assert_eq!(s.first_layer_accel_mm_s2, 1000.0);
+    }
+
+    #[test]
+    fn every_builtin_combination_resolves() {
+        let p = Profiles::builtin();
+        for printer in p.printer_names() {
+            for filament in p.filament_names() {
+                for process in p.process_names() {
+                    p.resolve(printer, filament, process)
+                        .unwrap_or_else(|e| panic!("{printer}/{filament}/{process}: {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_rename_heat_control_keys_still_load() {
+        // Process profiles saved before the heat-control rename carry the old
+        // key names — the serde aliases must keep them loading forever.
+        let p: ProcessProfile = toml::from_str(
+            "thermal_governor = true\n\
+             governor_max_heat_mw_mm2 = 12.5\n\
+             temp_shaping = true\n\
+             temp_shaping_swing_c = 18.0\n",
+        )
+        .unwrap();
+        assert_eq!(p.heat_control_speed, Some(true));
+        assert_eq!(p.max_heat_mw_mm2, Some(12.5));
+        assert_eq!(p.heat_control_temp, Some(true));
+        assert_eq!(p.temp_swing_c, Some(18.0));
+        // Saving writes only the new names — files migrate forward on save.
+        let out = toml::to_string(&p).unwrap();
+        assert!(out.contains("heat_control_speed") && out.contains("heat_control_temp"));
+        assert!(!out.contains("governor") && !out.contains("temp_shaping"));
     }
 
     #[test]

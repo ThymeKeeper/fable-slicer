@@ -147,7 +147,7 @@ impl Client {
 /// The hotend's measured thermal response near printing temperature, with the
 /// part fan off and at 100% — the fan's spillover both steals heater power
 /// (slower heating) and strips the block (faster cooling), and it runs for
-/// essentially every layer temperature shaping touches. Heating is driven by
+/// essentially every layer the temp schedule touches. Heating is driven by
 /// the full cartridge; cooling is passive. (Heat removed by flowing filament
 /// is not captured here; the scheduler's leads stay conservative because of it.)
 #[derive(Debug, Clone, Copy)]

@@ -61,7 +61,7 @@ enum ColorBy {
     /// Per-layer heat load: deposited energy ÷ (time × footprint). Red = lots
     /// of hot plastic delivered quickly to a small area.
     Heat,
-    /// Planned nozzle temperature per layer — temperature shaping's schedule
+    /// Planned nozzle temperature per layer — heat control's temp schedule
     /// made visible. One flat color = nothing scheduled.
     Temp,
 }
@@ -350,10 +350,10 @@ struct SliceSummary {
     /// The heat target in force at slice time (mW/mm²) — the slider in cap
     /// mode, the computed level in even mode.
     heat_target_mw: f64,
-    /// Thermal-governor interventions (empty when off or nothing ran hot).
-    governor: Vec<engine::GovernorRow>,
-    /// Temperature-shaping zones (empty when off or nothing to shape).
-    shaping: Vec<engine::TempZone>,
+    /// Heat-control slowdowns (empty when off or nothing ran hot).
+    slowdowns: Vec<engine::SlowdownRange>,
+    /// Heat-control temperature zones (empty when off or nothing to schedule).
+    temp_zones: Vec<engine::TempZone>,
 }
 
 struct App {
@@ -978,8 +978,8 @@ impl App {
             flow_cap: self.settings.max_volumetric_speed_mm3_s,
             clamps,
             heat_target_mw: engine::effective_heat_target(&layers, &self.settings) * 1e3,
-            governor: engine::audit_governor(&layers, &self.settings),
-            shaping: engine::audit_temp_shaping(&layers, &self.settings),
+            slowdowns: engine::audit_heat_control_speed(&layers, &self.settings),
+            temp_zones: engine::audit_heat_control_temp(&layers, &self.settings),
         });
         self.status.clear();
         self.slice_gen += 1;
@@ -1037,7 +1037,7 @@ impl App {
                 )
             }
             ColorBy::Temp => {
-                // The shaping schedule itself: a diverging map centered on the
+                // The temp schedule itself: a diverging map centered on the
                 // printing temperature — cooler zones toward blue, warmer
                 // toward red. (The first layer's adhesion temperature is its
                 // own mechanism and stays out of this view.)
@@ -1144,17 +1144,17 @@ impl App {
                      longer.",
                 );
             }
-            if !sum.shaping.is_empty() {
+            if !sum.temp_zones.is_empty() {
                 let r = egui::CollapsingHeader::new(format!(
-                    "Temperature shaping — {} zone{}",
-                    sum.shaping.len(),
-                    if sum.shaping.len() == 1 { "" } else { "s" }
+                    "heat control — {} temp zone{}",
+                    sum.temp_zones.len(),
+                    if sum.temp_zones.len() == 1 { "" } else { "s" }
                 ))
-                .id_salt("shaping_rows")
+                .id_salt("temp_zone_rows")
                 .default_open(false)
                 .show(ui, |ui| {
-                    egui::Grid::new("shaping_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                        for z in &sum.shaping {
+                    egui::Grid::new("temp_zone_grid").spacing([10.0, 2.0]).show(ui, |ui| {
+                        for z in &sum.temp_zones {
                             ui.label(if z.first_layer == z.last_layer {
                                 format!("layer {}", z.first_layer)
                             } else {
@@ -1167,35 +1167,35 @@ impl App {
                     });
                 });
                 r.header_response.on_hover_text(
-                    "Scheduled M104s baked into the g-code (Feature speeds → temperature \
-                     shaping): cooler through hot ranges, warmer through cold bands, ramps \
-                     started early per the printer's measured rates. The 'nozzle °C' preview \
-                     shows the schedule.",
+                    "Scheduled M104s baked into the g-code (Feature speeds → heat control → \
+                     schedule nozzle temp): cooler through hot ranges, warmer through cold \
+                     bands, ramps started early per the printer's measured rates. The \
+                     'nozzle °C' preview shows the schedule.",
                 );
             }
-            if !sum.governor.is_empty() {
+            if !sum.slowdowns.is_empty() {
                 let warn = ui.visuals().warn_fg_color;
-                let floored = sum.governor.iter().filter(|r| r.floor_hit).count();
+                let floored = sum.slowdowns.iter().filter(|r| r.floor_hit).count();
                 let title = if floored > 0 {
                     format!(
-                        "⚠ Governor slowed {} range{} — {} hot at cap",
-                        sum.governor.len(),
-                        if sum.governor.len() == 1 { "" } else { "s" },
+                        "⚠ heat control slowed {} range{} — {} hot at cap",
+                        sum.slowdowns.len(),
+                        if sum.slowdowns.len() == 1 { "" } else { "s" },
                         floored
                     )
                 } else {
                     format!(
-                        "Governor slowed {} range{}",
-                        sum.governor.len(),
-                        if sum.governor.len() == 1 { "" } else { "s" }
+                        "heat control slowed {} range{}",
+                        sum.slowdowns.len(),
+                        if sum.slowdowns.len() == 1 { "" } else { "s" }
                     )
                 };
                 let r = egui::CollapsingHeader::new(egui::RichText::new(title).color(warn))
-                    .id_salt("governor_rows")
+                    .id_salt("slowdown_rows")
                     .default_open(false)
                     .show(ui, |ui| {
-                        egui::Grid::new("governor_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                            for r in &sum.governor {
+                        egui::Grid::new("slowdown_grid").spacing([10.0, 2.0]).show(ui, |ui| {
+                            for r in &sum.slowdowns {
                                 ui.label(if r.first_layer == r.last_layer {
                                     format!("layer {}", r.first_layer)
                                 } else {
@@ -1226,12 +1226,12 @@ impl App {
                         });
                     });
                 r.header_response.on_hover_text(
-                    "The thermal governor (Feature speeds) slowed islands whose heat load \
-                     exceeded the target. The previews, time estimate, and g-code all show the \
-                     governed result; toggling it off restores your speeds exactly.",
+                    "Heat control (Feature speeds → slow hot zones) slowed islands whose heat \
+                     load exceeded the target. The previews, time estimate, and g-code all show \
+                     the slowed result; toggling it off restores your speeds exactly.",
                 );
             }
-            if self.settings.thermal_governor || self.settings.temp_shaping {
+            if self.settings.heat_control_speed || self.settings.heat_control_temp {
                 match self.settings.heat_mode {
                     config::HeatMode::Level => {
                         ui.weak(format!(
@@ -1249,7 +1249,7 @@ impl App {
                         ui.weak(format!(
                             "heat smoothing: ≤ {:.1}%/layer change (cap {:.0} mW/mm²)",
                             self.settings.heat_slew_pct_per_layer,
-                            self.settings.governor_max_heat_mw_mm2
+                            self.settings.max_heat_mw_mm2
                         ))
                         .on_hover_text(
                             "Smooth mode: each layer gets its own target so the heat load never \
@@ -1262,8 +1262,8 @@ impl App {
                 }
             }
             // Armed but idle is easy to misread as broken — say it.
-            if (self.settings.thermal_governor || self.settings.temp_shaping)
-                && sum.governor.is_empty()
+            if (self.settings.heat_control_speed || self.settings.heat_control_temp)
+                && sum.slowdowns.is_empty()
             {
                 let mut hottest = 0.0_f64;
                 for (li, l) in self.layer_islands.iter().enumerate() {
@@ -1280,8 +1280,8 @@ impl App {
                         hottest * 1e3
                     ))
                     .on_hover_text(
-                        "Both thermal features are armed, but every island already sits under \
-                         the heat target — nothing to slow, and shaping only nudges toward the \
+                        "Heat control is armed, but every island already sits under the heat \
+                         target — nothing to slow, and the temp schedule only nudges toward the \
                          target. If you expected intervention, the target ('max heat' under \
                          Feature speeds) is set above this print's hottest region.",
                     );
@@ -1704,8 +1704,8 @@ impl eframe::App for App {
                          maps spot overheating: layer time shows where the nozzle returns quickly (little \
                          cooling time), and heat load also weighs how much hot plastic is deposited and \
                          how much footprint it has to cool through — scored per island, i.e. per \
-                         disconnected region of each layer. Nozzle °C shows temperature shaping's \
-                         planned schedule directly. All views reflect the last slice — re-slice after \
+                         disconnected region of each layer. Nozzle °C shows the planned temp \
+                         schedule directly. All views reflect the last slice — re-slice after \
                          changing toggles.",
                     );
                     let before = self.color_by;
@@ -1745,8 +1745,8 @@ impl eframe::App for App {
                     let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     // Legend ends carry the real numbers: left = blue (safe), right = red (hot).
                     let anchored = self.color_by == ColorBy::Heat
-                        && (self.settings.thermal_governor || self.settings.temp_shaping)
-                        && self.settings.governor_max_heat_mw_mm2 > 0.0;
+                        && (self.settings.heat_control_speed || self.settings.heat_control_temp)
+                        && self.settings.max_heat_mw_mm2 > 0.0;
                     let (left, right, expl) = match self.color_by {
                         ColorBy::LayerTime => (
                             format!("{hi:.1}s"),
@@ -1768,21 +1768,21 @@ impl eframe::App for App {
                             (
                                 format!("{:.0} °C", base - span),
                                 format!("{:.0} °C", base + span),
-                                "Temperature shaping's schedule: the planned nozzle temperature of every \
+                                "Heat control's temp schedule: the planned nozzle temperature of every \
                                  layer, centered on the printing temperature — blue = scheduled cooler \
                                  (hot zones), red = scheduled warmer (cold bands). One flat color means \
-                                 nothing is scheduled (shaping off, or nothing to shape). The first \
+                                 nothing is scheduled ('schedule nozzle temp' off, or nothing to do). The first \
                                  layer's adhesion temperature is separate and not shown."
                                     .to_string(),
                             )
                         }
                         _ => {
-                            let governor_note = if anchored {
+                            let target_note = if anchored {
                                 let target_mw = self
                                     .slice_summary
                                     .as_ref()
                                     .map(|s| s.heat_target_mw)
-                                    .unwrap_or(self.settings.governor_max_heat_mw_mm2);
+                                    .unwrap_or(self.settings.max_heat_mw_mm2);
                                 format!(
                                     " The white tick marks the heat target in force ({target_mw:.1} \
                                      mW/mm² — the computed level in even mode) at its true position \
@@ -1801,8 +1801,8 @@ impl eframe::App for App {
                                      scored on its own: island energy ÷ (layer time × island footprint); \
                                      the cooling window stays the whole layer's, which is why lone \
                                      towers overheat and shared ones don't. A uniform band sitting at \
-                                     the tick is the governor holding everything exactly at the \
-                                     target — that's success, not a hot spot.{governor_note}"
+                                     the tick is heat control holding everything exactly at the \
+                                     target — that's success, not a hot spot.{target_note}"
                                 ),
                             )
                         }
@@ -1833,7 +1833,7 @@ impl eframe::App for App {
                                     .slice_summary
                                     .as_ref()
                                     .map(|s| s.heat_target_mw)
-                                    .unwrap_or(self.settings.governor_max_heat_mw_mm2);
+                                    .unwrap_or(self.settings.max_heat_mw_mm2);
                                 let lo = HEAT_SCALE_LO_MW.ln();
                                 let fr = ((target_mw.max(1e-6).ln() - lo)
                                     / (HEAT_SCALE_HI_MW.ln() - lo))
@@ -1993,40 +1993,50 @@ impl eframe::App for App {
                         "Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
                     hslider(ui, true, egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0), "min layer s",
                         "Cooling slowdown: layers faster than this are slowed so they can solidify.");
-                    hslider(ui, s.min_layer_time_s > 0.0 || s.thermal_governor, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0), "min mm/s",
-                        "Floor speed for the cooling slowdowns — both the minimum layer time and the thermal governor never push below it.");
-                    ui.checkbox(&mut s.thermal_governor, "thermal governor")
+                    hslider(ui, s.min_layer_time_s > 0.0 || s.heat_control_speed, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0), "min mm/s",
+                        "Floor speed for the cooling slowdowns — neither the minimum layer time nor heat control ever pushes below it.");
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("heat control").strong()).on_hover_text(
+                        "One thermal system, two levers: 'slow hot zones' governs print speed per \
+                         island, 'schedule nozzle temp' moves the temperature per layer range. \
+                         Both hold every region's heat load at the same target; the heat-load \
+                         preview shows the result.",
+                    );
+                    ui.checkbox(&mut s.heat_control_speed, "slow hot zones")
                         .on_hover_text(
-                            "Slow each hot island — a disconnected region of a layer — until its heat \
-                             load (deposited energy ÷ layer time ÷ island footprint) fits the target \
-                             below. Computed per slice on top of your speeds; switching it off restores \
-                             them exactly. Every intervention is listed in the slice summary, the \
-                             previews show the governed result, and speeds never drop below min mm/s.",
+                            "Heat control's speed lever: slow each hot island — a disconnected \
+                             region of a layer — until its heat load (deposited energy ÷ layer \
+                             time ÷ island footprint) fits the target below. Computed per slice on \
+                             top of your speeds; switching it off restores them exactly. Every \
+                             intervention is listed in the slice summary, the previews show the \
+                             slowed result, and speeds never drop below min mm/s.",
                         );
-                    hslider(ui, s.thermal_governor, egui::Slider::new(&mut s.governor_max_heat_mw_mm2, 2.0..=40.0), "max heat mW/mm²",
-                        "The heat-load ceiling, per island — used by the governor and as temperature shaping's reference level. Read natural values off the heat-load preview legend: broad hull-like regions sit low, lone towers spike. Lower = cooler but slower.");
-                    ui.checkbox(&mut s.temp_shaping, "temperature shaping")
+                    ui.checkbox(&mut s.heat_control_temp, "schedule nozzle temp")
                         .on_hover_text(
-                            "Bake a nozzle-temperature schedule into the g-code: cooler through layer \
-                             ranges that run over the heat target, gently warmer through cold bands \
-                             (evens deposition and gloss). Planned entirely at slice time from the \
-                             printer's heat/cool rates — asynchronous M104s with lead times, no live \
-                             feedback. Bounded by the filament's min/max °C; cooled zones also derate \
-                             the flow ceiling. Temperature is slow and global, so zones are layer \
-                             ranges — the governor stays the fast per-island lever.",
+                            "Heat control's temperature lever: bake a nozzle-temperature schedule \
+                             into the g-code — cooler through layer ranges that run over the heat \
+                             target, gently warmer through cold bands (evens deposition and \
+                             gloss). Planned entirely at slice time from the printer's heat/cool \
+                             rates — asynchronous M104s with lead times, no live feedback. Bounded \
+                             by the filament's min/max °C; cooled zones also derate the flow \
+                             ceiling. Temperature is slow and global, so zones are layer ranges — \
+                             'slow hot zones' stays the fast per-island lever.",
                         );
-                    hslider(ui, s.temp_shaping, egui::Slider::new(&mut s.temp_shaping_swing_c, 2.0..=30.0), "max swing °C",
-                        "Largest excursion shaping may schedule from the nozzle temperature, in both directions — always clipped by the filament's min/max window. Each layer is aimed exactly at the heat target (deposited power scales with °C above ambient), then clipped to these rails; temperature only has ~0.5%/°C of authority on the heat metric, so extremes peg the rails — but warming cold layers is free in print time and directly improves their layer bonding and gloss match.");
+                    let heat_on = s.heat_control_speed || s.heat_control_temp;
+                    hslider(ui, heat_on, egui::Slider::new(&mut s.max_heat_mw_mm2, 2.0..=40.0), "max heat mW/mm²",
+                        "The heat-load ceiling, per island — the one target both levers hold. Read natural values off the heat-load preview legend: broad hull-like regions sit low, lone towers spike. Lower = cooler but slower.");
                     ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("heat_mode")
-                            .selected_text(s.heat_mode.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Cap, "cap");
-                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Smooth, "smooth");
-                                ui.selectable_value(&mut s.heat_mode, config::HeatMode::Level, "level");
-                            });
+                        ui.add_enabled_ui(heat_on, |ui| {
+                            egui::ComboBox::from_id_salt("heat_mode")
+                                .selected_text(s.heat_mode.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Cap, "cap");
+                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Smooth, "smooth");
+                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Level, "level");
+                                });
+                        });
                         ui.label("heat goal").on_hover_text(
-                            "What the thermal levers aim at. Cap: a ceiling — nothing exceeds max \
+                            "What heat control aims at. Cap: a ceiling — nothing exceeds max \
                              heat, everything below is untouched (cheapest). Smooth: the heat load \
                              may change at most the %/layer below between neighbors — warm layers \
                              ramp into cold dips instead of cliffing, killing banding at transitions \
@@ -2034,8 +2044,10 @@ impl eframe::App for App {
                              coldest reachable heat load — maximal uniformity, maximal time.",
                         );
                     });
-                    hslider(ui, s.heat_mode == config::HeatMode::Smooth, egui::Slider::new(&mut s.heat_slew_pct_per_layer, 1.0..=25.0), "max change %/layer",
+                    hslider(ui, heat_on && s.heat_mode == config::HeatMode::Smooth, egui::Slider::new(&mut s.heat_slew_pct_per_layer, 1.0..=25.0), "max change %/layer",
                         "Smooth mode's gradient limit: the largest heat-load change allowed between adjacent layers. Lower = gentler transitions over more layers (slower); higher = sharper allowed steps.");
+                    hslider(ui, s.heat_control_temp, egui::Slider::new(&mut s.temp_swing_c, 2.0..=30.0), "max swing °C",
+                        "Largest excursion the temp schedule may take from the nozzle temperature, in both directions — always clipped by the filament's min/max window. Each layer is aimed exactly at the heat target (deposited power scales with °C above ambient), then clipped to these rails; temperature only has ~0.5%/°C of authority on the heat metric, so extremes peg the rails — but warming cold layers is free in print time and directly improves their layer bonding and gloss match.");
                     ui.weak("machine speed & accel live under Machine & motion");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
@@ -2078,9 +2090,9 @@ impl eframe::App for App {
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_nozzle_temp_c, 150..=300), "first layer °C",
                         "Hotend temperature for the first layer — usually a touch hotter for bed adhesion. The nozzle temperature takes over from layer 2.");
                     hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "min °C",
-                        "Coldest this filament prints acceptably — temperature shaping never schedules below it.");
+                        "Coldest this filament prints acceptably — the temp schedule never goes below it.");
                     hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "max °C",
-                        "Hottest this filament tolerates — temperature shaping never schedules above it.");
+                        "Hottest this filament tolerates — the temp schedule never goes above it.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
                         "Heated bed temperature.");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
@@ -2099,7 +2111,7 @@ impl eframe::App for App {
                     hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
                         mf_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.max_flow_derate_per_c, 0.0..=1.0), "flow derate /°C",
-                        "How much of the melt ceiling is lost per °C below the nozzle temperature. When temperature shaping cools a zone, that zone's max flow — and therefore its clamped speeds — shrink by this. mm³/s per °C; never raises the cap on warmer layers.");
+                        "How much of the melt ceiling is lost per °C below the nozzle temperature. When heat control cools a zone, that zone's max flow — and therefore its clamped speeds — shrink by this. mm³/s per °C; never raises the cap on warmer layers.");
                     hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
                         "Global extrusion multiplier — filament-specific flow tuning.");
                     hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
@@ -2152,11 +2164,11 @@ impl eframe::App for App {
                         &mut pins.first_layer_accel, config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2),
                         "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
                     hslider(ui, true, egui::Slider::new(&mut s.heat_rate_c_s, 0.2..=10.0), "heat °C/s",
-                        "How fast the hotend heats near printing temperatures. Temperature shaping starts warming ramps this much ahead so the nozzle arrives on temperature. Conservative default — a Moonraker calibration routine will measure the real value.");
+                        "How fast the hotend heats near printing temperatures. Heat control's temp schedule starts warming ramps this much ahead so the nozzle arrives on temperature. Conservative default — a Moonraker calibration routine will measure the real value.");
                     hslider(ui, true, egui::Slider::new(&mut s.cool_rate_c_s, 0.1..=5.0), "cool °C/s",
                         "Passive cooling rate near printing temperatures — far slower than heating; this sets the long lead times for cooling into a zone. Conservative default until measured.");
                     hslider(ui, true, egui::Slider::new(&mut s.heat_rate_fan_c_s, 0.2..=10.0), "heat °C/s (fan)",
-                        "Heating rate with the part fan at 100% — spillover steals heater power. Shaping interpolates between the fan-off and fan-on pairs by the filament's fan duty. Follows the fan-off rate until measured.");
+                        "Heating rate with the part fan at 100% — spillover steals heater power. The temp schedule interpolates between the fan-off and fan-on pairs by the filament's fan duty. Follows the fan-off rate until measured.");
                     hslider(ui, true, egui::Slider::new(&mut s.cool_rate_fan_c_s, 0.1..=10.0), "cool °C/s (fan)",
                         "Cooling rate with the part fan at 100% — the realistic in-print case, faster than passive. Follows the fan-off rate until measured.");
                     if ui
@@ -2168,7 +2180,7 @@ impl eframe::App for App {
                              the nozzle target around the printing temperature — fan off and at \
                              100% — and fits all four heating/cooling rates. Saves them into the \
                              printer profile. Takes a few minutes; clear the bed first. Never runs \
-                             on its own: temperature shaping just reads the saved rates at slice time.",
+                             on its own: the temp schedule just reads the saved rates at slice time.",
                         )
                         .on_disabled_hover_text(
                             "Needs a printer host (Connection section) and no other printer operation in flight.",

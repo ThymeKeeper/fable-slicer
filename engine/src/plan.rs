@@ -109,7 +109,7 @@ pub struct LayerPlan {
     pub outline: Polygons,
     /// Speed multiplier (≤1) applied to this layer for min-layer-time cooling.
     pub speed_scale: f64,
-    /// Per-path speed multipliers (≤1) from the thermal governor, parallel to
+    /// Per-path speed multipliers (≤1) from heat control's speed lever, parallel to
     /// `paths`; empty = all 1.0. Multiplies on top of `speed_scale`.
     pub path_speed_scale: Vec<f64>,
     /// Park-and-wait cooling dwell (s) appended after this layer: when an
@@ -118,13 +118,13 @@ pub struct LayerPlan {
     /// is the one unbounded lever. Emitted retracted and lifted clear.
     pub dwell_s: f64,
     /// The heat target (W/mm²) pinned at plan time — computed once on the raw
-    /// plan and stored so shaping, the governor, the audits, and the GUI all
+    /// plan and stored so both levers, the audits, and the GUI all
     /// chase the same number (recomputing on the governed plan drifts).
     pub planned_heat_target: Option<f64>,
-    /// Nozzle °C temperature shaping plans for this layer (None = the profile
+    /// Nozzle °C the temp schedule plans for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
-    /// Emit `M104 S<this>` at the layer's start — shaping's scheduled,
+    /// Emit `M104 S<this>` at the layer's start — the temp schedule's
     /// lead-adjusted setpoint staircase. Asynchronous by design: planned at
     /// slice time from the printer's ramp rates, no live feedback.
     pub temp_command_c: Option<f64>,
@@ -688,18 +688,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
-    // Pin per-layer heat targets on the raw plan — shaping and governing
+    // Pin per-layer heat targets on the raw plan — both heat-control levers
     // change the very quantities the targets are computed from, so everything
     // downstream must chase the same frozen numbers.
     let heat_targets = crate::emit::plan_heat_targets(&plans, settings);
     for (plan, t) in plans.iter_mut().zip(heat_targets) {
         plan.planned_heat_target = Some(t);
     }
-    // Temperature shaping first (it lowers deposited energy and flow caps in
-    // the zones it cools), then the speed governor mops up what remains —
+    // The temperature lever first (it lowers deposited energy and flow caps in
+    // the zones it cools), then the speed lever mops up what remains —
     // both stack on the min-layer-time pacing.
-    crate::emit::apply_temp_shaping(&mut plans, settings);
-    crate::emit::apply_thermal_governor(&mut plans, settings);
+    crate::emit::apply_heat_control_temp(&mut plans, settings);
+    crate::emit::apply_heat_control_speed(&mut plans, settings);
     plans
 }
 
