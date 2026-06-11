@@ -12,7 +12,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InfillPattern, SeamMode, Settings, SupportMode, WallMode, GENERIC_END_GCODE, GENERIC_START_GCODE};
+use crate::{
+    HeatMode, InfillPattern, SeamMode, Settings, SupportMode, WallMode, GENERIC_END_GCODE,
+    GENERIC_START_GCODE,
+};
 
 /// Printer (machine) tier: bed, extruder, and start/end g-code.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -232,6 +235,10 @@ pub struct ProcessProfile {
     pub temp_shaping: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_shaping_swing_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_slew_pct_per_layer: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -295,7 +302,7 @@ impl Tier for ProcessProfile {
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
             external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
             gap_fill_speed_mm_s, bridge_flow, thermal_governor, governor_max_heat_mw_mm2,
-            temp_shaping, temp_shaping_swing_c)
+            temp_shaping, temp_shaping_swing_c, heat_mode, heat_slew_pct_per_layer)
     }
 }
 
@@ -444,6 +451,8 @@ impl ProcessProfile {
             governor_max_heat_mw_mm2: diff_field!(cur.governor_max_heat_mw_mm2, base.governor_max_heat_mw_mm2),
             temp_shaping: diff_field!(cur.temp_shaping, base.temp_shaping),
             temp_shaping_swing_c: diff_field!(cur.temp_shaping_swing_c, base.temp_shaping_swing_c),
+            heat_mode: diff_field!(cur.heat_mode.label().to_string(), base.heat_mode.label().to_string()),
+            heat_slew_pct_per_layer: diff_field!(cur.heat_slew_pct_per_layer, base.heat_slew_pct_per_layer),
         }
     }
 
@@ -821,6 +830,10 @@ impl Profiles {
                 .unwrap_or(d.governor_max_heat_mw_mm2),
             temp_shaping: pc.temp_shaping.unwrap_or(d.temp_shaping),
             temp_shaping_swing_c: pc.temp_shaping_swing_c.unwrap_or(d.temp_shaping_swing_c),
+            heat_mode: pc.heat_mode.as_deref().and_then(HeatMode::parse).unwrap_or(d.heat_mode),
+            heat_slew_pct_per_layer: pc
+                .heat_slew_pct_per_layer
+                .unwrap_or(d.heat_slew_pct_per_layer),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
             fan_speed: fl.fan_speed.unwrap_or(d.fan_speed),
             bridge_fan_speed: fl.bridge_fan_speed.unwrap_or(d.bridge_fan_speed),

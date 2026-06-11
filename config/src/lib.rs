@@ -30,6 +30,42 @@ G1 Z5 F600
 G90
 M84";
 
+/// What the thermal system (governor + temperature shaping) aims its
+/// per-layer heat targets at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HeatMode {
+    /// Ceiling only: no island may exceed the heat target; below it, hands off.
+    #[default]
+    Cap,
+    /// Gradient limit: the heat load may change by at most
+    /// `heat_slew_pct_per_layer` between adjacent layers — warmer neighbors
+    /// ramp into cold dips instead of cliffing at them, killing banding at
+    /// transitions (a deck seam) without paying for full uniformity. The cap
+    /// still applies on top.
+    Smooth,
+    /// Level the whole print at the coldest reachable heat load — maximal
+    /// uniformity, maximal time cost.
+    Level,
+}
+
+impl HeatMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "cap" => Some(Self::Cap),
+            "smooth" | "slew" => Some(Self::Smooth),
+            "level" | "even" => Some(Self::Level),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cap => "cap",
+            Self::Smooth => "smooth",
+            Self::Level => "level",
+        }
+    }
+}
+
 /// Where the start/end seam of each closed wall loop is placed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SeamMode {
@@ -421,9 +457,17 @@ pub struct Settings {
     /// Bounded by the filament's min/max °C; cooled layers derate the flow
     /// ceiling via `max_flow_derate_per_c`.
     pub temp_shaping: bool,
-    /// Largest excursion shaping may schedule from the nozzle temp (°C).
-    /// Cooling uses up to all of it; warming at most 40% of it.
+    /// Largest excursion shaping may schedule from the nozzle temp (°C),
+    /// symmetric — both rails sit `swing` from the printing temperature,
+    /// always clipped by the filament's min/max window. Warming is free in
+    /// print time; its only cost is hotter-deposition side effects (gloss,
+    /// possible stringing on travel-heavy layers).
     pub temp_shaping_swing_c: f64,
+    /// What the thermal system aims at — see [`HeatMode`].
+    pub heat_mode: HeatMode,
+    /// Smooth mode: largest allowed heat-load change between adjacent layers
+    /// (% per layer). Transitions get ramped over enough layers to respect it.
+    pub heat_slew_pct_per_layer: f64,
 
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
@@ -532,6 +576,8 @@ impl Default for Settings {
             // 20 °C of cooling reaches a typical PLA's lower window edge —
             // the deepest rail the schedule can use on chronically hot zones.
             temp_shaping_swing_c: 20.0,
+            heat_mode: HeatMode::Cap,
+            heat_slew_pct_per_layer: 5.0,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }

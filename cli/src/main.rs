@@ -279,6 +279,19 @@ fn main() -> Result<()> {
             settings.max_volumetric_speed_mm3_s
         );
     }
+    if settings.thermal_governor || settings.temp_shaping {
+        match settings.heat_mode {
+            config::HeatMode::Level => println!(
+                "Heat level: {:.1} mW/mm2 (leveled to the coldest region)",
+                engine::effective_heat_target(&layers, &settings) * 1e3
+            ),
+            config::HeatMode::Smooth => println!(
+                "Heat smoothing: change limited to {:.1}%/layer (cap {:.0} mW/mm2)",
+                settings.heat_slew_pct_per_layer, settings.governor_max_heat_mw_mm2
+            ),
+            config::HeatMode::Cap => {}
+        }
+    }
     for z in engine::audit_temp_shaping(&layers, &settings) {
         println!(
             "Temp shaping: layers {}-{} -> {:.0}C",

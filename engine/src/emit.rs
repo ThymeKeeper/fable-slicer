@@ -63,6 +63,15 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             ));
         }
     }
+    if s.thermal_governor || s.temp_shaping {
+        let t = effective_heat_target(layers, s) * 1e3;
+        let mode = match s.heat_mode {
+            config::HeatMode::Cap => "",
+            config::HeatMode::Smooth => " (smooth mode: per-layer slew-limited targets)",
+            config::HeatMode::Level => " (even mode: leveled to the coldest region)",
+        };
+        g.comment(&format!("heat target = {t:.1} mW/mm2{mode}"));
+    }
     if s.temp_shaping {
         for z in audit_temp_shaping(layers, s) {
             g.comment(&format!(
@@ -1194,6 +1203,122 @@ fn islands_of(layer: &LayerPlan, s: &Settings) -> LayerIslands {
     }
 }
 
+/// The heat target in force (W/mm²). Cap mode: the user's `max heat` slider.
+/// Even mode (`thermal_even`): the target becomes a LEVEL — the coldest
+/// layer's aggregate heat load, lifted by what warming can add — so every
+/// layer is pulled onto one line by temperature, speed, and dwell together
+/// and the whole heat map flattens. Cold layers can only be *raised* the few
+/// percent the warm rail affords, which is why the level chases the coldest
+/// region rather than some middle: it is the highest level every layer can
+/// actually reach. The slider stays as the upper bound. Deterministic — the
+/// model stays monotone, so no search is needed even in concert.
+pub fn effective_heat_target(layers: &[LayerPlan], s: &Settings) -> f64 {
+    // Pinned at plan time: every pass and audit chases the same numbers.
+    if let Some(t) = layers.iter().find_map(|l| l.planned_heat_target) {
+        return t;
+    }
+    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    match s.heat_mode {
+        config::HeatMode::Level => level_to_coldest(layers, s, cap),
+        _ => cap,
+    }
+}
+
+/// Per-layer heat targets (W/mm²), pinned onto the plan before shaping and
+/// governing run. Cap: the slider everywhere. Level: one number the whole
+/// print can share. Smooth: the natural heat curve clipped by the cap, then
+/// min-propagated outward from every cold dip at the slew rate — warm
+/// neighbors ramp into dips instead of cliffing at them, so a transition
+/// costs a couple dozen ramp layers instead of the whole print.
+pub fn plan_heat_targets(layers: &[LayerPlan], s: &Settings) -> Vec<f64> {
+    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    let n = layers.len();
+    match s.heat_mode {
+        config::HeatMode::Cap => vec![cap; n],
+        config::HeatMode::Level => vec![level_to_coldest(layers, s, cap); n],
+        config::HeatMode::Smooth => {
+            let g = 1.0 + s.heat_slew_pct_per_layer.max(0.1) / 100.0;
+            let mut b = vec![cap; n];
+            for (i, layer) in layers.iter().enumerate().skip(1) {
+                let li = islands_of(layer, s);
+                let t = layer_print_seconds(layer, s, layer.speed_scale).max(0.05);
+                let (mut j, mut a) = (0.0_f64, 0.0_f64);
+                for isl in li.islands.iter().filter(|isl| isl.joules > 0.0) {
+                    j += isl.joules;
+                    a += isl.footprint_mm2;
+                }
+                if a > 0.0 && j > 0.0 {
+                    b[i] = (j / (t * a)).min(cap);
+                }
+            }
+            // The first layer is adhesion policy, not a thermal preference —
+            // it neither pulls its neighbors down nor gets pulled.
+            for i in 2..n {
+                b[i] = b[i].min(b[i - 1] * g);
+            }
+            for i in (1..n.saturating_sub(1)).rev() {
+                b[i] = b[i].min(b[i + 1] * g);
+            }
+            for v in &mut b {
+                *v = v.max(0.2e-3);
+            }
+            b
+        }
+    }
+}
+
+/// The level-mode target: the highest heat load every layer can reach.
+fn level_to_coldest(layers: &[LayerPlan], s: &Settings, cap: f64) -> f64 {
+    let base = s.nozzle_temp_c as f64;
+    let swing = s.temp_shaping_swing_c.max(0.0);
+    let tmin = (s.nozzle_temp_min_c as f64).min(base);
+    let warm_gain = ((base + swing).min(s.nozzle_temp_max_c as f64) - AMBIENT_C)
+        / (base - AMBIENT_C).max(1.0);
+    let cool_gain =
+        ((base - swing).max(tmin) - AMBIENT_C).max(1.0) / (base - AMBIENT_C).max(1.0);
+    let floor_v = s.min_print_speed_mm_s.max(1.0);
+    // Two bounds meet in the middle: the coldest layer can only be RAISED the
+    // few percent the warm rail affords, and the hardest-to-cool island can
+    // only be LOWERED so far (cool rail + speed floor + the dwell cap). The
+    // level is the highest value both sides can actually reach — chasing the
+    // absolute coldest layer alone demands more dwell than the cap allows and
+    // strands the print "hot at the cap" everywhere.
+    let mut coldest = f64::INFINITY;
+    let mut hardest = 0.0_f64;
+    for layer in layers.iter().skip(1) {
+        let li = islands_of(layer, s);
+        let t = layer_print_seconds(layer, s, layer.speed_scale).max(0.05);
+        // Reachable layer time: every path at the floor speed plus the full
+        // dwell cap (travel time only adds, so the bound stays conservative).
+        let len: f64 = layer
+            .paths
+            .iter()
+            .map(|p| {
+                let mut l: f64 = p.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
+                if p.closed && p.points.len() >= 2 {
+                    l += dist_mm(p.points[p.points.len() - 1], p.points[0]);
+                }
+                l
+            })
+            .sum();
+        let t_reach = (len / floor_v + max_dwell_s(s)).max(t);
+        let (mut j, mut a) = (0.0_f64, 0.0_f64);
+        for isl in li.islands.iter().filter(|i| i.joules > 0.0) {
+            j += isl.joules;
+            a += isl.footprint_mm2;
+            hardest = hardest
+                .max(isl.joules * cool_gain / (t_reach * isl.footprint_mm2.max(1e-9)));
+        }
+        if a > 0.0 && j > 0.0 {
+            coldest = coldest.min(j / (t * a));
+        }
+    }
+    if !coldest.is_finite() {
+        return cap;
+    }
+    (coldest * warm_gain).max(hardest).clamp(0.2e-3, cap)
+}
+
 /// Temperature shaping (v2, temp lever): bake a nozzle-temperature schedule
 /// into the plan — cooler through chronically hot layer ranges, gently warmer
 /// through cold bands — so deposition conditions even out toward the heat
@@ -1215,16 +1340,21 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
     let tmin = (s.nozzle_temp_min_c as f64).min(base);
     let tmax = (s.nozzle_temp_max_c as f64).max(base);
     let swing = s.temp_shaping_swing_c.max(0.0);
-    let target = s.governor_max_heat_mw_mm2 * 1e-3; // the thermal reference level
-    if target <= 0.0 || swing <= 0.0 {
+    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
+    if cap <= 0.0 || swing <= 0.0 {
         return;
     }
     let n = layers.len();
-    // 1. Raw demand from each layer's hottest island.
+    // 1. Raw demand from each layer's hottest island, against the layer's own
+    //    pinned target (per-layer in smooth mode).
     let mut demand = vec![base; n];
     let mut secs = vec![0.05_f64; n];
     for (i, layer) in layers.iter().enumerate() {
         secs[i] = layer_print_seconds(layer, s, layer.speed_scale).max(0.05);
+        let target = layer.planned_heat_target.unwrap_or(cap);
+        if target <= 0.0 {
+            continue;
+        }
         if i == 0 {
             continue; // the first layer owns its own (adhesion) temperature
         }
@@ -1255,7 +1385,7 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
             continue;
         }
         let ideal = AMBIENT_C + (base - AMBIENT_C) * (target / q_eff);
-        demand[i] = ideal.clamp(base - swing, base + 0.4 * swing).clamp(tmin, tmax);
+        demand[i] = ideal.clamp(base - swing, base + swing).clamp(tmin, tmax);
     }
     // 2. Suppress zones the hotend can't meaningfully follow (< ~20 s): short
     //    runs of a new value adopt their predecessor's temperature.
@@ -1364,9 +1494,14 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
     if s.spiral_vase {
         return;
     }
-    let target = s.governor_max_heat_mw_mm2 * 1e-3; // mW/mm² → W/mm²
     let floor_v = s.min_print_speed_mm_s.max(1.0);
+    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
     for layer in layers.iter_mut() {
+        // Each layer chases its own pinned target (per-layer in smooth mode).
+        let target = layer.planned_heat_target.unwrap_or(cap);
+        if target <= 0.0 {
+            continue;
+        }
         let li = islands_of(layer, s);
         let n_isl = li.islands.len();
         if n_isl == 0 || layer.paths.is_empty() {
@@ -1458,7 +1593,7 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
             }
         }
         if dwell_needed > 0.05 {
-            layer.dwell_s = dwell_needed.min(MAX_DWELL_S);
+            layer.dwell_s = dwell_needed.min(max_dwell_s(s));
         }
     }
 }
@@ -1467,6 +1602,21 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
 /// geometry demanding minutes of parking; the audit flags what the cap leaves
 /// hot.
 const MAX_DWELL_S: f64 = 20.0;
+
+/// Even mode's dwell cap. Leveling exists to trade time for uniformity, and
+/// the cap is what sets how low the level can reach (tiny layers need long
+/// parks to match a cold deck) — so it gets a far bigger budget than the
+/// protective cap-mode backstop.
+const MAX_DWELL_EVEN_S: f64 = 90.0;
+
+/// The dwell budget in force for the current mode — the uniformity modes
+/// exist to trade time for evenness, so they get the big budget.
+fn max_dwell_s(s: &Settings) -> f64 {
+    match s.heat_mode {
+        config::HeatMode::Level | config::HeatMode::Smooth => MAX_DWELL_EVEN_S,
+        config::HeatMode::Cap => MAX_DWELL_S,
+    }
+}
 
 /// How high the nozzle lifts while spending a cooling dwell.
 const DWELL_LIFT_MM: f64 = 5.0;
@@ -1487,14 +1637,16 @@ pub struct GovernorRow {
 /// Where the thermal governor intervened — read back from the plan the same
 /// way the g-code is generated, so the report can't drift from reality.
 pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
-    let target = s.governor_max_heat_mw_mm2 * 1e-3;
+    let cap = s.governor_max_heat_mw_mm2 * 1e-3;
     let mut rows: Vec<GovernorRow> = Vec::new();
     for layer in layers {
         if layer.path_speed_scale.iter().all(|&fk| fk >= 0.999) && layer.dwell_s <= 0.0 {
             continue; // empty (ungoverned) vecs land here too
         }
         let worst = layer.path_speed_scale.iter().copied().fold(1.0, f64::min);
-        // Post-governor heat check: anything still hot ran out of floor.
+        // Post-governor heat check against the layer's own pinned target:
+        // anything still hot ran out of floor and dwell.
+        let target = layer.planned_heat_target.unwrap_or(cap);
         let li = islands_of(layer, s);
         let t = layer_print_seconds(layer, s, layer.speed_scale);
         let floor = li.islands.iter().any(|isl| {
@@ -1763,8 +1915,8 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 mod tests {
     use super::{fit_arc, ARC_MIN_PTS, AMBIENT_C, CP_J_PER_G_K};
     use crate::{
-        audit_governor, estimate_filament, estimate_seconds, generate, per_layer_islands,
-        per_layer_stats, to_gcode,
+        audit_governor, effective_heat_target, estimate_filament, estimate_seconds, generate,
+        per_layer_islands, per_layer_stats, to_gcode,
     };
     use config::Settings;
 
@@ -2029,6 +2181,95 @@ mod tests {
         );
         // Slowing costs time, and the estimator reports it honestly.
         assert!(estimate_seconds(&governed, &s) > estimate_seconds(&plain, &s));
+    }
+
+    #[test]
+    fn even_mode_levels_the_print() {
+        // A 20 mm base with a 5×5×20 tower on top: naturally the base runs a
+        // few mW/mm² and the tower ~20+. Even mode must pull every island
+        // down to (about) the coldest layer's level using all three levers.
+        let base = mesh::Mesh::cube(20.0);
+        let spire = mesh::Mesh::cube(5.0);
+        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
+        for i in 0..base.triangles.len() {
+            soup.push(base.triangle(i));
+        }
+        for i in 0..spire.triangles.len() {
+            let t = spire.triangle(i);
+            soup.push(t.map(|v| [v[0] + 7.5, v[1] + 7.5, v[2] * 4.0 + 20.0]));
+        }
+        let m = mesh::Mesh::from_triangle_soup(&soup);
+        let mut s = Settings::default();
+        s.min_layer_time_s = 0.0;
+        s.thermal_governor = true;
+        s.temp_shaping = true;
+        s.heat_mode = config::HeatMode::Level;
+        let layers = generate(&m, &s);
+        let eff = effective_heat_target(&layers, &s);
+        assert!(
+            eff < s.governor_max_heat_mw_mm2 * 1e-3,
+            "the level sits below the cap"
+        );
+        // Every island in the print sits at or under the level.
+        let stats = per_layer_stats(&layers, &s);
+        let isl = per_layer_islands(&layers, &s);
+        let mut qmax = 0.0_f64;
+        for i in 1..layers.len() {
+            for island in isl[i].islands.iter().filter(|i| i.joules > 0.0) {
+                qmax = qmax.max(
+                    island.joules / (stats[i].secs.max(1e-9) * island.footprint_mm2.max(1e-9)),
+                );
+            }
+        }
+        assert!(qmax <= eff * 1.10, "leveled: hottest {qmax} vs level {eff}");
+    }
+
+    #[test]
+    fn smooth_mode_limits_layer_to_layer_heat_change() {
+        // Base + spire: the natural heat curve cliffs at the junction. Smooth
+        // mode must turn every cliff into a ramp no steeper than the slew.
+        let base = mesh::Mesh::cube(20.0);
+        let spire = mesh::Mesh::cube(5.0);
+        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
+        for i in 0..base.triangles.len() {
+            soup.push(base.triangle(i));
+        }
+        for i in 0..spire.triangles.len() {
+            let t = spire.triangle(i);
+            soup.push(t.map(|v| [v[0] + 7.5, v[1] + 7.5, v[2] * 4.0 + 20.0]));
+        }
+        let m = mesh::Mesh::from_triangle_soup(&soup);
+        let mut s = Settings::default();
+        s.min_layer_time_s = 0.0;
+        s.thermal_governor = true;
+        s.temp_shaping = true;
+        s.heat_mode = config::HeatMode::Smooth;
+        s.heat_slew_pct_per_layer = 5.0;
+        let layers = generate(&m, &s);
+        let stats = per_layer_stats(&layers, &s);
+        let isl = per_layer_islands(&layers, &s);
+        let q: Vec<f64> = (0..layers.len())
+            .map(|i| {
+                let (mut j, mut a) = (0.0_f64, 0.0_f64);
+                for island in isl[i].islands.iter().filter(|x| x.joules > 0.0) {
+                    j += island.joules;
+                    a += island.footprint_mm2;
+                }
+                j / (stats[i].secs.max(1e-9) * a.max(1e-9))
+            })
+            .collect();
+        let g = 1.0 + s.heat_slew_pct_per_layer / 100.0;
+        for i in 2..q.len() - 1 {
+            if q[i] <= 0.0 || q[i + 1] <= 0.0 {
+                continue;
+            }
+            let ratio = (q[i + 1] / q[i]).max(q[i] / q[i + 1]);
+            assert!(
+                ratio <= g * 1.15,
+                "layers {i}->{}: heat jumped ×{ratio:.3} (limit ×{g:.3})",
+                i + 1
+            );
+        }
     }
 
     #[test]

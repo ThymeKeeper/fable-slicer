@@ -117,6 +117,10 @@ pub struct LayerPlan {
     /// floor, tiny layers run out of path to slow — time without extrusion
     /// is the one unbounded lever. Emitted retracted and lifted clear.
     pub dwell_s: f64,
+    /// The heat target (W/mm²) pinned at plan time — computed once on the raw
+    /// plan and stored so shaping, the governor, the audits, and the GUI all
+    /// chase the same number (recomputing on the governed plan drifts).
+    pub planned_heat_target: Option<f64>,
     /// Nozzle °C temperature shaping plans for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
@@ -652,6 +656,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             speed_scale: 1.0,
             path_speed_scale: Vec::new(),
             dwell_s: 0.0,
+            planned_heat_target: None,
             planned_temp_c: None,
             temp_command_c: None,
         }
@@ -683,6 +688,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
+    // Pin per-layer heat targets on the raw plan — shaping and governing
+    // change the very quantities the targets are computed from, so everything
+    // downstream must chase the same frozen numbers.
+    let heat_targets = crate::emit::plan_heat_targets(&plans, settings);
+    for (plan, t) in plans.iter_mut().zip(heat_targets) {
+        plan.planned_heat_target = Some(t);
+    }
     // Temperature shaping first (it lowers deposited energy and flow caps in
     // the zones it cools), then the speed governor mops up what remains —
     // both stack on the min-layer-time pacing.
