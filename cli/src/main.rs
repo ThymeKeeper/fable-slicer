@@ -286,12 +286,13 @@ fn main() -> Result<()> {
         );
     }
     for r in engine::audit_governor(&layers, &settings) {
+        let dwell = if r.dwell_s > 0.05 { format!(" + {:.1}s dwell", r.dwell_s) } else { String::new() };
         println!(
-            "Thermal governor: layers {}-{} slowed to {:.0}%{}",
+            "Thermal governor: layers {}-{} slowed to {:.0}%{dwell}{}",
             r.first_layer,
             r.last_layer,
             r.worst_scale * 100.0,
-            if r.floor_hit { " (still hot at the min-speed floor)" } else { "" }
+            if r.floor_hit { " (still hot at the cap)" } else { "" }
         );
     }
 

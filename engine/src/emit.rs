@@ -73,12 +73,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     }
     if s.thermal_governor {
         for r in audit_governor(layers, s) {
+            let dwell = if r.dwell_s > 0.05 { format!(" + {:.1}s dwell", r.dwell_s) } else { String::new() };
             g.comment(&format!(
-                "thermal governor: layers {}-{} slowed to {:.0}%{}",
+                "thermal governor: layers {}-{} slowed to {:.0}%{dwell}{}",
                 r.first_layer,
                 r.last_layer,
                 r.worst_scale * 100.0,
-                if r.floor_hit { " (still hot at the min-speed floor)" } else { "" }
+                if r.floor_hit { " (still hot at the cap)" } else { "" }
             ));
         }
     }
@@ -288,6 +289,22 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 }
             }
             wipe_tail = compute_wipe_tail(path, s.wipe_mm);
+        }
+
+        // Park-and-wait cooling dwell: the governor banked seconds here when
+        // an island was over the heat target with every path already at the
+        // speed floor. Spend them retracted and lifted clear of the part so
+        // the hot block doesn't cook what it just printed.
+        if layer.dwell_s > 0.0 {
+            if s.retract_len_mm > 0.0 {
+                g.retract(s.retract_len_mm, retract_f);
+            }
+            g.move_z((layer.print_z_mm + DWELL_LIFT_MM).min(s.bed_size_z_mm.max(layer.print_z_mm)), travel_f);
+            g.raw(&format!("G4 P{:.0}", layer.dwell_s * 1000.0));
+            g.move_z(layer.print_z_mm, travel_f);
+            if s.retract_len_mm > 0.0 {
+                g.unretract(s.retract_len_mm, retract_f);
+            }
         }
     }
 
@@ -797,7 +814,9 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
         last_pos = Some(path_end(path));
         prev_path_len = path.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
     }
-    t
+    // The park-and-wait dwell is wall time like any other: estimates, M73,
+    // heat metrics, and the audits all see it through this one function.
+    t + layer.dwell_s
 }
 
 /// Plan the lead-in travel for every path: comb a route that stays inside the
@@ -1210,21 +1229,33 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
             continue; // the first layer owns its own (adhesion) temperature
         }
         let li = islands_of(layer, s);
-        let qmax = li
-            .islands
-            .iter()
-            .filter(|isl| isl.joules > 0.0)
-            .map(|isl| isl.joules / (secs[i] * isl.footprint_mm2.max(1e-9)))
-            .fold(0.0_f64, f64::max);
-        if qmax > target {
-            // Hot: cool proportionally — the full swing at 2× over target.
-            let sev = (qmax / target - 1.0).clamp(0.0, 1.0);
-            demand[i] = (base - swing * sev).max(tmin);
-        } else if qmax > 0.0 && qmax < 0.6 * target {
-            // Cold band: warm gently toward even deposition (≤ 40% of swing).
-            let sev = (1.0 - qmax / (0.6 * target)).clamp(0.0, 1.0);
-            demand[i] = (base + 0.4 * swing * sev).min(tmax);
+        let mut q_hot = 0.0_f64;
+        let (mut jsum, mut asum) = (0.0_f64, 0.0_f64);
+        for isl in li.islands.iter().filter(|isl| isl.joules > 0.0) {
+            q_hot = q_hot.max(isl.joules / (secs[i] * isl.footprint_mm2.max(1e-9)));
+            jsum += isl.joules;
+            asum += isl.footprint_mm2;
         }
+        if asum <= 0.0 {
+            continue;
+        }
+        // Deposited power scales with (T − ambient), so the temperature that
+        // lands a layer exactly on the heat target is
+        //     T = ambient + (base − ambient) · target / q
+        // — a continuous law, no thresholds, no dead zone: every layer is
+        // aimed at the target and the swing/window rails clip the result.
+        // Hot layers judge by their hottest island (safety); cold ones by the
+        // layer aggregate (one warm sliver must not veto a cold deck).
+        // Temperature has only ~0.5%/°C of authority while q varies several
+        // fold, so most layers rightly sit pegged at a rail — the bands in
+        // the nozzle-°C view are actuator saturation, not timidity. What the
+        // rails can't reach, the speed governor and the fan still can.
+        let q_eff = if q_hot > target { q_hot } else { jsum / (secs[i] * asum) };
+        if q_eff <= 0.0 {
+            continue;
+        }
+        let ideal = AMBIENT_C + (base - AMBIENT_C) * (target / q_eff);
+        demand[i] = ideal.clamp(base - swing, base + 0.4 * swing).clamp(tmin, tmax);
     }
     // 2. Suppress zones the hotend can't meaningfully follow (< ~20 s): short
     //    runs of a new value adopt their predecessor's temperature.
@@ -1248,8 +1279,13 @@ pub fn apply_temp_shaping(layers: &mut [LayerPlan], s: &Settings) {
     //    layers must already be partway there — cooling is the slow direction,
     //    so cool zones pull a long lead. Then a forward pass re-anchors on the
     //    fixed first-layer temperature (leads that don't fit arrive late).
-    let heat = s.heat_rate_c_s.max(0.1);
-    let cool = s.cool_rate_c_s.max(0.05);
+    // The fan changes both rates (spillover cools the block), and it runs for
+    // essentially every layer shaping touches — interpolate the profiled
+    // off/on pairs by the filament's fan duty. (Flow cooling isn't captured
+    // by the static profile; leads stay slightly conservative because of it.)
+    let duty = s.fan_speed.clamp(0.0, 1.0);
+    let heat = (s.heat_rate_c_s + (s.heat_rate_fan_c_s - s.heat_rate_c_s) * duty).max(0.1);
+    let cool = (s.cool_rate_c_s + (s.cool_rate_fan_c_s - s.cool_rate_c_s) * duty).max(0.05);
     for i in (0..n - 1).rev() {
         let reach_dn = cool * secs[i + 1];
         let reach_up = heat * secs[i + 1];
@@ -1289,7 +1325,12 @@ pub fn audit_temp_shaping(layers: &[LayerPlan], s: &Settings) -> Vec<TempZone> {
     for layer in layers {
         let Some(t) = layer.planned_temp_c else { continue };
         match rows.last_mut() {
-            Some(r) if r.last_layer + 1 == layer.index => {
+            // Merge contiguous layers shaped in the SAME direction — a warm
+            // band and the cool band after it stay separate rows.
+            Some(r)
+                if r.last_layer + 1 == layer.index
+                    && (r.temp_c - base).signum() == (t - base).signum() =>
+            {
                 r.last_layer = layer.index;
                 if (t - base).abs() > (r.temp_c - base).abs() {
                     r.temp_c = t;
@@ -1359,6 +1400,7 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
         let mut t_ext: Vec<f64> = (0..n_isl).map(|k| island_time(k, 1.0)).collect();
         let mut t_layer = layer_print_seconds(layer, s, layer.speed_scale);
         let mut f = vec![1.0_f64; n_isl];
+        let mut dwell_needed = 0.0_f64;
         // Worst-first: slowing one island lengthens the layer, cooling the rest.
         let q0: Vec<f64> = (0..n_isl)
             .map(|k| {
@@ -1378,10 +1420,17 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
             // The whole layer must take this long for island k to fit.
             let t_needed = li.islands[k].joules / (target * area);
             let t_others = t_layer - t_ext[k];
-            if t_others + island_time(k, 0.0) < t_needed {
-                // Hot even with every path at its floor: take the floor and
-                // let the audit say so — slowing can't fix this island.
+            let t_floor = t_others + island_time(k, 0.0);
+            if t_floor < t_needed {
+                // Every path at its floor and still hot: tiny layers run out
+                // of path to slow. Bank the remaining seconds as a parked
+                // cooling dwell — time without extrusion is unbounded, which
+                // makes the target reachable for every layer (up to the cap).
                 f[k] = 0.0;
+                dwell_needed += t_needed - t_floor;
+                t_ext[k] = island_time(k, 0.0);
+                t_layer = t_needed;
+                continue;
             } else {
                 // Bisect the factor against the real trapezoid time — short,
                 // accel-dominated moves don't gain time linearly, so a
@@ -1408,8 +1457,19 @@ pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
                 layer.path_speed_scale = scales;
             }
         }
+        if dwell_needed > 0.05 {
+            layer.dwell_s = dwell_needed.min(MAX_DWELL_S);
+        }
     }
 }
+
+/// Cap on the per-layer cooling dwell — a backstop against pathological
+/// geometry demanding minutes of parking; the audit flags what the cap leaves
+/// hot.
+const MAX_DWELL_S: f64 = 20.0;
+
+/// How high the nozzle lifts while spending a cooling dwell.
+const DWELL_LIFT_MM: f64 = 5.0;
 
 /// One contiguous run of governed layers, for the reports.
 pub struct GovernorRow {
@@ -1417,8 +1477,10 @@ pub struct GovernorRow {
     pub last_layer: usize,
     /// The strongest slowdown in the range (0.38 = slowed to 38% speed).
     pub worst_scale: f64,
-    /// Some island in the range is still over the target even at the
-    /// min-print-speed floor — it needs cooling, not more slowing.
+    /// Total park-and-wait dwell spent across the range (s).
+    pub dwell_s: f64,
+    /// Some island in the range is still over the target even with the floor
+    /// AND the dwell cap spent — it needs more cooling hardware.
     pub floor_hit: bool,
 }
 
@@ -1428,7 +1490,7 @@ pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
     let target = s.governor_max_heat_mw_mm2 * 1e-3;
     let mut rows: Vec<GovernorRow> = Vec::new();
     for layer in layers {
-        if layer.path_speed_scale.iter().all(|&fk| fk >= 0.999) {
+        if layer.path_speed_scale.iter().all(|&fk| fk >= 0.999) && layer.dwell_s <= 0.0 {
             continue; // empty (ungoverned) vecs land here too
         }
         let worst = layer.path_speed_scale.iter().copied().fold(1.0, f64::min);
@@ -1443,12 +1505,14 @@ pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
             Some(r) if r.last_layer + 1 == layer.index => {
                 r.last_layer = layer.index;
                 r.worst_scale = r.worst_scale.min(worst);
+                r.dwell_s += layer.dwell_s;
                 r.floor_hit |= floor;
             }
             _ => rows.push(GovernorRow {
                 first_layer: layer.index,
                 last_layer: layer.index,
                 worst_scale: worst,
+                dwell_s: layer.dwell_s,
                 floor_hit: floor,
             }),
         }
@@ -1954,10 +2018,15 @@ mod tests {
         let isl = per_layer_islands(&governed, &s);
         let q = isl[mid].islands[0].joules
             / (stats[mid].secs.max(1e-9) * isl[mid].islands[0].footprint_mm2.max(1e-9));
-        let floored = rows
-            .iter()
-            .any(|r| r.floor_hit && (r.first_layer..=r.last_layer).contains(&mid));
-        assert!(q <= 6.0e-3 * 1.06 || floored, "governed heat {q} still over target");
+        // With park-and-wait completing the governor, the target is reachable
+        // outright (the 20 s/layer dwell cap is far above what a tower needs).
+        assert!(q <= 6.0e-3 * 1.06, "governed heat {q} still over target");
+        let dwelled: f64 = governed.iter().map(|l| l.dwell_s).sum();
+        let floored = rows.iter().any(|r| r.floor_hit);
+        assert!(
+            dwelled > 0.0 || !floored,
+            "a floored range must have spent dwell time"
+        );
         // Slowing costs time, and the estimator reports it honestly.
         assert!(estimate_seconds(&governed, &s) > estimate_seconds(&plain, &s));
     }

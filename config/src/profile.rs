@@ -59,6 +59,10 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cool_rate_c_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_rate_fan_c_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cool_rate_fan_c_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aux_fan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaust_fan: Option<bool>,
@@ -255,7 +259,8 @@ impl Tier for PrinterProfile {
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
-            heat_rate_c_s, cool_rate_c_s, aux_fan, exhaust_fan, start_gcode, end_gcode)
+            heat_rate_c_s, cool_rate_c_s, heat_rate_fan_c_s, cool_rate_fan_c_s,
+            aux_fan, exhaust_fan, start_gcode, end_gcode)
     }
 }
 
@@ -331,6 +336,8 @@ impl PrinterProfile {
             api_key: diff_field!(cur.api_key.clone(), base.api_key),
             heat_rate_c_s: diff_field!(cur.heat_rate_c_s, base.heat_rate_c_s),
             cool_rate_c_s: diff_field!(cur.cool_rate_c_s, base.cool_rate_c_s),
+            heat_rate_fan_c_s: diff_field!(cur.heat_rate_fan_c_s, base.heat_rate_fan_c_s),
+            cool_rate_fan_c_s: diff_field!(cur.cool_rate_fan_c_s, base.cool_rate_fan_c_s),
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
@@ -773,6 +780,13 @@ impl Profiles {
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
             heat_rate_c_s: pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s),
             cool_rate_c_s: pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s),
+            // Auto: un-measured fan-on rates follow the fan-off ones.
+            heat_rate_fan_c_s: pr
+                .heat_rate_fan_c_s
+                .unwrap_or_else(|| pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s)),
+            cool_rate_fan_c_s: pr
+                .cool_rate_fan_c_s
+                .unwrap_or_else(|| pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s)),
             print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
             first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),

@@ -331,6 +331,14 @@ pub struct Settings {
     /// Passive cooling rate near printing temps (°C/s) — far slower than
     /// heating; sets the long lead times for cooling into a zone.
     pub cool_rate_c_s: f64,
+    /// Heating rate with the part fan at 100% (°C/s) — fan spillover steals
+    /// heater power, so this is ≤ `heat_rate_c_s`. Auto: follows the fan-off
+    /// rate until measured. The shaping scheduler interpolates between the
+    /// off/on pairs by the filament's fan duty.
+    pub heat_rate_fan_c_s: f64,
+    /// Cooling rate with the part fan at 100% (°C/s) — the realistic in-print
+    /// case, faster than passive. Auto: follows the fan-off rate until measured.
+    pub cool_rate_fan_c_s: f64,
 
     // --- speeds (mm/s) ---
     pub print_speed_mm_s: f64,
@@ -490,6 +498,8 @@ impl Default for Settings {
             nozzle_temp_max_c: 215,
             heat_rate_c_s: 2.0,
             cool_rate_c_s: 0.7,
+            heat_rate_fan_c_s: 2.0,
+            cool_rate_fan_c_s: 0.7,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
@@ -519,7 +529,9 @@ impl Default for Settings {
             // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
             governor_max_heat_mw_mm2: 15.0,
             temp_shaping: false,
-            temp_shaping_swing_c: 15.0,
+            // 20 °C of cooling reaches a typical PLA's lower window edge —
+            // the deepest rail the schedule can use on chronically hot zones.
+            temp_shaping_swing_c: 20.0,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }

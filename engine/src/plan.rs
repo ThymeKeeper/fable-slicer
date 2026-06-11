@@ -112,6 +112,11 @@ pub struct LayerPlan {
     /// Per-path speed multipliers (≤1) from the thermal governor, parallel to
     /// `paths`; empty = all 1.0. Multiplies on top of `speed_scale`.
     pub path_speed_scale: Vec<f64>,
+    /// Park-and-wait cooling dwell (s) appended after this layer: when an
+    /// island is over the heat target with every path already at the speed
+    /// floor, tiny layers run out of path to slow — time without extrusion
+    /// is the one unbounded lever. Emitted retracted and lifted clear.
+    pub dwell_s: f64,
     /// Nozzle °C temperature shaping plans for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
@@ -646,6 +651,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
             path_speed_scale: Vec::new(),
+            dwell_s: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }
