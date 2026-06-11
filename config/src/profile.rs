@@ -55,6 +55,10 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub aux_fan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exhaust_fan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_gcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_gcode: Option<String>,
@@ -73,6 +77,8 @@ pub struct FilamentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nozzle_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_layer_nozzle_temp_c: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bed_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extrusion_multiplier: Option<f64>,
@@ -86,6 +92,10 @@ pub struct FilamentProfile {
     pub bridge_fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_off_layers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aux_fan_speed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exhaust_fan_speed: Option<f64>,
 }
 
 /// Process (print) tier: quality/geometry knobs.
@@ -200,6 +210,10 @@ pub struct ProcessProfile {
     pub gap_fill_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_flow: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thermal_governor: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governor_max_heat_mw_mm2: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -226,7 +240,8 @@ impl Tier for PrinterProfile {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk,
-            retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key, start_gcode, end_gcode)
+            retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
+            aux_fan, exhaust_fan, start_gcode, end_gcode)
     }
 }
 
@@ -235,8 +250,9 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, bed_temp_c,
-            extrusion_multiplier, max_volumetric_speed_mm3_s, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers)
+        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, first_layer_nozzle_temp_c, bed_temp_c,
+            extrusion_multiplier, max_volumetric_speed_mm3_s, pressure_advance, fan_speed, bridge_fan_speed, fan_off_layers,
+            aux_fan_speed, exhaust_fan_speed)
     }
 }
 
@@ -258,7 +274,7 @@ impl Tier for ProcessProfile {
             ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
             external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
-            gap_fill_speed_mm_s, bridge_flow)
+            gap_fill_speed_mm_s, bridge_flow, thermal_governor, governor_max_heat_mw_mm2)
     }
 }
 
@@ -297,6 +313,8 @@ impl PrinterProfile {
             wipe_mm: diff_field!(cur.wipe_mm, base.wipe_mm),
             host_url: diff_field!(cur.host_url.clone(), base.host_url),
             api_key: diff_field!(cur.api_key.clone(), base.api_key),
+            aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
+            exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
             end_gcode: diff_field!(cur.end_gcode.clone(), base.end_gcode),
         }
@@ -316,6 +334,7 @@ impl FilamentProfile {
             filament_diameter_mm: diff_field!(cur.filament_diameter_mm, base.filament_diameter_mm),
             density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
             nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
+            first_layer_nozzle_temp_c: diff_field!(cur.first_layer_nozzle_temp_c, base.first_layer_nozzle_temp_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
@@ -323,6 +342,8 @@ impl FilamentProfile {
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
+            aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
+            exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
         }
     }
 
@@ -391,6 +412,8 @@ impl ProcessProfile {
             support_speed_mm_s: diff_field!(cur.support_speed_mm_s, base.support_speed_mm_s),
             gap_fill_speed_mm_s: diff_field!(cur.gap_fill_speed_mm_s, base.gap_fill_speed_mm_s),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
+            thermal_governor: diff_field!(cur.thermal_governor, base.thermal_governor),
+            governor_max_heat_mw_mm2: diff_field!(cur.governor_max_heat_mw_mm2, base.governor_max_heat_mw_mm2),
         }
     }
 
@@ -643,6 +666,12 @@ impl Profiles {
         // Printer speed (machine default) takes precedence over the process value.
         let print_v = pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s);
         let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
+        // The flow triangle: speed × bead area (line width × layer height) must
+        // fit the filament's melt ceiling, so derived speeds balance against it.
+        let line_w = pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle));
+        let layer_h = pc.layer_height_mm.unwrap_or(d.layer_height_mm);
+        let max_flow = fl.max_volumetric_speed_mm3_s.unwrap_or(d.max_volumetric_speed_mm3_s);
+        let flow_cap = crate::flow_speed_cap_mm_s(max_flow, line_w, layer_h);
         Ok(Settings {
             nozzle_diameter_mm: nozzle,
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
@@ -658,9 +687,9 @@ impl Profiles {
                 crate::derived_first_layer_accel_mm_s2(pr.acceleration.unwrap_or(d.acceleration_mm_s2))
             }),
             jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
-            layer_height_mm: pc.layer_height_mm.unwrap_or(d.layer_height_mm),
+            layer_height_mm: layer_h,
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
-            line_width_mm: pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle)),
+            line_width_mm: line_w,
             max_resolution_mm: pc.max_resolution_mm.unwrap_or(d.max_resolution_mm),
             arc_fitting: pc.arc_fitting.unwrap_or(d.arc_fitting),
             arc_tolerance_mm: pc.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
@@ -712,6 +741,10 @@ impl Profiles {
             host_url: pr.host_url.unwrap_or(d.host_url),
             api_key: pr.api_key.unwrap_or(d.api_key),
             nozzle_temp_c: fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c),
+            // Auto: an unset first-layer temp follows the nozzle temp.
+            first_layer_nozzle_temp_c: fl
+                .first_layer_nozzle_temp_c
+                .unwrap_or_else(|| fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c)),
             bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
             print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
@@ -721,29 +754,37 @@ impl Profiles {
             // an Ender's pace just because the default table says 25).
             external_perimeter_speed_mm_s: pc
                 .external_perimeter_speed_mm_s
-                .unwrap_or_else(|| crate::derived_external_perimeter_speed_mm_s(print_v)),
-            solid_speed_mm_s: pc.solid_speed_mm_s.unwrap_or_else(|| crate::derived_solid_speed_mm_s(print_v)),
+                .unwrap_or_else(|| crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap)),
+            solid_speed_mm_s: pc
+                .solid_speed_mm_s
+                .unwrap_or_else(|| crate::derived_solid_speed_mm_s(print_v, flow_cap)),
             support_speed_mm_s: pc
                 .support_speed_mm_s
-                .unwrap_or_else(|| crate::derived_support_speed_mm_s(print_v)),
+                .unwrap_or_else(|| crate::derived_support_speed_mm_s(print_v, flow_cap)),
             gap_fill_speed_mm_s: pc
                 .gap_fill_speed_mm_s
-                .unwrap_or_else(|| crate::derived_gap_fill_speed_mm_s(print_v)),
+                .unwrap_or_else(|| crate::derived_gap_fill_speed_mm_s(print_v, flow_cap)),
             bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             overhang_speed_mm_s: pc.overhang_speed_mm_s.unwrap_or_else(|| {
                 crate::derived_overhang_speed_mm_s(pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s))
             }),
             min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
             min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
-            max_volumetric_speed_mm3_s: fl
-                .max_volumetric_speed_mm3_s
-                .unwrap_or(d.max_volumetric_speed_mm3_s),
+            max_volumetric_speed_mm3_s: max_flow,
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
             bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
+            thermal_governor: pc.thermal_governor.unwrap_or(d.thermal_governor),
+            governor_max_heat_mw_mm2: pc
+                .governor_max_heat_mw_mm2
+                .unwrap_or(d.governor_max_heat_mw_mm2),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
             fan_speed: fl.fan_speed.unwrap_or(d.fan_speed),
             bridge_fan_speed: fl.bridge_fan_speed.unwrap_or(d.bridge_fan_speed),
             fan_off_layers: fl.fan_off_layers.unwrap_or(d.fan_off_layers),
+            has_aux_fan: pr.aux_fan.unwrap_or(d.has_aux_fan),
+            has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
+            aux_fan_speed: fl.aux_fan_speed.unwrap_or(d.aux_fan_speed),
+            exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or(d.exhaust_fan_speed),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })
@@ -820,9 +861,11 @@ mod tests {
         assert_eq!(s.bed_size_x_mm, 350.0);
         assert_eq!(s.bed_size_z_mm, 340.0); // build height
         assert_eq!(s.nozzle_diameter_mm, 0.4); // inherited from generic
-        assert_eq!(s.nozzle_temp_c, 200); // from pla
+        assert_eq!(s.nozzle_temp_c, 210); // from pla (Orca-matched bulk temp)
         assert_eq!(s.layer_height_mm, 0.2); // from standard
         assert!(s.start_gcode.contains("PRINT_START"));
+        // No declared aux/exhaust hardware: M106 P-forms must stay locked out.
+        assert!(!s.has_aux_fan && !s.has_exhaust_fan);
         // Per-feature acceleration: voron24 pins a gentle outer wall under a
         // fast interior; the first layer auto-derives to the adhesion cap.
         assert_eq!(s.acceleration_mm_s2, 10000.0);
@@ -845,9 +888,53 @@ mod tests {
         assert_eq!(s.travel_speed_mm_s, 1000.0); // Orca travel
         assert_eq!(s.jerk_mm_s, 5.0); // Orca square-corner velocity
         assert_eq!(s.max_volumetric_speed_mm3_s, 21.0); // Orca generic-PLA melt ceiling
+        // Stock firmware macros are bare START_PRINT/END_PRINT (not Voron-style
+        // PRINT_START) and they do no heating — the g-code must heat explicitly,
+        // to the first-layer temp (the emitter drops to the bulk temp at layer 2).
+        assert!(s.start_gcode.contains("START_PRINT"));
+        assert!(s.start_gcode.contains("M190 S{bed_temp}"));
+        assert!(s.start_gcode.contains("M109 S{first_layer_nozzle_temp}"));
+        assert!(s.end_gcode.contains("END_PRINT"));
+        // Temps + pressure advance pinned to the same Orca pairing (its PLA
+        // profile on this machine): hot 230 first layer for adhesion, 210 bulk.
+        assert_eq!(s.first_layer_nozzle_temp_c, 230);
+        assert_eq!(s.nozzle_temp_c, 210);
+        assert_eq!(s.bed_temp_c, 65);
+        assert_eq!(s.pressure_advance, 0.032);
+        // Fan hardware flags + the Orca PLA duties for the side/exhaust fans.
+        assert!(s.has_aux_fan && s.has_exhaust_fan);
+        assert_eq!(s.aux_fan_speed, 0.75);
+        assert_eq!(s.exhaust_fan_speed, 0.8);
         // The stock hotend is high-flow: pla-hf raises only the ceiling.
         let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
         assert_eq!(hf.max_volumetric_speed_mm3_s, 30.0);
+    }
+
+    #[test]
+    fn auto_speeds_balance_to_flow_ceiling() {
+        let p = Profiles::builtin();
+        let s = p.resolve("sovol-zero", "pla", "standard").unwrap();
+        // 21 mm³/s through a 0.45 × 0.2 bead ≈ 258 mm/s. Solid (80% of 400)
+        // and support (90%) would overshoot — the triangle binds them...
+        let cap = crate::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
+        assert!((cap - 258.0).abs() < 1.0);
+        assert_eq!(s.solid_speed_mm_s, cap);
+        assert_eq!(s.support_speed_mm_s, cap);
+        // ...while outer wall's 50% (200) fits beneath it untouched.
+        assert_eq!(s.external_perimeter_speed_mm_s, 200.0);
+        // A high-flow filament lifts the ceiling and the 80% rule returns.
+        let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        assert_eq!(hf.solid_speed_mm_s, 320.0);
+    }
+
+    #[test]
+    fn first_layer_temp_follows_nozzle_when_unset() {
+        // petg doesn't set a first-layer temp: it must track the nozzle temp,
+        // not fall back to the in-code default.
+        let p = Profiles::builtin();
+        let s = p.resolve("generic", "petg", "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 240);
+        assert_eq!(s.first_layer_nozzle_temp_c, 240);
     }
 
     #[test]

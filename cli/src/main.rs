@@ -101,6 +101,9 @@ struct Args {
     xy_compensation: Option<f64>,
     #[arg(long)]
     nozzle_temp: Option<u32>,
+    /// First-layer nozzle °C (with --nozzle-temp alone, the first layer follows it)
+    #[arg(long)]
+    first_layer_nozzle_temp: Option<u32>,
     #[arg(long)]
     bed_temp: Option<u32>,
     #[arg(long)]
@@ -198,6 +201,11 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;
+        // Keep the first layer in lockstep unless pinned explicitly below.
+        settings.first_layer_nozzle_temp_c = v;
+    }
+    if let Some(v) = args.first_layer_nozzle_temp {
+        settings.first_layer_nozzle_temp_c = v;
     }
     if let Some(v) = args.bed_temp {
         settings.bed_temp_c = v;
@@ -266,8 +274,18 @@ fn main() -> Result<()> {
     println!("Combing: {cross} crossing travels — {combed} combed, {fb} straight ({fb_hole} cut a hole)");
     for (kind, nominal, clamped) in engine::audit_flow_clamps(&layers, &settings) {
         println!(
-            "Flow-limited: {kind:?} {nominal:.0} -> {clamped:.0} mm/s (filament ceiling {:.1} mm³/s)",
+            "Flow-limited: {} {nominal:.0} -> {clamped:.0} mm/s (filament ceiling {:.1} mm³/s)",
+            engine::kind_label(kind),
             settings.max_volumetric_speed_mm3_s
+        );
+    }
+    for r in engine::audit_governor(&layers, &settings) {
+        println!(
+            "Thermal governor: layers {}-{} slowed to {:.0}%{}",
+            r.first_layer,
+            r.last_layer,
+            r.worst_scale * 100.0,
+            if r.floor_hit { " (still hot at the min-speed floor)" } else { "" }
         );
     }
 

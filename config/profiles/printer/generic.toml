@@ -13,9 +13,9 @@ z_hop_mm = 0.4
 
 start_gcode = """
 M140 S{bed_temp}
-M104 S{nozzle_temp}
+M104 S{first_layer_nozzle_temp}
 M190 S{bed_temp}
-M109 S{nozzle_temp}
+M109 S{first_layer_nozzle_temp}
 G28
 """
 

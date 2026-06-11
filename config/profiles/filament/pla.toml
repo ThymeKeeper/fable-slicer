@@ -1,9 +1,20 @@
-# Generic PLA.
+# Generic PLA. Temps and pressure advance mirror the OrcaSlicer PLA profile
+# paired with the Sovol Zero: hot 230 first layer for adhesion, 210 for the
+# bulk, bed 65; PA as tuned on the Zero's stock hotend (a sane PLA default
+# for direct drive generally).
 filament_diameter_mm = 1.75
 density_g_cm3 = 1.24
-nozzle_temp_c = 200
-bed_temp_c = 60
+nozzle_temp_c = 210
+first_layer_nozzle_temp_c = 230
+bed_temp_c = 65
+pressure_advance = 0.032
 # Melt ceiling for basic PLA on a modern standard hotend — matched to
 # OrcaSlicer's generic-PLA value so flow clamping compares like for like.
 # True high-flow hotends (Sovol Zero stock, Revo HF, Rapido) use pla-hf.
 max_volumetric_speed_mm3_s = 21.0
+
+# On machines that declare the hardware (aux_fan / exhaust_fan in the printer
+# profile): side-fan and chamber-exhaust duties, at Orca's PLA values
+# (75% aux past the fan-off layers, 80% exhaust for the whole print).
+aux_fan_speed = 0.75
+exhaust_fan_speed = 0.8

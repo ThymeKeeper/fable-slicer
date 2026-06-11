@@ -18,8 +18,9 @@ mod slice;
 mod wall;
 
 pub use emit::{
-    audit_combing, audit_flow_clamps, estimate_filament, estimate_seconds, format_duration,
-    to_gcode,
+    audit_combing, audit_flow_clamps, audit_governor, estimate_filament, estimate_seconds,
+    format_duration, kind_label, per_layer_islands, per_layer_stats, to_gcode, GovernorRow,
+    IslandStats, LayerIslands, LayerStats,
 };
 pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};

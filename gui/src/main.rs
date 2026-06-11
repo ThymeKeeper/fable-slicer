@@ -30,6 +30,30 @@ enum HostOp {
     Status,
 }
 
+/// What a finished host operation reports back to the UI thread.
+enum HostReply {
+    /// One-line outcome for the status line (test / pause / resume / cancel).
+    Message(String),
+    /// A Send / Send & print finished; success reveals the live-print overlay.
+    SendDone { ok: bool, msg: String },
+    /// A quiet interval poll feeding the live-print overlay — never touches
+    /// the status line.
+    Status(Result<printhost::PrintStatus, String>),
+}
+
+/// What the preview colors encode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorBy {
+    /// Feature type (walls, infill, …) — the classic view.
+    Feature,
+    /// Per-layer print time: red = quick layers, little cooling before the
+    /// nozzle returns.
+    LayerTime,
+    /// Per-layer heat load: deposited energy ÷ (time × footprint). Red = lots
+    /// of hot plastic delivered quickly to a small area.
+    Heat,
+}
+
 /// Which derivable settings the user has pinned to manual values. Unpinned
 /// fields recompute live from their master setting every frame (camera-style
 /// "priority mode": auto until touched, visible either way).
@@ -58,11 +82,13 @@ fn auto_slider(
     hover: &str,
 ) {
     ui.horizontal(|ui| {
-        let r = ui.add(egui::Slider::new(value, range).text(label));
+        // Tooltip lives on the label only: popping help text while hovering
+        // or dragging the slider itself would cover the value.
+        let r = ui.add(egui::Slider::new(value, range));
         if r.changed() {
             *pinned = true;
         }
-        r.on_hover_text(hover);
+        ui.label(label).on_hover_text(hover);
         if *pinned {
             if ui
                 .small_button("⟲")
@@ -79,6 +105,120 @@ fn auto_slider(
                 .on_hover_text("Following its master setting — drag the slider to pin a manual value.");
         }
     });
+}
+
+/// The flow-triangle ceiling spelled out with live numbers, for tooltips —
+/// names every participant so the relationship is learnable from any corner:
+/// "max flow 21.0 mm³/s ÷ bead (line width 0.45 × layer height 0.20 mm) = ~258 mm/s".
+fn flow_ceiling_text(s: &config::Settings) -> String {
+    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
+    if cap.is_finite() {
+        format!(
+            "max flow {:.1} mm³/s ÷ bead (line width {:.2} × layer height {:.2} mm) = ~{:.0} mm/s",
+            s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm, cap
+        )
+    } else {
+        "max flow 0 = unlimited".into()
+    }
+}
+
+/// Tooltip for an auto speed slider: the rule, the flow triangle with live
+/// numbers, and which of the two is winning right now.
+fn speed_hint(intro: &str, rule: &str, asked: f64, s: &config::Settings) -> String {
+    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
+    let verdict = if !cap.is_finite() {
+        format!("max flow is 0 (unlimited), so auto = {asked:.0}.")
+    } else if cap < asked {
+        format!("only ~{cap:.0} fits, so auto = ~{cap:.0} — the triangle wins over the rule.")
+    } else {
+        format!("{asked:.0} fits under the ceiling, so auto = {asked:.0} — the rule wins.")
+    };
+    format!(
+        "{intro}\n\nAuto balances two bounds:\n\
+         - rule: {rule} = {asked:.0} mm/s\n\
+         - flow triangle: the nozzle extrudes line width × layer height of bead for every mm \
+         travelled, and the hotend can only melt `max flow` mm³ each second, so \
+         {}\n\
+         Right now {verdict}\n\n\
+         Moving print speed, layer height, line width, or max flow re-balances this live; \
+         dragging this slider pins it to a manual value.",
+        flow_ceiling_text(s),
+    )
+}
+
+/// A labelled slider whose hover help triggers on the label — and only the
+/// label: tooltips over the slider itself would cover the value while
+/// adjusting. (egui's built-in `.text()` label can't carry a tooltip at all —
+/// it sits outside the slider's response.)
+fn hslider(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    slider: egui::Slider<'_>,
+    label: &str,
+    hover: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let r = ui.add_enabled(enabled, slider);
+        ui.add_enabled(enabled, egui::Label::new(label)).on_hover_text(hover);
+        r
+    })
+    .inner
+}
+
+/// `hslider` plus a lockout explanation shown while the row is disabled.
+fn hslider_lockout(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    slider: egui::Slider<'_>,
+    label: &str,
+    hover: &str,
+    disabled_hover: &str,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let r = ui.add_enabled(enabled, slider);
+        ui.add_enabled(enabled, egui::Label::new(label))
+            .on_hover_text(hover)
+            .on_disabled_hover_text(disabled_hover);
+        r
+    })
+    .inner
+}
+
+/// Where a flow-limited feature's speed comes from — shown on the warning
+/// rows so a slowed feature can be traced back to its slider (or lack of one).
+fn clamp_source_hint(name: &str) -> &'static str {
+    match name {
+        "inner wall" | "infill" => {
+            "No slider of its own: inner walls and sparse infill run at the machine's \
+             print speed (Machine & motion → print mm/s). The ceiling clamps each path \
+             individually, and variable-width walls can be wider than the nominal line \
+             width — so they may be slowed harder than the nominal ceiling suggests."
+        }
+        "outer wall" => "Slider: Feature speeds → outer wall mm/s.",
+        "solid" => "Slider: Feature speeds → solid mm/s.",
+        "support" => "Slider: Feature speeds → support mm/s.",
+        "gap fill" => "Slider: Feature speeds → gap fill mm/s.",
+        "bridge" | "internal bridge" => "Slider: Feature speeds → bridge mm/s.",
+        "overhang wall" => "Slider: Feature speeds → overhang mm/s.",
+        "arc overhang" => "Derived from bridge speed (Feature speeds).",
+        "skirt" => "Prints at first-layer speed (Machine & motion).",
+        _ => "Flow-clamped at slice time.",
+    }
+}
+
+/// Blue → green → yellow → red ramp for the preview heat maps (u in 0..=1).
+fn heat_ramp(u: f32) -> [f32; 3] {
+    const STOPS: [[f32; 3]; 4] = [
+        [0.20, 0.35, 0.90], // cool blue
+        [0.10, 0.75, 0.45], // green
+        [0.95, 0.85, 0.15], // yellow
+        [0.92, 0.13, 0.10], // red
+    ];
+    let x = u.clamp(0.0, 1.0) * 3.0;
+    let i = (x.floor() as usize).min(2);
+    let f = x - i as f32;
+    let (a, b) = (STOPS[i], STOPS[i + 1]);
+    [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
 }
 
 /// Accent color per profile tier — used on the selector rows and on every
@@ -177,6 +317,23 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
+/// What the last slice produced — rendered as a structured block in the left
+/// panel. The one-line `status` stays for transient messages (imports,
+/// exports, printer ops).
+struct SliceSummary {
+    layers: usize,
+    toolpaths: usize,
+    secs: f64,
+    filament_m: f64,
+    grams: f64,
+    /// The filament's melt ceiling (mm³/s) in force during the slice.
+    flow_cap: f64,
+    /// Features the ceiling slowed: (name, asked mm/s, clamped-to mm/s).
+    clamps: Vec<(&'static str, f64, f64)>,
+    /// Thermal-governor interventions (empty when off or nothing ran hot).
+    governor: Vec<engine::GovernorRow>,
+}
+
 struct App {
     profiles: Profiles,
     printer: String,
@@ -196,9 +353,26 @@ struct App {
     camera: Camera,
     status: String,
     sliced: Option<Vec<engine::LayerPlan>>,
-    /// In-flight printer-host operation: its final status message arrives
-    /// here from the worker thread (one op at a time; buttons disable).
-    host_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Readable result block for the last slice; cleared with `sliced`.
+    slice_summary: Option<SliceSummary>,
+    /// Per-layer time/heat numbers behind the preview color modes.
+    layer_stats: Vec<engine::LayerStats>,
+    /// Per-island split of the heat numbers (parallel to `layer_stats`).
+    layer_islands: Vec<engine::LayerIslands>,
+    /// What the preview colors encode.
+    color_by: ColorBy,
+    /// In-flight printer-host operation: its reply arrives here from the
+    /// worker thread (one op at a time; buttons disable).
+    host_rx: Option<std::sync::mpsc::Receiver<HostReply>>,
+    /// True once a file has been sent this session — reveals the live-print
+    /// overlay on the viewport.
+    sent_to_printer: bool,
+    /// Latest polled printer state (None until the first poll lands).
+    printer_status: Option<Result<printhost::PrintStatus, String>>,
+    /// When the last quiet status poll started (None = poll next frame).
+    last_status_poll: Option<std::time::Instant>,
+    /// Viewport rect of the live-print overlay (blocks camera input under it).
+    print_overlay_rect: Option<egui::Rect>,
     /// Cumulative bead-instance count after each layer (for the layer slider).
     layer_ends: Vec<u32>,
     /// Cumulative joint-blob count after each layer.
@@ -279,7 +453,15 @@ impl App {
             camera: Camera::new(),
             status,
             sliced: None,
+            slice_summary: None,
+            layer_stats: Vec::new(),
+            layer_islands: Vec::new(),
+            color_by: ColorBy::Feature,
             host_rx: None,
+            sent_to_printer: false,
+            printer_status: None,
+            last_status_poll: None,
+            print_overlay_rect: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
@@ -360,6 +542,7 @@ impl App {
             self.settings.auto_center_on_bed = false;
             self.baseline = self.settings.clone();
             self.sliced = None;
+            self.slice_summary = None;
             self.view_preview = false;
             self.needs_rebuild = true;
             self.refit_camera = true;
@@ -393,18 +576,22 @@ impl App {
         if !self.pins.line_width {
             s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
         }
+        // The flow triangle: unpinned speeds rebalance live against the melt
+        // ceiling for the current bead (line width × layer height), so moving
+        // any side of the triangle visibly moves its dependents.
+        let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
         if !self.pins.external_speed {
             s.external_perimeter_speed_mm_s =
-                config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s);
+                config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
         }
         if !self.pins.solid_speed {
-            s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s);
+            s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
         }
         if !self.pins.support_speed {
-            s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s);
+            s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
         }
         if !self.pins.gap_fill_speed {
-            s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s);
+            s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
         }
         if !self.pins.overhang_speed {
             s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
@@ -585,6 +772,7 @@ impl App {
     fn after_scene_change(&mut self) {
         self.arrange();
         self.sliced = None;
+        self.slice_summary = None;
         self.view_preview = false;
         self.needs_rebuild = true;
         self.refit_camera = true;
@@ -633,43 +821,141 @@ impl App {
             return;
         };
         let layers = generate(&m, &self.settings);
+        let n = layers.len();
+        let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
+        let secs = engine::estimate_seconds(&layers, &self.settings);
+        let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
+        // Loud, not silent: name exactly which features the flow ceiling slowed.
+        let clamps: Vec<(&'static str, f64, f64)> = engine::audit_flow_clamps(&layers, &self.settings)
+            .into_iter()
+            .map(|(k, nom, cl)| (engine::kind_label(k), nom, cl))
+            .collect();
+        self.slice_summary = Some(SliceSummary {
+            layers: n,
+            toolpaths: paths,
+            secs,
+            filament_m: fil_mm / 1000.0,
+            grams,
+            flow_cap: self.settings.max_volumetric_speed_mm3_s,
+            clamps,
+            governor: engine::audit_governor(&layers, &self.settings),
+        });
+        self.status.clear();
+        self.layer_stats = engine::per_layer_stats(&layers, &self.settings);
+        self.layer_islands = engine::per_layer_islands(&layers, &self.settings);
+        self.sliced = Some(layers);
+        self.set_preview_instances(rs);
+        self.preview_layer = n.max(1);
+        self.view_preview = true;
+    }
+
+    /// (Re)build the preview bead instances from the sliced layers, colored
+    /// per the active mode. Called after slicing and when the mode changes.
+    fn set_preview_instances(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        let Some(layers) = self.sliced.as_ref() else { return };
         // Match the emitter's brick-aware hop height so preview travels line up.
         let hop = if self.settings.brick_layers {
             self.settings.z_hop_mm.max(self.settings.layer_height_mm + 0.25)
         } else {
             self.settings.z_hop_mm
         };
-        let (verts, ends, joints, joint_ends) = build_instances(&layers, hop as f32);
+        let layer_colors = self.layer_color_table();
+        let (verts, ends, joints, joint_ends) = build_instances(layers, hop as f32, layer_colors.as_deref());
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
-        let n = layers.len();
-        let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
-        let secs = engine::estimate_seconds(&layers, &self.settings);
-        let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
-        self.status = format!(
-            "Sliced {n} layers, {paths} toolpaths · ~{} · {:.2} m / {:.0} g",
-            engine::format_duration(secs),
-            fil_mm / 1000.0,
-            grams
-        );
-        // Loud, not silent: say exactly which features the flow ceiling slowed.
-        let clamps = engine::audit_flow_clamps(&layers, &self.settings);
-        if !clamps.is_empty() {
-            let list: Vec<String> = clamps
-                .iter()
-                .map(|(k, nom, cl)| format!("{k:?} {nom:.0}→{cl:.0}"))
-                .collect();
-            self.status += &format!(
-                " · ⚠ flow-limited ({:.0} mm³/s): {} mm/s",
-                self.settings.max_volumetric_speed_mm3_s,
-                list.join(", ")
-            );
-        }
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
-        self.preview_layer = n.max(1);
-        self.view_preview = true;
-        self.sliced = Some(layers);
+    }
+
+    /// The active metric mapped to ramp colors, per path — or None in feature
+    /// mode (`build_instances` then colors by path kind). Layer time is one
+    /// color per layer broadcast to its paths; heat load is scored per island,
+    /// so a skinny chimney can't hide inside a big layer's average.
+    fn layer_color_table(&self) -> Option<Vec<Vec<[f32; 3]>>> {
+        if self.color_by == ColorBy::Feature || self.layer_stats.is_empty() {
+            return None;
+        }
+        let layers = self.sliced.as_ref()?;
+        match self.color_by {
+            ColorBy::LayerTime => {
+                let logs: Vec<f64> = self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
+                let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
+                let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let span = (hi - lo).max(1e-12);
+                Some(
+                    layers
+                        .iter()
+                        .zip(&logs)
+                        .map(|(layer, &l)| {
+                            // Inverted: short layers = least cooling = the hot end.
+                            let u = 1.0 - ((l - lo) / span) as f32;
+                            vec![heat_ramp(u); layer.paths.len()]
+                        })
+                        .collect(),
+                )
+            }
+            ColorBy::Heat => {
+                if self.layer_islands.len() != layers.len() {
+                    return None;
+                }
+                // Log-normalize over every island that actually got plastic.
+                let mut lo = f64::INFINITY;
+                let mut hi = f64::NEG_INFINITY;
+                for (li, l) in self.layer_islands.iter().enumerate() {
+                    for isl in &l.islands {
+                        if isl.joules > 0.0 {
+                            let v = self.island_heat(li, isl).max(1e-12).ln();
+                            lo = lo.min(v);
+                            hi = hi.max(v);
+                        }
+                    }
+                }
+                let span = (hi - lo).max(1e-12);
+                // With the governor on, anchor the ramp to its target: the
+                // yellow→red boundary sits exactly at the target, so red
+                // strictly means "still over" — governing visibly drains it.
+                // (A purely relative ramp re-stretches to the new max and the
+                // before/after look deceptively similar.)
+                let anchor = (self.settings.thermal_governor
+                    && self.settings.governor_max_heat_mw_mm2 > 0.0)
+                    .then(|| (self.settings.governor_max_heat_mw_mm2 * 1e-3).max(1e-12).ln());
+                let u_of = |v: f64| -> f32 {
+                    match anchor {
+                        Some(t) if v <= t => {
+                            ((v - lo) / (t - lo).max(1e-12)).clamp(0.0, 1.0) as f32 * (2.0 / 3.0)
+                        }
+                        Some(t) => {
+                            2.0 / 3.0
+                                + ((v - t) / (hi - t).max(1e-12)).clamp(0.0, 1.0) as f32 * (1.0 / 3.0)
+                        }
+                        None => (((v - lo) / span).clamp(0.0, 1.0)) as f32,
+                    }
+                };
+                Some(
+                    self.layer_islands
+                        .iter()
+                        .enumerate()
+                        .map(|(li, l)| {
+                            l.path_island
+                                .iter()
+                                .map(|&k| {
+                                    let v = self.island_heat(li, &l.islands[k]).max(1e-12).ln();
+                                    heat_ramp(u_of(v))
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                )
+            }
+            ColorBy::Feature => unreachable!(),
+        }
+    }
+
+    /// Heat-load metric for one island (W/mm²): its deposited energy over the
+    /// whole layer's time (an island keeps cooling while the nozzle is
+    /// elsewhere) and its own footprint.
+    fn island_heat(&self, li: usize, isl: &engine::IslandStats) -> f64 {
+        isl.joules / (self.layer_stats[li].secs.max(1e-9) * isl.footprint_mm2.max(1e-9))
     }
 
     fn export(&mut self) {
@@ -699,12 +985,14 @@ impl App {
         format!("{base}.gcode")
     }
 
-    /// Run a printer-host operation on a worker thread; its result message
-    /// lands in the status line. One at a time — callers disable while busy.
+    /// Run a printer-host operation on a worker thread; its reply lands in
+    /// `host_rx`. One at a time — callers disable while busy. `quiet` skips
+    /// the "Contacting printer…" status (interval polls would spam it).
     fn spawn_host_op(
         &mut self,
         ctx: &egui::Context,
-        op: impl FnOnce(&printhost::Client) -> String + Send + 'static,
+        quiet: bool,
+        op: impl FnOnce(&printhost::Client) -> HostReply + Send + 'static,
     ) {
         let host = self.settings.host_url.trim().to_string();
         if host.is_empty() {
@@ -714,7 +1002,9 @@ impl App {
         let client = printhost::Client::new(&host, &self.settings.api_key);
         let (tx, rx) = std::sync::mpsc::channel();
         self.host_rx = Some(rx);
-        self.status = "Contacting printer…".into();
+        if !quiet {
+            self.status = "Contacting printer…".into();
+        }
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(op(&client));
@@ -766,11 +1056,27 @@ impl eframe::App for App {
         self.apply_auto();
 
         // 320 wide fits the longest slider row (90 slider + value + 19-char
-        // A finished printer-host operation reports into the status line.
+        // A finished printer-host operation reports back; quiet status polls
+        // feed the live-print overlay, everything else the status line.
         if let Some(rx) = &self.host_rx {
-            if let Ok(msg) = rx.try_recv() {
-                self.status = msg;
+            if let Ok(reply) = rx.try_recv() {
                 self.host_rx = None;
+                match reply {
+                    HostReply::Message(msg) => {
+                        self.status = msg;
+                        // Pause/resume/cancel just changed the printer's state:
+                        // refresh the overlay promptly.
+                        self.last_status_poll = None;
+                    }
+                    HostReply::SendDone { ok, msg } => {
+                        self.status = msg;
+                        if ok {
+                            self.sent_to_printer = true;
+                            self.last_status_poll = None;
+                        }
+                    }
+                    HostReply::Status(st) => self.printer_status = Some(st),
+                }
             }
         }
         // Host actions requested from inside the panel closure (which borrows
@@ -778,6 +1084,20 @@ impl eframe::App for App {
         let mut host_op: Option<HostOp> = None;
         let host_busy = self.host_rx.is_some();
         let host_set = !self.settings.host_url.trim().is_empty();
+        // The live-print overlay keeps itself fresh with quiet polls — brisk
+        // while printing, relaxed once idle/finished. No manual status button.
+        if self.sent_to_printer && host_set {
+            let interval = match &self.printer_status {
+                Some(Ok(st)) if st.state == "printing" || st.state == "paused" => 2.0,
+                None => 2.0, // first reading after a send
+                _ => 10.0,
+            };
+            if !host_busy && self.last_status_poll.map_or(true, |t| t.elapsed().as_secs_f64() >= interval) {
+                host_op = Some(HostOp::Status);
+            }
+            // egui only repaints on input; keep frames coming for the timer.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         // label + auto badge ≈ 287). Content wider than the panel doesn't just
         // clip: egui reserves the overflowed width, pushing the central panel
@@ -892,33 +1212,56 @@ impl eframe::App for App {
             }
             ui.separator();
 
-            // Slice / export + status stay pinned above the scrollable settings.
+            // Slice / export / send — the panel's primary actions, sized to be
+            // unmissable. Live-print controls float over the viewport instead
+            // (they appear after a successful send).
+            let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            let big = egui::vec2(half, 32.0);
             ui.horizontal(|ui| {
+                // Slice carries the accent fill: it's the action everything
+                // else waits on.
+                let can_slice = !self.objects.is_empty();
+                let accent = ui.visuals().selection;
+                let mut label = egui::RichText::new("Slice").size(15.0).strong();
+                if can_slice {
+                    label = label.color(accent.stroke.color);
+                }
+                let mut slice_btn = egui::Button::new(label).min_size(big);
+                if can_slice {
+                    slice_btn = slice_btn.fill(accent.bg_fill);
+                }
                 if ui
-                    .add_enabled(!self.objects.is_empty(), egui::Button::new("Slice"))
+                    .add_enabled(can_slice, slice_btn)
                     .on_hover_text("Slice all objects on the bed into toolpaths using the current settings.")
+                    .on_disabled_hover_text("Import a model first.")
                     .clicked()
                 {
                     self.slice(&rs);
                 }
+                let export_btn = egui::Button::new(egui::RichText::new("💾 Export…").size(15.0)).min_size(big);
                 if ui
-                    .add_enabled(self.sliced.is_some(), egui::Button::new("Export g-code…"))
+                    .add_enabled(self.sliced.is_some(), export_btn)
                     .on_hover_text("Save the sliced toolpaths to a .gcode file.")
+                    .on_disabled_hover_text("Slice first.")
                     .clicked()
                 {
                     self.export();
                 }
+            });
+            ui.horizontal(|ui| {
                 let can_send = self.sliced.is_some() && host_set && !host_busy;
+                let send_btn = egui::Button::new(egui::RichText::new("Send").size(15.0)).min_size(big);
                 if ui
-                    .add_enabled(can_send, egui::Button::new("Send"))
+                    .add_enabled(can_send, send_btn)
                     .on_hover_text("Upload the g-code to the printer's storage (host under Connection).")
                     .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
                     .clicked()
                 {
                     host_op = Some(HostOp::Send { start: false });
                 }
+                let print_btn = egui::Button::new(egui::RichText::new("▶ Send & print").size(15.0)).min_size(big);
                 if ui
-                    .add_enabled(can_send, egui::Button::new("Send & print"))
+                    .add_enabled(can_send, print_btn)
                     .on_hover_text("Upload the g-code and start printing it immediately.")
                     .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
                     .clicked()
@@ -926,32 +1269,72 @@ impl eframe::App for App {
                     host_op = Some(HostOp::Send { start: true });
                 }
             });
-            if host_set {
-                ui.horizontal(|ui| {
-                    let live = !host_busy;
-                    if ui.add_enabled(live, egui::Button::new("⏸"))
-                        .on_hover_text("Pause the running print.").clicked()
-                    {
-                        host_op = Some(HostOp::Pause);
-                    }
-                    if ui.add_enabled(live, egui::Button::new("▶"))
-                        .on_hover_text("Resume a paused print.").clicked()
-                    {
-                        host_op = Some(HostOp::Resume);
-                    }
-                    if ui.add_enabled(live, egui::Button::new("✖"))
-                        .on_hover_text("Cancel the running print.").clicked()
-                    {
-                        host_op = Some(HostOp::Cancel);
-                    }
-                    if ui.add_enabled(live, egui::Button::new("status"))
-                        .on_hover_text("Ask the printer what it's doing.").clicked()
-                    {
-                        host_op = Some(HostOp::Status);
-                    }
-                });
+            if !self.status.is_empty() {
+                ui.label(&self.status);
             }
-            ui.label(&self.status);
+            if let Some(sum) = &self.slice_summary {
+                ui.label(format!("Sliced: {} layers, {} toolpaths", sum.layers, sum.toolpaths))
+                    .on_hover_text("Toolpaths = individual extrusion paths (walls, infill, …) across all layers.");
+                ui.label(format!(
+                    "~{} · {:.2} m / {:.0} g filament",
+                    engine::format_duration(sum.secs),
+                    sum.filament_m,
+                    sum.grams
+                ))
+                .on_hover_text("Estimated print time and filament length / weight.");
+                if !sum.clamps.is_empty() {
+                    let warn = ui.visuals().warn_fg_color;
+                    ui.colored_label(warn, format!("⚠ Slowed to fit max flow ({:.0} mm³/s)", sum.flow_cap))
+                        .on_hover_text(
+                            "Flow = line width × layer height × speed. The filament profile caps it at \
+                             what the hotend can melt per second ('max flow' under Material & temperature) — \
+                             printing faster than it can melt would under-extrude. The features below asked \
+                             for more speed and were slowed to fit; quality is unaffected, the print just \
+                             takes longer. To actually go faster, raise the cap only with a hotend/filament \
+                             that can melt it (e.g. the pla-hf profile for high-flow hotends like the \
+                             Sovol Zero's stock one).",
+                        );
+                    egui::Grid::new("flow_clamp_rows").spacing([10.0, 2.0]).show(ui, |ui| {
+                        for (name, asked, got) in &sum.clamps {
+                            ui.label(*name).on_hover_text(clamp_source_hint(name));
+                            ui.weak(format!("{asked:.0}"));
+                            ui.label(format!("-> {got:.0} mm/s"));
+                            ui.end_row();
+                        }
+                    });
+                }
+                if !sum.governor.is_empty() {
+                    let warn = ui.visuals().warn_fg_color;
+                    ui.colored_label(warn, "⚠ Thermal governor slowed hot islands")
+                        .on_hover_text(
+                            "The thermal governor (Feature speeds) slowed islands whose heat load \
+                             exceeded the target. The heat-load and layer-time previews, the time \
+                             estimate, and the g-code all show the governed result; toggling it off \
+                             restores your speeds exactly.",
+                        );
+                    egui::Grid::new("governor_rows").spacing([10.0, 2.0]).show(ui, |ui| {
+                        for r in &sum.governor {
+                            ui.label(if r.first_layer == r.last_layer {
+                                format!("layer {}", r.first_layer)
+                            } else {
+                                format!("layers {}-{}", r.first_layer, r.last_layer)
+                            });
+                            ui.label(format!("-> {:.0}% speed", r.worst_scale * 100.0));
+                            if r.floor_hit {
+                                ui.colored_label(ui.visuals().error_fg_color, "hot at floor")
+                                    .on_hover_text(
+                                        "Even at min print speed this region exceeds the target — \
+                                         slowing alone can't cool it. It needs more part cooling, a \
+                                         lower temperature, or a sacrificial cooling tower beside it.",
+                                    );
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+            }
             ui.separator();
 
             // Prominent Model / Preview toggle (Preview enabled once sliced).
@@ -980,8 +1363,8 @@ impl eframe::App for App {
                 }
             });
             if self.view_preview && n_layers > 0 {
-                ui.add(egui::Slider::new(&mut self.preview_layer, 1..=n_layers).text("layer"))
-                    .on_hover_text("Highest layer shown; lower layers are dimmed.");
+                hslider(ui, true, egui::Slider::new(&mut self.preview_layer, 1..=n_layers), "layer",
+                    "Highest layer shown; lower layers are dimmed.");
                 ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
                 ui.add_space(2.0);
                 ui.horizontal_wrapped(|ui| {
@@ -995,6 +1378,115 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.show_travel, "travel").on_hover_text("Show non-printing travel moves.");
                     ui.checkbox(&mut self.show_seams, "seams").on_hover_text("Highlight where each wall loop starts (the seam).");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("color").on_hover_text(
+                        "What the preview colors encode. Feature type is the classic view. The two heat \
+                         maps spot overheating: layer time shows where the nozzle returns quickly (little \
+                         cooling time), and heat load also weighs how much hot plastic is deposited and \
+                         how much footprint it has to cool through — scored per island, i.e. per \
+                         disconnected region of each layer.",
+                    );
+                    let before = self.color_by;
+                    egui::ComboBox::from_id_salt("preview_color_by")
+                        .selected_text(match self.color_by {
+                            ColorBy::Feature => "feature type",
+                            ColorBy::LayerTime => "layer time",
+                            ColorBy::Heat => "heat load",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.color_by, ColorBy::Feature, "feature type");
+                            ui.selectable_value(&mut self.color_by, ColorBy::LayerTime, "layer time");
+                            ui.selectable_value(&mut self.color_by, ColorBy::Heat, "heat load");
+                        });
+                    if self.color_by != before {
+                        self.set_preview_instances(&rs);
+                    }
+                });
+                if self.color_by != ColorBy::Feature && !self.layer_stats.is_empty() {
+                    let mut vals: Vec<f64> = Vec::new();
+                    match self.color_by {
+                        ColorBy::LayerTime => vals.extend(self.layer_stats.iter().map(|st| st.secs)),
+                        _ => {
+                            for (li, l) in self.layer_islands.iter().enumerate() {
+                                for isl in &l.islands {
+                                    if isl.joules > 0.0 {
+                                        vals.push(self.island_heat(li, isl));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let lo = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    // Legend ends carry the real numbers: left = blue (safe), right = red (hot).
+                    let governed_map = self.color_by == ColorBy::Heat
+                        && self.settings.thermal_governor
+                        && self.settings.governor_max_heat_mw_mm2 > 0.0;
+                    let (left, right, expl) = match self.color_by {
+                        ColorBy::LayerTime => (
+                            format!("{hi:.1}s"),
+                            format!("{lo:.1}s"),
+                            "Per-layer print time, log scale. Red = the quickest layers: the plastic \
+                             below gets the least time to cool before the nozzle returns. The min-layer \
+                             slowdown under Feature speeds is the usual fix."
+                                .to_string(),
+                        ),
+                        _ => {
+                            let governor_note = if governed_map {
+                                format!(
+                                    " The white tick is the governor target ({:.0} mW/mm²) — the ramp \
+                                     is anchored to it, so red strictly means still over the target.",
+                                    self.settings.governor_max_heat_mw_mm2
+                                )
+                            } else {
+                                String::new()
+                            };
+                            (
+                                format!("{:.1}", lo * 1000.0),
+                                format!("{:.1} mW/mm²", hi * 1000.0),
+                                format!(
+                                    "Heat load per island, log scale: each disconnected region of a layer is \
+                                     scored on its own — island energy ÷ (layer time × island footprint) — so a \
+                                     skinny chimney can't hide inside a big layer's average. The time stays the \
+                                     whole layer's, because an island keeps cooling while the nozzle works \
+                                     elsewhere (that's why lone towers overheat and shared ones don't). Energy = \
+                                     bead volume × density × specific heat × (nozzle − ambient). Red = hot \
+                                     plastic delivered quickly to a small footprint.{governor_note}"
+                                ),
+                            )
+                        }
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(left).small()).on_hover_text(expl.as_str());
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 10.0), egui::Sense::hover());
+                        if ui.is_rect_visible(rect) {
+                            let n = 24;
+                            for i in 0..n {
+                                let c = heat_ramp(i as f32 / (n - 1) as f32);
+                                let x0 = rect.min.x + rect.width() * i as f32 / n as f32;
+                                let x1 = rect.min.x + rect.width() * (i + 1) as f32 / n as f32;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y)),
+                                    0.0,
+                                    egui::Color32::from_rgb(
+                                        (c[0] * 255.0) as u8,
+                                        (c[1] * 255.0) as u8,
+                                        (c[2] * 255.0) as u8,
+                                    ),
+                                );
+                            }
+                            if governed_map {
+                                // Target tick: the yellow→red boundary of the anchored ramp.
+                                let x = rect.min.x + rect.width() * (2.0 / 3.0);
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)],
+                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                );
+                            }
+                        }
+                        ui.label(egui::RichText::new(right).small()).on_hover_text(expl.as_str());
+                    });
+                }
             }
             ui.separator();
 
@@ -1003,42 +1495,56 @@ impl eframe::App for App {
                 let s = &mut self.settings;
                 let pins = &mut self.pins;
                 tier_section(ui, "Quality", TierKind::Process, true, |ui| {
-                    ui.add(egui::Slider::new(&mut s.layer_height_mm, 0.05..=0.4).text("layer mm"))
-                        .on_hover_text("Height of each printed layer. Smaller = finer detail but slower.");
-                    ui.add(egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4).text("first layer mm"))
-                        .on_hover_text("Thickness of the first layer — often thicker for bed adhesion.");
+                    let lh_hint = format!(
+                        "Height of each printed layer. Smaller = finer detail but slower.\n\n\
+                         One corner of the flow triangle: every mm/s of print speed extrudes a bead of \
+                         line width × layer height, and the hotend can only melt `max flow` mm³ per second. \
+                         The speed ceiling is therefore {}. \
+                         Thicker layers lower that ceiling — unpinned feature speeds follow it live.",
+                        flow_ceiling_text(s)
+                    );
+                    hslider(ui, true, egui::Slider::new(&mut s.layer_height_mm, 0.05..=0.4), "layer mm",
+                        lh_hint);
+                    hslider(ui, true, egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4), "first layer mm",
+                        "Thickness of the first layer — often thicker for bed adhesion.");
                     let d_lw = config::derived_line_width_mm(s.nozzle_diameter_mm);
-                    auto_slider(ui, &mut s.line_width_mm, 0.2..=1.0, "line width mm", &mut pins.line_width, d_lw,
-                        "Width of one extruded line. Auto = 112.5% of the nozzle, so it follows nozzle changes.");
-                    ui.add(egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5).text("resolution mm"))
-                        .on_hover_text("Merge contour points closer than this to drop mesh noise. 0 = off.");
+                    let lw_hint = format!(
+                        "Width of one extruded line. Auto = 112.5% of the nozzle, so it follows nozzle changes.\n\n\
+                         One corner of the flow triangle: wider lines make a fatter bead, and speed × bead \
+                         must stay under the filament's melt ceiling — currently {}. \
+                         Wider lines lower that ceiling; unpinned feature speeds follow it live.",
+                        flow_ceiling_text(s)
+                    );
+                    auto_slider(ui, &mut s.line_width_mm, 0.2..=1.0, "line width mm", &mut pins.line_width, d_lw, &lw_hint);
+                    hslider(ui, true, egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5), "resolution mm",
+                        "Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
                     ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")
                         .on_hover_text("Emit curved toolpaths as G2/G3 arcs — smaller g-code, smoother motion. Needs firmware arc support (Klipper [gcode_arcs]).");
-                    ui.add_enabled(s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2).text("arc tol mm"))
-                        .on_hover_text("Max deviation a point may have from a fitted arc to be folded into it.");
-                    ui.add(egui::Slider::new(&mut s.elephant_foot_mm, 0.0..=0.5).text("elephant foot mm"))
-                        .on_hover_text("Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
-                    ui.add(egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5).text("XY comp mm"))
-                        .on_hover_text("Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
+                    hslider(ui, s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2), "arc tol mm",
+                        "Max deviation a point may have from a fitted arc to be folded into it.");
+                    hslider(ui, true, egui::Slider::new(&mut s.elephant_foot_mm, 0.0..=0.5), "elephant foot mm",
+                        "Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
+                    hslider(ui, true, egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5), "XY comp mm",
+                        "Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
                     let vase = s.spiral_vase;
                     ui.add_enabled(!vase, egui::Checkbox::new(&mut s.ironing, "ironing"))
                         .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.")
                         .on_disabled_hover_text("Forced off in spiral vase mode.");
-                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5).text("ironing flow"))
-                        .on_hover_text("Ironing extrusion as a fraction of a normal line at that spacing.");
-                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5).text("ironing spacing mm"))
-                        .on_hover_text("Distance between ironing passes — finer is smoother and slower.");
-                    ui.add_enabled(s.ironing && !vase, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0).text("ironing mm/s"))
-                        .on_hover_text("Ironing pass speed.");
+                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5), "ironing flow",
+                        "Ironing extrusion as a fraction of a normal line at that spacing.");
+                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5), "ironing spacing mm",
+                        "Distance between ironing passes — finer is smoother and slower.");
+                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0), "ironing mm/s",
+                        "Ironing pass speed.");
                     ui.add_enabled(!vase, egui::Checkbox::new(&mut s.fuzzy_skin, "fuzzy skin"))
                         .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).")
                         .on_disabled_hover_text("Forced off in spiral vase mode.");
-                    ui.add_enabled(s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_thickness_mm, 0.05..=1.0).text("fuzzy thickness mm"))
-                        .on_hover_text("Total jitter band, centered on the wall line.");
-                    ui.add_enabled(s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0).text("fuzzy point dist mm"))
-                        .on_hover_text("Spacing between jittered points — smaller is noisier.");
+                    hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_thickness_mm, 0.05..=1.0), "fuzzy thickness mm",
+                        "Total jitter band, centered on the wall line.");
+                    hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0), "fuzzy point dist mm",
+                        "Spacing between jittered points — smaller is noisier.");
                     ui.checkbox(&mut s.spiral_vase, "spiral vase")
                         .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).");
                 });
@@ -1056,14 +1562,14 @@ impl eframe::App for App {
                             .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
                         ui.label("wall mode");
                     });
-                    ui.add_enabled(!vase, egui::Slider::new(&mut s.wall_count, 1..=6).text("walls"))
-                        .on_hover_text("Number of perimeter loops (shell wall thickness).")
-                        .on_disabled_hover_text("Spiral vase forces a single wall.");
-                    ui.add_enabled(!vase, egui::Slider::new(&mut s.top_layers, 0..=10).text("top layers"))
-                        .on_hover_text("Number of solid layers on top surfaces.")
-                        .on_disabled_hover_text("Spiral vase prints no top shells.");
-                    ui.add(egui::Slider::new(&mut s.bottom_layers, 0..=10).text("bottom layers"))
-                        .on_hover_text("Number of solid layers on bottom surfaces.");
+                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 1..=6), "walls",
+                        "Number of perimeter loops (shell wall thickness).",
+                        "Spiral vase forces a single wall.");
+                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.top_layers, 0..=10), "top layers",
+                        "Number of solid layers on top surfaces.",
+                        "Spiral vase prints no top shells.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bottom_layers, 0..=10), "bottom layers",
+                        "Number of solid layers on bottom surfaces.");
                     ui.add_enabled(!vase && s.wall_mode == config::WallMode::Classic, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
                         .on_hover_text("Classic mode: fill gaps too thin for walls/infill with single width-matched strokes.")
                         .on_disabled_hover_text("Arachne absorbs gaps into the walls themselves — gap fill only applies to classic mode (and is off in spiral vase).");
@@ -1075,48 +1581,69 @@ impl eframe::App for App {
                     ui.add_enabled(!vase && !s.half_height_outer_walls, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). Best with 3+ walls.")
                         .on_disabled_hover_text("Unavailable in spiral vase mode or with half-height outer walls.");
-                    ui.add_enabled(s.brick_layers && !vase, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3).text("brick flow"))
-                        .on_hover_text("Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
+                    hslider(ui, s.brick_layers && !vase, egui::Slider::new(&mut s.brick_flow, 1.0..=1.3), "brick flow",
+                        "Extra extrusion on the lifted brick perimeters to fill the diagonal gaps between staggered beads so they mesh solidly.");
                 });
                 tier_section(ui, "Infill", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
-                    ui.add_enabled(!vase, egui::Slider::new(&mut s.infill_density, 0.0..=1.0).text("density"))
-                        .on_hover_text("Sparse interior fill density (0 = hollow, 1 = solid).")
-                        .on_disabled_hover_text("Spiral vase prints no infill.");
+                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.infill_density, 0.0..=1.0), "density",
+                        "Sparse interior fill density (0 = hollow, 1 = solid).",
+                        "Spiral vase prints no infill.");
                     ui.add_enabled_ui(s.infill_density > 0.0 && !vase, |ui| {
                         pattern_combo(ui, "sparse fill", &mut s.sparse_pattern)
                             .on_hover_text("Pattern for the sparse interior infill.");
                     });
                     pattern_combo(ui, "solid fill", &mut s.solid_pattern)
                         .on_hover_text("Pattern for the solid top/bottom layers.");
-                    ui.add(egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5).text("wall overlap"))
-                        .on_hover_text("How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
+                    hslider(ui, true, egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5), "wall overlap",
+                        "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });
                 tier_section(ui, "Feature speeds", TierKind::Process, false, |ui| {
                     let v = s.print_speed_mm_s;
-                    auto_slider(ui, &mut s.external_perimeter_speed_mm_s, 5.0..=200.0, "outer wall mm/s",
-                        &mut pins.external_speed, config::derived_external_perimeter_speed_mm_s(v),
-                        "Speed for the visible outermost wall — slower is cleaner. Auto = 50% of print speed.");
-                    auto_slider(ui, &mut s.solid_speed_mm_s, 5.0..=200.0, "solid mm/s",
-                        &mut pins.solid_speed, config::derived_solid_speed_mm_s(v),
-                        "Speed for solid top/bottom fill. Auto = 80% of print speed.");
-                    auto_slider(ui, &mut s.support_speed_mm_s, 5.0..=200.0, "support mm/s",
-                        &mut pins.support_speed, config::derived_support_speed_mm_s(v),
-                        "Speed for support structure. Auto = 90% of print speed.");
+                    // Auto speeds balance the flow triangle: speed × bead area
+                    // (line width × layer height) must fit the filament's max flow.
+                    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
+                    let hint_outer = speed_hint(
+                        "Speed for the visible outermost wall — slower is cleaner.",
+                        "50% of print speed", v * 0.5, s);
+                    let hint_solid = speed_hint(
+                        "Speed for solid top/bottom fill.",
+                        "80% of print speed", v * 0.8, s);
+                    let hint_support = speed_hint(
+                        "Speed for support structure (surface quality doesn't matter).",
+                        "90% of print speed", v * 0.9, s);
+                    let hint_gap = speed_hint(
+                        "Speed for thin gap-fill strokes.",
+                        "40% of print speed, capped at 40 for tight corners", (v * 0.4).min(40.0), s);
+                    auto_slider(ui, &mut s.external_perimeter_speed_mm_s, 5.0..=400.0, "outer wall mm/s",
+                        &mut pins.external_speed, config::derived_external_perimeter_speed_mm_s(v, cap), &hint_outer);
+                    auto_slider(ui, &mut s.solid_speed_mm_s, 5.0..=400.0, "solid mm/s",
+                        &mut pins.solid_speed, config::derived_solid_speed_mm_s(v, cap), &hint_solid);
+                    auto_slider(ui, &mut s.support_speed_mm_s, 5.0..=400.0, "support mm/s",
+                        &mut pins.support_speed, config::derived_support_speed_mm_s(v, cap), &hint_support);
                     auto_slider(ui, &mut s.gap_fill_speed_mm_s, 5.0..=100.0, "gap fill mm/s",
-                        &mut pins.gap_fill_speed, config::derived_gap_fill_speed_mm_s(v),
-                        "Speed for thin gap-fill strokes. Auto = 40% of print speed, capped at 40.");
-                    ui.add(egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0).text("bridge mm/s"))
-                        .on_hover_text("Speed for straight bridges (spans anchored on both sides). Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — arcs cantilever off the previous ring and need to set in place.");
+                        &mut pins.gap_fill_speed, config::derived_gap_fill_speed_mm_s(v, cap), &hint_gap);
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0), "bridge mm/s",
+                        "Speed for straight bridges (spans anchored on both sides). Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — arcs cantilever off the previous ring and need to set in place.");
                     auto_slider(ui, &mut s.overhang_speed_mm_s, 5.0..=100.0, "overhang mm/s",
                         &mut pins.overhang_speed, config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s),
                         "Speed for wall stretches hanging past the layer below (printed with bridge cooling). Auto = bridge speed — same physics, beads onto air.");
-                    ui.add(egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2).text("bridge flow ×"))
-                        .on_hover_text("Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
-                    ui.add(egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0).text("min layer s"))
-                        .on_hover_text("Cooling slowdown: layers faster than this are slowed so they can solidify.");
-                    ui.add_enabled(s.min_layer_time_s > 0.0, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0).text("min mm/s"))
-                        .on_hover_text("Floor speed when slowing down to hit the minimum layer time.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2), "bridge flow ×",
+                        "Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
+                    hslider(ui, true, egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0), "min layer s",
+                        "Cooling slowdown: layers faster than this are slowed so they can solidify.");
+                    hslider(ui, s.min_layer_time_s > 0.0 || s.thermal_governor, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0), "min mm/s",
+                        "Floor speed for the cooling slowdowns — both the minimum layer time and the thermal governor never push below it.");
+                    ui.checkbox(&mut s.thermal_governor, "thermal governor")
+                        .on_hover_text(
+                            "Slow each hot island — a disconnected region of a layer — until its heat \
+                             load (deposited energy ÷ layer time ÷ island footprint) fits the target \
+                             below. Computed per slice on top of your speeds; switching it off restores \
+                             them exactly. Every intervention is listed in the slice summary, the \
+                             previews show the governed result, and speeds never drop below min mm/s.",
+                        );
+                    hslider(ui, s.thermal_governor, egui::Slider::new(&mut s.governor_max_heat_mw_mm2, 2.0..=40.0), "max heat mW/mm²",
+                        "The governor's per-island heat-load ceiling. Read natural values off the heat-load preview legend: broad hull-like regions sit low, lone towers spike. Lower = cooler but slower.");
                     ui.weak("machine speed & accel live under Machine & motion");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
@@ -1128,91 +1655,110 @@ impl eframe::App for App {
                     });
                     let has_support = s.support_mode != config::SupportMode::None && !vase;
                     let arc = s.support_mode == config::SupportMode::Arc && !vase;
-                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0).text("overhang °"))
-                        .on_hover_text("Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
-                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_density, 0.0..=1.0).text("density"))
-                        .on_hover_text("Infill density of grid supports.");
-                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_xy_clearance_mm, 0.0..=2.0).text("xy gap mm"))
-                        .on_hover_text("Horizontal gap between support and the model (for easy removal).");
-                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_z_gap_layers, 0..=5).text("z-gap layers"))
-                        .on_hover_text("Empty layers between a support top and the part it holds up.");
-                    ui.add_enabled(has_support, egui::Slider::new(&mut s.support_interface_layers, 0..=5).text("interface"))
-                        .on_hover_text("Dense solid layers at the support top for a smoother overhang underside.");
-                    ui.add_enabled(arc, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0).text("bridge span mm"))
-                        .on_hover_text("Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
-                    ui.add_enabled(arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0).text("arc radius mm"))
-                        .on_hover_text("Arc mode: max arc-overhang radius before a fan re-seeds.");
-                    ui.add_enabled(arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6).text("arc seam overlap mm"))
-                        .on_hover_text("Arc mode: how far fans overlap where they meet (per fan). A little helps them mesh; too much over-extrudes the seam. 0 = butt.");
+                    hslider(ui, has_support, egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0), "overhang °",
+                        "Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
+                    hslider(ui, has_support, egui::Slider::new(&mut s.support_density, 0.0..=1.0), "density",
+                        "Infill density of grid supports.");
+                    hslider(ui, has_support, egui::Slider::new(&mut s.support_xy_clearance_mm, 0.0..=2.0), "xy gap mm",
+                        "Horizontal gap between support and the model (for easy removal).");
+                    hslider(ui, has_support, egui::Slider::new(&mut s.support_z_gap_layers, 0..=5), "z-gap layers",
+                        "Empty layers between a support top and the part it holds up.");
+                    hslider(ui, has_support, egui::Slider::new(&mut s.support_interface_layers, 0..=5), "interface",
+                        "Dense solid layers at the support top for a smoother overhang underside.");
+                    hslider(ui, arc, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0), "bridge span mm",
+                        "Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
+                    hslider(ui, arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0), "arc radius mm",
+                        "Arc mode: max arc-overhang radius before a fan re-seeds.");
+                    hslider(ui, arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6), "arc seam overlap mm",
+                        "Arc mode: how far fans overlap where they meet (per fan). A little helps them mesh; too much over-extrudes the seam. 0 = butt.");
                 });
                 tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.skirt_loops, 0..=5).text("skirt loops"))
-                        .on_hover_text("Loops printed around the first layer to prime the nozzle. 0 = off.");
-                    ui.add_enabled(s.skirt_loops > 0, egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0).text("skirt gap mm"))
-                        .on_hover_text("Distance from the skirt to the model.");
-                    ui.add(egui::Slider::new(&mut s.brim_loops, 0..=20).text("brim loops"))
-                        .on_hover_text("Loops attached around the first layer for adhesion. 0 = off.");
+                    hslider(ui, true, egui::Slider::new(&mut s.skirt_loops, 0..=5), "skirt loops",
+                        "Loops printed around the first layer to prime the nozzle. 0 = off.");
+                    hslider(ui, s.skirt_loops > 0, egui::Slider::new(&mut s.skirt_gap_mm, 0.0..=10.0), "skirt gap mm",
+                        "Distance from the skirt to the model.");
+                    hslider(ui, true, egui::Slider::new(&mut s.brim_loops, 0..=20), "brim loops",
+                        "Loops attached around the first layer for adhesion. 0 = off.");
                 });
                 tier_section(ui, "Material & temperature", TierKind::Filament, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.nozzle_temp_c, 150..=300).text("nozzle °C"))
-                        .on_hover_text("Hotend temperature.");
-                    ui.add(egui::Slider::new(&mut s.bed_temp_c, 0..=120).text("bed °C"))
-                        .on_hover_text("Heated bed temperature.");
-                    ui.add(egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0).text("filament Ø mm"))
-                        .on_hover_text("Filament diameter (1.75 or 2.85). Drives the extrusion math.");
-                    ui.add(egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0).text("density g/cm³"))
-                        .on_hover_text("Filament density — used for the weight estimate.");
-                    ui.add(egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0).text("max flow mm³/s"))
-                        .on_hover_text("The filament's melt-rate ceiling through the hotend. Speeds are clamped so width × height × speed never exceeds it — the status line reports anything that gets slowed. 0 = unlimited.");
-                    ui.add(egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2).text("flow ×"))
-                        .on_hover_text("Global extrusion multiplier — filament-specific flow tuning.");
-                    ui.add(egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2).text("pressure advance"))
-                        .on_hover_text("Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_c, 150..=300), "nozzle °C",
+                        "Hotend temperature.");
+                    hslider(ui, true, egui::Slider::new(&mut s.first_layer_nozzle_temp_c, 150..=300), "first layer °C",
+                        "Hotend temperature for the first layer — usually a touch hotter for bed adhesion. The nozzle temperature takes over from layer 2.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
+                        "Heated bed temperature.");
+                    hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
+                        "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
+                    hslider(ui, true, egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0), "density g/cm³",
+                        "Filament density — used for the weight estimate.");
+                    let mf_hint = format!(
+                        "The filament's melt-rate ceiling through the hotend, in mm³ of plastic per second.\n\n\
+                         The limiting corner of the flow triangle: every mm/s of speed extrudes a bead of \
+                         line width × layer height, so speed × bead must stay under this. Right now: {}.\n\n\
+                         Unpinned feature speeds rebalance against it live; whatever still overshoots \
+                         (pinned speeds, or infill/inner walls driven by print speed) is slowed at slice \
+                         time and reported in the slice summary. 0 = unlimited.",
+                        flow_ceiling_text(s)
+                    );
+                    hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
+                        mf_hint);
+                    hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
+                        "Global extrusion multiplier — filament-specific flow tuning.");
+                    hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
+                        "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
                 });
                 tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.fan_speed, 0.0..=1.0).text("fan"))
-                        .on_hover_text("Part-cooling fan duty while printing.");
-                    ui.add(egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0).text("bridge fan"))
-                        .on_hover_text("Fan duty on bridges and arc overhangs — usually maxed.");
-                    ui.add(egui::Slider::new(&mut s.fan_off_layers, 0..=5).text("fan off layers"))
-                        .on_hover_text("Keep the fan off for this many first layers (bed adhesion).");
+                    hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
+                        "Part-cooling fan duty while printing.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
+                        "Fan duty on bridges and arc overhangs — usually maxed.");
+                    hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
+                        "Keep the fan off for this many first layers (bed adhesion).");
+                    hslider(ui, s.has_aux_fan, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
+                        "Auxiliary part-cooling fan duty (M106 P2), on once past the fan-off layers. Needs the aux fan declared under Machine & motion.");
+                    hslider(ui, s.has_exhaust_fan, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
+                        "Chamber-exhaust fan duty (M106 P3), on for the whole print — vents chamber heat. PLA wants it high, ABS low or off. Needs the exhaust fan declared under Machine & motion.");
                     ui.weak("min-layer-time slowdown lives under Feature speeds");
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0).text("length mm"))
-                        .on_hover_text("Filament pulled back on travels to prevent oozing/stringing.");
-                    ui.add(egui::Slider::new(&mut s.retract_speed_mm_s, 5.0..=100.0).text("speed mm/s"))
-                        .on_hover_text("How fast filament is retracted and recovered.");
-                    ui.add(egui::Slider::new(&mut s.z_hop_mm, 0.0..=2.0).text("z-hop mm"))
-                        .on_hover_text("Lift the nozzle on travels that cross a gap/void. 0 = off.");
-                    ui.add(egui::Slider::new(&mut s.wipe_mm, 0.0..=5.0).text("wipe mm"))
-                        .on_hover_text("After retracting, drag the nozzle back along the printed bead by this much before travelling — ooze smears onto plastic instead of blobbing the seam. 0 = off.");
+                    hslider(ui, true, egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0), "length mm",
+                        "Filament pulled back on travels to prevent oozing/stringing.");
+                    hslider(ui, true, egui::Slider::new(&mut s.retract_speed_mm_s, 5.0..=100.0), "speed mm/s",
+                        "How fast filament is retracted and recovered.");
+                    hslider(ui, true, egui::Slider::new(&mut s.z_hop_mm, 0.0..=2.0), "z-hop mm",
+                        "Lift the nozzle on travels that cross a gap/void. 0 = off.");
+                    hslider(ui, true, egui::Slider::new(&mut s.wipe_mm, 0.0..=5.0), "wipe mm",
+                        "After retracting, drag the nozzle back along the printed bead by this much before travelling — ooze smears onto plastic instead of blobbing the seam. 0 = off.");
                 });
                 tier_section(ui, "Machine & motion", TierKind::Printer, false, |ui| {
-                    ui.add(egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0).text("bed X mm"))
-                        .on_hover_text("Bed width (X).");
-                    ui.add(egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0).text("bed Y mm"))
-                        .on_hover_text("Bed depth (Y).");
-                    ui.add(egui::Slider::new(&mut s.bed_size_z_mm, 50.0..=600.0).text("bed Z mm"))
-                        .on_hover_text("Maximum build height (Z).");
-                    ui.add(egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2).text("nozzle mm"))
-                        .on_hover_text("Nozzle diameter.");
-                    ui.add(egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0).text("print mm/s"))
-                        .on_hover_text("The machine's nominal print speed (inner walls, sparse infill). Per-feature speeds derive from it when a profile leaves them unset. Lives here because the printer profile owns it.");
-                    ui.add(egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0).text("1st layer mm/s"))
-                        .on_hover_text("Speed for the first layer — slower improves bed adhesion.");
-                    ui.add(egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0).text("travel mm/s"))
-                        .on_hover_text("Speed for non-printing moves between features.");
-                    ui.add(egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0).text("accel mm/s²"))
-                        .on_hover_text("Acceleration for inner walls, infill, solid, support, and travel — emitted as M204 per feature. Klipper clamps to printer.cfg max_accel. Higher = faster but more ringing.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bed_size_x_mm, 50.0..=500.0), "bed X mm",
+                        "Bed width (X).");
+                    hslider(ui, true, egui::Slider::new(&mut s.bed_size_y_mm, 50.0..=500.0), "bed Y mm",
+                        "Bed depth (Y).");
+                    hslider(ui, true, egui::Slider::new(&mut s.bed_size_z_mm, 50.0..=600.0), "bed Z mm",
+                        "Maximum build height (Z).");
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2), "nozzle mm",
+                        "Nozzle diameter.");
+                    hslider(ui, true, egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0), "print mm/s",
+                        "The machine's nominal print speed (inner walls, sparse infill). Per-feature speeds derive from it when a profile leaves them unset. Lives here because the printer profile owns it.");
+                    hslider(ui, true, egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0), "1st layer mm/s",
+                        "Speed for the first layer — slower improves bed adhesion.");
+                    hslider(ui, true, egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0), "travel mm/s",
+                        "Speed for non-printing moves between features.");
+                    hslider(ui, true, egui::Slider::new(&mut s.acceleration_mm_s2, 100.0..=20000.0), "accel mm/s²",
+                        "Acceleration for inner walls, infill, solid, support, and travel — emitted as M204 per feature. Klipper clamps to printer.cfg max_accel. Higher = faster but more ringing.");
                     auto_slider(ui, &mut s.outer_wall_accel_mm_s2, 100.0..=20000.0, "outer accel",
                         &mut pins.outer_wall_accel, config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2),
                         "Acceleration for the visible outermost wall — lower hides ringing. Auto = 50% of accel.");
                     auto_slider(ui, &mut s.first_layer_accel_mm_s2, 100.0..=20000.0, "1st layer accel",
                         &mut pins.first_layer_accel, config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2),
                         "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
-                    ui.add(egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0).text("jerk mm/s"))
-                        .on_hover_text("Klipper square-corner-velocity — how briskly direction changes are taken.");
+                    hslider(ui, true, egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0), "jerk mm/s",
+                        "Klipper square-corner-velocity — how briskly direction changes are taken.");
+                    ui.checkbox(&mut s.has_aux_fan, "aux part fan (M106 P2)")
+                        .on_hover_text("The machine has an auxiliary side part-cooling fan (Sovol Zero, Bambu-style). Unlocks the filament's aux-fan duty; off = M106 P2 is never emitted (vanilla firmware reads it as the primary fan).");
+                    ui.checkbox(&mut s.has_exhaust_fan, "exhaust fan (M106 P3)")
+                        .on_hover_text("The machine has a chamber-exhaust fan. Unlocks the filament's exhaust duty; off = M106 P3 is never emitted.");
                 });
                 tier_section(ui, "Connection", TierKind::Printer, false, |ui| {
                     ui.label("printer host").on_hover_text(
@@ -1235,7 +1781,7 @@ impl eframe::App for App {
                 });
                 tier_section(ui, "Custom g-code", TierKind::Printer, false, |ui| {
                     ui.label("Start g-code").on_hover_text(
-                        "Emitted before the print. Placeholders: {nozzle_temp} {bed_temp} {bed_x} {bed_y} {bed_z} {layer_height} {first_layer_height} {nozzle_diameter}.",
+                        "Emitted before the print. Placeholders: {nozzle_temp} {first_layer_nozzle_temp} {bed_temp} {bed_x} {bed_y} {bed_z} {layer_height} {first_layer_height} {nozzle_diameter}.",
                     );
                     ui.add(
                         egui::TextEdit::multiline(&mut s.start_gcode)
@@ -1257,48 +1803,6 @@ impl eframe::App for App {
         });
 
         // Execute any printer-host action requested above, on a worker thread.
-        if let Some(op) = host_op {
-            let ctx = ui.ctx().clone();
-            match op {
-                HostOp::Test => self.spawn_host_op(&ctx, |c| match c.server_info() {
-                    Ok(state) => format!("Printer reachable — Klipper is {state}."),
-                    Err(e) => format!("Connection failed: {e}"),
-                }),
-                HostOp::Send { start } => {
-                    if let Some(layers) = self.sliced.as_ref() {
-                        let gcode = engine::to_gcode(layers, &self.settings);
-                        let filename = self.upload_filename();
-                        self.spawn_host_op(&ctx, move |c| {
-                            match c.upload(&filename, gcode.as_bytes(), start) {
-                                Ok(()) if start => format!("Printing {filename}."),
-                                Ok(()) => format!("Uploaded {filename}."),
-                                Err(e) => format!("Upload failed: {e}"),
-                            }
-                        });
-                    }
-                }
-                HostOp::Pause => self.spawn_host_op(&ctx, |c| match c.pause() {
-                    Ok(()) => "Print paused.".into(),
-                    Err(e) => format!("Pause failed: {e}"),
-                }),
-                HostOp::Resume => self.spawn_host_op(&ctx, |c| match c.resume() {
-                    Ok(()) => "Print resumed.".into(),
-                    Err(e) => format!("Resume failed: {e}"),
-                }),
-                HostOp::Cancel => self.spawn_host_op(&ctx, |c| match c.cancel() {
-                    Ok(()) => "Print cancelled.".into(),
-                    Err(e) => format!("Cancel failed: {e}"),
-                }),
-                HostOp::Status => self.spawn_host_op(&ctx, |c| match c.print_status() {
-                    Ok(st) if st.filename.is_empty() => format!("Printer is {}.", st.state),
-                    Ok(st) => {
-                        format!("{} {} — {:.0}%", st.state, st.filename, st.progress * 100.0)
-                    }
-                    Err(e) => format!("Status failed: {e}"),
-                }),
-            }
-        }
-
         // Frameless: the viewport texture runs edge-to-edge against the panel
         // separator instead of sitting in an 8 pt dark mat.
         egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
@@ -1308,11 +1812,10 @@ impl eframe::App for App {
 
             // Objects are only editable in Model view; Preview is read-only.
             let edit = !self.view_preview;
-            // Ignore viewport input when the cursor is over the transform overlay.
-            let blocked = match (self.overlay_rect, ui.ctx().pointer_interact_pos()) {
-                (Some(r), Some(p)) => r.contains(p),
-                _ => false,
-            };
+            // Ignore viewport input when the cursor is over a floating overlay.
+            let pointer = ui.ctx().pointer_interact_pos();
+            let over = |r: Option<egui::Rect>| matches!((r, pointer), (Some(r), Some(p)) if r.contains(p));
+            let blocked = over(self.overlay_rect) || over(self.print_overlay_rect);
 
             // Left-press on an object grabs it for dragging; on empty space, orbits.
             if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
@@ -1340,6 +1843,7 @@ impl eframe::App for App {
                                     [xy.x as f64 + self.drag_grab[0], xy.y as f64 + self.drag_grab[1]];
                                 self.needs_rebuild = true;
                                 self.sliced = None;
+                                self.slice_summary = None;
                                 self.view_preview = false;
                             }
                         }
@@ -1448,12 +1952,132 @@ impl eframe::App for App {
                 if changed {
                     self.needs_rebuild = true;
                     self.sliced = None;
+                    self.slice_summary = None;
                     self.view_preview = false;
                 }
             } else {
                 self.overlay_rect = None;
             }
+
+            // Live-print card: translucent, top-right of the viewport, shown
+            // once a file has been sent. The state refreshes itself on a timer
+            // (quiet polls), so there's no manual status button.
+            if self.sent_to_printer && host_set {
+                let state = self
+                    .printer_status
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|st| st.state.as_str())
+                    .unwrap_or("");
+                let area = egui::Area::new(egui::Id::new("print_overlay"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(rect.right() - 240.0, rect.top() + 10.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
+                            .show(ui, |ui| {
+                                ui.set_width(220.0);
+                                match &self.printer_status {
+                                    None => {
+                                        ui.label(egui::RichText::new("Printer").strong());
+                                        ui.weak("checking…");
+                                    }
+                                    Some(Err(e)) => {
+                                        ui.label(egui::RichText::new("Printer").strong());
+                                        ui.colored_label(ui.visuals().error_fg_color, e);
+                                    }
+                                    Some(Ok(st)) => {
+                                        let name = if st.filename.is_empty() { "(no file)" } else { st.filename.as_str() };
+                                        ui.label(egui::RichText::new(name).strong());
+                                        if st.state == "printing" || st.state == "paused" {
+                                            ui.add(egui::ProgressBar::new(st.progress as f32).show_percentage());
+                                        }
+                                        ui.weak(&st.state);
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    let live = !host_busy;
+                                    if ui
+                                        .add_enabled(live && state == "printing", egui::Button::new("⏸"))
+                                        .on_hover_text("Pause the running print.")
+                                        .clicked()
+                                    {
+                                        host_op = Some(HostOp::Pause);
+                                    }
+                                    if ui
+                                        .add_enabled(live && state == "paused", egui::Button::new("▶"))
+                                        .on_hover_text("Resume the paused print.")
+                                        .clicked()
+                                    {
+                                        host_op = Some(HostOp::Resume);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            live && (state == "printing" || state == "paused"),
+                                            egui::Button::new("✖"),
+                                        )
+                                        .on_hover_text("Cancel the running print.")
+                                        .clicked()
+                                    {
+                                        host_op = Some(HostOp::Cancel);
+                                    }
+                                });
+                            });
+                    });
+                self.print_overlay_rect = Some(area.response.rect);
+            } else {
+                self.print_overlay_rect = None;
+            }
         });
+
+        // Dispatch host actions after both panels have run — the left panel
+        // and the live-print overlay both request them via `host_op`.
+        if let Some(op) = host_op {
+            let ctx = ui.ctx().clone();
+            match op {
+                HostOp::Test => self.spawn_host_op(&ctx, false, |c| {
+                    HostReply::Message(match c.server_info() {
+                        Ok(state) => format!("Printer reachable — Klipper is {state}."),
+                        Err(e) => format!("Connection failed: {e}"),
+                    })
+                }),
+                HostOp::Send { start } => {
+                    if let Some(layers) = self.sliced.as_ref() {
+                        let gcode = engine::to_gcode(layers, &self.settings);
+                        let filename = self.upload_filename();
+                        self.spawn_host_op(&ctx, false, move |c| {
+                            match c.upload(&filename, gcode.as_bytes(), start) {
+                                Ok(()) if start => HostReply::SendDone { ok: true, msg: format!("Printing {filename}.") },
+                                Ok(()) => HostReply::SendDone { ok: true, msg: format!("Uploaded {filename}.") },
+                                Err(e) => HostReply::SendDone { ok: false, msg: format!("Upload failed: {e}") },
+                            }
+                        });
+                    }
+                }
+                HostOp::Pause => self.spawn_host_op(&ctx, false, |c| {
+                    HostReply::Message(match c.pause() {
+                        Ok(()) => "Print paused.".into(),
+                        Err(e) => format!("Pause failed: {e}"),
+                    })
+                }),
+                HostOp::Resume => self.spawn_host_op(&ctx, false, |c| {
+                    HostReply::Message(match c.resume() {
+                        Ok(()) => "Print resumed.".into(),
+                        Err(e) => format!("Resume failed: {e}"),
+                    })
+                }),
+                HostOp::Cancel => self.spawn_host_op(&ctx, false, |c| {
+                    HostReply::Message(match c.cancel() {
+                        Ok(()) => "Print cancelled.".into(),
+                        Err(e) => format!("Cancel failed: {e}"),
+                    })
+                }),
+                HostOp::Status => {
+                    self.last_status_poll = Some(std::time::Instant::now());
+                    self.spawn_host_op(&ctx, true, |c| HostReply::Status(c.print_status()));
+                }
+            }
+        }
 
         // Save / delete profile dialog (floats over the viewport).
         if let Some(mut dlg) = self.profile_dialog.take() {
@@ -1654,7 +2278,11 @@ const CAT_IRONING: f32 = 8.0;
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
 type Instances = (Vec<[f32; 13]>, Vec<u32>, Vec<[f32; 10]>, Vec<u32>);
-fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
+fn build_instances(
+    layers: &[engine::LayerPlan],
+    z_hop_mm: f32,
+    path_colors: Option<&[Vec<[f32; 3]>]>,
+) -> Instances {
     let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
     let mut joints: Vec<[f32; 10]> = Vec::new();
@@ -1682,7 +2310,8 @@ fn build_instances(layers: &[engine::LayerPlan], z_hop_mm: f32) -> Instances {
                     from = pt;
                 }
             }
-            let c = color_for(path.kind);
+            // Heat-map modes override the feature palette per path (per island).
+            let c = path_colors.map_or_else(|| color_for(path.kind), |t| t[li][pi]);
             let cat = category_of(path.kind);
             // Brick-layered perimeters render half a layer up (z_offset) and a touch
             // fatter (flow > 1), so the staggered, over-packed walls are visible.

@@ -12,7 +12,7 @@
 
 use config::Settings;
 use gcode::GcodeBuilder;
-use geo2d::{Point, Polygons};
+use geo2d::{Contour, Point, Polygons};
 use rayon::prelude::*;
 
 use crate::plan::{LayerPlan, PathKind, ToolPath, Travel};
@@ -63,6 +63,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             ));
         }
     }
+    if s.thermal_governor {
+        for r in audit_governor(layers, s) {
+            g.comment(&format!(
+                "thermal governor: layers {}-{} slowed to {:.0}%{}",
+                r.first_layer,
+                r.last_layer,
+                r.worst_scale * 100.0,
+                if r.floor_hit { " (still hot at the min-speed floor)" } else { "" }
+            ));
+        }
+    }
     g.comment(&format!(
         "layer_h={} line_w={} walls={} top/bot={}/{} infill={} ({}) bed={}x{}",
         s.layer_height_mm,
@@ -95,6 +106,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let mut cur_fan = 0u32;
 
     let fan_duty = |frac: f64| (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
+    // Extra fans, gated on the printer declaring them — vanilla Klipper/Marlin
+    // reads the M106 P-form as the primary fan. The aux part fan (M106 P2)
+    // follows the part fan's first-layers gate in the loop below; the chamber
+    // exhaust (M106 P3) runs flat for the whole print. Both shut off at the end.
+    let mut cur_aux_fan = 0u32;
+    if s.has_aux_fan {
+        g.raw("M106 P2 S0");
+    }
+    if s.has_exhaust_fan && s.exhaust_fan_speed > 0.0 {
+        g.raw(&format!("M106 P3 S{}", fan_duty(s.exhaust_fan_speed)));
+    }
     let first_spiral = s.bottom_layers; // vase mode: first continuously-rising layer
     // Tail of the most recently printed path, for wiping the nozzle back over
     // it when the next travel retracts. Carried across layers: a layer-change
@@ -113,12 +135,24 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 ((total_secs - done) / 60.0).ceil()
             ));
         }
+        // Start g-code heated to the first-layer temp; drop to the printing
+        // temp once the first layer is down (M104: set without waiting).
+        if layer.index == 1 && s.first_layer_nozzle_temp_c != s.nozzle_temp_c {
+            g.raw(&format!("M104 S{}", s.nozzle_temp_c));
+        }
         // Part cooling: off for the first `fan_off_layers`, then the normal duty;
         // bridges may override per path below.
         let normal_fan = if layer.index < s.fan_off_layers { 0 } else { fan_duty(s.fan_speed) };
         if normal_fan != cur_fan {
             g.fan(normal_fan);
             cur_fan = normal_fan;
+        }
+        if s.has_aux_fan {
+            let aux = if layer.index < s.fan_off_layers { 0 } else { fan_duty(s.aux_fan_speed) };
+            if aux != cur_aux_fan {
+                g.raw(&format!("M106 P2 S{aux}"));
+                cur_aux_fan = aux;
+            }
         }
 
         // Spiral vase: above the solid bottom, the single wall loop climbs
@@ -177,7 +211,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
 
             // Brick-layered perimeters print half a layer up and over-extrude a touch.
             let z = layer.print_z_mm + path.z_offset_mm;
-            let feed = feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale;
+            let feed =
+                feed_for(path, layer.index, layer.height_mm, s) * layer.speed_scale * path_scale(layer, i);
             let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
                 * flow_factor(path, s);
             let start = path.points[0];
@@ -247,6 +282,14 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     }
     if total_secs > 0.0 {
         g.raw("M73 P100 R0");
+    }
+    // Leave no P-addressed fan running: end g-code macros handle the primary
+    // fan (M107) but don't know about these.
+    if cur_aux_fan != 0 {
+        g.raw("M106 P2 S0");
+    }
+    if s.has_exhaust_fan && s.exhaust_fan_speed > 0.0 {
+        g.raw("M106 P3 S0");
     }
     emit_template(&mut g, &s.end_gcode, s);
 
@@ -327,6 +370,7 @@ fn emit_template(g: &mut GcodeBuilder, template: &str, s: &Settings) {
 fn substitute(template: &str, s: &Settings) -> String {
     template
         .replace("{nozzle_temp}", &s.nozzle_temp_c.to_string())
+        .replace("{first_layer_nozzle_temp}", &s.first_layer_nozzle_temp_c.to_string())
         .replace("{bed_temp}", &s.bed_temp_c.to_string())
         .replace("{bed_x}", &format!("{:.3}", s.bed_size_x_mm))
         .replace("{bed_y}", &format!("{:.3}", s.bed_size_y_mm))
@@ -422,7 +466,9 @@ pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f
     worst.into_values().collect()
 }
 
-pub(crate) fn kind_label(kind: PathKind) -> &'static str {
+/// Human-readable feature name for a path kind — used in g-code header
+/// comments, the CLI flow report, and the GUI's flow-limit table.
+pub fn kind_label(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Skirt => "skirt",
         PathKind::ExternalPerimeter => "outer wall",
@@ -661,7 +707,6 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
 /// using the planned travels. Acceleration follows the per-feature M204s the
 /// emitter writes, so the estimate tracks what the printer is actually told.
 fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
-    let jerk = s.jerk_mm_s.max(0.1);
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let retract_t = if s.retract_len_mm > 0.0 {
         2.0 * s.retract_len_mm / s.retract_speed_mm_s.max(1.0)
@@ -699,8 +744,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
                 t += hop_t;
             }
         }
-        let v_nom = feed_for(path, layer.index, layer.height_mm, s) / 60.0 * scale;
-        t += polyline_time(&path.points, path.closed, v_nom, accel, jerk);
+        t += path_extrusion_seconds(layer, i, s, scale * path_scale(layer, i));
         last_pos = Some(path_end(path));
         prev_path_len = path.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
     }
@@ -881,39 +925,371 @@ pub fn format_duration(seconds: f64) -> String {
     }
 }
 
+/// Deposited bead volume (mm³) for one path — honors variable widths,
+/// per-path flow (brick, ironing), bridge flow, and the extrusion multiplier.
+/// Shared by the filament estimate and the heat stats so the preview maps
+/// can't disagree with the totals.
+fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, s: &Settings) -> f64 {
+    if let Some(ws) = &path.widths {
+        let n_pts = path.points.len();
+        let segs = if path.closed { n_pts } else { n_pts.saturating_sub(1) };
+        let mut volume = 0.0;
+        for k in 0..segs {
+            let d = dist_mm(path.points[k], path.points[(k + 1) % n_pts]);
+            let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
+            volume += d
+                * config::bead_area_mm2(w, layer_height_mm * path.height_scale)
+                * flow_factor(path, s);
+        }
+        return volume;
+    }
+    let mut len = 0.0;
+    for w in path.points.windows(2) {
+        len += dist_mm(w[0], w[1]);
+    }
+    if path.closed && path.points.len() >= 2 {
+        len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
+    }
+    len * config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s)
+}
+
+/// Deposited bead volume (mm³) for one layer.
+fn layer_volume_mm3(layer: &LayerPlan, s: &Settings) -> f64 {
+    layer.paths.iter().map(|p| path_volume_mm3(p, layer.height_mm, s)).sum()
+}
+
+/// The thermal governor's per-path speed multiplier (1.0 when ungoverned).
+fn path_scale(layer: &LayerPlan, i: usize) -> f64 {
+    layer.path_speed_scale.get(i).copied().unwrap_or(1.0)
+}
+
+/// Extrusion-only seconds for one path at a total speed multiplier — the
+/// trapezoid simulation the layer estimate uses, exposed so the thermal
+/// governor budgets with the same numbers.
+fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale: f64) -> f64 {
+    let path = &layer.paths[i];
+    if path.points.len() < 2 {
+        return 0.0;
+    }
+    let accel = accel_for(path.kind, layer.index, s).max(1.0);
+    let v = feed_for(path, layer.index, layer.height_mm, s) / 60.0 * total_scale;
+    polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1))
+}
+
 /// Estimate filament used: `(length_mm, grams)`. Honors per-path flow (brick,
 /// ironing), bridge flow, and the global extrusion multiplier.
 pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
-    let mut volume = 0.0; // mm³
-    for layer in layers {
-        for path in &layer.paths {
-            if let Some(ws) = &path.widths {
-                let n_pts = path.points.len();
-                let segs = if path.closed { n_pts } else { n_pts.saturating_sub(1) };
-                for k in 0..segs {
-                    let d = dist_mm(path.points[k], path.points[(k + 1) % n_pts]);
-                    let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
-                    volume += d
-                        * config::bead_area_mm2(w, layer.height_mm * path.height_scale)
-                        * flow_factor(path, s);
-                }
-                continue;
-            }
-            let mut len = 0.0;
-            for w in path.points.windows(2) {
-                len += dist_mm(w[0], w[1]);
-            }
-            if path.closed && path.points.len() >= 2 {
-                len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
-            }
-            volume += len
-                * config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale)
-                * flow_factor(path, s);
-        }
-    }
+    let volume: f64 = layers.iter().map(|l| layer_volume_mm3(l, s)).sum();
     let length_mm = volume / s.filament_area_mm2();
     let grams = volume / 1000.0 * s.filament_density_g_cm3; // 1000 mm³ = 1 cm³
     (length_mm, grams)
+}
+
+/// Per-layer numbers behind the preview heat maps.
+pub struct LayerStats {
+    /// Seconds printing this layer (its Z move + extrusion + travels).
+    pub secs: f64,
+    /// Thermal energy deposited (J): bead volume × density × cₚ × (nozzle − ambient).
+    pub joules: f64,
+    /// Solid footprint of the part at this Z (mm², net of holes) — the area
+    /// the heat must spread over and shed through. Falls back to the deposited
+    /// cross-section when a layer carries no outline.
+    pub footprint_mm2: f64,
+}
+
+/// Specific heat of FDM thermoplastics, J/(g·K): PLA ≈ 1.9, PETG ≈ 1.3,
+/// ABS ≈ 1.5. One mid value is fine while the heat map is relative; promote
+/// to a filament field if absolute joules ever matter.
+const CP_J_PER_G_K: f64 = 1.8;
+/// Temperature the deposited bead cools toward (°C).
+const AMBIENT_C: f64 = 25.0;
+
+/// Time, deposited heat, and footprint per layer. Time mirrors
+/// [`estimate_seconds`]'s per-layer terms and volume comes from the same bead
+/// math as [`estimate_filament`], so the preview maps track what the totals
+/// and M73 progress already report.
+pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
+    let travel_v = s.travel_speed_mm_s.max(1.0);
+    let mut prev_z = 0.0;
+    let mut out = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let mut secs = (layer.print_z_mm - prev_z).abs() / travel_v;
+        prev_z = layer.print_z_mm;
+        secs += layer_print_seconds(layer, s, layer.speed_scale);
+
+        let volume = layer_volume_mm3(layer, s);
+        let nozzle_c = if layer.index == 0 { s.first_layer_nozzle_temp_c } else { s.nozzle_temp_c };
+        let joules = volume * s.filament_density_g_cm3 * 1e-3 // g/cm³ → g/mm³
+            * CP_J_PER_G_K
+            * (nozzle_c as f64 - AMBIENT_C).max(0.0);
+
+        let outline_area = layer.outline.net_area_mm2().abs();
+        let footprint_mm2 = if outline_area > 1e-6 {
+            outline_area
+        } else {
+            volume / layer.height_mm.max(1e-6)
+        };
+        out.push(LayerStats { secs, joules, footprint_mm2 });
+    }
+    out
+}
+
+/// One island's (connected region's) share of a layer's heat numbers.
+pub struct IslandStats {
+    /// Thermal energy deposited into this island (J).
+    pub joules: f64,
+    /// The island's solid footprint (mm², its outer contour minus its holes).
+    pub footprint_mm2: f64,
+}
+
+/// Per-island refinement of [`per_layer_stats`]: which island every path
+/// lands on, and each island's deposited heat and footprint. The cooling
+/// window is *not* per island — a region keeps cooling while the nozzle works
+/// elsewhere on the layer — so heat maps should divide island joules by the
+/// **layer** seconds and the island footprint. That is exactly why a chimney
+/// sharing layers with a hull is safe while a lone chimney overheats.
+pub struct LayerIslands {
+    /// Island index for every path (parallel to `LayerPlan::paths`).
+    pub path_island: Vec<usize>,
+    pub islands: Vec<IslandStats>,
+}
+
+/// Floor for an island's thermal footprint (mm²) — about a 3×3-bead pad.
+/// True lone needles thinner than this are under-represented by the heat
+/// model anyway (nozzle dwell dominates); min-layer-time owns that class.
+const MIN_ISLAND_FOOTPRINT_MM2: f64 = 2.0;
+
+pub fn per_layer_islands(layers: &[LayerPlan], s: &Settings) -> Vec<LayerIslands> {
+    layers.iter().map(|layer| islands_of(layer, s)).collect()
+}
+
+/// Island split for one layer — see [`per_layer_islands`].
+fn islands_of(layer: &LayerPlan, s: &Settings) -> LayerIslands {
+    {
+        {
+            // CCW outer contours are the islands; CW holes subtract from the
+            // outer that contains them.
+            let outers: Vec<&Contour> =
+                layer.outline.contours.iter().filter(|c| c.signed_area_mm2() > 0.0).collect();
+            let mut islands: Vec<IslandStats> = outers
+                .iter()
+                .map(|c| IslandStats { joules: 0.0, footprint_mm2: c.signed_area_mm2() })
+                .collect();
+            for hole in layer.outline.contours.iter().filter(|c| c.signed_area_mm2() < 0.0) {
+                if let Some(&p) = hole.points.first() {
+                    if let Some(k) = outers.iter().position(|o| o.contains(p)) {
+                        islands[k].footprint_mm2 =
+                            (islands[k].footprint_mm2 + hole.signed_area_mm2()).max(1e-6);
+                    }
+                }
+            }
+            // No outline (degenerate layer) → one catch-all island sized by
+            // the deposited cross-section, like per_layer_stats' fallback.
+            if islands.is_empty() {
+                islands.push(IslandStats {
+                    joules: 0.0,
+                    footprint_mm2: (layer_volume_mm3(layer, s) / layer.height_mm.max(1e-6)).max(1e-6),
+                });
+            }
+            // Sub-bead slivers (the Benchy's 0.1 mm² towing-eye ring, deck
+            // engravings) are not thermal islands: their heat conducts
+            // laterally into the adjacent plastic within a couple of bead
+            // widths, so a raw sub-mm² footprint would make the heat metric
+            // meaninglessly huge. Floor the area at roughly a 3-bead pad.
+            for isl in &mut islands {
+                isl.footprint_mm2 = isl.footprint_mm2.max(MIN_ISLAND_FOOTPRINT_MM2);
+            }
+            let nozzle_c = if layer.index == 0 { s.first_layer_nozzle_temp_c } else { s.nozzle_temp_c };
+            let j_per_mm3 = s.filament_density_g_cm3 * 1e-3 // g/cm³ → g/mm³
+                * CP_J_PER_G_K
+                * (nozzle_c as f64 - AMBIENT_C).max(0.0);
+            let path_island: Vec<usize> = layer
+                .paths
+                .iter()
+                .map(|path| {
+                    // Walls and fills sit strictly inside their outline; skirt
+                    // and brim (outside every outer) snap to the nearest one
+                    // for coloring, but their heat lands on open bed far from
+                    // the part — it must not count against any island.
+                    let rep = path.points.first().copied();
+                    let k = rep
+                        .and_then(|p| outers.iter().position(|o| o.contains(p)))
+                        .unwrap_or_else(|| nearest_outer(&outers, rep));
+                    if path.kind != PathKind::Skirt {
+                        islands[k].joules += path_volume_mm3(path, layer.height_mm, s) * j_per_mm3;
+                    }
+                    k
+                })
+                .collect();
+            LayerIslands { path_island, islands }
+        }
+    }
+}
+
+/// Thermal governor (v1, speed lever): for every island whose heat load —
+/// deposited joules ÷ (layer seconds × island footprint) — exceeds the
+/// target, scale that island's print speeds down until it fits. Slowing one
+/// island lengthens the whole layer, which also cools the others, so islands
+/// are handled worst-first against the updated layer time. Speeds never drop
+/// below `min_print_speed_mm_s`; islands still hot at that floor are left
+/// there and surface via [`audit_governor`] — slowing alone can't fix them.
+/// Derived at slice time and stored only on the plan: toggling off returns
+/// exactly the user's speeds.
+pub fn apply_thermal_governor(layers: &mut [LayerPlan], s: &Settings) {
+    if !s.thermal_governor || s.governor_max_heat_mw_mm2 <= 0.0 {
+        return;
+    }
+    // Spiral vase is one continuous loop — per-island pacing can't apply
+    // mid-loop; the min-layer-time slowdown already paces it.
+    if s.spiral_vase {
+        return;
+    }
+    let target = s.governor_max_heat_mw_mm2 * 1e-3; // mW/mm² → W/mm²
+    let floor_v = s.min_print_speed_mm_s.max(1.0);
+    for layer in layers.iter_mut() {
+        let li = islands_of(layer, s);
+        let n_isl = li.islands.len();
+        if n_isl == 0 || layer.paths.is_empty() {
+            continue;
+        }
+        // Nominal per-path speeds for the floor clamps.
+        let v_nom: Vec<f64> = (0..layer.paths.len())
+            .map(|i| {
+                if layer.paths[i].points.len() < 2 {
+                    return f64::INFINITY;
+                }
+                feed_for(&layer.paths[i], layer.index, layer.height_mm, s) / 60.0 * layer.speed_scale
+            })
+            .collect();
+        // Effective scale of path i under island factor `f`: the floor binds
+        // per path, so one already-slow path (an arc overhang, say) never
+        // blocks the island's fast paths from slowing — and paths already
+        // under the floor simply stay where they are.
+        let eff = |i: usize, f: f64| -> f64 { f.max((floor_v / v_nom[i]).min(1.0)) };
+        // Exact (trapezoid) extrusion seconds of island k at factor f.
+        let island_time = |k: usize, f: f64| -> f64 {
+            li.path_island
+                .iter()
+                .enumerate()
+                .filter(|&(_, &kk)| kk == k)
+                .map(|(i, _)| path_extrusion_seconds(layer, i, s, layer.speed_scale * eff(i, f)))
+                .sum::<f64>()
+        };
+        let mut t_ext: Vec<f64> = (0..n_isl).map(|k| island_time(k, 1.0)).collect();
+        let mut t_layer = layer_print_seconds(layer, s, layer.speed_scale);
+        let mut f = vec![1.0_f64; n_isl];
+        // Worst-first: slowing one island lengthens the layer, cooling the rest.
+        let q0: Vec<f64> = (0..n_isl)
+            .map(|k| {
+                li.islands[k].joules / (t_layer.max(1e-9) * li.islands[k].footprint_mm2.max(1e-9))
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..n_isl).collect();
+        order.sort_by(|&a, &b| q0[b].partial_cmp(&q0[a]).unwrap_or(std::cmp::Ordering::Equal));
+        for &k in &order {
+            if li.islands[k].joules <= 0.0 {
+                continue;
+            }
+            let area = li.islands[k].footprint_mm2.max(1e-9);
+            if li.islands[k].joules / (t_layer.max(1e-9) * area) <= target * 1.001 {
+                continue;
+            }
+            // The whole layer must take this long for island k to fit.
+            let t_needed = li.islands[k].joules / (target * area);
+            let t_others = t_layer - t_ext[k];
+            if t_others + island_time(k, 0.0) < t_needed {
+                // Hot even with every path at its floor: take the floor and
+                // let the audit say so — slowing can't fix this island.
+                f[k] = 0.0;
+            } else {
+                // Bisect the factor against the real trapezoid time — short,
+                // accel-dominated moves don't gain time linearly, so a
+                // first-order guess under-slows small islands.
+                let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+                for _ in 0..20 {
+                    let mid = 0.5 * (lo + hi);
+                    if t_others + island_time(k, mid) >= t_needed {
+                        lo = mid; // slow enough — try faster
+                    } else {
+                        hi = mid;
+                    }
+                }
+                f[k] = lo;
+            }
+            let grown = island_time(k, f[k]);
+            t_layer = t_others + grown;
+            t_ext[k] = grown;
+        }
+        if f.iter().any(|&fk| fk < 1.0) {
+            let scales: Vec<f64> =
+                li.path_island.iter().enumerate().map(|(i, &k)| eff(i, f[k]).min(1.0)).collect();
+            if scales.iter().any(|&x| x < 0.999) {
+                layer.path_speed_scale = scales;
+            }
+        }
+    }
+}
+
+/// One contiguous run of governed layers, for the reports.
+pub struct GovernorRow {
+    pub first_layer: usize,
+    pub last_layer: usize,
+    /// The strongest slowdown in the range (0.38 = slowed to 38% speed).
+    pub worst_scale: f64,
+    /// Some island in the range is still over the target even at the
+    /// min-print-speed floor — it needs cooling, not more slowing.
+    pub floor_hit: bool,
+}
+
+/// Where the thermal governor intervened — read back from the plan the same
+/// way the g-code is generated, so the report can't drift from reality.
+pub fn audit_governor(layers: &[LayerPlan], s: &Settings) -> Vec<GovernorRow> {
+    let target = s.governor_max_heat_mw_mm2 * 1e-3;
+    let mut rows: Vec<GovernorRow> = Vec::new();
+    for layer in layers {
+        if layer.path_speed_scale.iter().all(|&fk| fk >= 0.999) {
+            continue; // empty (ungoverned) vecs land here too
+        }
+        let worst = layer.path_speed_scale.iter().copied().fold(1.0, f64::min);
+        // Post-governor heat check: anything still hot ran out of floor.
+        let li = islands_of(layer, s);
+        let t = layer_print_seconds(layer, s, layer.speed_scale);
+        let floor = li.islands.iter().any(|isl| {
+            isl.joules > 0.0
+                && isl.joules / (t.max(1e-9) * isl.footprint_mm2.max(1e-9)) > target * 1.05
+        });
+        match rows.last_mut() {
+            Some(r) if r.last_layer + 1 == layer.index => {
+                r.last_layer = layer.index;
+                r.worst_scale = r.worst_scale.min(worst);
+                r.floor_hit |= floor;
+            }
+            _ => rows.push(GovernorRow {
+                first_layer: layer.index,
+                last_layer: layer.index,
+                worst_scale: worst,
+                floor_hit: floor,
+            }),
+        }
+    }
+    rows
+}
+
+/// Closest outer contour to `rep` (by first-point distance), or 0.
+fn nearest_outer(outers: &[&Contour], rep: Option<Point>) -> usize {
+    let Some(p) = rep else { return 0 };
+    let mut best = 0;
+    let mut best_d = f64::INFINITY;
+    for (k, o) in outers.iter().enumerate() {
+        if let Some(&q) = o.points.first() {
+            let d = dist_mm(p, q);
+            if d < best_d {
+                best_d = d;
+                best = k;
+            }
+        }
+    }
+    best
 }
 
 const MIN_TRAVEL_MM: f64 = 0.8;
@@ -1140,8 +1516,11 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_arc, ARC_MIN_PTS};
-    use crate::{estimate_seconds, generate, to_gcode};
+    use super::{fit_arc, ARC_MIN_PTS, AMBIENT_C, CP_J_PER_G_K};
+    use crate::{
+        audit_governor, estimate_filament, estimate_seconds, generate, per_layer_islands,
+        per_layer_stats, to_gcode,
+    };
     use config::Settings;
 
     #[test]
@@ -1263,6 +1642,143 @@ mod tests {
         let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
         assert!(g.contains("PRINT_START EXTRUDER=215 BED=65"), "macro substituted");
         assert!(!g.contains("{nozzle_temp}"), "no leftover placeholders");
+    }
+
+    #[test]
+    fn first_layer_temp_drops_after_first_layer() {
+        let m = mesh::Mesh::cube(10.0);
+        let mut s = Settings::default();
+        s.first_layer_nozzle_temp_c = 230;
+        s.nozzle_temp_c = 210;
+        let g = to_gcode(&generate(&m, &s), &s);
+        let l0 = g.find("; LAYER 0 ").unwrap();
+        let l1 = g.find("; LAYER 1 ").unwrap();
+        assert!(g[..l0].contains("M104 S230"), "start g-code heats to the first-layer temp");
+        assert!(!g[l0..l1].contains("M104"), "no temp change during the first layer");
+        assert!(g[l1..].contains("M104 S210"), "drops to the printing temp at layer 2");
+
+        // Equal temps (the auto default): no temp change at all between the
+        // first layer and the end g-code's cooldown.
+        s.first_layer_nozzle_temp_c = 210;
+        let g = to_gcode(&generate(&m, &s), &s);
+        let l0 = g.find("; LAYER 0 ").unwrap();
+        let cooldown = g.rfind("M104 S0").unwrap();
+        assert!(!g[l0..cooldown].contains("M104"), "no mid-print temp change");
+    }
+
+    #[test]
+    fn aux_and_exhaust_fans_gated_and_emitted() {
+        let m = mesh::Mesh::cube(10.0);
+        let mut s = Settings::default();
+        s.aux_fan_speed = 0.75;
+        s.exhaust_fan_speed = 0.8;
+        // Without the hardware flags the P-forms must never appear — vanilla
+        // Klipper/Marlin would read them as the primary fan.
+        let g = to_gcode(&generate(&m, &s), &s);
+        assert!(!g.contains("M106 P"), "no P-fans without the hardware flags");
+
+        s.has_aux_fan = true;
+        s.has_exhaust_fan = true;
+        let g = to_gcode(&generate(&m, &s), &s);
+        let l0 = g.find("; LAYER 0 ").unwrap();
+        let l1 = g.find("; LAYER 1 ").unwrap();
+        assert!(g[..l0].contains("M106 P3 S204"), "exhaust on from the start");
+        assert!(!g[l0..l1].contains("M106 P2 S191"), "aux respects fan-off layers");
+        assert!(g[l1..].contains("M106 P2 S191"), "aux at duty past the first layer");
+        assert!(g.rfind("M106 P2 S0").unwrap() > l1, "aux shut off at the end");
+        assert!(g.rfind("M106 P3 S0").unwrap() > l1, "exhaust shut off at the end");
+    }
+
+    #[test]
+    fn per_layer_stats_match_totals() {
+        let m = mesh::Mesh::cube(20.0);
+        let s = Settings::default();
+        let layers = generate(&m, &s);
+        let stats = per_layer_stats(&layers, &s);
+        assert_eq!(stats.len(), layers.len());
+        // Per-layer seconds sum to the total estimate (identical terms).
+        let total: f64 = stats.iter().map(|st| st.secs).sum();
+        let est = estimate_seconds(&layers, &s);
+        assert!((total - est).abs() < est * 1e-9, "{total} vs {est}");
+        // Mid-layer footprint is the cube's 20×20 cross-section.
+        let mid = &stats[stats.len() / 2];
+        assert!((mid.footprint_mm2 - 400.0).abs() < 40.0, "got {}", mid.footprint_mm2);
+        // Energy tracks the filament estimate: grams × cₚ × ΔT (all layers
+        // share one temp under default settings).
+        let (_mm, grams) = estimate_filament(&layers, &s);
+        let joules: f64 = stats.iter().map(|st| st.joules).sum();
+        let expect = grams * CP_J_PER_G_K * (s.nozzle_temp_c as f64 - AMBIENT_C);
+        assert!((joules - expect).abs() < expect * 1e-6, "{joules} vs {expect}");
+    }
+
+    #[test]
+    fn per_island_stats_split_disjoint_parts() {
+        // Two 10 mm cubes 20 mm apart: every layer carries two islands, each
+        // with one cube's footprint and half the deposited heat.
+        let c = mesh::Mesh::cube(10.0);
+        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
+        for i in 0..c.triangles.len() {
+            let t = c.triangle(i);
+            soup.push(t);
+            soup.push(t.map(|v| [v[0] + 20.0, v[1], v[2]]));
+        }
+        let m = mesh::Mesh::from_triangle_soup(&soup);
+        let s = Settings::default();
+        let layers = generate(&m, &s);
+        let isl = per_layer_islands(&layers, &s);
+        let stats = per_layer_stats(&layers, &s);
+        let mid = layers.len() / 2;
+        assert_eq!(isl[mid].islands.len(), 2, "two separate bodies");
+        for k in 0..2 {
+            let a = isl[mid].islands[k].footprint_mm2;
+            assert!((a - 100.0).abs() < 12.0, "island footprint {a}");
+        }
+        let (a, b) = (isl[mid].islands[0].joules, isl[mid].islands[1].joules);
+        assert!((a - b).abs() < (a + b) * 0.05, "heat splits evenly: {a} vs {b}");
+        let total = stats[mid].joules;
+        assert!(((a + b) - total).abs() < total * 1e-6, "islands sum to the layer");
+        assert_eq!(isl[mid].path_island.len(), layers[mid].paths.len());
+    }
+
+    #[test]
+    fn thermal_governor_slows_hot_tower() {
+        // A 5×5×30 mm tower: tiny island, quick layers → hot. Governed, its
+        // layers must slow until the heat load fits (or the floor binds); off,
+        // the plan is untouched.
+        let c = mesh::Mesh::cube(5.0);
+        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
+        for i in 0..c.triangles.len() {
+            let t = c.triangle(i);
+            soup.push(t.map(|v| [v[0], v[1], v[2] * 6.0]));
+        }
+        let m = mesh::Mesh::from_triangle_soup(&soup);
+        let mut s = Settings::default();
+        s.min_layer_time_s = 0.0; // isolate the governor from the layer-time pacing
+        let plain = generate(&m, &s);
+        assert!(plain.iter().all(|l| l.path_speed_scale.is_empty()), "off = untouched");
+
+        s.thermal_governor = true;
+        s.governor_max_heat_mw_mm2 = 6.0;
+        let governed = generate(&m, &s);
+        let mid = governed.len() / 2;
+        assert!(
+            governed[mid].path_speed_scale.iter().any(|&f| f < 0.999),
+            "tower layers slowed"
+        );
+        let rows = audit_governor(&governed, &s);
+        assert!(!rows.is_empty(), "intervention reported");
+        // Post-governor heat sits at/under the target, unless the row says the
+        // min-speed floor bound first.
+        let stats = per_layer_stats(&governed, &s);
+        let isl = per_layer_islands(&governed, &s);
+        let q = isl[mid].islands[0].joules
+            / (stats[mid].secs.max(1e-9) * isl[mid].islands[0].footprint_mm2.max(1e-9));
+        let floored = rows
+            .iter()
+            .any(|r| r.floor_hit && (r.first_layer..=r.last_layer).contains(&mid));
+        assert!(q <= 6.0e-3 * 1.06 || floored, "governed heat {q} still over target");
+        // Slowing costs time, and the estimator reports it honestly.
+        assert!(estimate_seconds(&governed, &s) > estimate_seconds(&plain, &s));
     }
 
     #[test]

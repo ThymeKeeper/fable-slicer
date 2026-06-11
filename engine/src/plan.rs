@@ -109,6 +109,9 @@ pub struct LayerPlan {
     pub outline: Polygons,
     /// Speed multiplier (≤1) applied to this layer for min-layer-time cooling.
     pub speed_scale: f64,
+    /// Per-path speed multipliers (≤1) from the thermal governor, parallel to
+    /// `paths`; empty = all 1.0. Multiplies on top of `speed_scale`.
+    pub path_speed_scale: Vec<f64>,
 }
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
@@ -635,6 +638,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // separate islands that then can't be combed.
             outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
+            path_speed_scale: Vec::new(),
         }
         })
         .collect();
@@ -664,6 +668,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
+    // After min-layer-time so the governor sees (and stacks on) its pacing.
+    crate::emit::apply_thermal_governor(&mut plans, settings);
     plans
 }
 

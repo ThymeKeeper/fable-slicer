@@ -30,7 +30,7 @@ retract_speed_mm_s = 40.0
 # api_key = ""
 
 start_gcode = """
-PRINT_START EXTRUDER={nozzle_temp} BED={bed_temp}
+PRINT_START EXTRUDER={first_layer_nozzle_temp} BED={bed_temp}
 """
 
 end_gcode = """

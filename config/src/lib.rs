@@ -15,9 +15,9 @@ pub use profile::{tier_dirty, FilamentProfile, PrinterProfile, ProcessProfile, P
 /// substituted by the emitter. Used when a printer profile sets no `start_gcode`.
 pub const GENERIC_START_GCODE: &str = "\
 M140 S{bed_temp}
-M104 S{nozzle_temp}
+M104 S{first_layer_nozzle_temp}
 M190 S{bed_temp}
-M109 S{nozzle_temp}
+M109 S{first_layer_nozzle_temp}
 G28";
 
 /// Default end g-code (cool down, lift, disable steppers).
@@ -314,6 +314,10 @@ pub struct Settings {
 
     // --- temperatures (°C) ---
     pub nozzle_temp_c: u32,
+    /// First-layer nozzle °C — typically hotter for bed adhesion. Start g-code
+    /// heats to this ({first_layer_nozzle_temp}); the emitter drops to
+    /// `nozzle_temp_c` at layer 2. Profiles leaving it unset follow the nozzle temp.
+    pub first_layer_nozzle_temp_c: u32,
     pub bed_temp_c: u32,
 
     // --- speeds (mm/s) ---
@@ -363,6 +367,26 @@ pub struct Settings {
     pub bridge_fan_speed: f64,
     /// Keep the fan off for this many initial layers (adhesion).
     pub fan_off_layers: usize,
+    /// The machine has an auxiliary part-cooling fan addressed as `M106 P2`
+    /// (Sovol Zero / Bambu-style side fan). Gates all P2 emission: vanilla
+    /// Klipper/Marlin would read the P-form as the primary fan.
+    pub has_aux_fan: bool,
+    /// Aux-fan duty 0.0..=1.0, flat once past `fan_off_layers`. 0 = off.
+    pub aux_fan_speed: f64,
+    /// The machine has a chamber-exhaust fan addressed as `M106 P3`.
+    pub has_exhaust_fan: bool,
+    /// Exhaust duty 0.0..=1.0 for the whole print — vents chamber heat
+    /// (PLA wants it high, ABS low or zero). 0 = off.
+    pub exhaust_fan_speed: f64,
+    /// Thermal governor (speed lever): slow each island (disconnected region
+    /// of a layer) whose heat load — deposited energy ÷ (layer time × island
+    /// footprint) — exceeds `governor_max_heat_mw_mm2`, until it fits. Derived
+    /// at slice time on top of the user's speeds; off restores them exactly.
+    /// Speeds never drop below `min_print_speed_mm_s`; islands still hot at
+    /// that floor are reported loudly instead.
+    pub thermal_governor: bool,
+    /// The governor's per-island heat-load ceiling (mW/mm²).
+    pub governor_max_heat_mw_mm2: f64,
 
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
@@ -432,6 +456,7 @@ impl Default for Settings {
             host_url: String::new(),
             api_key: String::new(),
             nozzle_temp_c: 200,
+            first_layer_nozzle_temp_c: 200,
             bed_temp_c: 60,
             print_speed_mm_s: 50.0,
             travel_speed_mm_s: 120.0,
@@ -451,6 +476,14 @@ impl Default for Settings {
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,
             fan_off_layers: 1,
+            has_aux_fan: false,
+            aux_fan_speed: 0.0,
+            has_exhaust_fan: false,
+            exhaust_fan_speed: 0.0,
+            thermal_governor: false,
+            // Calibrated on the Benchy: lone towers / chimneys / arch pillars
+            // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
+            governor_max_heat_mw_mm2: 15.0,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }
@@ -476,25 +509,39 @@ pub fn derived_line_width_mm(nozzle_diameter_mm: f64) -> f64 {
     nozzle_diameter_mm * 1.125
 }
 
-/// Auto outer-wall speed: half the machine's print speed, for surface quality.
-pub fn derived_external_perimeter_speed_mm_s(print_speed_mm_s: f64) -> f64 {
-    print_speed_mm_s * 0.5
+/// The flow triangle's speed bound: the fastest feed (mm/s) at which a
+/// `line_width × layer_height` bead still fits under the filament's melt
+/// ceiling (mm³/s). Auto speeds balance against this, so the slice-time
+/// volumetric clamp never has to quietly slow a derived value — it only
+/// fires for pinned or master-driven speeds. Unlimited when the ceiling is 0.
+pub fn flow_speed_cap_mm_s(max_flow_mm3_s: f64, line_width_mm: f64, layer_height_mm: f64) -> f64 {
+    if max_flow_mm3_s <= 0.0 {
+        return f64::INFINITY;
+    }
+    max_flow_mm3_s / bead_area_mm2(line_width_mm, layer_height_mm)
 }
 
-/// Auto solid-fill speed: 80% of print speed.
-pub fn derived_solid_speed_mm_s(print_speed_mm_s: f64) -> f64 {
-    print_speed_mm_s * 0.8
+/// Auto outer-wall speed: half the machine's print speed, for surface
+/// quality; never past the flow cap.
+pub fn derived_external_perimeter_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.5).min(flow_cap_mm_s)
 }
 
-/// Auto support speed: 90% of print speed (surface quality doesn't matter).
-pub fn derived_support_speed_mm_s(print_speed_mm_s: f64) -> f64 {
-    print_speed_mm_s * 0.9
+/// Auto solid-fill speed: 80% of print speed, never past the flow cap.
+pub fn derived_solid_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.8).min(flow_cap_mm_s)
+}
+
+/// Auto support speed: 90% of print speed (surface quality doesn't matter),
+/// never past the flow cap.
+pub fn derived_support_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.9).min(flow_cap_mm_s)
 }
 
 /// Auto gap-fill speed: 40% of print speed, capped — gap strokes live in tight
-/// corners where the head is always turning.
-pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64) -> f64 {
-    (print_speed_mm_s * 0.4).min(40.0)
+/// corners where the head is always turning; never past the flow cap.
+pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.4).min(40.0).min(flow_cap_mm_s)
 }
 
 /// Auto overhang-wall speed: same as bridges — both lay beads onto air.
