@@ -11,12 +11,7 @@
 A from-scratch FDM slicer in Rust. GUI-first (egui + wgpu), Klipper-flavored
 g-code out, and a deliberately small settings surface.
 
-**Status: work in progress.** It prints real parts on a real printer daily,
-and it is nowhere near finished.
-
-> This project is **vibe-coded**: Claude (Anthropic's *Fable* model, hence the
-> name) writes essentially all of the code, while a human picks the direction,
-> argues with the results, and prints the Benchies.
+**Status: work in progress.**
 
 ## Why another slicer
 
