@@ -11,8 +11,6 @@
 A from-scratch FDM slicer in Rust. GUI-first (egui + wgpu), Klipper-flavored
 g-code out, and a deliberately small settings surface.
 
-**Status: work in progress.**
-
 ## Why another slicer
 
 Nearly every mainstream slicer is one family tree: **Slic3r → PrusaSlicer →
