@@ -19,7 +19,7 @@ deep in inherited code, inherited UI, and above all inherited *settings*.
 Hundreds of knobs survive not because users need them but because removing
 them would break someone's muscle memory.
 
-Fable Slicer starts from the ground up and aims to stay minimal and lean. The concept: you provide a filament profile, a printer profile, and your strength preferences (walls, infill, layer height). Everything else — every speed, every temperature, every flow limit — is derived from those three, under the filament's melt ceiling. There is no print-speed slider. There is no temperature slider. The system chooses temperatures and speeds to maximize bead coalescence while avoiding the layer-to-layer temperature swings that print shrinkage rings into the surface.
+Fable Slicer starts from the ground up, and aims to stay minimal and lean. The concept: you provide a filament profile, a printer profile, and your strength preferences (walls, infill, layer height). Everything else — every speed, every temperature, every flow limit — is derived from those three, under the filament's melt ceiling. There is no print-speed slider. There is no temperature slider. The system chooses temperatures and speeds to maximize bead coalescence while avoiding the layer-to-layer temperature swings that print shrinkage rings into the surface.
 
 ## Heat control
 
