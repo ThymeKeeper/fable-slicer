@@ -27,11 +27,11 @@ Fable Slicer starts from the ground up and aims to stay minimal and lean. The co
 
 The headline feature. The slicer models per-island heat load (deposited joules ÷ time × footprint) for every layer, pins per-layer targets, and serves them with three levers, planned entirely at slice time:
 
-- a **nozzle-temperature schedule** — slew-limited M104 fades (≈1 °C/layer) derived from the hotend's *measured* thermal response, warming cold bulk for free and cooling hot zones inside the spool's printed range;
+- a **nozzle-temperature schedule** — slew-limited M104 fades (≈1 °C/layer) derived from the hotend's measured thermal response, warming cold bulk for free and cooling hot zones inside the spool's printed range;
 - **per-island slowdowns** where temperature runs out of authority;
-- **park-and-wait dwells** — parked over sparse infill so ooze lands where the next layers bury it — for tiny islands that run out of path to slow.
+- **park-and-wait dwells** — find a place to park the toolhead and wait for a layer to cool slightly when slowing the flow rate isnt enough.
 
-The result: even heat across layer transitions (the banding killer), a chimney that doesn't melt, and a report of every intervention in the g-code header. One switch, on by default; one preference (how much extra print time smoothing may spend). The hotend thermal profiler runs over Moonraker with one click and saves the measured rates into the printer profile.
+The result: even heat across layer transitions (the banding killer), and good prints without much effort.
 
 ## What works today
 
