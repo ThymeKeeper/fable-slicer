@@ -66,7 +66,7 @@ struct Args {
     /// Number of brim loops (0 disables).
     #[arg(long)]
     brim: Option<usize>,
-    /// Seam placement: nearest | sharpest | random.
+    /// Seam placement: nearest | aligned | sharpest | random.
     #[arg(long)]
     seam: Option<String>,
     /// Sparse infill pattern: lines | grid | triangles | concentric | gyroid.
@@ -272,42 +272,6 @@ fn main() -> Result<()> {
     println!("Filament: {:.2} m, {:.1} g", fil_mm / 1000.0, grams);
     let (cross, combed, fb, fb_hole) = engine::audit_combing(&layers);
     println!("Combing: {cross} crossing travels — {combed} combed, {fb} straight ({fb_hole} cut a hole)");
-    for (kind, nominal, clamped) in engine::audit_flow_clamps(&layers, &settings) {
-        println!(
-            "Flow-limited: {} {nominal:.0} -> {clamped:.0} mm/s (filament ceiling {:.1} mm³/s)",
-            engine::kind_label(kind),
-            settings.max_volumetric_speed_mm3_s
-        );
-    }
-    if settings.heat_control_speed || settings.heat_control_temp {
-        match settings.heat_mode {
-            config::HeatMode::Level => println!(
-                "Heat level: {:.1} mW/mm2 (leveled to the coldest region)",
-                engine::effective_heat_target(&layers, &settings) * 1e3
-            ),
-            config::HeatMode::Smooth => println!(
-                "Heat smoothing: change limited to {:.1}%/layer (cap {:.0} mW/mm2)",
-                settings.heat_slew_pct_per_layer, settings.max_heat_mw_mm2
-            ),
-            config::HeatMode::Cap => {}
-        }
-    }
-    for z in engine::audit_heat_control_temp(&layers, &settings) {
-        println!(
-            "Heat control (temp): layers {}-{} -> {:.0}C",
-            z.first_layer, z.last_layer, z.temp_c
-        );
-    }
-    for r in engine::audit_heat_control_speed(&layers, &settings) {
-        let dwell = if r.dwell_s > 0.05 { format!(" + {:.1}s dwell", r.dwell_s) } else { String::new() };
-        println!(
-            "Heat control (speed): layers {}-{} slowed to {:.0}%{dwell}{}",
-            r.first_layer,
-            r.last_layer,
-            r.worst_scale * 100.0,
-            if r.floor_hit { " (still hot at the cap)" } else { "" }
-        );
-    }
 
     let gcode = to_gcode(&layers, &settings);
     std::fs::write(&args.output, &gcode)
@@ -399,6 +363,8 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::Perimeter => "#5fa8e8",
             PathKind::OverhangWall => "#f59e16",
             PathKind::Solid => "#2ca02c",
+            PathKind::TopSkin => "#ed618c",
+            PathKind::BottomSkin => "#9e7333",
             PathKind::Infill => "#e08a2b",
             PathKind::GapFill => "#d62728",
             PathKind::Ironing => "#bcbd22",

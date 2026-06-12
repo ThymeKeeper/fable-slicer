@@ -27,8 +27,16 @@ pub enum PathKind {
     /// Wall stretch hanging more than half a bead past the layer below —
     /// printed slow, with bridge-grade cooling, so it sets in place.
     OverhangWall,
-    /// Dense (100%) top/bottom shell fill.
+    /// Dense (100%) shell fill buried inside the part (covered above and below).
     Solid,
+    /// Dense shell fill exposed to open air above — the visible top surfaces.
+    /// Prints at the visible-surface pace: outer-wall speed and acceleration,
+    /// always monotonic.
+    TopSkin,
+    /// Dense shell fill with nothing printed below it: the bed-facing first
+    /// layer, plus unsupported undersides that didn't qualify as bridges.
+    /// Same visible-surface pace as [`PathKind::TopSkin`].
+    BottomSkin,
     /// The first solid layer over sparse infill: beads span the open cells
     /// below, so they print like (short, well-anchored) bridges.
     InternalBridge,
@@ -121,6 +129,12 @@ pub struct LayerPlan {
     /// plan and stored so both levers, the audits, and the GUI all
     /// chase the same number (recomputing on the governed plan drifts).
     pub planned_heat_target: Option<f64>,
+    /// Layer-time floor (s) pinned with the targets: the shared clock every
+    /// island's cooling window divides by must ramp as smoothly as the
+    /// targets, or dwell boundaries and hot-island changes step it between
+    /// neighbors and band every cold island. 0 = no floor. The speed pass
+    /// tops any deficit up with dwell.
+    pub planned_floor_secs: f64,
     /// Nozzle °C the temp schedule plans for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
@@ -528,28 +542,56 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
 
             if !solid.is_empty() {
-                // A perimeter loop following the solid region's boundary (so where
+                // Split the shell by what shows: skin with open air above (top),
+                // skin with nothing printed below it (bottom — the bed face and
+                // unsupported undersides that didn't bridge), and the buried
+                // rest. Skins print at the visible-surface pace and always
+                // monotonic. Coverage tests use the neighbors' full outlines —
+                // a surface under nothing but the wall ring above is still
+                // hidden — and a light open drops the hair-thin ribbons the
+                // coverage differences leave behind.
+                let open = |p: Polygons| offset(&offset(&p, -lw * 0.1), lw * 0.1);
+                let skin_bottom = if i == 0 {
+                    solid.clone()
+                } else {
+                    open(difference(&solid, &offset(&layers[i - 1].polygons, 0.05)))
+                };
+                let buried = difference(&solid, &skin_bottom);
+                let skin_top = if i + 1 < n {
+                    open(difference(&buried, &offset(&layers[i + 1].polygons, 0.05)))
+                } else {
+                    buried.clone()
+                };
+                let internal = difference(&buried, &skin_top);
+                let regions = [
+                    (skin_bottom, PathKind::BottomSkin, true),
+                    (internal, PathKind::Solid, settings.monotonic_solid),
+                    (skin_top, PathKind::TopSkin, true),
+                ];
+                // A perimeter loop following each region's boundary (so where
                 // it runs alongside the shell it becomes a clean concentric bead),
                 // then straight-fill only the interior left inside that loop. Thin
                 // solid bands are consumed entirely by the loop — no lone strands.
                 // The loop and the fill both push `ov` into their neighbor so
                 // solid surfaces bond to the walls.
-                let solid_loop = offset(&solid, -(lw * 0.5 - ov * 0.5));
-                for c in solid_loop.contours {
-                    if c.points.len() < 3 {
-                        continue;
+                for (region, kind, _) in &regions {
+                    let region_loop = offset(region, -(lw * 0.5 - ov * 0.5));
+                    for c in region_loop.contours {
+                        if c.points.len() < 3 {
+                            continue;
+                        }
+                        // Offsetting a dumbbell-shaped region can pinch off
+                        // micro-rings the island rebalance couldn't see; a loop
+                        // shorter than ~4 beads is a dab, not a surface.
+                        let m = c.points.len();
+                        let perim: f64 =
+                            (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
+                        if perim < lw * 4.0 {
+                            continue;
+                        }
+                        let points = place_seam(c.points, settings.seam_mode, i);
+                        paths.push(ToolPath::new(*kind, true, lw, points));
                     }
-                    // Offsetting a dumbbell-shaped region can pinch off
-                    // micro-rings the island rebalance couldn't see; a loop
-                    // shorter than ~4 beads is a dab, not a surface.
-                    let m = c.points.len();
-                    let perim: f64 =
-                        (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
-                    if perim < lw * 4.0 {
-                        continue;
-                    }
-                    let points = place_seam(c.points, settings.seam_mode, i);
-                    paths.push(ToolPath::new(PathKind::Solid, true, lw, points));
                 }
                 let solid_core = offset(&solid, -(0.5 * (lw + sp) - 0.5 * ov));
                 if !internal_bridge.is_empty() {
@@ -563,16 +605,22 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         paths.push(ToolPath::new(PathKind::InternalBridge, false, lw, seg));
                     }
                 }
-                let solid_fill = if internal_bridge.is_empty() {
-                    solid_core.clone()
-                } else {
-                    difference(&solid_core, &internal_bridge)
-                };
-                if !solid_fill.is_empty() {
-                    fill_region(
-                        &solid_fill, settings.solid_pattern, sp, angle, lw, PathKind::Solid,
-                        settings.seam_mode, i, layers[i].z_mm, settings.monotonic_solid, &mut paths,
-                    );
+                for (region, kind, monotone) in regions {
+                    if region.is_empty() {
+                        continue;
+                    }
+                    let core = offset(&region, -(0.5 * (lw + sp) - 0.5 * ov));
+                    let fill = if internal_bridge.is_empty() {
+                        core
+                    } else {
+                        difference(&core, &internal_bridge)
+                    };
+                    if !fill.is_empty() {
+                        fill_region(
+                            &fill, settings.solid_pattern, sp, angle, lw, kind,
+                            settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
+                        );
+                    }
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
@@ -657,6 +705,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             path_speed_scale: Vec::new(),
             dwell_s: 0.0,
             planned_heat_target: None,
+            planned_floor_secs: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }
@@ -683,17 +732,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     add_supports(&mut plans, &layers, settings);
     order_layers(&mut plans);
     center_on_bed(&mut plans, mesh, settings);
-    if settings.seam_mode == SeamMode::Aligned {
-        align_seams(&mut plans);
+    if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
+        align_seams(&mut plans, settings.seam_mode);
     }
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     // Pin per-layer heat targets on the raw plan — both heat-control levers
     // change the very quantities the targets are computed from, so everything
     // downstream must chase the same frozen numbers.
-    let heat_targets = crate::emit::plan_heat_targets(&plans, settings);
-    for (plan, t) in plans.iter_mut().zip(heat_targets) {
+    let (heat_targets, floor_secs) = crate::emit::plan_heat_targets(&plans, settings);
+    for ((plan, t), fs) in plans.iter_mut().zip(heat_targets).zip(floor_secs) {
         plan.planned_heat_target = Some(t);
+        plan.planned_floor_secs = fs;
     }
     // The temperature lever first (it lowers deposited energy and flow caps in
     // the zones it cools), then the speed lever mops up what remains —
@@ -1376,76 +1426,250 @@ fn place_seam(mut points: Vec<Point>, mode: SeamMode, layer_index: usize) -> Vec
     if n < 3 {
         return points;
     }
+    // Rear-most vertex (max Y, tie-break max X) — seams align into a column.
+    let rear = |points: &[Point]| (0..points.len()).max_by_key(|&i| (points[i].y, points[i].x)).unwrap();
     let start = match mode {
-        // Rear-most vertex (max Y, tie-break max X) — seams align into a column.
-        SeamMode::Nearest => (0..n)
-            .max_by_key(|&i| (points[i].y, points[i].x))
-            .unwrap(),
-        // Sharpest corner — tucks the seam where it's least visible.
-        SeamMode::Sharpest => (0..n)
-            .max_by(|&a, &b| sharpness(&points, a).total_cmp(&sharpness(&points, b)))
-            .unwrap(),
+        SeamMode::Nearest => rear(&points),
+        // Sharpest REAL corner (concave preferred — the seam tucks into the
+        // notch). A smooth loop has no corner worth chasing: picking the
+        // sharpest of its noise scatters the seam, so fall back to the rear
+        // column instead. External walls are then held in line across layers
+        // by `align_seams`.
+        SeamMode::Sharpest => {
+            let (concave, convex) = corner_candidates(&points);
+            best_corner(&points, &concave, &convex).unwrap_or_else(|| rear(&points))
+        }
         // Deterministic per-layer scatter.
         SeamMode::Random => layer_index.wrapping_mul(2_654_435_761).wrapping_add(40_503) % n,
         // Aligned starts from the rear like Nearest; `align_seams` then walks
         // the layers in order and snaps each loop to the previous layer's
         // seam, so this is only the first layer's seed.
-        SeamMode::Aligned => (0..n)
-            .max_by_key(|&i| (points[i].y, points[i].x))
-            .unwrap(),
+        SeamMode::Aligned => rear(&points),
     };
     points.rotate_left(start);
     points
 }
 
-/// Aligned seams: walk the layers bottom-up, rotating every closed outer-wall
-/// loop to start at the vertex nearest the seam of the loop below it — the
-/// seam follows one continuous line up the print even where the rear-most
-/// vertex would jump between competing features. Loops with no seam within
-/// `SEAM_TRACK_RADIUS_MM` below them (new islands) seed a new track at their
-/// place_seam position. Runs before travel planning, so combing and lead-ins
-/// see the final start points.
-fn align_seams(plans: &mut [LayerPlan]) {
+/// Hold external seams in line across layers: walk the layers bottom-up,
+/// rotating every closed outer-wall loop to start at the candidate vertex
+/// nearest the seam of the loop below it, so the seam follows one continuous
+/// line up the print instead of jumping between competing features.
+///
+/// The candidate set is the mode's: Aligned may use any vertex (and snaps to
+/// a real corner when one sits within `CORNER_SNAP_MM` of the column, rather
+/// than drifting across a smooth face beside it); Sharpest only ever lands on
+/// real corners while the loop has any — ties between equal corners stop
+/// flip-flopping because the column decides — and degrades to Aligned
+/// behavior on smooth loops, where "sharpest" would only amplify noise.
+/// Loops with no track within `SEAM_TRACK_RADIUS_MM` (new islands) seed a new
+/// track at the mode's best stand-alone choice. Runs after `center_on_bed`
+/// and before travel planning, so combing and lead-ins see the final starts.
+fn align_seams(plans: &mut [LayerPlan], mode: SeamMode) {
     const SEAM_TRACK_RADIUS_MM: f64 = 10.0;
+    const CORNER_SNAP_MM: f64 = 2.5;
     let mut tracks: Vec<Point> = Vec::new();
     for plan in plans.iter_mut() {
-        for path in plan.paths.iter_mut() {
-            if path.kind != PathKind::ExternalPerimeter || !path.closed || path.points.len() < 3 {
-                continue;
-            }
-            // Nearest (track, vertex) pair for this loop.
-            let mut best: Option<(f64, usize, usize)> = None; // (dist, vertex, track)
-            for (ti, t) in tracks.iter().enumerate() {
-                for (vi, p) in path.points.iter().enumerate() {
-                    let d = pt_dist_mm(*p, *t);
-                    if best.map_or(true, |(bd, _, _)| d < bd) {
-                        best = Some((d, vi, ti));
+        let loop_ids: Vec<usize> = plan
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.kind == PathKind::ExternalPerimeter && p.closed && p.points.len() >= 3
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if loop_ids.is_empty() {
+            continue;
+        }
+        // Candidate vertices per loop. Sharpest may land on any REAL corner —
+        // concavity only biases the seed, because restricting the tracked set
+        // to one concavity class makes it flap when a small notch appears or
+        // vanishes, teleporting the column. Smooth loops (and Aligned) use
+        // every vertex; the track then pulls them into a straight column.
+        let per_loop: Vec<(Vec<usize>, Vec<Corner>, Vec<Corner>)> = loop_ids
+            .iter()
+            .map(|&pi| {
+                let pts = &plan.paths[pi].points;
+                let (concave, convex) = corner_candidates(pts);
+                let cands: Vec<usize> = if mode == SeamMode::Sharpest
+                    && !(concave.is_empty() && convex.is_empty())
+                {
+                    concave.iter().chain(convex.iter()).map(|c| c.idx).collect()
+                } else {
+                    (0..pts.len()).collect()
+                };
+                (cands, concave, convex)
+            })
+            .collect();
+        // Greedy nearest-first (loop ↔ track) assignment, one track per loop
+        // per layer — without it, two islands inside one radius (a hull and
+        // the cabin beside it) take turns dragging the same track around.
+        let mut assigned: Vec<Option<(usize, usize)>> = vec![None; loop_ids.len()]; // (vertex, track)
+        let mut track_used = vec![false; tracks.len()];
+        loop {
+            let mut best: Option<(f64, usize, usize, usize)> = None; // (dist, loop, vertex, track)
+            for (li, &pi) in loop_ids.iter().enumerate() {
+                if assigned[li].is_some() {
+                    continue;
+                }
+                let pts = &plan.paths[pi].points;
+                for (ti, t) in tracks.iter().enumerate() {
+                    if track_used[ti] {
+                        continue;
+                    }
+                    for &vi in &per_loop[li].0 {
+                        let d = pt_dist_mm(pts[vi], *t);
+                        if d <= SEAM_TRACK_RADIUS_MM
+                            && best.map_or(true, |(bd, _, _, _)| d < bd)
+                        {
+                            best = Some((d, li, vi, ti));
+                        }
                     }
                 }
             }
-            match best {
-                Some((d, vi, ti)) if d <= SEAM_TRACK_RADIUS_MM => {
-                    path.points.rotate_left(vi);
-                    if let Some(ws) = path.widths.as_mut() {
-                        ws.rotate_left(vi);
+            let Some((_, li, vi, ti)) = best else { break };
+            assigned[li] = Some((vi, ti));
+            track_used[ti] = true;
+        }
+        // Apply: rotate matched loops onto their column (Aligned additionally
+        // snaps to a real corner within reach — it hides the seam better than
+        // the bare nearest vertex); unmatched loops seed a new track at the
+        // mode's stand-alone best.
+        for (li, &pi) in loop_ids.iter().enumerate() {
+            let (_, concave, convex) = &per_loop[li];
+            let path = &mut plan.paths[pi];
+            let vi = match assigned[li] {
+                Some((mut vi, ti)) => {
+                    if mode == SeamMode::Aligned {
+                        if let Some((_, ci)) = concave
+                            .iter()
+                            .chain(convex.iter())
+                            .map(|c| (pt_dist_mm(path.points[c.idx], tracks[ti]), c.idx))
+                            .filter(|(cd, _)| *cd <= CORNER_SNAP_MM)
+                            .min_by(|a, b| a.0.total_cmp(&b.0))
+                        {
+                            vi = ci;
+                        }
                     }
-                    tracks[ti] = path.points[0];
+                    vi
                 }
-                _ => tracks.push(path.points[0]), // new island: seed where place_seam put it
+                None => match mode {
+                    SeamMode::Sharpest => best_corner(&path.points, concave, convex),
+                    _ => None,
+                }
+                .unwrap_or_else(|| {
+                    (0..path.points.len())
+                        .max_by_key(|&i| (path.points[i].y, path.points[i].x))
+                        .unwrap()
+                }),
+            };
+            path.points.rotate_left(vi);
+            if let Some(ws) = path.widths.as_mut() {
+                ws.rotate_left(vi);
+            }
+            match assigned[li] {
+                Some((_, ti)) => tracks[ti] = path.points[0],
+                None => tracks.push(path.points[0]),
             }
         }
     }
 }
 
-/// Corner sharpness at vertex `i`: `1 - cos(turn)` (0 = straight, up to 2 = hairpin).
-fn sharpness(points: &[Point], i: usize) -> f64 {
+/// Minimum windowed sharpness (1 − cos turn) for a vertex to count as a
+/// seam-worthy corner: ≈30° of direction change across the window. Below it
+/// a loop is treated as smooth — "sharpest" would otherwise latch onto
+/// discretization noise and scatter layer to layer.
+const SEAM_CORNER_MIN_SHARP: f64 = 0.13;
+
+/// How far (mm of arc, each way) the corner test looks when measuring the
+/// turn. Real models round their corners: a 90° transom corner with a 1.5 mm
+/// fillet never turns more than a few degrees at any single vertex, but at
+/// print scale it is still the corner where a seam belongs. Chords this long
+/// see the fillet's full turn while a gentle hull curve still reads smooth.
+const SEAM_CORNER_WINDOW_MM: f64 = 1.25;
+
+/// A corner candidate: vertex index + its windowed sharpness.
+struct Corner {
+    idx: usize,
+    sharp: f64,
+}
+
+/// The real corners of a closed loop, split by concavity (concave corners
+/// turn into the material — a seam bead tucks into the notch out of sight —
+/// so seeding prefers them). Sharpness is measured between chords reaching
+/// `SEAM_CORNER_WINDOW_MM` of arc each way, so filleted corners count and a
+/// run of fillet vertices simply yields a cluster of candidates. Both lists
+/// empty = smooth loop.
+fn corner_candidates(points: &[Point]) -> (Vec<Corner>, Vec<Corner>) {
     let n = points.len();
-    let prev = points[(i + n - 1) % n];
-    let cur = points[i];
-    let next = points[(i + 1) % n];
-    let a = unit(cur.x_mm() - prev.x_mm(), cur.y_mm() - prev.y_mm());
-    let b = unit(next.x_mm() - cur.x_mm(), next.y_mm() - cur.y_mm());
-    1.0 - (a.0 * b.0 + a.1 * b.1)
+    // Cumulative arc length around the ring, for the window walks.
+    let mut cum = vec![0.0_f64; n + 1];
+    for k in 0..n {
+        cum[k + 1] = cum[k] + pt_dist_mm(points[k], points[(k + 1) % n]);
+    }
+    let total = cum[n];
+    if total <= 1.0e-6 {
+        return (Vec::new(), Vec::new());
+    }
+    // Tiny loops can't fit the full window without folding onto themselves.
+    let w = SEAM_CORNER_WINDOW_MM.min(total / 4.0);
+    // Shoelace orientation: a turn opposing the loop's winding is concave
+    // regardless of which way the loop happens to be wound.
+    let mut area2 = 0.0;
+    for i in 0..n {
+        let (a, b) = (points[i], points[(i + 1) % n]);
+        area2 += a.x_mm() * b.y_mm() - b.x_mm() * a.y_mm();
+    }
+    let (mut concave, mut convex) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        // First vertex ≥ w of arc behind / ahead of i along the ring.
+        let mut back = (i + n - 1) % n;
+        while arc_between(&cum, total, back, i) < w {
+            back = (back + n - 1) % n;
+        }
+        let mut fwd = (i + 1) % n;
+        while arc_between(&cum, total, i, fwd) < w {
+            fwd = (fwd + 1) % n;
+        }
+        let cur = points[i];
+        let a = unit(cur.x_mm() - points[back].x_mm(), cur.y_mm() - points[back].y_mm());
+        let b = unit(points[fwd].x_mm() - cur.x_mm(), points[fwd].y_mm() - cur.y_mm());
+        let sharp = 1.0 - (a.0 * b.0 + a.1 * b.1);
+        if sharp < SEAM_CORNER_MIN_SHARP {
+            continue;
+        }
+        let cross = a.0 * b.1 - a.1 * b.0;
+        let c = Corner { idx: i, sharp };
+        if cross * area2 < 0.0 {
+            concave.push(c);
+        } else {
+            convex.push(c);
+        }
+    }
+    (concave, convex)
+}
+
+/// Arc length walking forward around the ring from vertex `from` to `to`.
+fn arc_between(cum: &[f64], total: f64, from: usize, to: usize) -> f64 {
+    if from == to {
+        return 0.0;
+    }
+    let d = cum[to] - cum[from];
+    if d >= 0.0 { d } else { d + total }
+}
+
+/// Best stand-alone corner: the sharpest concave one when the loop has any
+/// (the seam hides in the notch), else the sharpest convex; rear-most on ties.
+fn best_corner(points: &[Point], concave: &[Corner], convex: &[Corner]) -> Option<usize> {
+    let cands = if concave.is_empty() { convex } else { concave };
+    cands
+        .iter()
+        .max_by(|a, b| {
+            a.sharp.total_cmp(&b.sharp).then_with(|| {
+                (points[a.idx].y, points[a.idx].x).cmp(&(points[b.idx].y, points[b.idx].x))
+            })
+        })
+        .map(|c| c.idx)
 }
 
 fn unit(x: f64, y: f64) -> (f64, f64) {
@@ -1488,6 +1712,136 @@ mod tests {
             [1, 2, 6], [1, 6, 5],
         ] {
             tris.push([v[t[0]], v[t[1]], v[t[2]]]);
+        }
+    }
+
+    /// External-wall seam point (loop start) of every layer, bottom-up.
+    fn external_seams(layers: &[LayerPlan]) -> Vec<(usize, f64, f64)> {
+        let mut out = Vec::new();
+        for l in layers {
+            for p in &l.paths {
+                if p.kind == PathKind::ExternalPerimeter && p.closed && p.points.len() >= 3 {
+                    out.push((l.index, p.points[0].x_mm(), p.points[0].y_mm()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sharpest_seam_locks_to_the_concave_corner() {
+        // An L-bracket: the only concave corner is the inner notch. Every
+        // layer's external seam must sit there, in one vertical column.
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 10.0, 6.0]);
+        push_box(&mut tris, [0.0, 0.0, 0.0], [10.0, 20.0, 6.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.seam_mode = SeamMode::Sharpest;
+        s.skirt_loops = 0;
+        let layers = generate(&m, &s);
+        let seams = external_seams(&layers);
+        assert!(seams.len() >= layers.len(), "one external loop per layer");
+        // The notch vertex of the printed wall loop sits half a bead inside
+        // the model's (10,10) corner; everything lands centered on the bed,
+        // so compare against the centered corner position instead.
+        let (cx, cy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+        let (corner_x, corner_y) = (cx + (10.0 - 10.0), cy + (10.0 - 10.0)); // model center = (10,10)
+        for &(li, x, y) in &seams {
+            let d = ((x - corner_x).powi(2) + (y - corner_y).powi(2)).sqrt();
+            assert!(d < 1.5, "layer {li}: seam {x:.2},{y:.2} not at the notch (d={d:.2})");
+        }
+        // And the column is steady: consecutive seams barely move.
+        for w in seams.windows(2) {
+            let d = ((w[1].1 - w[0].1).powi(2) + (w[1].2 - w[0].2).powi(2)).sqrt();
+            assert!(d < 1.0, "seam jumped {d:.2} mm between layers {} and {}", w[0].0, w[1].0);
+        }
+    }
+
+    #[test]
+    fn sharpest_seam_finds_filleted_corners() {
+        // A 20×20 box with r=1.5 corner fillets — like a hull transom, no
+        // single vertex turns more than a few degrees, but the fillets are
+        // still the corners. The seam must land in one fillet and stay put,
+        // not fall back to the middle of a smooth face.
+        let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+        let (half, r, steps) = (10.0_f64, 1.5_f64, 12_usize);
+        let mut outline: Vec<(f64, f64)> = Vec::new();
+        for (k, (cx, cy, a0)) in [
+            (half - r, half - r, 0.0_f64),
+            (-(half - r), half - r, 90.0),
+            (-(half - r), -(half - r), 180.0),
+            (half - r, -(half - r), 270.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = k;
+            for s in 0..=steps {
+                let a = (a0 + 90.0 * s as f64 / steps as f64).to_radians();
+                outline.push((cx + r * a.cos(), cy + r * a.sin()));
+            }
+        }
+        let n = outline.len();
+        for k in 0..n {
+            let (x0, y0) = outline[k];
+            let (x1, y1) = outline[(k + 1) % n];
+            tris.push([[x0, y0, 0.0], [x1, y1, 0.0], [x1, y1, 4.0]]);
+            tris.push([[x0, y0, 0.0], [x1, y1, 4.0], [x0, y0, 4.0]]);
+            tris.push([[0.0, 0.0, 0.0], [x1, y1, 0.0], [x0, y0, 0.0]]);
+            tris.push([[0.0, 0.0, 4.0], [x0, y0, 4.0], [x1, y1, 4.0]]);
+        }
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.seam_mode = SeamMode::Sharpest;
+        s.skirt_loops = 0;
+        let layers = generate(&m, &s);
+        let seams = external_seams(&layers);
+        assert!(seams.len() >= layers.len());
+        let (cx, cy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+        for &(li, x, y) in &seams {
+            // In a fillet = within ~2.2mm of one of the four fillet centers
+            // (the wall loop runs half a bead inside the outline).
+            let (dx, dy) = ((x - cx).abs(), (y - cy).abs());
+            let d = ((dx - (half - r)).powi(2) + (dy - (half - r)).powi(2)).sqrt();
+            assert!(d < r + 0.8, "layer {li}: seam {x:.2},{y:.2} not in a corner fillet (d={d:.2})");
+        }
+        for w in seams.windows(2) {
+            let d = ((w[1].1 - w[0].1).powi(2) + (w[1].2 - w[0].2).powi(2)).sqrt();
+            assert!(d < 1.5, "fillet seam jumped {d:.2} mm at layer {}", w[1].0);
+        }
+    }
+
+    #[test]
+    fn sharpest_seam_stays_in_a_column_on_smooth_loops() {
+        // A 24-gon prism has no vertex past the corner threshold (15° turns):
+        // "sharpest" must degrade to an aligned column, not per-layer noise.
+        let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+        let n = 24;
+        let r = 10.0;
+        let pt = |k: usize| {
+            let a = (k % n) as f64 / n as f64 * std::f64::consts::TAU;
+            (r * a.cos(), r * a.sin())
+        };
+        for k in 0..n {
+            let (x0, y0) = pt(k);
+            let (x1, y1) = pt(k + 1);
+            // Side quad (outward), bottom fan, top fan.
+            tris.push([[x0, y0, 0.0], [x1, y1, 0.0], [x1, y1, 6.0]]);
+            tris.push([[x0, y0, 0.0], [x1, y1, 6.0], [x0, y0, 6.0]]);
+            tris.push([[0.0, 0.0, 0.0], [x1, y1, 0.0], [x0, y0, 0.0]]);
+            tris.push([[0.0, 0.0, 6.0], [x0, y0, 6.0], [x1, y1, 6.0]]);
+        }
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.seam_mode = SeamMode::Sharpest;
+        s.skirt_loops = 0;
+        let layers = generate(&m, &s);
+        let seams = external_seams(&layers);
+        assert!(seams.len() >= layers.len());
+        for w in seams.windows(2) {
+            let d = ((w[1].1 - w[0].1).powi(2) + (w[1].2 - w[0].2).powi(2)).sqrt();
+            assert!(d < 3.0, "smooth loop seam wandered {d:.2} mm at layer {}", w[1].0);
         }
     }
 
@@ -1803,9 +2157,12 @@ mod tests {
         let s = Settings::default(); // 4 top / 4 bottom
         let layers = generate(&m, &s);
 
-        // Bottom and top shells are solid; the middle is sparse only.
-        assert!(count(&layers[0], PathKind::Solid) > 0, "bottom shell solid");
-        assert!(count(&layers[99], PathKind::Solid) > 0, "top shell solid");
+        // Bottom and top shells are solid — the exposed faces as skins, the
+        // covered shell layers buried Solid; the middle is sparse only.
+        assert!(count(&layers[0], PathKind::BottomSkin) > 0, "bed face is bottom skin");
+        assert!(count(&layers[1], PathKind::Solid) > 0, "covered bottom shell solid");
+        assert!(count(&layers[99], PathKind::TopSkin) > 0, "roof is top skin");
+        assert!(count(&layers[98], PathKind::Solid) > 0, "covered top shell solid");
 
         let mid = &layers[50];
         assert!(count(mid, PathKind::Infill) > 0, "middle has sparse infill");
@@ -2257,8 +2614,8 @@ mod tests {
         assert_eq!(printable.len(), 1, "vase layer = exactly one path");
         assert_eq!(printable[0].kind, PathKind::ExternalPerimeter);
         assert!(printable[0].closed);
-        // Bottom shell still solid.
-        assert!(count(&layers[0], PathKind::Solid) > 0, "vase keeps a solid bottom");
+        // Bottom shell still solid (the bed face prints as bottom skin).
+        assert!(count(&layers[0], PathKind::BottomSkin) > 0, "vase keeps a solid bottom");
     }
 
     #[test]

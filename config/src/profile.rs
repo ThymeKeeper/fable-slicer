@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HeatMode, InfillPattern, SeamMode, Settings, SupportMode, WallMode, GENERIC_END_GCODE,
+    InfillPattern, SeamMode, Settings, SupportMode, WallMode, GENERIC_END_GCODE,
     GENERIC_START_GCODE,
 };
 
@@ -81,18 +81,22 @@ pub struct PrinterProfile {
 pub struct FilamentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits: Option<String>,
+    /// Material class off the box ("pla", "petg", "abs", "tpu", "other") —
+    /// drives every default below until a calibration value pins one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filament_diameter_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub density_g_cm3: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nozzle_temp_c: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_layer_nozzle_temp_c: Option<u32>,
+    /// The packaging temperature range printed on the spool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nozzle_temp_min_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nozzle_temp_max_c: Option<u32>,
+    /// Cold ↔ hot preference (−1..+1) inside the packaging range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_bias: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bed_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,6 +111,10 @@ pub struct FilamentProfile {
     pub bridge_fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_flow_derate_per_c: Option<f64>,
+    /// Allowable heat-load ceiling (mW/mm², per island) — a material range
+    /// bound heat control works within, not a tuning target. Auto: 15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_heat_mw_mm2: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_off_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,8 +133,6 @@ pub struct ProcessProfile {
     pub layer_height_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_layer_height_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub line_width_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_resolution_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,18 +186,6 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_seam_overlap_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub print_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_layer_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bridge_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overhang_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_layer_time_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_print_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub infill_overlap: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monotonic_solid: Option<bool>,
@@ -206,42 +200,19 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ironing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ironing_flow: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ironing_spacing_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ironing_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub elephant_foot_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xy_compensation_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spiral_vase: Option<bool>,
+    /// Finish ↔ speed preference (−1..+1) — the one speed control. Scales
+    /// the derived speeds between 60% and 100% of the machine's rating.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub external_perimeter_speed_mm_s: Option<f64>,
+    pub speed_quality: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub solid_speed_mm_s: Option<f64>,
+    pub heat_control: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub support_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap_fill_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bridge_flow: Option<f64>,
-    // The four heat-control keys carry aliases from before the rename
-    // ("thermal governor" / "temperature shaping") so profiles saved back
-    // then keep loading; saving writes the new names.
-    #[serde(skip_serializing_if = "Option::is_none", alias = "thermal_governor")]
-    pub heat_control_speed: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "governor_max_heat_mw_mm2")]
-    pub max_heat_mw_mm2: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "temp_shaping")]
-    pub heat_control_temp: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "temp_shaping_swing_c")]
-    pub temp_swing_c: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heat_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heat_slew_pct_per_layer: Option<f64>,
+    pub smooth_extra_time_pct: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -279,9 +250,10 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, filament_diameter_mm, density_g_cm3, nozzle_temp_c, first_layer_nozzle_temp_c,
+        merge_fields!(self, base, material, filament_diameter_mm, density_g_cm3, temp_bias,
             nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_c,
-            extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c, pressure_advance,
+            extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
+            max_heat_mw_mm2, pressure_advance,
             fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed)
     }
 }
@@ -291,21 +263,18 @@ impl Tier for ProcessProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
+        merge_fields!(self, base, layer_height_mm, first_layer_height_mm,
             max_resolution_mm, arc_fitting, arc_tolerance_mm, wall_count, wall_mode, top_layers, bottom_layers,
             half_height_outer_walls, brick_layers, brick_flow,
             infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
-            max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm, print_speed_mm_s, first_layer_speed_mm_s,
-            bridge_speed_mm_s, overhang_speed_mm_s, min_layer_time_s, min_print_speed_mm_s,
+            max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm,
             infill_overlap, monotonic_solid, gap_fill,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
-            ironing, ironing_flow, ironing_spacing_mm, ironing_speed_mm_s,
+            ironing,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
-            external_perimeter_speed_mm_s, solid_speed_mm_s, support_speed_mm_s,
-            gap_fill_speed_mm_s, bridge_flow, heat_control_speed, max_heat_mw_mm2,
-            heat_control_temp, temp_swing_c, heat_mode, heat_slew_pct_per_layer)
+            speed_quality, heat_control, smooth_extra_time_pct)
     }
 }
 
@@ -332,7 +301,7 @@ impl PrinterProfile {
             bed_size_z_mm: diff_field!(cur.bed_size_z_mm, base.bed_size_z_mm),
             nozzle_diameter_mm: diff_field!(cur.nozzle_diameter_mm, base.nozzle_diameter_mm),
             travel_speed_mm_s: diff_field!(cur.travel_speed_mm_s, base.travel_speed_mm_s),
-            print_speed_mm_s: diff_field!(cur.print_speed_mm_s, base.print_speed_mm_s),
+            print_speed_mm_s: diff_field!(cur.machine_speed_mm_s, base.machine_speed_mm_s),
             first_layer_speed_mm_s: diff_field!(cur.first_layer_speed_mm_s, base.first_layer_speed_mm_s),
             acceleration: diff_field!(cur.acceleration_mm_s2, base.acceleration_mm_s2),
             outer_wall_accel: diff_field!(cur.outer_wall_accel_mm_s2, base.outer_wall_accel_mm_s2),
@@ -368,14 +337,15 @@ impl FilamentProfile {
             inherits: None,
             filament_diameter_mm: diff_field!(cur.filament_diameter_mm, base.filament_diameter_mm),
             density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
-            nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
-            first_layer_nozzle_temp_c: diff_field!(cur.first_layer_nozzle_temp_c, base.first_layer_nozzle_temp_c),
+            material: diff_field!(cur.material.label().to_string(), base.material.label().to_string()),
+            temp_bias: diff_field!(cur.temp_bias, base.temp_bias),
             nozzle_temp_min_c: diff_field!(cur.nozzle_temp_min_c, base.nozzle_temp_min_c),
             nozzle_temp_max_c: diff_field!(cur.nozzle_temp_max_c, base.nozzle_temp_max_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
             max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
+            max_heat_mw_mm2: diff_field!(cur.max_heat_mw_mm2, base.max_heat_mw_mm2),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
@@ -398,7 +368,6 @@ impl ProcessProfile {
             inherits: None,
             layer_height_mm: diff_field!(cur.layer_height_mm, base.layer_height_mm),
             first_layer_height_mm: diff_field!(cur.first_layer_height_mm, base.first_layer_height_mm),
-            line_width_mm: diff_field!(cur.line_width_mm, base.line_width_mm),
             max_resolution_mm: diff_field!(cur.max_resolution_mm, base.max_resolution_mm),
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
             arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
@@ -426,12 +395,6 @@ impl ProcessProfile {
             max_arc_radius_mm: diff_field!(cur.max_arc_radius_mm, base.max_arc_radius_mm),
             arc_seam_overlap_mm: diff_field!(cur.arc_seam_overlap_mm, base.arc_seam_overlap_mm),
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
-            print_speed_mm_s: None,
-            first_layer_speed_mm_s: None,
-            bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
-            overhang_speed_mm_s: diff_field!(cur.overhang_speed_mm_s, base.overhang_speed_mm_s),
-            min_layer_time_s: diff_field!(cur.min_layer_time_s, base.min_layer_time_s),
-            min_print_speed_mm_s: diff_field!(cur.min_print_speed_mm_s, base.min_print_speed_mm_s),
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
             monotonic_solid: diff_field!(cur.monotonic_solid, base.monotonic_solid),
             gap_fill: diff_field!(cur.gap_fill, base.gap_fill),
@@ -439,23 +402,12 @@ impl ProcessProfile {
             fuzzy_skin_thickness_mm: diff_field!(cur.fuzzy_skin_thickness_mm, base.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: diff_field!(cur.fuzzy_skin_point_dist_mm, base.fuzzy_skin_point_dist_mm),
             ironing: diff_field!(cur.ironing, base.ironing),
-            ironing_flow: diff_field!(cur.ironing_flow, base.ironing_flow),
-            ironing_spacing_mm: diff_field!(cur.ironing_spacing_mm, base.ironing_spacing_mm),
-            ironing_speed_mm_s: diff_field!(cur.ironing_speed_mm_s, base.ironing_speed_mm_s),
             elephant_foot_mm: diff_field!(cur.elephant_foot_mm, base.elephant_foot_mm),
             xy_compensation_mm: diff_field!(cur.xy_compensation_mm, base.xy_compensation_mm),
             spiral_vase: diff_field!(cur.spiral_vase, base.spiral_vase),
-            external_perimeter_speed_mm_s: diff_field!(cur.external_perimeter_speed_mm_s, base.external_perimeter_speed_mm_s),
-            solid_speed_mm_s: diff_field!(cur.solid_speed_mm_s, base.solid_speed_mm_s),
-            support_speed_mm_s: diff_field!(cur.support_speed_mm_s, base.support_speed_mm_s),
-            gap_fill_speed_mm_s: diff_field!(cur.gap_fill_speed_mm_s, base.gap_fill_speed_mm_s),
-            bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
-            heat_control_speed: diff_field!(cur.heat_control_speed, base.heat_control_speed),
-            max_heat_mw_mm2: diff_field!(cur.max_heat_mw_mm2, base.max_heat_mw_mm2),
-            heat_control_temp: diff_field!(cur.heat_control_temp, base.heat_control_temp),
-            temp_swing_c: diff_field!(cur.temp_swing_c, base.temp_swing_c),
-            heat_mode: diff_field!(cur.heat_mode.label().to_string(), base.heat_mode.label().to_string()),
-            heat_slew_pct_per_layer: diff_field!(cur.heat_slew_pct_per_layer, base.heat_slew_pct_per_layer),
+            speed_quality: diff_field!(cur.speed_quality, base.speed_quality),
+            heat_control: diff_field!(cur.heat_control, base.heat_control),
+            smooth_extra_time_pct: diff_field!(cur.smooth_extra_time_pct, base.smooth_extra_time_pct),
         }
     }
 
@@ -705,20 +657,30 @@ impl Profiles {
         let fl = resolve_tier(&self.filaments, filament, "filament")?;
         let pc = resolve_tier(&self.processes, process, "process")?;
         let d = Settings::default();
-        // Printer speed (machine default) takes precedence over the process value.
-        let print_v = pr.print_speed_mm_s.or(pc.print_speed_mm_s).unwrap_or(d.print_speed_mm_s);
+        // The material class off the box drives every filament default a
+        // calibration entry doesn't pin.
+        let material = fl.material.as_deref().and_then(crate::Material::parse).unwrap_or(d.material);
+        // Packaging range + cold↔hot bias → the operating temperatures.
+        let (class_min, class_max) = material.packaging_temp_c();
+        let temp_min = fl.nozzle_temp_min_c.unwrap_or(class_min);
+        let temp_max = fl.nozzle_temp_max_c.unwrap_or(class_max);
+        let bias = fl.temp_bias.unwrap_or(d.temp_bias);
+        let nozzle_temp = crate::derived_nozzle_temp_c(temp_min, temp_max, bias);
+        // The machine's rating × the finish↔speed dial → the nominal speed.
+        let machine_v = pr.print_speed_mm_s.unwrap_or(d.machine_speed_mm_s);
+        let quality = pc.speed_quality.unwrap_or(d.speed_quality);
+        let print_v = crate::derived_print_speed_mm_s(machine_v, quality);
         let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
-        let nozzle_temp = fl.nozzle_temp_c.unwrap_or(d.nozzle_temp_c);
         // The flow triangle: speed × bead area (line width × layer height) must
         // fit the filament's melt ceiling, so derived speeds balance against it.
-        let line_w = pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle));
+        let line_w = crate::derived_line_width_mm(nozzle);
         let layer_h = pc.layer_height_mm.unwrap_or(d.layer_height_mm);
-        let max_flow = fl.max_volumetric_speed_mm3_s.unwrap_or(d.max_volumetric_speed_mm3_s);
+        let max_flow = fl.max_volumetric_speed_mm3_s.unwrap_or_else(|| material.max_flow_mm3_s());
         let flow_cap = crate::flow_speed_cap_mm_s(max_flow, line_w, layer_h);
         Ok(Settings {
             nozzle_diameter_mm: nozzle,
             filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
-            filament_density_g_cm3: fl.density_g_cm3.unwrap_or(d.filament_density_g_cm3),
+            filament_density_g_cm3: fl.density_g_cm3.unwrap_or_else(|| material.density_g_cm3()),
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
             bed_size_z_mm: pr.bed_size_z_mm.unwrap_or(d.bed_size_z_mm),
@@ -755,9 +717,9 @@ impl Profiles {
             fuzzy_skin_thickness_mm: pc.fuzzy_skin_thickness_mm.unwrap_or(d.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: pc.fuzzy_skin_point_dist_mm.unwrap_or(d.fuzzy_skin_point_dist_mm),
             ironing: pc.ironing.unwrap_or(d.ironing),
-            ironing_flow: pc.ironing_flow.unwrap_or(d.ironing_flow),
-            ironing_spacing_mm: pc.ironing_spacing_mm.unwrap_or(d.ironing_spacing_mm),
-            ironing_speed_mm_s: pc.ironing_speed_mm_s.unwrap_or(d.ironing_speed_mm_s),
+            ironing_flow: d.ironing_flow,
+            ironing_spacing_mm: d.ironing_spacing_mm,
+            ironing_speed_mm_s: d.ironing_speed_mm_s,
             elephant_foot_mm: pc.elephant_foot_mm.unwrap_or(d.elephant_foot_mm),
             xy_compensation_mm: pc.xy_compensation_mm.unwrap_or(d.xy_compensation_mm),
             spiral_vase: pc.spiral_vase.unwrap_or(d.spiral_vase),
@@ -783,13 +745,13 @@ impl Profiles {
             wipe_mm: pr.wipe_mm.unwrap_or(d.wipe_mm),
             host_url: pr.host_url.unwrap_or(d.host_url),
             api_key: pr.api_key.unwrap_or(d.api_key),
+            material,
             nozzle_temp_c: nozzle_temp,
-            // Auto: an unset first-layer temp follows the nozzle temp.
-            first_layer_nozzle_temp_c: fl.first_layer_nozzle_temp_c.unwrap_or(nozzle_temp),
-            // Auto: a ±15 °C printable window around the nozzle temp.
-            nozzle_temp_min_c: fl.nozzle_temp_min_c.unwrap_or_else(|| nozzle_temp.saturating_sub(15)),
-            nozzle_temp_max_c: fl.nozzle_temp_max_c.unwrap_or(nozzle_temp + 15),
-            bed_temp_c: fl.bed_temp_c.unwrap_or(d.bed_temp_c),
+            first_layer_nozzle_temp_c: crate::derived_first_layer_temp_c(temp_min, temp_max, bias, material),
+            nozzle_temp_min_c: temp_min,
+            nozzle_temp_max_c: temp_max,
+            temp_bias: bias,
+            bed_temp_c: fl.bed_temp_c.unwrap_or_else(|| material.bed_temp_c()),
             heat_rate_c_s: pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s),
             cool_rate_c_s: pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s),
             // Auto: un-measured fan-on rates follow the fan-off ones.
@@ -799,52 +761,38 @@ impl Profiles {
             cool_rate_fan_c_s: pr
                 .cool_rate_fan_c_s
                 .unwrap_or_else(|| pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s)),
+            machine_speed_mm_s: machine_v,
+            speed_quality: quality,
             print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
-            first_layer_speed_mm_s: pr.first_layer_speed_mm_s.or(pc.first_layer_speed_mm_s).unwrap_or(d.first_layer_speed_mm_s),
-            // Per-feature speeds scale with the machine's print speed when the
-            // profile doesn't pin them (a Voron's outer wall shouldn't crawl at
-            // an Ender's pace just because the default table says 25).
-            external_perimeter_speed_mm_s: pc
-                .external_perimeter_speed_mm_s
-                .unwrap_or_else(|| crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap)),
-            solid_speed_mm_s: pc
-                .solid_speed_mm_s
-                .unwrap_or_else(|| crate::derived_solid_speed_mm_s(print_v, flow_cap)),
-            support_speed_mm_s: pc
-                .support_speed_mm_s
-                .unwrap_or_else(|| crate::derived_support_speed_mm_s(print_v, flow_cap)),
-            gap_fill_speed_mm_s: pc
-                .gap_fill_speed_mm_s
-                .unwrap_or_else(|| crate::derived_gap_fill_speed_mm_s(print_v, flow_cap)),
-            bridge_speed_mm_s: pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
-            overhang_speed_mm_s: pc.overhang_speed_mm_s.unwrap_or_else(|| {
-                crate::derived_overhang_speed_mm_s(pc.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s))
-            }),
-            min_layer_time_s: pc.min_layer_time_s.unwrap_or(d.min_layer_time_s),
-            min_print_speed_mm_s: pc.min_print_speed_mm_s.unwrap_or(d.min_print_speed_mm_s),
+            first_layer_speed_mm_s: pr.first_layer_speed_mm_s.unwrap_or(d.first_layer_speed_mm_s),
+            // Every feature speed derives: nominal × its quality ratio, under
+            // the filament's flow ceiling. Heat control governs from there.
+            external_perimeter_speed_mm_s: crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap),
+            solid_speed_mm_s: crate::derived_solid_speed_mm_s(print_v, flow_cap),
+            support_speed_mm_s: crate::derived_support_speed_mm_s(print_v, flow_cap),
+            gap_fill_speed_mm_s: crate::derived_gap_fill_speed_mm_s(print_v, flow_cap),
+            bridge_speed_mm_s: d.bridge_speed_mm_s,
+            overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(d.bridge_speed_mm_s),
+            min_layer_time_s: d.min_layer_time_s,
+            min_print_speed_mm_s: d.min_print_speed_mm_s,
             max_volumetric_speed_mm3_s: max_flow,
-            max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or(d.max_flow_derate_per_c),
+            max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
-            bridge_flow: pc.bridge_flow.unwrap_or(d.bridge_flow),
-            heat_control_speed: pc.heat_control_speed.unwrap_or(d.heat_control_speed),
-            max_heat_mw_mm2: pc
-                .max_heat_mw_mm2
-                .unwrap_or(d.max_heat_mw_mm2),
-            heat_control_temp: pc.heat_control_temp.unwrap_or(d.heat_control_temp),
-            temp_swing_c: pc.temp_swing_c.unwrap_or(d.temp_swing_c),
-            heat_mode: pc.heat_mode.as_deref().and_then(HeatMode::parse).unwrap_or(d.heat_mode),
-            heat_slew_pct_per_layer: pc
-                .heat_slew_pct_per_layer
-                .unwrap_or(d.heat_slew_pct_per_layer),
+            bridge_flow: d.bridge_flow,
+            heat_control: pc.heat_control.unwrap_or(d.heat_control),
+            // Material ranges live with the filament; the class supplies
+            // them until calibration pins one.
+            max_heat_mw_mm2: fl.max_heat_mw_mm2.unwrap_or_else(|| material.max_heat_mw_mm2()),
+            smooth_extra_time_pct: pc.smooth_extra_time_pct.unwrap_or(d.smooth_extra_time_pct),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
-            fan_speed: fl.fan_speed.unwrap_or(d.fan_speed),
-            bridge_fan_speed: fl.bridge_fan_speed.unwrap_or(d.bridge_fan_speed),
-            fan_off_layers: fl.fan_off_layers.unwrap_or(d.fan_off_layers),
+            fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
+            bridge_fan_speed: fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1),
+            fan_off_layers: fl.fan_off_layers.unwrap_or_else(|| material.fan().2),
             has_aux_fan: pr.aux_fan.unwrap_or(d.has_aux_fan),
             has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
-            aux_fan_speed: fl.aux_fan_speed.unwrap_or(d.aux_fan_speed),
-            exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or(d.exhaust_fan_speed),
+            aux_fan_speed: fl.aux_fan_speed.unwrap_or_else(|| material.aux_exhaust().0),
+            exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or_else(|| material.aux_exhaust().1),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })
@@ -947,24 +895,22 @@ mod tests {
     }
 
     #[test]
-    fn pre_rename_heat_control_keys_still_load() {
-        // Process profiles saved before the heat-control rename carry the old
-        // key names — the serde aliases must keep them loading forever.
-        let p: ProcessProfile = toml::from_str(
-            "thermal_governor = true\n\
-             governor_max_heat_mw_mm2 = 12.5\n\
-             temp_shaping = true\n\
-             temp_shaping_swing_c = 18.0\n",
-        )
-        .unwrap();
-        assert_eq!(p.heat_control_speed, Some(true));
-        assert_eq!(p.max_heat_mw_mm2, Some(12.5));
-        assert_eq!(p.heat_control_temp, Some(true));
-        assert_eq!(p.temp_swing_c, Some(18.0));
-        // Saving writes only the new names — files migrate forward on save.
-        let out = toml::to_string(&p).unwrap();
-        assert!(out.contains("heat_control_speed") && out.contains("heat_control_temp"));
-        assert!(!out.contains("governor") && !out.contains("temp_shaping"));
+    fn heat_control_keys_route_to_their_tiers() {
+        // The switch + budget live on the process tier; the ranges are
+        // material properties on the filament tier (auto when unset).
+        let pc: ProcessProfile =
+            toml::from_str("heat_control = true\nsmooth_extra_time_pct = 25.0\n").unwrap();
+        assert_eq!(pc.heat_control, Some(true));
+        assert_eq!(pc.smooth_extra_time_pct, Some(25.0));
+        let fl: FilamentProfile =
+            toml::from_str("material = \"petg\"\nmax_heat_mw_mm2 = 12.5\n").unwrap();
+        assert_eq!(fl.max_heat_mw_mm2, Some(12.5));
+        assert_eq!(fl.material.as_deref(), Some("petg"));
+        // An unset ceiling resolves to the material class's value.
+        let p = Profiles::builtin();
+        let s = p.resolve("voron24", "pla", "standard").unwrap();
+        assert_eq!(s.max_heat_mw_mm2, crate::Material::Pla.max_heat_mw_mm2());
+        assert!(!s.heat_control, "off by default");
     }
 
     #[test]
@@ -974,10 +920,13 @@ mod tests {
         // profile edit can't silently regress the pairing.
         let p = Profiles::builtin();
         let s = p.resolve("sovol-zero", "pla", "standard").unwrap();
-        assert_eq!(s.acceleration_mm_s2, 40000.0); // Orca default/travel accel
-        assert_eq!(s.outer_wall_accel_mm_s2, 10000.0); // Orca outer wall accel
+        // Acceleration deliberately runs under the 40000 rating — full rate
+        // hammers the frame for ~7% of a Benchy (see the profile comment).
+        assert_eq!(s.acceleration_mm_s2, 15000.0);
+        assert_eq!(s.outer_wall_accel_mm_s2, 6000.0); // also paces top/bottom skins
         assert_eq!(s.first_layer_accel_mm_s2, 1000.0); // auto = Orca's initial layer
-        assert_eq!(s.print_speed_mm_s, 400.0); // Orca inner wall
+        assert_eq!(s.machine_speed_mm_s, 400.0); // Orca inner wall = the rating
+        assert_eq!(s.print_speed_mm_s, 320.0); // derived: 80% of rated at dial 0
         assert_eq!(s.first_layer_speed_mm_s, 55.0); // Orca initial layer
         assert_eq!(s.travel_speed_mm_s, 1000.0); // Orca travel
         assert_eq!(s.jerk_mm_s, 5.0); // Orca square-corner velocity
@@ -1008,27 +957,34 @@ mod tests {
     fn auto_speeds_balance_to_flow_ceiling() {
         let p = Profiles::builtin();
         let s = p.resolve("sovol-zero", "pla", "standard").unwrap();
-        // 21 mm³/s through a 0.45 × 0.2 bead ≈ 258 mm/s. Solid (80% of 400)
-        // and support (90%) would overshoot — the triangle binds them...
+        // Nominal = 80% of the 400 rating = 320. 21 mm³/s through a
+        // 0.45 × 0.2 bead ≈ 258 mm/s. Support (90% of 320 = 288) would
+        // overshoot — the triangle binds it...
         let cap = crate::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
         assert!((cap - 258.0).abs() < 1.0);
-        assert_eq!(s.solid_speed_mm_s, cap);
+        assert_eq!(s.print_speed_mm_s, 320.0);
         assert_eq!(s.support_speed_mm_s, cap);
-        // ...while outer wall's 50% (200) fits beneath it untouched.
-        assert_eq!(s.external_perimeter_speed_mm_s, 200.0);
-        // A high-flow filament lifts the ceiling and the 80% rule returns.
+        // ...while solid's 80% (256) and outer wall's 50% (160) fit beneath.
+        assert_eq!(s.solid_speed_mm_s, 256.0);
+        assert_eq!(s.external_perimeter_speed_mm_s, 160.0);
+        // A high-flow filament lifts the ceiling clear of every ratio.
         let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
-        assert_eq!(hf.solid_speed_mm_s, 320.0);
+        assert_eq!(hf.solid_speed_mm_s, 256.0);
     }
 
     #[test]
-    fn first_layer_temp_follows_nozzle_when_unset() {
-        // petg doesn't set a first-layer temp: it must track the nozzle temp,
-        // not fall back to the in-code default.
+    fn temperatures_derive_from_packaging() {
+        // petg's packaging card says 230–250: the operating point lands at
+        // the center, and the first layer adds the class bump clipped by the
+        // packaging max.
         let p = Profiles::builtin();
         let s = p.resolve("generic", "petg", "standard").unwrap();
         assert_eq!(s.nozzle_temp_c, 240);
-        assert_eq!(s.first_layer_nozzle_temp_c, 240);
+        assert_eq!(s.first_layer_nozzle_temp_c, 250); // +10 PETG bump, fits
+        // pla-hf biases warm: 190–230 at +0.25 → 215, first layer clipped 230.
+        let s = p.resolve("generic", "pla-hf", "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 215);
+        assert_eq!(s.first_layer_nozzle_temp_c, 230);
     }
 
     #[test]
@@ -1061,12 +1017,9 @@ mod tests {
         p.save_user_printer("fat-nozzle", pr).unwrap();
         let s = p.resolve("fat-nozzle", "pla", "standard").unwrap();
         assert!((s.line_width_mm - 0.675).abs() < 1e-9, "auto lw {}", s.line_width_mm);
-        // `draft` pins 0.5 explicitly - pin wins over auto.
+        // Line width is pure stadium math now — every process derives it.
         let s = p.resolve("fat-nozzle", "pla", "draft").unwrap();
-        assert!((s.line_width_mm - 0.5).abs() < 1e-9);
-        // Provenance is visible to the GUI: standard leaves it unset, draft pins.
-        assert!(p.merged_process("standard").unwrap().line_width_mm.is_none());
-        assert!(p.merged_process("draft").unwrap().line_width_mm.is_some());
+        assert!((s.line_width_mm - 0.675).abs() < 1e-9);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1075,17 +1028,16 @@ mod tests {
         let base = Settings::default();
         let mut cur = base.clone();
         cur.wall_count = 5; // process
-        cur.nozzle_temp_c = 245; // filament
-        cur.print_speed_mm_s = 120.0; // printer (precedence)
+        cur.temp_bias = 0.5; // filament
+        cur.machine_speed_mm_s = 120.0; // printer (datasheet)
         cur.bed_size_x_mm = 300.0; // printer
 
         let pc = ProcessProfile::diff(&cur, &base);
         assert_eq!(pc.wall_count, Some(5));
-        assert_eq!(pc.print_speed_mm_s, None, "print speed must not land in process");
         assert!(pc.layer_height_mm.is_none(), "untouched fields stay unset");
 
         let fl = FilamentProfile::diff(&cur, &base);
-        assert_eq!(fl.nozzle_temp_c, Some(245));
+        assert_eq!(fl.temp_bias, Some(0.5));
         assert!(fl.bed_temp_c.is_none());
 
         let pr = PrinterProfile::diff(&cur, &base);
@@ -1105,7 +1057,8 @@ mod tests {
         p.load_user_profiles(Some(dir.clone())).unwrap();
 
         // Save a filament diff inheriting petg with a hotter nozzle.
-        let fl = FilamentProfile { inherits: Some("petg".into()), nozzle_temp_c: Some(245), ..Default::default() };
+        // bias 0.5 over petg's 230-250 packaging range derives exactly 245.
+        let fl = FilamentProfile { inherits: Some("petg".into()), temp_bias: Some(0.5), ..Default::default() };
         p.save_user_filament("my-petg", fl).unwrap();
         assert!(p.is_user(TierKind::Filament, "my-petg"));
         assert!(!p.is_builtin(TierKind::Filament, "my-petg"));
@@ -1113,7 +1066,7 @@ mod tests {
         // The saved file is a minimal diff (only inherits + the changed field).
         let text = fs::read_to_string(dir.join("filament/my-petg.toml")).unwrap();
         assert!(text.contains("inherits = \"petg\""), "saved: {text}");
-        assert!(text.contains("nozzle_temp_c = 245"));
+        assert!(text.contains("temp_bias = 0.5"));
         assert!(!text.contains("bed_temp_c"), "unchanged fields must not be written");
 
         // It resolves over its parent, and a fresh registry loads it from disk.

@@ -1,7 +1,10 @@
-# Generic PETG.
+# Generic PETG packaging card. The class supplies density, cooling, and the
+# heat ceiling; the melt ceiling below is a measured-conservative value.
+material = "petg"
 filament_diameter_mm = 1.75
-density_g_cm3 = 1.27
-nozzle_temp_c = 240
+nozzle_temp_min_c = 230
+nozzle_temp_max_c = 250
 bed_temp_c = 80
-# PETG melts slower than PLA.
+
+# --- calibration ---
 max_volumetric_speed_mm3_s = 11.0

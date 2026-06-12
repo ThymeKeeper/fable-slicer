@@ -1,4 +1,6 @@
-# 0.20mm standard quality.
+# 0.20mm standard quality. Geometry intent only — speeds, temperatures, and
+# flow are derived from the machine datasheet, the filament packaging, and
+# heat control.
 layer_height_mm = 0.2
 first_layer_height_mm = 0.2
 max_resolution_mm = 0.05
@@ -12,7 +14,3 @@ skirt_loops = 2
 skirt_gap_mm = 3.0
 brim_loops = 0
 seam = "nearest"
-print_speed_mm_s = 50.0
-first_layer_speed_mm_s = 20.0
-min_layer_time_s = 8.0
-min_print_speed_mm_s = 10.0

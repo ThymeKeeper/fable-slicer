@@ -71,14 +71,9 @@ enum ColorBy {
 /// "priority mode": auto until touched, visible either way).
 #[derive(Default, Clone, Copy)]
 struct Pins {
-    line_width: bool,
-    external_speed: bool,
-    solid_speed: bool,
-    support_speed: bool,
-    gap_fill_speed: bool,
-    overhang_speed: bool,
     outer_wall_accel: bool,
     first_layer_accel: bool,
+    max_heat: bool,
 }
 
 /// A slider with an auto/pin badge: while unpinned it shows a weak "auto" tag
@@ -134,29 +129,6 @@ fn flow_ceiling_text(s: &config::Settings) -> String {
     }
 }
 
-/// Tooltip for an auto speed slider: the rule, the flow triangle with live
-/// numbers, and which of the two is winning right now.
-fn speed_hint(intro: &str, rule: &str, asked: f64, s: &config::Settings) -> String {
-    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
-    let verdict = if !cap.is_finite() {
-        format!("max flow is 0 (unlimited), so auto = {asked:.0}.")
-    } else if cap < asked {
-        format!("only ~{cap:.0} fits, so auto = ~{cap:.0} — the triangle wins over the rule.")
-    } else {
-        format!("{asked:.0} fits under the ceiling, so auto = {asked:.0} — the rule wins.")
-    };
-    format!(
-        "{intro}\n\nAuto balances two bounds:\n\
-         - rule: {rule} = {asked:.0} mm/s\n\
-         - flow triangle: the nozzle extrudes line width × layer height of bead for every mm \
-         travelled, and the hotend can only melt `max flow` mm³ each second, so \
-         {}\n\
-         Right now {verdict}\n\n\
-         Moving print speed, layer height, line width, or max flow re-balances this live; \
-         dragging this slider pins it to a manual value.",
-        flow_ceiling_text(s),
-    )
-}
 
 /// A labelled slider whose hover help triggers on the label — and only the
 /// label: tooltips over the slider itself would cover the value while
@@ -194,28 +166,6 @@ fn hslider_lockout(
         r
     })
     .inner
-}
-
-/// Where a flow-limited feature's speed comes from — shown on the warning
-/// rows so a slowed feature can be traced back to its slider (or lack of one).
-fn clamp_source_hint(name: &str) -> &'static str {
-    match name {
-        "inner wall" | "infill" => {
-            "No slider of its own: inner walls and sparse infill run at the machine's \
-             print speed (Machine & motion → print mm/s). The ceiling clamps each path \
-             individually, and variable-width walls can be wider than the nominal line \
-             width — so they may be slowed harder than the nominal ceiling suggests."
-        }
-        "outer wall" => "Slider: Feature speeds → outer wall mm/s.",
-        "solid" => "Slider: Feature speeds → solid mm/s.",
-        "support" => "Slider: Feature speeds → support mm/s.",
-        "gap fill" => "Slider: Feature speeds → gap fill mm/s.",
-        "bridge" | "internal bridge" => "Slider: Feature speeds → bridge mm/s.",
-        "overhang wall" => "Slider: Feature speeds → overhang mm/s.",
-        "arc overhang" => "Derived from bridge speed (Feature speeds).",
-        "skirt" => "Prints at first-layer speed (Machine & motion).",
-        _ => "Flow-clamped at slice time.",
-    }
 }
 
 /// Fixed bounds of the heat-load color scale (mW/mm², log) — constant so any
@@ -343,17 +293,8 @@ struct SliceSummary {
     secs: f64,
     filament_m: f64,
     grams: f64,
-    /// The filament's melt ceiling (mm³/s) in force during the slice.
-    flow_cap: f64,
-    /// Features the ceiling slowed: (name, asked mm/s, clamped-to mm/s).
-    clamps: Vec<(&'static str, f64, f64)>,
-    /// The heat target in force at slice time (mW/mm²) — the slider in cap
-    /// mode, the computed level in even mode.
+    /// The filament's heat-load ceiling in force at slice time (mW/mm²).
     heat_target_mw: f64,
-    /// Heat-control slowdowns (empty when off or nothing ran hot).
-    slowdowns: Vec<engine::SlowdownRange>,
-    /// Heat-control temperature zones (empty when off or nothing to schedule).
-    temp_zones: Vec<engine::TempZone>,
 }
 
 struct App {
@@ -471,16 +412,15 @@ impl App {
         let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         let baseline = settings.clone();
-        let pins = match (profiles.merged_process(&process), profiles.merged_printer(&printer)) {
-            (Ok(pc), Ok(pr)) => Pins {
-                line_width: pc.line_width_mm.is_some(),
-                external_speed: pc.external_perimeter_speed_mm_s.is_some(),
-                solid_speed: pc.solid_speed_mm_s.is_some(),
-                support_speed: pc.support_speed_mm_s.is_some(),
-                gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
-                overhang_speed: pc.overhang_speed_mm_s.is_some(),
+        let pins = match (
+            profiles.merged_process(&process),
+            profiles.merged_printer(&printer),
+            profiles.merged_filament(&filament),
+        ) {
+            (Ok(_pc), Ok(pr), Ok(fl)) => Pins {
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
+                max_heat: fl.max_heat_mw_mm2.is_some(),
             },
             _ => Pins::default(),
         };
@@ -607,18 +547,15 @@ impl App {
     /// Pin state comes from the selected profiles: a field the profile chain
     /// sets explicitly is pinned; one it leaves unset follows auto.
     fn refresh_pins(&mut self) {
-        if let (Ok(pc), Ok(pr)) =
-            (self.profiles.merged_process(&self.process), self.profiles.merged_printer(&self.printer))
-        {
+        if let (Ok(_pc), Ok(pr), Ok(fl)) = (
+            self.profiles.merged_process(&self.process),
+            self.profiles.merged_printer(&self.printer),
+            self.profiles.merged_filament(&self.filament),
+        ) {
             self.pins = Pins {
-                line_width: pc.line_width_mm.is_some(),
-                external_speed: pc.external_perimeter_speed_mm_s.is_some(),
-                solid_speed: pc.solid_speed_mm_s.is_some(),
-                support_speed: pc.support_speed_mm_s.is_some(),
-                gap_fill_speed: pc.gap_fill_speed_mm_s.is_some(),
-                overhang_speed: pc.overhang_speed_mm_s.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
+                max_heat: fl.max_heat_mw_mm2.is_some(),
             };
         }
     }
@@ -627,29 +564,30 @@ impl App {
     /// print speed (or changing the nozzle) visibly moves its dependents.
     fn apply_auto(&mut self) {
         let s = &mut self.settings;
-        if !self.pins.line_width {
-            s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
+        // The data-driven chain: bead from the nozzle, temperatures from the
+        // packaging range + bias, nominal speed from the machine rating ×
+        // the finish↔speed dial, features from the nominal under the melt
+        // ceiling. No speed or temperature is a slider anywhere.
+        s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
+        s.nozzle_temp_c =
+            config::derived_nozzle_temp_c(s.nozzle_temp_min_c, s.nozzle_temp_max_c, s.temp_bias);
+        s.first_layer_nozzle_temp_c = config::derived_first_layer_temp_c(
+            s.nozzle_temp_min_c,
+            s.nozzle_temp_max_c,
+            s.temp_bias,
+            s.material,
+        );
+        if !self.pins.max_heat {
+            s.max_heat_mw_mm2 = s.material.max_heat_mw_mm2();
         }
-        // The flow triangle: unpinned speeds rebalance live against the melt
-        // ceiling for the current bead (line width × layer height), so moving
-        // any side of the triangle visibly moves its dependents.
+        s.print_speed_mm_s = config::derived_print_speed_mm_s(s.machine_speed_mm_s, s.speed_quality);
         let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
-        if !self.pins.external_speed {
-            s.external_perimeter_speed_mm_s =
-                config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
-        }
-        if !self.pins.solid_speed {
-            s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
-        }
-        if !self.pins.support_speed {
-            s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
-        }
-        if !self.pins.gap_fill_speed {
-            s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
-        }
-        if !self.pins.overhang_speed {
-            s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
-        }
+        s.external_perimeter_speed_mm_s =
+            config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
+        s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
+        s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
+        s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
+        s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
         if !self.pins.outer_wall_accel {
             s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
         }
@@ -660,24 +598,10 @@ impl App {
 
     /// Strip unpinned auto fields from a process diff: auto values are derived,
     /// not chosen, so they're never saved (and never count as dirty).
-    fn mask_auto(&self, pc: &mut ProcessProfile) {
-        if !self.pins.line_width {
-            pc.line_width_mm = None;
-        }
-        if !self.pins.external_speed {
-            pc.external_perimeter_speed_mm_s = None;
-        }
-        if !self.pins.solid_speed {
-            pc.solid_speed_mm_s = None;
-        }
-        if !self.pins.support_speed {
-            pc.support_speed_mm_s = None;
-        }
-        if !self.pins.gap_fill_speed {
-            pc.gap_fill_speed_mm_s = None;
-        }
-        if !self.pins.overhang_speed {
-            pc.overhang_speed_mm_s = None;
+    /// Strip unpinned auto fields from a filament diff.
+    fn mask_auto_filament(&self, fl: &mut FilamentProfile) {
+        if !self.pins.max_heat {
+            fl.max_heat_mw_mm2 = None;
         }
     }
 
@@ -695,9 +619,9 @@ impl App {
     fn tier_dirty_masked(&self) -> [bool; 3] {
         let mut pr = PrinterProfile::diff(&self.settings, &self.baseline);
         self.mask_auto_printer(&mut pr);
-        let fl = FilamentProfile::diff(&self.settings, &self.baseline);
-        let mut pc = ProcessProfile::diff(&self.settings, &self.baseline);
-        self.mask_auto(&mut pc);
+        let mut fl = FilamentProfile::diff(&self.settings, &self.baseline);
+        self.mask_auto_filament(&mut fl);
+        let pc = ProcessProfile::diff(&self.settings, &self.baseline);
         [!pr.is_empty(), !fl.is_empty(), !pc.is_empty()]
     }
 
@@ -733,6 +657,7 @@ impl App {
             }
             TierKind::Filament => {
                 let mut diff = FilamentProfile::diff(&self.settings, &self.baseline);
+                self.mask_auto_filament(&mut diff);
                 if name == self.filament && self.profiles.is_user(kind, name) {
                     let existing = self.profiles.get_filament(name).cloned().unwrap_or_default();
                     let parent = existing.parent().map(str::to_string);
@@ -746,7 +671,6 @@ impl App {
             }
             TierKind::Process => {
                 let mut diff = ProcessProfile::diff(&self.settings, &self.baseline);
-                self.mask_auto(&mut diff);
                 if name == self.process && self.profiles.is_user(kind, name) {
                     let existing = self.profiles.get_process(name).cloned().unwrap_or_default();
                     let parent = existing.parent().map(str::to_string);
@@ -964,22 +888,13 @@ impl App {
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
         let secs = engine::estimate_seconds(&layers, &self.settings);
         let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
-        // Loud, not silent: name exactly which features the flow ceiling slowed.
-        let clamps: Vec<(&'static str, f64, f64)> = engine::audit_flow_clamps(&layers, &self.settings)
-            .into_iter()
-            .map(|(k, nom, cl)| (engine::kind_label(k), nom, cl))
-            .collect();
         self.slice_summary = Some(SliceSummary {
             layers: n,
             toolpaths: paths,
             secs,
             filament_m: fil_mm / 1000.0,
             grams,
-            flow_cap: self.settings.max_volumetric_speed_mm3_s,
-            clamps,
             heat_target_mw: engine::effective_heat_target(&layers, &self.settings) * 1e3,
-            slowdowns: engine::audit_heat_control_speed(&layers, &self.settings),
-            temp_zones: engine::audit_heat_control_temp(&layers, &self.settings),
         });
         self.status.clear();
         self.slice_gen += 1;
@@ -1113,180 +1028,6 @@ impl App {
                 sum.grams
             ))
             .on_hover_text("Estimated print time and filament length / weight.");
-            if !sum.clamps.is_empty() {
-                let warn = ui.visuals().warn_fg_color;
-                let r = egui::CollapsingHeader::new(
-                    egui::RichText::new(format!(
-                        "⚠ {} feature{} slowed to fit max flow ({:.0} mm³/s)",
-                        sum.clamps.len(),
-                        if sum.clamps.len() == 1 { "" } else { "s" },
-                        sum.flow_cap
-                    ))
-                    .color(warn),
-                )
-                .id_salt("flow_rows")
-                .default_open(false)
-                .show(ui, |ui| {
-                    egui::Grid::new("flow_clamp_rows").spacing([10.0, 2.0]).show(ui, |ui| {
-                        for (name, asked, got) in &sum.clamps {
-                            ui.label(*name).on_hover_text(clamp_source_hint(name));
-                            ui.weak(format!("{asked:.0}"));
-                            ui.label(format!("-> {got:.0} mm/s"));
-                            ui.end_row();
-                        }
-                    });
-                });
-                r.header_response.on_hover_text(
-                    "Flow = line width × layer height × speed. The filament profile caps it at \
-                     what the hotend can melt per second ('max flow' under Material & temperature) — \
-                     printing faster than it can melt would under-extrude. These features asked for \
-                     more speed and were slowed to fit; quality is unaffected, the print just takes \
-                     longer.",
-                );
-            }
-            if !sum.temp_zones.is_empty() {
-                let r = egui::CollapsingHeader::new(format!(
-                    "heat control — {} temp zone{}",
-                    sum.temp_zones.len(),
-                    if sum.temp_zones.len() == 1 { "" } else { "s" }
-                ))
-                .id_salt("temp_zone_rows")
-                .default_open(false)
-                .show(ui, |ui| {
-                    egui::Grid::new("temp_zone_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                        for z in &sum.temp_zones {
-                            ui.label(if z.first_layer == z.last_layer {
-                                format!("layer {}", z.first_layer)
-                            } else {
-                                format!("layers {}-{}", z.first_layer, z.last_layer)
-                            });
-                            let delta = z.temp_c - self.settings.nozzle_temp_c as f64;
-                            ui.label(format!("-> {:.0} °C ({delta:+.0}°)", z.temp_c));
-                            ui.end_row();
-                        }
-                    });
-                });
-                r.header_response.on_hover_text(
-                    "Scheduled M104s baked into the g-code (Feature speeds → heat control → \
-                     schedule nozzle temp): cooler through hot ranges, warmer through cold \
-                     bands, ramps started early per the printer's measured rates. The \
-                     'nozzle °C' preview shows the schedule.",
-                );
-            }
-            if !sum.slowdowns.is_empty() {
-                let warn = ui.visuals().warn_fg_color;
-                let floored = sum.slowdowns.iter().filter(|r| r.floor_hit).count();
-                let title = if floored > 0 {
-                    format!(
-                        "⚠ heat control slowed {} range{} — {} hot at cap",
-                        sum.slowdowns.len(),
-                        if sum.slowdowns.len() == 1 { "" } else { "s" },
-                        floored
-                    )
-                } else {
-                    format!(
-                        "heat control slowed {} range{}",
-                        sum.slowdowns.len(),
-                        if sum.slowdowns.len() == 1 { "" } else { "s" }
-                    )
-                };
-                let r = egui::CollapsingHeader::new(egui::RichText::new(title).color(warn))
-                    .id_salt("slowdown_rows")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::Grid::new("slowdown_grid").spacing([10.0, 2.0]).show(ui, |ui| {
-                            for r in &sum.slowdowns {
-                                ui.label(if r.first_layer == r.last_layer {
-                                    format!("layer {}", r.first_layer)
-                                } else {
-                                    format!("layers {}-{}", r.first_layer, r.last_layer)
-                                });
-                                ui.label(if r.dwell_s > 0.05 {
-                                    format!("-> {:.0}% speed + {:.1}s dwell", r.worst_scale * 100.0, r.dwell_s)
-                                } else {
-                                    format!("-> {:.0}% speed", r.worst_scale * 100.0)
-                                })
-                                .on_hover_text(
-                                    "Dwell = park-and-wait cooling: when an island is over the heat \
-                                     target with every path already at min print speed, the missing \
-                                     seconds are spent retracted and lifted clear of the part.",
-                                );
-                                if r.floor_hit {
-                                    ui.colored_label(ui.visuals().error_fg_color, "hot at cap")
-                                        .on_hover_text(
-                                            "Still over the target even with the speed floor and the \
-                                             20 s/layer dwell cap spent — this region needs more part \
-                                             cooling or a lower temperature.",
-                                        );
-                                } else {
-                                    ui.label("");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    });
-                r.header_response.on_hover_text(
-                    "Heat control (Feature speeds → slow hot zones) slowed islands whose heat \
-                     load exceeded the target. The previews, time estimate, and g-code all show \
-                     the slowed result; toggling it off restores your speeds exactly.",
-                );
-            }
-            if self.settings.heat_control_speed || self.settings.heat_control_temp {
-                match self.settings.heat_mode {
-                    config::HeatMode::Level => {
-                        ui.weak(format!(
-                            "heat level: {:.1} mW/mm² (leveled to the coldest region)",
-                            sum.heat_target_mw
-                        ))
-                        .on_hover_text(
-                            "Level mode: every layer is aimed at this value — the coldest \
-                             region's heat load, the highest the whole print can share — using \
-                             temperature, per-island slowing, and dwells together. The heat-load \
-                             map should flatten to one band.",
-                        );
-                    }
-                    config::HeatMode::Smooth => {
-                        ui.weak(format!(
-                            "heat smoothing: ≤ {:.1}%/layer change (cap {:.0} mW/mm²)",
-                            self.settings.heat_slew_pct_per_layer,
-                            self.settings.max_heat_mw_mm2
-                        ))
-                        .on_hover_text(
-                            "Smooth mode: each layer gets its own target so the heat load never \
-                             changes faster than this between neighbors — warm layers ramp into \
-                             cold dips instead of cliffing at them. Kills banding at transitions \
-                             for a fraction of level mode's cost.",
-                        );
-                    }
-                    config::HeatMode::Cap => {}
-                }
-            }
-            // Armed but idle is easy to misread as broken — say it.
-            if (self.settings.heat_control_speed || self.settings.heat_control_temp)
-                && sum.slowdowns.is_empty()
-            {
-                let mut hottest = 0.0_f64;
-                for (li, l) in self.layer_islands.iter().enumerate() {
-                    for isl in &l.islands {
-                        if isl.joules > 0.0 {
-                            hottest = hottest.max(self.island_heat(li, isl));
-                        }
-                    }
-                }
-                if hottest > 0.0 && hottest * 1e3 <= sum.heat_target_mw {
-                    ui.weak(format!(
-                        "thermal: nothing over the {:.0} mW/mm² target (hottest island ≈ {:.0})",
-                        sum.heat_target_mw,
-                        hottest * 1e3
-                    ))
-                    .on_hover_text(
-                        "Heat control is armed, but every island already sits under the heat \
-                         target — nothing to slow, and the temp schedule only nudges toward the \
-                         target. If you expected intervention, the target ('max heat' under \
-                         Feature speeds) is set above this print's hottest region.",
-                    );
-                }
-            }
         }
     }
 
@@ -1387,6 +1128,23 @@ impl eframe::App for App {
             self.last_bed = bed;
             self.needs_rebuild = true;
             self.recenter_camera = true;
+            // Objects placed for the old plate may not fit the new one —
+            // re-grid them onto it. Only when something actually hangs off:
+            // manual placements that still fit are left alone. (Without this,
+            // a 350→152 mm switch leaves the model far outside the plate and
+            // the freshly recentered pivot FEELS broken — you orbit an empty
+            // bed while the part sweeps in the distance.)
+            let off_bed = self.objects.iter().any(|o| {
+                let (minx, miny, maxx, maxy, _) = o.footprint();
+                minx < 0.0 || miny < 0.0 || maxx > bed.0 || maxy > bed.1
+            });
+            if off_bed {
+                self.arrange();
+                self.sliced = None;
+                self.slice_summary = None;
+                self.view_preview = false;
+                self.refit_camera = true;
+            }
         }
         if self.needs_rebuild {
             self.rebuild_scene(&rs);
@@ -1745,7 +1503,7 @@ impl eframe::App for App {
                     let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     // Legend ends carry the real numbers: left = blue (safe), right = red (hot).
                     let anchored = self.color_by == ColorBy::Heat
-                        && (self.settings.heat_control_speed || self.settings.heat_control_temp)
+                        && self.settings.heat_control
                         && self.settings.max_heat_mw_mm2 > 0.0;
                     let (left, right, expl) = match self.color_by {
                         ColorBy::LayerTime => (
@@ -1771,7 +1529,7 @@ impl eframe::App for App {
                                 "Heat control's temp schedule: the planned nozzle temperature of every \
                                  layer, centered on the printing temperature — blue = scheduled cooler \
                                  (hot zones), red = scheduled warmer (cold bands). One flat color means \
-                                 nothing is scheduled ('schedule nozzle temp' off, or nothing to do). The first \
+                                 nothing is scheduled (heat control off, or nothing to do). The first \
                                  layer's adhesion temperature is separate and not shown."
                                     .to_string(),
                             )
@@ -1783,11 +1541,7 @@ impl eframe::App for App {
                                     .as_ref()
                                     .map(|s| s.heat_target_mw)
                                     .unwrap_or(self.settings.max_heat_mw_mm2);
-                                format!(
-                                    " The white tick marks the heat target in force ({target_mw:.1} \
-                                     mW/mm² — the computed level in even mode) at its true position \
-                                     on the scale.",
-                                )
+                                format!(" The white tick is the ceiling ({target_mw:.1}).")
                             } else {
                                 String::new()
                             };
@@ -1795,14 +1549,15 @@ impl eframe::App for App {
                                 format!("{HEAT_SCALE_LO_MW:.0}"),
                                 format!("{HEAT_SCALE_HI_MW:.0} mW/mm²"),
                                 format!(
-                                    "Heat load per island on a FIXED log scale ({HEAT_SCALE_LO_MW:.0}–{HEAT_SCALE_HI_MW:.0} mW/mm²) — \
-                                     colors mean the same thing in every slice, so before/after \
-                                     comparisons of settings are honest. Each disconnected region is \
-                                     scored on its own: island energy ÷ (layer time × island footprint); \
-                                     the cooling window stays the whole layer's, which is why lone \
-                                     towers overheat and shared ones don't. A uniform band sitting at \
-                                     the tick is heat control holding everything exactly at the \
-                                     target — that's success, not a hot spot.{target_note}"
+                                    "Heat load: how fast hot plastic lands on a region, per mm² of \
+                                     it — the heat the new layer deposits there, divided by the \
+                                     layer's print time and the region's area. Too high and the \
+                                     plastic below can't cool before more heat arrives (sagging, \
+                                     gloss bands). Too low and the layers contract as they print, \
+                                     pulling the band inward — the dimple that appears where the \
+                                     cross-section suddenly grows and layers turn slow and cold — \
+                                     and fuse weakly. \
+                                     Fixed log scale, {HEAT_SCALE_LO_MW:.0}–{HEAT_SCALE_HI_MW:.0} mW/mm².{target_note}"
                                 ),
                             )
                         }
@@ -1868,15 +1623,8 @@ impl eframe::App for App {
                         lh_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4), "first layer mm",
                         "Thickness of the first layer — often thicker for bed adhesion.");
-                    let d_lw = config::derived_line_width_mm(s.nozzle_diameter_mm);
-                    let lw_hint = format!(
-                        "Width of one extruded line. Auto = 112.5% of the nozzle, so it follows nozzle changes.\n\n\
-                         One corner of the flow triangle: wider lines make a fatter bead, and speed × bead \
-                         must stay under the filament's melt ceiling — currently {}. \
-                         Wider lines lower that ceiling; unpinned feature speeds follow it live.",
-                        flow_ceiling_text(s)
-                    );
-                    auto_slider(ui, &mut s.line_width_mm, 0.2..=1.0, "line width mm", &mut pins.line_width, d_lw, &lw_hint);
+                    hslider(ui, true, egui::Slider::new(&mut s.speed_quality, -1.0..=1.0), "finish ↔ speed",
+                        "The one speed preference. Every print speed derives from the machine's rated motion (Machine & motion), the filament's melt ceiling, and heat control — this dial biases the result between surface finish (−1, 60% of rated) and speed (+1, the full rating).");
                     hslider(ui, true, egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5), "resolution mm",
                         "Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
@@ -1893,12 +1641,6 @@ impl eframe::App for App {
                     ui.add_enabled(!vase, egui::Checkbox::new(&mut s.ironing, "ironing"))
                         .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.")
                         .on_disabled_hover_text("Forced off in spiral vase mode.");
-                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_flow, 0.0..=0.5), "ironing flow",
-                        "Ironing extrusion as a fraction of a normal line at that spacing.");
-                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_spacing_mm, 0.05..=0.5), "ironing spacing mm",
-                        "Distance between ironing passes — finer is smoother and slower.");
-                    hslider(ui, s.ironing && !vase, egui::Slider::new(&mut s.ironing_speed_mm_s, 5.0..=100.0), "ironing mm/s",
-                        "Ironing pass speed.");
                     ui.add_enabled(!vase, egui::Checkbox::new(&mut s.fuzzy_skin, "fuzzy skin"))
                         .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).")
                         .on_disabled_hover_text("Forced off in spiral vase mode.");
@@ -1959,96 +1701,27 @@ impl eframe::App for App {
                     hslider(ui, true, egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5), "wall overlap",
                         "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });
-                tier_section(ui, "Feature speeds", TierKind::Process, false, |ui| {
-                    let v = s.print_speed_mm_s;
-                    // Auto speeds balance the flow triangle: speed × bead area
-                    // (line width × layer height) must fit the filament's max flow.
-                    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
-                    let hint_outer = speed_hint(
-                        "Speed for the visible outermost wall — slower is cleaner.",
-                        "50% of print speed", v * 0.5, s);
-                    let hint_solid = speed_hint(
-                        "Speed for solid top/bottom fill.",
-                        "80% of print speed", v * 0.8, s);
-                    let hint_support = speed_hint(
-                        "Speed for support structure (surface quality doesn't matter).",
-                        "90% of print speed", v * 0.9, s);
-                    let hint_gap = speed_hint(
-                        "Speed for thin gap-fill strokes.",
-                        "40% of print speed, capped at 40 for tight corners", (v * 0.4).min(40.0), s);
-                    auto_slider(ui, &mut s.external_perimeter_speed_mm_s, 5.0..=400.0, "outer wall mm/s",
-                        &mut pins.external_speed, config::derived_external_perimeter_speed_mm_s(v, cap), &hint_outer);
-                    auto_slider(ui, &mut s.solid_speed_mm_s, 5.0..=400.0, "solid mm/s",
-                        &mut pins.solid_speed, config::derived_solid_speed_mm_s(v, cap), &hint_solid);
-                    auto_slider(ui, &mut s.support_speed_mm_s, 5.0..=400.0, "support mm/s",
-                        &mut pins.support_speed, config::derived_support_speed_mm_s(v, cap), &hint_support);
-                    auto_slider(ui, &mut s.gap_fill_speed_mm_s, 5.0..=100.0, "gap fill mm/s",
-                        &mut pins.gap_fill_speed, config::derived_gap_fill_speed_mm_s(v, cap), &hint_gap);
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0), "bridge mm/s",
-                        "Speed for straight bridges (spans anchored on both sides). Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — arcs cantilever off the previous ring and need to set in place.");
-                    auto_slider(ui, &mut s.overhang_speed_mm_s, 5.0..=100.0, "overhang mm/s",
-                        &mut pins.overhang_speed, config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s),
-                        "Speed for wall stretches hanging past the layer below (printed with bridge cooling). Auto = bridge speed — same physics, beads onto air.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_flow, 0.7..=1.2), "bridge flow ×",
-                        "Flow multiplier on bridges; slight under-extrusion tightens sagging strands.");
-                    hslider(ui, true, egui::Slider::new(&mut s.min_layer_time_s, 0.0..=30.0), "min layer s",
-                        "Cooling slowdown: layers faster than this are slowed so they can solidify.");
-                    hslider(ui, s.min_layer_time_s > 0.0 || s.heat_control_speed, egui::Slider::new(&mut s.min_print_speed_mm_s, 5.0..=50.0), "min mm/s",
-                        "Floor speed for the cooling slowdowns — neither the minimum layer time nor heat control ever pushes below it.");
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("heat control").strong()).on_hover_text(
-                        "One thermal system, two levers: 'slow hot zones' governs print speed per \
-                         island, 'schedule nozzle temp' moves the temperature per layer range. \
-                         Both hold every region's heat load at the same target; the heat-load \
-                         preview shows the result.",
-                    );
-                    ui.checkbox(&mut s.heat_control_speed, "slow hot zones")
+                tier_section(ui, "Heat control", TierKind::Process, false, |ui| {
+                    ui.checkbox(&mut s.heat_control, "heat control")
                         .on_hover_text(
-                            "Heat control's speed lever: slow each hot island — a disconnected \
-                             region of a layer — until its heat load (deposited energy ÷ layer \
-                             time ÷ island footprint) fits the target below. Computed per slice on \
-                             top of your speeds; switching it off restores them exactly. Every \
-                             intervention is listed in the slice summary, the previews show the \
-                             slowed result, and speeds never drop below min mm/s.",
+                            "The automatic: keeps every island's heat load inside the filament's \
+                             allowable ranges and smooths layer-to-layer transitions — the \
+                             banding/shrinkage killer. One gradient-limited heat curve is derived \
+                             per print, the gentlest the time budget below affords, and both \
+                             levers serve it: the nozzle-temperature schedule warms cold dips and \
+                             cools hot ranges inside the filament's packaging range (free in \
+                             print time, and never past the point where the flow derate would \
+                             cost more than the cooling saves), per-island slowing and \
+                             park-and-wait dwells supply what temperature can't reach. The \
+                             schedule only ever FADES — a few °C per millimetre of height — so \
+                             temperature itself never draws a line on the surface. Off restores \
+                             the derived speeds and temperatures exactly.",
                         );
-                    ui.checkbox(&mut s.heat_control_temp, "schedule nozzle temp")
-                        .on_hover_text(
-                            "Heat control's temperature lever: bake a nozzle-temperature schedule \
-                             into the g-code — cooler through layer ranges that run over the heat \
-                             target, gently warmer through cold bands (evens deposition and \
-                             gloss). Planned entirely at slice time from the printer's heat/cool \
-                             rates — asynchronous M104s with lead times, no live feedback. Bounded \
-                             by the filament's min/max °C; cooled zones also derate the flow \
-                             ceiling. Temperature is slow and global, so zones are layer ranges — \
-                             'slow hot zones' stays the fast per-island lever.",
-                        );
-                    let heat_on = s.heat_control_speed || s.heat_control_temp;
-                    hslider(ui, heat_on, egui::Slider::new(&mut s.max_heat_mw_mm2, 2.0..=40.0), "max heat mW/mm²",
-                        "The heat-load ceiling, per island — the one target both levers hold. Read natural values off the heat-load preview legend: broad hull-like regions sit low, lone towers spike. Lower = cooler but slower.");
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(heat_on, |ui| {
-                            egui::ComboBox::from_id_salt("heat_mode")
-                                .selected_text(s.heat_mode.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Cap, "cap");
-                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Smooth, "smooth");
-                                    ui.selectable_value(&mut s.heat_mode, config::HeatMode::Level, "level");
-                                });
-                        });
-                        ui.label("heat goal").on_hover_text(
-                            "What heat control aims at. Cap: a ceiling — nothing exceeds max \
-                             heat, everything below is untouched (cheapest). Smooth: the heat load \
-                             may change at most the %/layer below between neighbors — warm layers \
-                             ramp into cold dips instead of cliffing, killing banding at transitions \
-                             for minutes, not hours. Level: the whole print is flattened to the \
-                             coldest reachable heat load — maximal uniformity, maximal time.",
-                        );
-                    });
-                    hslider(ui, heat_on && s.heat_mode == config::HeatMode::Smooth, egui::Slider::new(&mut s.heat_slew_pct_per_layer, 1.0..=25.0), "max change %/layer",
-                        "Smooth mode's gradient limit: the largest heat-load change allowed between adjacent layers. Lower = gentler transitions over more layers (slower); higher = sharper allowed steps.");
-                    hslider(ui, s.heat_control_temp, egui::Slider::new(&mut s.temp_swing_c, 2.0..=30.0), "max swing °C",
-                        "Largest excursion the temp schedule may take from the nozzle temperature, in both directions — always clipped by the filament's min/max window. Each layer is aimed exactly at the heat target (deposited power scales with °C above ambient), then clipped to these rails; temperature only has ~0.5%/°C of authority on the heat metric, so extremes peg the rails — but warming cold layers is free in print time and directly improves their layer bonding and gloss match.");
-                    ui.weak("machine speed & accel live under Machine & motion");
+                    hslider(ui, s.heat_control, egui::Slider::new(&mut s.smooth_extra_time_pct, 0.0..=50.0), "extra time %",
+                        "Heat control's budget: the most extra print time smoothing may spend, as a % of the un-smoothed estimate. The transition gradient is bisected to the gentlest that fits and reported after slicing; 0 still does everything free (warming cold dips, capping at the filament's ceiling).");
+                    ui.weak("speeds and temperatures are chosen by the system: machine rating × \
+                             finish↔speed (Quality) under the filament's melt ceiling, then heat \
+                             control governs the result");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
                     let vase = s.spiral_vase;
@@ -2084,51 +1757,97 @@ impl eframe::App for App {
                     hslider(ui, true, egui::Slider::new(&mut s.brim_loops, 0..=20), "brim loops",
                         "Loops attached around the first layer for adhesion. 0 = off.");
                 });
-                tier_section(ui, "Material & temperature", TierKind::Filament, false, |ui| {
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_c, 150..=300), "nozzle °C",
-                        "Hotend temperature.");
-                    hslider(ui, true, egui::Slider::new(&mut s.first_layer_nozzle_temp_c, 150..=300), "first layer °C",
-                        "Hotend temperature for the first layer — usually a touch hotter for bed adhesion. The nozzle temperature takes over from layer 2.");
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "min °C",
-                        "Coldest this filament prints acceptably — the temp schedule never goes below it.");
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "max °C",
-                        "Hottest this filament tolerates — the temp schedule never goes above it.");
+                tier_section(ui, "Filament", TierKind::Filament, false, |ui| {
+                    // The packaging card: type in what the box says; the
+                    // material class supplies everything else until a
+                    // calibration value pins it.
+                    let before_mat = s.material;
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("material_class")
+                            .selected_text(s.material.label())
+                            .show_ui(ui, |ui| {
+                                for m in [
+                                    config::Material::Pla,
+                                    config::Material::Petg,
+                                    config::Material::Abs,
+                                    config::Material::Tpu,
+                                    config::Material::Other,
+                                ] {
+                                    ui.selectable_value(&mut s.material, m, m.label());
+                                }
+                            });
+                        ui.label("material").on_hover_text(
+                            "The material class off the box. Drives density, cooling, melt \
+                             ceiling, heat ceiling, and bed default — all visible under \
+                             calibration, all overridable there.",
+                        );
+                    });
+                    if s.material != before_mat {
+                        // A new class repopulates its data-driven fields once;
+                        // calibration edits after this stick.
+                        let m = s.material;
+                        let (tmin, tmax) = m.packaging_temp_c();
+                        s.nozzle_temp_min_c = tmin;
+                        s.nozzle_temp_max_c = tmax;
+                        s.bed_temp_c = m.bed_temp_c();
+                        s.filament_density_g_cm3 = m.density_g_cm3();
+                        s.max_volumetric_speed_mm3_s = m.max_flow_mm3_s();
+                        s.max_flow_derate_per_c = m.max_flow_derate_per_c();
+                        let (fan, bridge_fan, off) = m.fan();
+                        s.fan_speed = fan;
+                        s.bridge_fan_speed = bridge_fan;
+                        s.fan_off_layers = off;
+                        let (aux, exhaust) = m.aux_exhaust();
+                        s.aux_fan_speed = aux;
+                        s.exhaust_fan_speed = exhaust;
+                        pins.max_heat = false;
+                    }
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "packaging min °C",
+                        "The low end of the temperature range printed on the spool. Heat control's schedules never go below it.");
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "packaging max °C",
+                        "The high end of the range on the spool. Heat control's schedules never go above it.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
-                        "Heated bed temperature.");
+                        "Bed temperature from the packaging.");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
                         "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
-                    hslider(ui, true, egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0), "density g/cm³",
-                        "Filament density — used for the weight estimate.");
-                    let mf_hint = format!(
-                        "The filament's melt-rate ceiling through the hotend, in mm³ of plastic per second.\n\n\
-                         The limiting corner of the flow triangle: every mm/s of speed extrudes a bead of \
-                         line width × layer height, so speed × bead must stay under this. Right now: {}.\n\n\
-                         Unpinned feature speeds rebalance against it live; whatever still overshoots \
-                         (pinned speeds, or infill/inner walls driven by print speed) is slowed at slice \
-                         time and reported in the slice summary. 0 = unlimited.",
-                        flow_ceiling_text(s)
-                    );
-                    hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
-                        mf_hint);
-                    hslider(ui, true, egui::Slider::new(&mut s.max_flow_derate_per_c, 0.0..=1.0), "flow derate /°C",
-                        "How much of the melt ceiling is lost per °C below the nozzle temperature. When heat control cools a zone, that zone's max flow — and therefore its clamped speeds — shrink by this. mm³/s per °C; never raises the cap on warmer layers.");
-                    hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
-                        "Global extrusion multiplier — filament-specific flow tuning.");
-                    hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
-                        "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
-                });
-                tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
-                    hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
-                        "Part-cooling fan duty while printing.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
-                        "Fan duty on bridges and arc overhangs — usually maxed.");
-                    hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
-                        "Keep the fan off for this many first layers (bed adhesion).");
-                    hslider(ui, s.has_aux_fan, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
-                        "Auxiliary part-cooling fan duty (M106 P2), on once past the fan-off layers. Needs the aux fan declared under Machine & motion.");
-                    hslider(ui, s.has_exhaust_fan, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
-                        "Chamber-exhaust fan duty (M106 P3), on for the whole print — vents chamber heat. PLA wants it high, ABS low or off. Needs the exhaust fan declared under Machine & motion.");
-                    ui.weak("min-layer-time slowdown lives under Feature speeds");
+                    hslider(ui, true, egui::Slider::new(&mut s.temp_bias, -1.0..=1.0), "cold ↔ hot bias",
+                        "Where in the packaging range the system centers its operating temperature (shown below). Cold = matte, dimensional, less stringing; hot = glossy, stronger bonding, more flow headroom. Heat control still uses the whole range around it.");
+                    ui.weak(format!(
+                        "operating point: {} °C (first layer {} °C) — chosen by the system",
+                        s.nozzle_temp_c, s.first_layer_nozzle_temp_c
+                    ));
+                    egui::CollapsingHeader::new("calibration")
+                        .id_salt("filament_calibration")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.weak("class defaults until you measure better numbers; saved with the filament");
+                            hslider(ui, true, egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0), "density g/cm³",
+                                "Filament density — used for the weight estimate. Auto: the material class's value.");
+                            hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
+                                "Global extrusion multiplier — the per-spool flow calibration escape.");
+                            let mf_hint = format!(
+                                "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
+                                flow_ceiling_text(s)
+                            );
+                            hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
+                                mf_hint);
+                            hslider(ui, true, egui::Slider::new(&mut s.max_flow_derate_per_c, 0.0..=1.0), "flow derate /°C",
+                                "How much of the melt ceiling is lost per °C below the operating temperature. Heat control weighs this when cooling: once a zone's flow-bound paths would lose more time to the derate than the cooling saves in slowdowns, the schedule holds at that crossing instead of the cold rail — steep derates mean gentler cooling.");
+                            auto_slider(ui, &mut s.max_heat_mw_mm2, 2.0..=40.0, "max heat mW/mm²", &mut pins.max_heat, s.material.max_heat_mw_mm2(),
+                                "The material's allowable heat-load ceiling, per island — heat control never plans above it. Read natural values off the heat-load preview legend. Auto: the class's value.");
+                            hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
+                                "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+                            hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
+                                "Part-cooling fan duty while printing. Auto: the class's policy.");
+                            hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
+                                "Fan duty on bridges and arc overhangs.");
+                            hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
+                                "Keep the fan off for this many first layers (bed adhesion).");
+                            hslider(ui, s.has_aux_fan, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
+                                "Auxiliary part-cooling duty (M106 P2). Needs the aux fan declared under Machine & motion.");
+                            hslider(ui, s.has_exhaust_fan, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
+                                "Chamber-exhaust duty (M106 P3), whole print. Needs the exhaust fan declared under Machine & motion.");
+                        });
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
                     hslider(ui, true, egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0), "length mm",
@@ -2149,8 +1868,8 @@ impl eframe::App for App {
                         "Maximum build height (Z).");
                     hslider(ui, true, egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2), "nozzle mm",
                         "Nozzle diameter.");
-                    hslider(ui, true, egui::Slider::new(&mut s.print_speed_mm_s, 10.0..=400.0), "print mm/s",
-                        "The machine's nominal print speed (inner walls, sparse infill). Per-feature speeds derive from it when a profile leaves them unset. Lives here because the printer profile owns it.");
+                    hslider(ui, true, egui::Slider::new(&mut s.machine_speed_mm_s, 10.0..=700.0), "rated mm/s",
+                        "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine; the finish↔speed dial (Quality) chooses where below it to run.");
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0), "1st layer mm/s",
                         "Speed for the first layer — slower improves bed adhesion.");
                     hslider(ui, true, egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0), "travel mm/s",
@@ -2417,9 +2136,23 @@ impl eframe::App for App {
                             .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
                             .show(ui, |ui| {
                                 ui.set_width(220.0);
-                                // Header: title left, dismiss ✖ pinned right
-                                // (the title truncates, never pushing it off).
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Header: title left (fixed width, truncating)
+                                // with the dismiss ✖ to its right. No fill
+                                // layouts in here: an Area hands its content
+                                // LAST frame's rect as the available space, so
+                                // anything that centers or justifies against
+                                // it re-measures bigger every repaint and the
+                                // card grows ~1 Hz with the status polls.
+                                ui.horizontal(|ui| {
+                                    let title = match &self.printer_status {
+                                        Some(Ok(st)) if !st.filename.is_empty() => st.filename.as_str(),
+                                        Some(Ok(_)) => "(no file)",
+                                        _ => "Printer",
+                                    };
+                                    ui.scope(|ui| {
+                                        ui.set_width(194.0);
+                                        ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+                                    });
                                     if ui
                                         .small_button("✖")
                                         .on_hover_text("Hide this card. Sending to the printer again brings it back.")
@@ -2427,14 +2160,6 @@ impl eframe::App for App {
                                     {
                                         hide_card = true;
                                     }
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                        let title = match &self.printer_status {
-                                            Some(Ok(st)) if !st.filename.is_empty() => st.filename.as_str(),
-                                            Some(Ok(_)) => "(no file)",
-                                            _ => "Printer",
-                                        };
-                                        ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
-                                    });
                                 });
                                 match &self.printer_status {
                                     None => {
@@ -2957,8 +2682,11 @@ fn build_instances(
                 ]);
             }
             // Highlight the external-perimeter seam (loop start) with a larger
-            // magenta marker, toggleable via the "seams" category.
-            if path.kind == engine::PathKind::ExternalPerimeter {
+            // magenta marker, toggleable via the "seams" category. Only closed
+            // loops have a seam — the open pieces of an overhang-split wall
+            // start mid-loop wherever the split fell, and marking those reads
+            // as scatter that no seam strategy could fix.
+            if path.kind == engine::PathKind::ExternalPerimeter && path.closed {
                 let s = path.points[0];
                 joints.push([
                     s.x_mm() as f32, s.y_mm() as f32, zc,
@@ -3012,7 +2740,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
     match kind {
         Skirt => CAT_SKIRT,
         ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
-        Solid => CAT_SOLID,
+        Solid | TopSkin | BottomSkin => CAT_SOLID,
         Infill => CAT_INFILL,
         GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
@@ -3029,6 +2757,10 @@ fn color_for(kind: engine::PathKind) -> [f32; 3] {
         // Hot amber: slowed wall stretches hanging past the layer below.
         OverhangWall => [0.98, 0.62, 0.10],
         Solid => [0.94, 0.80, 0.24],
+        // Raspberry: the visible top skin (outer-wall pace).
+        TopSkin => [0.93, 0.38, 0.55],
+        // Bronze: bed-facing and unsupported undersides (outer-wall pace).
+        BottomSkin => [0.62, 0.45, 0.20],
         Infill => [0.32, 0.62, 0.95],
         GapFill => [0.95, 0.45, 0.55],
         Ironing => [0.85, 0.85, 0.55],

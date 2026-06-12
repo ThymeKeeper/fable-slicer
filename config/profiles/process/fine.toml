@@ -1,7 +1,7 @@
-# 0.12mm fine quality. Thicker shells (more layers) to match the finer height.
+# 0.12mm fine quality: thicker shells (more layers), the dial toward finish.
 # First layer stays at 0.2mm for adhesion (inherited from standard).
 inherits = "standard"
 layer_height_mm = 0.12
 top_layers = 6
 bottom_layers = 6
-print_speed_mm_s = 40.0
+speed_quality = -0.6

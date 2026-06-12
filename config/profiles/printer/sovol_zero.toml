@@ -6,17 +6,22 @@ bed_size_y_mm = 152.4
 bed_size_z_mm = 152.5
 
 # High-speed CoreXY: rated 1200 mm/s / 40000 mm/s², ~50 mm³/s flow hotend.
-# Motion numbers matched to OrcaSlicer's high-speed profile (measured from
-# its g-code): interior accel + travel 40000, outer wall 10000, first layer
-# auto-derives to Orca's 1000; inner walls 400 mm/s (Orca asks 500 for sparse
-# but the volumetric cap clamps both the same), first layer 55, travel 1000,
-# square-corner velocity 5. Basic pla (21 mm³/s, = Orca's generic PLA) is the
-# like-for-like pairing; the stock hotend is high-flow, so pla-hf (30) is the
-# machine's real ceiling — the melt cap is what actually limits speed here.
+# Speeds matched to OrcaSlicer's high-speed profile (measured from its
+# g-code): inner walls 400 mm/s (Orca asks 500 for sparse but the volumetric
+# cap clamps both the same), first layer 55, travel 1000, square-corner
+# velocity 5. Basic pla (21 mm³/s, = Orca's generic PLA) is the like-for-like
+# pairing; the stock hotend is high-flow, so pla-hf (30) is the machine's
+# real ceiling — the melt cap is what actually limits speed here.
 # (Our external-wall auto stays at 50% of print speed — quality-first — where
 # Orca asks 350; pin "external mm/s" in the GUI for Orca's number.)
-acceleration = 40000.0
-outer_wall_accel = 10000.0
+#
+# Acceleration runs well under the 40000 rating: full rate hammers the frame
+# on every infill turnaround and travel whip, for ~7% of a Benchy's time
+# (40000/10000 → 15000/6000 measured 30m51s → 33m01s). The outer-wall accel
+# also paces the top/bottom skins, landing near Orca's 5000 top-surface
+# value. First layer still auto-derives to 1000.
+acceleration = 15000.0
+outer_wall_accel = 6000.0
 jerk = 5.0
 travel_speed_mm_s = 1000.0
 print_speed_mm_s = 400.0
