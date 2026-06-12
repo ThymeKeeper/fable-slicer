@@ -277,8 +277,21 @@ fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
 }
 
 fn main() -> eframe::Result<()> {
+    // The window/taskbar icon: a Playfair "F" sliced into offset layers on a
+    // cream tile (generated from the wordmark font; raw RGBA so no image
+    // decoder is needed). Wayland ignores per-window icons by design — there
+    // it comes from a .desktop file instead, when we ship one.
+    let icon = egui::IconData {
+        rgba: include_bytes!("../assets/icon.rgba").to_vec(),
+        width: 128,
+        height: 128,
+    };
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1600.0, 1000.0])
+            .with_min_inner_size([1024.0, 640.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native("Fable Slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
@@ -397,6 +410,18 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // The wordmark's serif (Playfair Display, OFL — license alongside the
+        // asset). Registered as its own family so nothing else picks it up.
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "playfair".into(),
+            egui::FontData::from_static(include_bytes!("../assets/PlayfairDisplay.ttf")).into(),
+        );
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("wordmark".into()), vec!["playfair".into()]);
+        cc.egui_ctx.set_fonts(fonts);
+
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -1285,7 +1310,103 @@ impl eframe::App for App {
         // if a future row overflows, that band is the symptom to look for.
         egui::Panel::left("controls").resizable(false).exact_size(320.0).show_inside(ui, |ui| {
             ui.spacing_mut().slider_width = 90.0;
-            ui.heading("Fable Slicer");
+            // The wordmark, after the Fable model's own branding: a classic
+            // high-contrast serif in near-monochrome ink — warm paper cream
+            // with only a whisper of blush across "Fable" — paired with a
+            // small tracked sans "Slicer", serif-name / sans-subtitle.
+            // Painted as two galleys so "Slicer" can sit a precise few pixels
+            // above the serif row's descent-heavy bottom — LayoutJob's valign
+            // stops (bottom / center) bracket the right spot but miss it.
+            const SLICER_RAISE_PX: f32 = 3.5;
+            let serif = egui::FontFamily::Name("wordmark".into());
+            let wordmark_px = 30.0;
+            let ink = |t: f32| {
+                let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+                egui::Color32::from_rgb(lerp(242.0, 230.0), lerp(236.0, 212.0), lerp(222.0, 226.0))
+            };
+            let wordmark_fmt = |color: egui::Color32| egui::TextFormat {
+                font_id: egui::FontId::new(wordmark_px, serif.clone()),
+                color,
+                ..Default::default()
+            };
+            // Three galleys: the full "Fable" (sizing + where "able" lands,
+            // so any cross-glyph kerning is preserved), plus a lone "F" and
+            // the tail "able" — the F is painted sliced, like the icon.
+            let mut fable_job = egui::text::LayoutJob::default();
+            let mut f_job = egui::text::LayoutJob::default();
+            let mut able_job = egui::text::LayoutJob::default();
+            let fable: Vec<char> = "Fable".chars().collect();
+            for (i, ch) in fable.iter().enumerate() {
+                let t = i as f32 / (fable.len() - 1) as f32;
+                fable_job.append(&ch.to_string(), 0.0, wordmark_fmt(ink(t)));
+                if i == 0 {
+                    f_job.append(&ch.to_string(), 0.0, wordmark_fmt(ink(t)));
+                } else {
+                    able_job.append(&ch.to_string(), 0.0, wordmark_fmt(ink(t)));
+                }
+            }
+            let mut slicer_job = egui::text::LayoutJob::default();
+            slicer_job.append(
+                "Slicer",
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(20.0),
+                    color: egui::Color32::from_rgb(188, 192, 200),
+                    extra_letter_spacing: 1.4,
+                    ..Default::default()
+                },
+            );
+            let fable_galley = ui.ctx().fonts_mut(|f| f.layout_job(fable_job));
+            let f_galley = ui.ctx().fonts_mut(|f| f.layout_job(f_job));
+            let able_galley = ui.ctx().fonts_mut(|f| f.layout_job(able_job));
+            let slicer_galley = ui.ctx().fonts_mut(|f| f.layout_job(slicer_job));
+            let gap = 9.0;
+            let size = egui::vec2(
+                fable_galley.size().x + gap + slicer_galley.size().x,
+                fable_galley.size().y,
+            );
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let slicer_pos = egui::pos2(
+                rect.min.x + fable_galley.size().x + gap,
+                rect.max.y - slicer_galley.size().y - SLICER_RAISE_PX,
+            );
+            // The F gets the icon's treatment (it IS the icon): the glyph cut
+            // into three horizontal slices with a hairline of background at
+            // each cut, middle slice nudged right. Geometry measured off the
+            // icon, as fractions of cap height below the cap top: slice 1
+            // ends at 0.307, slice 2 spans 0.360–0.727 shifted +0.083·cap,
+            // slice 3 starts at 0.779. Cap metrics are Playfair's "F" ink:
+            // cap height 0.711 × size, cap top 0.375 × size below galley top.
+            let cap = 0.711 * wordmark_px;
+            let cap_top = rect.min.y + 0.375 * wordmark_px;
+            let f_width = f_galley.size().x;
+            let slices: [(f32, f32, f32); 3] = [
+                (f32::NEG_INFINITY, 0.307, 0.0),
+                (0.360, 0.727, 0.083),
+                (0.779, f32::INFINITY, 0.0),
+            ];
+            // Snapped to the pixel grid so the cuts are hard lines, not
+            // antialiased smears — at 30 px the gaps are only ~1 px.
+            let ppp = ui.ctx().pixels_per_point();
+            let snap = |v: f32| (v * ppp).round() / ppp;
+            for (top, bot, dx) in slices {
+                let band = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x - 2.0, snap((cap_top + top * cap).max(rect.min.y))),
+                    egui::pos2(rect.min.x + f_width + 4.0, snap((cap_top + bot * cap).min(rect.max.y))),
+                );
+                ui.painter().with_clip_rect(band).galley(
+                    rect.min + egui::vec2(snap(dx * cap), 0.0),
+                    f_galley.clone(),
+                    egui::Color32::WHITE,
+                );
+            }
+            // "able" lands exactly where the one-galley layout put it.
+            let able_pos = egui::pos2(
+                rect.min.x + fable_galley.size().x - able_galley.size().x,
+                rect.min.y,
+            );
+            ui.painter().galley(able_pos, able_galley, egui::Color32::WHITE);
+            ui.painter().galley(slicer_pos, slicer_galley, egui::Color32::WHITE);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
