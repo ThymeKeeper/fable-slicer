@@ -279,7 +279,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let brick =
                     settings.brick_layers && w % 2 == 1 && layer.index > 0 && layer.index + 1 < n;
                 let (z_offset_mm, flow) = if brick {
-                    (0.5 * settings.layer_height_mm, settings.brick_flow)
+                    // The lifted bead's extra material is derived from the
+                    // stadium model — what its halved flank contact leaves
+                    // unfilled (see config::brick_flow_factor).
+                    (
+                        0.5 * settings.layer_height_mm,
+                        config::brick_flow_factor(lw, settings.layer_height_mm),
+                    )
                 } else {
                     (0.0, 1.0)
                 };
