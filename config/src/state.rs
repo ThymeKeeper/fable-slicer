@@ -51,6 +51,10 @@ pub struct AppState {
     /// Where the g-code export dialog last saved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_export_dir: Option<PathBuf>,
+    /// The GUI's 3D-view accent color ("#RRGGBB") — the one hue its model
+    /// tint, feature palette, and heat ramps are derived from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
 }
 
 impl AppState {
@@ -99,6 +103,7 @@ mod tests {
             process: "sovol-zero-custom".into(),
             last_model_dir: Some("/tmp/models".into()),
             last_export_dir: None,
+            accent: Some("#D8A852".into()),
         };
         s.save_to(&path).unwrap();
         assert_eq!(AppState::load_from(&path), s);

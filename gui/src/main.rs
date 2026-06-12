@@ -12,6 +12,101 @@ use config::{FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Settings
 use engine::generate;
 use std::sync::Arc;
 
+/// The "ink & cream" palette: the wordmark's warm paper colors inverted into
+/// a dark mode. Surfaces are warm near-blacks (ink), text is the icon's cream,
+/// and the wordmark gradient's blush is the one accent. Everything chrome
+/// derives from these — preview/heat colors stay semantic and are not here.
+mod palette {
+    use eframe::egui::Color32;
+
+    /// Deepest surface: the viewport stage, text-entry wells, code blocks.
+    pub const INK_DEEP: Color32 = Color32::from_rgb(17, 14, 11);
+    /// Panel / window surface.
+    pub const INK: Color32 = Color32::from_rgb(26, 22, 17);
+    /// Raised widgets (buttons, checkboxes, slider rails).
+    pub const INK_RAISED: Color32 = Color32::from_rgb(39, 34, 27);
+    /// Hovered widgets.
+    pub const INK_HOVER: Color32 = Color32::from_rgb(52, 45, 36);
+    /// Pressed widgets.
+    pub const INK_ACTIVE: Color32 = Color32::from_rgb(63, 55, 44);
+
+    /// Headline cream — the icon tile / wordmark "F".
+    pub const CREAM: Color32 = Color32::from_rgb(242, 236, 222);
+    /// Body text.
+    pub const CREAM_DIM: Color32 = Color32::from_rgb(189, 181, 163);
+    /// Weak / hint text.
+    pub const CREAM_FAINT: Color32 = Color32::from_rgb(142, 134, 120);
+
+    /// The wordmark gradient's far end — selection strokes, links, highlights.
+    pub const BLUSH: Color32 = Color32::from_rgb(230, 212, 226);
+    /// Blush sunk into ink — selection fills, slider trailing fill.
+    pub const PLUM: Color32 = Color32::from_rgb(84, 64, 78);
+
+    /// Warm status colors (terracotta / amber, not alarm red / traffic yellow).
+    pub const ERROR: Color32 = Color32::from_rgb(224, 118, 92);
+    pub const WARN: Color32 = Color32::from_rgb(214, 164, 92);
+
+    /// Hairline rule: cream at low alpha (premultiplied).
+    pub const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(25, 24, 23, 26);
+    /// Slightly louder hairline for hovered outlines.
+    pub const HAIRLINE_LOUD: Color32 = Color32::from_rgba_premultiplied(57, 55, 52, 60);
+}
+
+/// Apply the ink & cream theme: warm dark visuals, square-ish corners,
+/// hairline strokes, and a slightly airier vertical rhythm than egui's
+/// default. Called once at startup.
+fn apply_ink_cream(ctx: &eframe::egui::Context) {
+    use palette::*;
+    let mut style = (*ctx.global_style()).clone();
+    let v = &mut style.visuals;
+
+    v.panel_fill = INK;
+    v.window_fill = INK;
+    v.window_stroke = egui::Stroke::new(1.0, HAIRLINE_LOUD);
+    v.extreme_bg_color = INK_DEEP;
+    v.code_bg_color = INK_DEEP;
+    v.faint_bg_color = INK_RAISED;
+    v.selection.bg_fill = PLUM;
+    v.selection.stroke = egui::Stroke::new(1.0, BLUSH);
+    v.hyperlink_color = BLUSH;
+    v.error_fg_color = ERROR;
+    v.warn_fg_color = WARN;
+    // Sliders show their filled portion — the value reads at a glance.
+    v.slider_trailing_fill = true;
+
+    let r = egui::CornerRadius::same(3);
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = INK;
+    w.noninteractive.weak_bg_fill = INK;
+    w.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    w.noninteractive.fg_stroke = egui::Stroke::new(1.0, CREAM_DIM);
+    w.noninteractive.corner_radius = r;
+    w.inactive.bg_fill = INK_RAISED;
+    w.inactive.weak_bg_fill = INK_RAISED;
+    w.inactive.bg_stroke = egui::Stroke::NONE;
+    w.inactive.fg_stroke = egui::Stroke::new(1.0, CREAM_DIM);
+    w.inactive.corner_radius = r;
+    w.hovered.bg_fill = INK_HOVER;
+    w.hovered.weak_bg_fill = INK_HOVER;
+    w.hovered.bg_stroke = egui::Stroke::new(1.0, HAIRLINE_LOUD);
+    w.hovered.fg_stroke = egui::Stroke::new(1.5, CREAM);
+    w.hovered.corner_radius = r;
+    w.active.bg_fill = INK_ACTIVE;
+    w.active.weak_bg_fill = INK_ACTIVE;
+    w.active.bg_stroke = egui::Stroke::new(1.0, BLUSH);
+    w.active.fg_stroke = egui::Stroke::new(1.5, CREAM);
+    w.active.corner_radius = r;
+    w.open.bg_fill = INK_RAISED;
+    w.open.weak_bg_fill = INK_RAISED;
+    w.open.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    w.open.fg_stroke = egui::Stroke::new(1.0, CREAM);
+    w.open.corner_radius = r;
+
+    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+    style.spacing.button_padding = egui::vec2(8.0, 3.0);
+    ctx.set_global_style(style);
+}
+
 /// State of the save / delete profile dialog.
 struct ProfileDialog {
     kind: TierKind,
@@ -173,34 +268,134 @@ fn hslider_lockout(
 const HEAT_SCALE_LO_MW: f64 = 1.0;
 const HEAT_SCALE_HI_MW: f64 = 40.0;
 
-/// Blue → green → yellow → red ramp for the preview heat maps (u in 0..=1).
-fn heat_ramp(u: f32) -> [f32; 3] {
-    const STOPS: [[f32; 3]; 4] = [
-        [0.20, 0.35, 0.90], // cool blue
-        [0.10, 0.75, 0.45], // green
-        [0.95, 0.85, 0.15], // yellow
-        [0.92, 0.13, 0.10], // red
-    ];
-    let x = u.clamp(0.0, 1.0) * 3.0;
-    let i = (x.floor() as usize).min(2);
-    let f = x - i as f32;
-    let (a, b) = (STOPS[i], STOPS[i + 1]);
-    [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
+/// The default accent (brass): ONE hue drives every 3D-view color — the
+/// model tint, the feature palette, and the heat ramps are all derived from
+/// it (see `color_for` / `heat_ramp` / `mesh_tints`). The user picks any
+/// color via the expandable picker in the panel; persisted in the state
+/// dotfile as "#RRGGBB".
+const DEFAULT_ACCENT: egui::Color32 = egui::Color32::from_rgb(216, 168, 82);
+
+fn accent_to_hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+fn accent_from_hex(s: &str) -> Option<egui::Color32> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    Some(egui::Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// The accent as (hue°, saturation, lightness), with a saturation floor so
+/// muted swatches still yield distinguishable derived palettes.
+fn accent_hsl(c: egui::Color32) -> (f32, f32, f32) {
+    let (r, g, b) = (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d < 1e-6 {
+        return (0.0, 0.35, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, s.max(0.35), l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s.clamp(0.0, 1.0);
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [r + m, g + m, b + m]
+}
+
+/// Model-mesh tints derived from the accent: unselected = the accent sunk
+/// into porcelain, selected = the accent proper.
+fn mesh_tints(accent: egui::Color32) -> ([f32; 3], [f32; 3]) {
+    let (h, s, _) = accent_hsl(accent);
+    (hsl_to_rgb(h, s * 0.22, 0.72), hsl_to_rgb(h, s * 0.85, 0.60))
+}
+
+/// Cool → hot ramp for the preview heat maps (u in 0..=1), riffed off the
+/// accent: its hue glowing up from a dark cool-drifted shade, through the
+/// accent itself, to a bright — but still saturated — top end (capped at
+/// L 0.76 with the saturation held up, so the hot end reads as the accent
+/// at full glow, never as white). Lightness is monotonic — dark = cool,
+/// bright = hot — so the ramp stays ordered whichever hue drives it.
+fn heat_ramp(u: f32, accent: (f32, f32, f32)) -> [f32; 3] {
+    let (h, s, _) = accent;
+    let u = u.clamp(0.0, 1.0);
+    let hh = h - 20.0 + 30.0 * u;
+    let ll = 0.24 + 0.52 * u;
+    let arc = 1.0 - (u - 0.6).abs() * 0.9;
+    let ss = (s * (0.50 + 0.70 * arc)).clamp(0.05, 0.95);
+    hsl_to_rgb(hh, ss, ll)
 }
 
 /// Accent color per profile tier — used on the selector rows and on every
 /// settings-section header, so it's visible at a glance which profile a
 /// setting is saved to.
 fn tier_color(kind: TierKind) -> egui::Color32 {
+    // Dusty hues that keep their identities (blue/ochre/sage) but sit inside
+    // the ink & cream world instead of shouting over it. Saturated just
+    // enough to tell apart at dot size.
     match kind {
-        TierKind::Printer => egui::Color32::from_rgb(110, 170, 255), // blue
-        TierKind::Filament => egui::Color32::from_rgb(255, 170, 90), // orange
-        TierKind::Process => egui::Color32::from_rgb(140, 210, 120), // green
+        TierKind::Printer => egui::Color32::from_rgb(124, 165, 215), // dusty steel
+        TierKind::Filament => egui::Color32::from_rgb(228, 158, 72), // ochre
+        TierKind::Process => egui::Color32::from_rgb(148, 192, 116), // sage
     }
 }
 
-/// A collapsible settings section owned by one profile tier: the header is
-/// tinted with the tier's color and explains the mapping on hover.
+/// Editorial section title: a small tier-colored dot, then the title as
+/// tracked small caps in cream — print-like, with the tier as a quiet mark
+/// instead of a colored headline.
+fn section_title(title: &str, kind: TierKind) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    // U+2022 bullet — present in egui's default fonts (U+25CF "●" is not,
+    // and renders as a missing-glyph box).
+    job.append(
+        "•  ",
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(18.0),
+            color: tier_color(kind),
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        &title.to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: palette::CREAM_DIM,
+            extra_letter_spacing: 1.1,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// A collapsible settings section owned by one profile tier: the header
+/// carries the tier's dot and explains the mapping on hover.
 fn tier_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -208,15 +403,14 @@ fn tier_section(
     default_open: bool,
     add: impl FnOnce(&mut egui::Ui),
 ) {
-    let header = egui::CollapsingHeader::new(
-        egui::RichText::new(title).color(tier_color(kind)).strong(),
-    )
-    .default_open(default_open)
-    .show(ui, add);
+    let header = egui::CollapsingHeader::new(section_title(title, kind))
+        .default_open(default_open)
+        .show(ui, add);
     header.header_response.on_hover_text(format!(
-        "These settings are saved to the {} profile (color-matched in the selector above).",
+        "These settings are saved to the {} profile (dot-matched in the selector above).",
         kind.label()
     ));
+    ui.add_space(2.0);
 }
 
 /// One object placed on the bed: shared mesh geometry plus an editable placement
@@ -350,6 +544,12 @@ struct App {
     layer_islands: Vec<engine::LayerIslands>,
     /// What the preview colors encode.
     color_by: ColorBy,
+    /// The 3D view's accent: model tint, feature palette, and heat ramps are
+    /// all derived from this one hue. Persisted in the state dotfile.
+    accent: egui::Color32,
+    /// Set while the accent picker is changing; the preview instance buffers
+    /// re-bake once the pointer releases (not every drag frame).
+    accent_rebake: bool,
     /// In-flight printer-host operation: its reply arrives here from the
     /// worker thread (one op at a time; buttons disable).
     host_rx: Option<std::sync::mpsc::Receiver<HostReply>>,
@@ -421,6 +621,7 @@ impl App {
             .families
             .insert(egui::FontFamily::Name("wordmark".into()), vec!["playfair".into()]);
         cc.egui_ctx.set_fonts(fonts);
+        apply_ink_cream(&cc.egui_ctx);
 
         let rs = cc
             .wgpu_render_state
@@ -443,6 +644,7 @@ impl App {
         // they still exist — a deleted profile falls back tier by tier, and a
         // restored triple that no longer resolves falls back entirely.
         let state = config::AppState::load();
+        let accent = state.accent.as_deref().and_then(accent_from_hex).unwrap_or(DEFAULT_ACCENT);
         let pick = |saved: &str, names: Vec<&str>, default: &str| {
             if !saved.is_empty() && names.contains(&saved) {
                 saved.to_string()
@@ -488,6 +690,8 @@ impl App {
             last_model_dir: state.last_model_dir.clone(),
             last_export_dir: state.last_export_dir.clone(),
             saved_state: state,
+            accent,
+            accent_rebake: false,
             settings,
             baseline,
             profile_dialog: None,
@@ -975,7 +1179,8 @@ impl App {
             self.settings.z_hop_mm
         };
         let layer_colors = self.layer_color_table();
-        let (verts, ends, joints, joint_ends) = build_instances(layers, hop as f32, layer_colors.as_deref());
+        let (verts, ends, joints, joint_ends) =
+            build_instances(layers, hop as f32, layer_colors.as_deref(), accent_hsl(self.accent));
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
         self.layer_ends = ends;
@@ -991,6 +1196,7 @@ impl App {
             return None;
         }
         let layers = self.sliced.as_ref()?;
+        let acc = accent_hsl(self.accent);
         match self.color_by {
             ColorBy::LayerTime => {
                 let logs: Vec<f64> = self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
@@ -1004,7 +1210,7 @@ impl App {
                         .map(|(layer, &l)| {
                             // Inverted: short layers = least cooling = the hot end.
                             let u = 1.0 - ((l - lo) / span) as f32;
-                            vec![heat_ramp(u); layer.paths.len()]
+                            vec![heat_ramp(u, acc); layer.paths.len()]
                         })
                         .collect(),
                 )
@@ -1026,7 +1232,7 @@ impl App {
                         .map(|layer| {
                             let t = layer.planned_temp_c.unwrap_or(base);
                             let u = 0.5 + ((t - base) / (2.0 * span)) as f32;
-                            vec![heat_ramp(u); layer.paths.len()]
+                            vec![heat_ramp(u, acc); layer.paths.len()]
                         })
                         .collect(),
                 )
@@ -1052,7 +1258,7 @@ impl App {
                                 .iter()
                                 .map(|&k| {
                                     let q = (self.island_heat(li, &l.islands[k]) * 1e3).max(1e-6).ln();
-                                    heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32)
+                                    heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32, acc)
                                 })
                                 .collect()
                         })
@@ -1117,6 +1323,7 @@ impl App {
             process: self.process.clone(),
             last_model_dir: self.last_model_dir.clone(),
             last_export_dir: self.last_export_dir.clone(),
+            accent: Some(accent_to_hex(self.accent)),
         };
         if cur != self.saved_state {
             if let Err(e) = cur.save() {
@@ -1308,7 +1515,15 @@ impl eframe::App for App {
         // clip: egui reserves the overflowed width, pushing the central panel
         // right and leaving an unpainted band between the two (egui #4475) —
         // if a future row overflows, that band is the symptom to look for.
-        egui::Panel::left("controls").resizable(false).exact_size(320.0).show_inside(ui, |ui| {
+        egui::Panel::left("controls")
+            .resizable(false)
+            .exact_size(320.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette::INK)
+                    .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 6 }),
+            )
+            .show_inside(ui, |ui| {
             ui.spacing_mut().slider_width = 90.0;
             // The wordmark, after the Fable model's own branding: a classic
             // high-contrast serif in near-monochrome ink — warm paper cream
@@ -1351,7 +1566,7 @@ impl eframe::App for App {
                 0.0,
                 egui::TextFormat {
                     font_id: egui::FontId::proportional(20.0),
-                    color: egui::Color32::from_rgb(188, 192, 200),
+                    color: palette::CREAM_FAINT,
                     extra_letter_spacing: 1.4,
                     ..Default::default()
                 },
@@ -1407,10 +1622,13 @@ impl eframe::App for App {
             );
             ui.painter().galley(able_pos, able_galley, egui::Color32::WHITE);
             ui.painter().galley(slicer_pos, slicer_galley, egui::Color32::WHITE);
-            ui.add_space(4.0);
+            ui.add_space(8.0);
+            // Object actions as one even row — same grid the Slice/Export
+            // rows use, so the panel's top reads as aligned blocks.
+            let third = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
             ui.horizontal(|ui| {
                 if ui
-                    .button("Import STL…")
+                    .add(egui::Button::new("Import STL…").min_size(egui::vec2(third, 26.0)))
                     .on_hover_text("Load an STL file and add it to the bed as a new object.")
                     .clicked()
                 {
@@ -1424,14 +1642,20 @@ impl eframe::App for App {
                     }
                 }
                 if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Duplicate"))
+                    .add_enabled(
+                        self.selected.is_some(),
+                        egui::Button::new("Duplicate").min_size(egui::vec2(third, 26.0)),
+                    )
                     .on_hover_text("Add a copy of the selected object (shares geometry; re-arranged on the bed).")
                     .clicked()
                 {
                     self.duplicate_selected();
                 }
                 if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
+                    .add_enabled(
+                        self.selected.is_some(),
+                        egui::Button::new("Delete").min_size(egui::vec2(third, 26.0)),
+                    )
                     .on_hover_text("Remove the selected object from the bed.")
                     .clicked()
                 {
@@ -1480,14 +1704,36 @@ impl eframe::App for App {
                             TierKind::Filament => "Filament",
                             TierKind::Process => "Process",
                         };
-                        let label = egui::RichText::new(format!(
-                            "{title}{}",
-                            if is_dirty { " *" } else { "" }
-                        ))
-                        .color(tier_color(kind))
-                        .strong();
+                        // Fixed-width label column (tier dot + name) so the
+                        // three combos align into one clean column. The dot is
+                        // the same mark the section headers carry.
+                        ui.scope(|ui| {
+                            ui.set_width(78.0);
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            // Painted dot (the "●" glyph is missing from the
+                            // default fonts and renders as a box).
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 5.0, tier_color(kind));
+                            let label = if is_dirty {
+                                egui::RichText::new(format!("{title} *")).color(palette::CREAM)
+                            } else {
+                                egui::RichText::new(title).color(palette::CREAM_DIM)
+                            };
+                            ui.label(label).on_hover_text(hover);
+                        });
                         let is_user = self.profiles.is_user(kind, sel);
-                        changed |= combo(ui, kind.label(), label, sel, names, hover);
+                        let r = egui::ComboBox::from_id_salt(kind.label())
+                            .width(136.0)
+                            .selected_text(sel.clone())
+                            .show_ui(ui, |ui| {
+                                for opt in names {
+                                    if ui.selectable_value(sel, opt.clone(), opt).changed() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        r.response.on_hover_text(hover);
                         if ui
                             .small_button("💾")
                             .on_hover_text(if is_dirty {
@@ -1542,17 +1788,16 @@ impl eframe::App for App {
             let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             let big = egui::vec2(half, 32.0);
             ui.horizontal(|ui| {
-                // Slice carries the accent fill: it's the action everything
-                // else waits on.
+                // Slice is the hero action: printed in reverse — cream plate,
+                // ink text — the one inverted block in the panel.
                 let can_slice = !self.objects.is_empty();
-                let accent = ui.visuals().selection;
                 let mut label = egui::RichText::new("Slice").size(15.0).strong();
                 if can_slice {
-                    label = label.color(accent.stroke.color);
+                    label = label.color(palette::INK);
                 }
                 let mut slice_btn = egui::Button::new(label).min_size(big);
                 if can_slice {
-                    slice_btn = slice_btn.fill(accent.bg_fill);
+                    slice_btn = slice_btn.fill(palette::CREAM);
                 }
                 if ui
                     .add_enabled(can_slice, slice_btn)
@@ -1562,7 +1807,7 @@ impl eframe::App for App {
                 {
                     self.slice(&rs);
                 }
-                let export_btn = egui::Button::new(egui::RichText::new("💾 Export…").size(15.0)).min_size(big);
+                let export_btn = egui::Button::new(egui::RichText::new("Export…").size(15.0)).min_size(big);
                 if ui
                     .add_enabled(self.sliced.is_some(), export_btn)
                     .on_hover_text("Save the sliced toolpaths to a .gcode file.")
@@ -1620,6 +1865,36 @@ impl eframe::App for App {
                     self.view_preview = true;
                 }
             });
+            // The accent picker: one hue drives the whole 3D view (model
+            // tint, feature palette, heat ramps). The mesh tints ride shader
+            // uniforms and follow the picker live; the baked preview colors
+            // re-derive when the mouse releases — re-baking every instance
+            // buffer per drag frame would stutter on big slices.
+            ui.horizontal(|ui| {
+                ui.label("accent").on_hover_text(
+                    "The 3D view's color. The model tint, the feature palette, and the \
+                     heat-map ramps are all derived from this one hue — pick whatever \
+                     reads best to you. Remembered across sessions.",
+                );
+                let mut rgb = [self.accent.r(), self.accent.g(), self.accent.b()];
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    self.accent = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                    self.accent_rebake = true;
+                }
+                if self.accent != DEFAULT_ACCENT
+                    && ui
+                        .small_button("⟲")
+                        .on_hover_text("Back to the default brass.")
+                        .clicked()
+                {
+                    self.accent = DEFAULT_ACCENT;
+                    self.accent_rebake = true;
+                }
+            });
+            if self.accent_rebake && !ui.ctx().input(|i| i.pointer.any_down()) {
+                self.accent_rebake = false;
+                self.set_preview_instances(&rs);
+            }
             if self.view_preview && n_layers > 0 {
                 hslider(ui, true, egui::Slider::new(&mut self.preview_layer, 1..=n_layers), "layer",
                     "Highest layer shown; lower layers are dimmed.");
@@ -1681,7 +1956,7 @@ impl eframe::App for App {
                     }
                     let lo = vals.iter().cloned().fold(f64::INFINITY, f64::min);
                     let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    // Legend ends carry the real numbers: left = blue (safe), right = red (hot).
+                    // Legend ends carry the real numbers: left = dark (cool/safe), right = bright (hot).
                     let anchored = self.color_by == ColorBy::Heat
                         && self.settings.heat_control
                         && self.settings.max_heat_mw_mm2 > 0.0;
@@ -1689,7 +1964,7 @@ impl eframe::App for App {
                         ColorBy::LayerTime => (
                             format!("{hi:.1}s"),
                             format!("{lo:.1}s"),
-                            "Per-layer print time, log scale. Red = the quickest layers: the plastic \
+                            "Per-layer print time, log scale. Brightest = the quickest layers: the plastic \
                              below gets the least time to cool before the nozzle returns. The min-layer \
                              slowdown under Feature speeds is the usual fix."
                                 .to_string(),
@@ -1707,8 +1982,8 @@ impl eframe::App for App {
                                 format!("{:.0} °C", base - span),
                                 format!("{:.0} °C", base + span),
                                 "Heat control's temp schedule: the planned nozzle temperature of every \
-                                 layer, centered on the printing temperature — blue = scheduled cooler \
-                                 (hot zones), red = scheduled warmer (cold bands). One flat color means \
+                                 layer, centered on the printing temperature — dark = scheduled cooler \
+                                 (hot zones), bright = scheduled warmer (cold bands). One flat color means \
                                  nothing is scheduled (heat control off, or nothing to do). The first \
                                  layer's adhesion temperature is separate and not shown."
                                     .to_string(),
@@ -1721,7 +1996,7 @@ impl eframe::App for App {
                                     .as_ref()
                                     .map(|s| s.heat_target_mw)
                                     .unwrap_or(self.settings.max_heat_mw_mm2);
-                                format!(" The white tick is the ceiling ({target_mw:.1}).")
+                                format!(" The tick marks the ceiling ({target_mw:.1}).")
                             } else {
                                 String::new()
                             };
@@ -1747,8 +2022,9 @@ impl eframe::App for App {
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 10.0), egui::Sense::hover());
                         if ui.is_rect_visible(rect) {
                             let n = 24;
+                            let acc = accent_hsl(self.accent);
                             for i in 0..n {
-                                let c = heat_ramp(i as f32 / (n - 1) as f32);
+                                let c = heat_ramp(i as f32 / (n - 1) as f32, acc);
                                 let x0 = rect.min.x + rect.width() * i as f32 / n as f32;
                                 let x1 = rect.min.x + rect.width() * (i + 1) as f32 / n as f32;
                                 ui.painter().rect_filled(
@@ -1774,10 +2050,12 @@ impl eframe::App for App {
                                     / (HEAT_SCALE_HI_MW.ln() - lo))
                                     .clamp(0.0, 1.0) as f32;
                                 let x = rect.min.x + rect.width() * fr;
-                                ui.painter().line_segment(
-                                    [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)],
-                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
-                                );
+                                // Cream core in an ink casing: visible on
+                                // both the dark and bright halves, whatever
+                                // hue the ramp runs in.
+                                let seg = [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)];
+                                ui.painter().line_segment(seg, egui::Stroke::new(3.5, palette::INK));
+                                ui.painter().line_segment(seg, egui::Stroke::new(1.5, palette::CREAM));
                             }
                         }
                         ui.label(egui::RichText::new(right).small()).on_hover_text(expl.as_str());
@@ -2191,7 +2469,8 @@ impl eframe::App for App {
             } else {
                 None
             };
-            self.scene.render(&rs, vp, show_mesh, preview);
+            let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
+            self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel);
 
             ui.painter().image(
                 self.scene.texture_id(),
@@ -2210,7 +2489,7 @@ impl eframe::App for App {
                     .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 205))
+                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 220))
                             .show(ui, |ui| {
                                 ui.set_max_width(210.0);
                                 let obj = &mut self.objects[i];
@@ -2267,7 +2546,7 @@ impl eframe::App for App {
                     .fixed_pos(egui::pos2(rect.right() - 240.0, rect.top() + 10.0))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
+                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 196))
                             .show(ui, |ui| {
                                 ui.set_width(220.0);
                                 // Header: title left (fixed width, truncating)
@@ -2367,7 +2646,7 @@ impl eframe::App for App {
                     .fixed_pos(rect.left_bottom() + egui::vec2(10.0, -10.0))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160))
+                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 196))
                             .show(ui, |ui| {
                                 ui.horizontal_top(|ui| {
                                     // The content inherits this row's
@@ -2705,29 +2984,6 @@ fn support_combo(ui: &mut egui::Ui, current: &mut config::SupportMode) -> egui::
 
 /// Profile picker: a combo with a stable id (the colored label text changes
 /// with the dirty `*`, so it can't double as the widget id).
-fn combo(
-    ui: &mut egui::Ui,
-    id: &str,
-    label: egui::RichText,
-    current: &mut String,
-    options: &[String],
-    hover: &str,
-) -> bool {
-    let mut changed = false;
-    let r = egui::ComboBox::from_id_salt(id)
-        .selected_text(current.clone())
-        .show_ui(ui, |ui| {
-            for opt in options {
-                if ui.selectable_value(current, opt.clone(), opt).changed() {
-                    changed = true;
-                }
-            }
-        });
-    r.response.on_hover_text(hover);
-    ui.label(label).on_hover_text(hover);
-    changed
-}
-
 /// Flatten sliced layers into line-segment vertices (`[x,y,z,r,g,b]`, consecutive
 /// pairs = segments) plus a cumulative per-layer vertex count for the layer slider.
 // Category ids — must match the bit positions in `App::category_mask`.
@@ -2751,12 +3007,17 @@ fn build_instances(
     layers: &[engine::LayerPlan],
     z_hop_mm: f32,
     path_colors: Option<&[Vec<[f32; 3]>]>,
+    accent: (f32, f32, f32),
 ) -> Instances {
     let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
     let mut joints: Vec<[f32; 10]> = Vec::new();
     let mut joint_ends: Vec<u32> = Vec::with_capacity(layers.len());
-    let travel_color = [0.45, 0.75, 0.85];
+    let (ah, as_, _) = accent;
+    // Travels whisper on the complement (hairline, usually toggled off);
+    // seams scream on it (debug dots must pop against the accent shell).
+    let travel_color = hsl_to_rgb(ah + 180.0, as_ * 0.30, 0.62);
+    let seam_color = hsl_to_rgb(ah + 180.0, (as_ * 0.90).clamp(0.0, 0.9), 0.55);
     let travel_dim = 0.08_f32;
     let mut prev_end: Option<geo2d::Point> = None;
 
@@ -2780,7 +3041,7 @@ fn build_instances(
                 }
             }
             // Heat-map modes override the feature palette per path (per island).
-            let c = path_colors.map_or_else(|| color_for(path.kind), |t| t[li][pi]);
+            let c = path_colors.map_or_else(|| color_for(path.kind, accent), |t| t[li][pi]);
             let cat = category_of(path.kind);
             // Brick-layered perimeters render half a layer up (z_offset) and a touch
             // fatter (flow > 1), so the staggered, over-packed walls are visible.
@@ -2821,7 +3082,8 @@ fn build_instances(
                 ]);
             }
             // Highlight the external-perimeter seam (loop start) with a larger
-            // magenta marker, toggleable via the "seams" category. Only closed
+            // complement-colored marker, toggleable via the "seams" category.
+            // Only closed
             // loops have a seam — the open pieces of an overhang-split wall
             // start mid-loop wherever the split fell, and marking those reads
             // as scatter that no seam strategy could fix.
@@ -2830,7 +3092,7 @@ fn build_instances(
                 joints.push([
                     s.x_mm() as f32, s.y_mm() as f32, zc,
                     w * 2.5, h * 2.5,
-                    1.0, 0.2, 0.85,
+                    seam_color[0], seam_color[1], seam_color[2],
                     layer_id, CAT_SEAM,
                 ]);
             }
@@ -2887,28 +3149,33 @@ fn category_of(kind: engine::PathKind) -> f32 {
     }
 }
 
-fn color_for(kind: engine::PathKind) -> [f32; 3] {
+fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
     use engine::PathKind::*;
+    // The categorical palette, derived from the one accent hue. Structure:
+    // the printed shell reads as paper (near-cream with a whisper of the
+    // accent), solid surfaces are the accent family ordered by lightness
+    // (bright crown → core → dark underside), the analogous neighbors ±40°
+    // carry infill and gap fill, and auxiliary material (support/bridge
+    // family) sits on the complement — unmistakably "other" whatever hue
+    // drives the scheme. Feature view stays flat blocks, so it never
+    // masquerades as a heat map (which is gradients).
+    let (h, s, _) = accent;
+    let col = |dh: f32, sm: f32, l: f32| hsl_to_rgb(h + dh, (s * sm).clamp(0.0, 0.95), l);
     match kind {
-        Skirt => [0.60, 0.60, 0.66],
-        ExternalPerimeter => [0.92, 0.34, 0.22],
-        Perimeter => [0.36, 0.80, 0.45],
-        // Hot amber: slowed wall stretches hanging past the layer below.
-        OverhangWall => [0.98, 0.62, 0.10],
-        Solid => [0.94, 0.80, 0.24],
-        // Raspberry: the visible top skin (outer-wall pace).
-        TopSkin => [0.93, 0.38, 0.55],
-        // Bronze: bed-facing and unsupported undersides (outer-wall pace).
-        BottomSkin => [0.62, 0.45, 0.20],
-        Infill => [0.32, 0.62, 0.95],
-        GapFill => [0.95, 0.45, 0.55],
-        Ironing => [0.85, 0.85, 0.55],
-        Support => [0.55, 0.40, 0.70],
-        Bridge => [0.20, 0.85, 0.85],
-        // Deeper teal: solid-over-sparse spans (anchored every infill cell).
-        InternalBridge => [0.12, 0.55, 0.75],
-        // Sea green: concentric arc fans growing over open air.
-        ArcOverhang => [0.25, 0.78, 0.55],
+        Skirt => col(0.0, 0.08, 0.42),         // near-neutral — peripheral
+        ExternalPerimeter => col(0.0, 0.18, 0.86), // paper shell
+        Perimeter => col(0.0, 0.30, 0.56),     // the wall family's shadow step
+        OverhangWall => col(0.0, 1.0, 0.42),   // deepest + fully saturated: walls over air
+        Solid => col(0.0, 0.80, 0.52),         // the accent's core
+        TopSkin => col(0.0, 0.90, 0.68),       // the crown — the accent at its brightest
+        BottomSkin => col(0.0, 0.70, 0.36),    // dark underside
+        Infill => col(40.0, 0.45, 0.54),       // analogous step one way — recedes
+        GapFill => col(-40.0, 0.55, 0.50),     // analogous step the other way
+        Ironing => col(0.0, 0.30, 0.78),       // pale sheen over the top skin
+        Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
+        Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air
+        InternalBridge => col(180.0, 0.55, 0.40), // complement, deep — spans over infill
+        ArcOverhang => col(150.0, 0.50, 0.55), // just off the complement — arc fans
     }
 }
 

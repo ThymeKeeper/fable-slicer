@@ -26,6 +26,9 @@ struct U {
     light: vec4<f32>,
     // x = current (top visible) layer, y = dim factor, z = category bitmask, w = unused
     ctrl: vec4<f32>,
+    // Accent-derived model tints (rgb; w unused).
+    mesh_unsel: vec4<f32>,
+    mesh_sel: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -41,8 +44,9 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
     let l = normalize(u.light.xyz);
     let d = max(dot(normalize(i.normal), l), 0.0);
-    // unselected = blue, selected = orange
-    let base = mix(vec3<f32>(0.30, 0.55, 0.90), vec3<f32>(0.96, 0.62, 0.18), i.sel);
+    // Accent-derived: unselected = the accent sunk into porcelain,
+    // selected = the accent proper (see main.rs mesh_tints).
+    let base = mix(u.mesh_unsel.rgb, u.mesh_sel.rgb, i.sel);
     return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
 }
 
@@ -151,6 +155,8 @@ struct Uniforms {
     mvp: [[f32; 4]; 4],
     light: [f32; 4],
     ctrl: [f32; 4],
+    mesh_unsel: [f32; 4],
+    mesh_sel: [f32; 4],
 }
 
 /// How to draw the toolpaths this frame.
@@ -401,8 +407,9 @@ impl Scene {
 
     /// Build the bed grid (gray lines on z=0 plus a brighter border).
     pub fn set_bed(&mut self, device: &wgpu::Device, bed_x: f32, bed_y: f32) {
-        let grid = [0.35, 0.35, 0.40];
-        let border = [0.65, 0.65, 0.72];
+        // Warm ink grid with a cream plate border.
+        let grid = [0.28, 0.25, 0.20];
+        let border = [0.64, 0.60, 0.51];
         let step = 20.0_f32;
         let mut v = Vec::new();
         let mut x = 0.0;
@@ -440,7 +447,15 @@ impl Scene {
         self.joint_vbuf = make_vbuf(device, "joint_instances", bytemuck::cast_slice(joints));
     }
 
-    pub fn render(&self, rs: &RenderState, view_proj: glam::Mat4, show_mesh: bool, preview: Option<Preview>) {
+    pub fn render(
+        &self,
+        rs: &RenderState,
+        view_proj: glam::Mat4,
+        show_mesh: bool,
+        preview: Option<Preview>,
+        mesh_unsel: [f32; 3],
+        mesh_sel: [f32; 3],
+    ) {
         let ctrl = match &preview {
             Some(p) => [p.current_layer, p.dim, p.mask as f32, 0.0],
             None => [0.0, 1.0, 0.0, 0.0],
@@ -449,6 +464,8 @@ impl Scene {
             mvp: view_proj.to_cols_array_2d(),
             light: [0.4, 0.5, 0.85, 0.0],
             ctrl,
+            mesh_unsel: [mesh_unsel[0], mesh_unsel[1], mesh_unsel[2], 0.0],
+            mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
         };
         rs.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -463,7 +480,9 @@ impl Scene {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.12, b: 0.14, a: 1.0 }),
+                        // The viewport stage: ink a step deeper than the
+                        // panels, so the chrome floats on it.
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.058, g: 0.048, b: 0.038, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
