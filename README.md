@@ -33,7 +33,7 @@ The result: even heat across layer transitions (the banding killer), and good pr
 
 ## What works today
 
-- Own geometry kernel; arachne-style variable-width walls and a classic mode; exact skeletal trapezoidation; gap fill
+- Own geometry kernel; arachne-style variable-width walls and a classic mode; exact skeletal trapezoidation (ported from CuraEngine — the one ported subsystem, attributed in-file); gap fill
 - Top/bottom skins as first-class features (outer-wall pace, monotonic, proper `;TYPE:` labels), internal solid, five sparse patterns including gyroid
 - Bridges, internal bridges, arc overhangs, grid + arc supports
 - Seam strategies with real corner detection (a filleted corner is still a corner) and vertical seam-column tracking
@@ -60,3 +60,10 @@ Rust stable, Linux-first (X11/Wayland).
 ## License
 
 [AGPL-3.0-or-later](LICENSE)
+
+One subsystem is ported rather than original: the Arachne skeletal
+trapezoidation (`engine/src/skeletal.rs`) derives from
+[CuraEngine](https://github.com/Ultimaker/CuraEngine)'s implementation
+(© UltiMaker, AGPL-3.0-or-higher) and carries that attribution in its file
+header. Everything else in the engine is original work, and all third-party
+crates are permissively licensed.

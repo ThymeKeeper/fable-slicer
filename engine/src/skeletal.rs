@@ -1,3 +1,11 @@
+// Contains code ported from CuraEngine's SkeletalTrapezoidation /
+// SkeletalTrapezoidationGraph (https://github.com/Ultimaker/CuraEngine):
+// the half-edge graph surgery, transitioning, beading propagation /
+// interpolation, parabola discretization, and the quad toolpath walk.
+//
+// Copyright (c) 2023 UltiMaker
+// CuraEngine is released under the terms of the AGPLv3 or higher.
+
 //! Exact skeletal trapezoidation — the Arachne graph walk.
 //!
 //! Replaces the grid extractor's piecewise extraction + reassembly (level sets
@@ -12,11 +20,14 @@
 //!
 //! Reference: Kuipers, Doubrovski, Wu, Wang 2020, *A framework for adaptive
 //! width control of dense contour-parallel toolpaths* (§3 skeletal
-//! trapezoidation, §5 toolpath extraction, §6.2 transitions), as implemented
-//! by CuraEngine's `SkeletalTrapezoidation` (read for algorithms — this is a
-//! clean reimplementation, see PLAN decision log). The beading scheme itself
-//! is `wall.rs`'s `Scheme` verbatim: stretch / absorb / absorb-2 / saturated
-//! with the same thresholds, so the infill gate in `plan.rs` stays in sync.
+//! trapezoidation, §5 toolpath extraction, §6.2 transitions), ported from
+//! CuraEngine's `SkeletalTrapezoidation` — a structural port (same
+//! decomposition, constants, and graph surgery; attribution above), not the
+//! clean-room reimplementation the PLAN originally called for (see the
+//! decision log). The beading scheme itself is *not* Cura's strategy stack:
+//! it is `wall.rs`'s `Scheme` verbatim — stretch / absorb / absorb-2 /
+//! saturated with the same thresholds, so the infill gate in `plan.rs` stays
+//! in sync.
 //!
 //! Internally everything is integer micrometers (boost::polygon::voronoi wants
 //! integer input; µm keeps predicate intermediates small). geo2d nanometers
@@ -2670,7 +2681,9 @@ fn interpolate_switching(left: &Beading, ratio_left: f64, right: &Beading, switc
 }
 
 // ===========================================================================
-// Parabola discretization (boost voronoi_visual_utils / Cura discretizeParabola)
+// Parabola discretization (ported from Cura's VoronoiUtils::discretizeParabola
+// — boost's voronoi_visual_utils is the conceptual ancestor, but the fixed-step
+// + marking/apex machinery here is Cura's expression, AGPL per the file header)
 // ===========================================================================
 
 /// Sample the parabola with focus `p` and directrix through segment `seg`

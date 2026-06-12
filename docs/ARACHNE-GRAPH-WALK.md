@@ -34,7 +34,10 @@ width control of dense contour-parallel toolpaths* (§3 skeletal
 trapezoidation, §5 toolpath extraction, §6.2 transitions). Reference code:
 CuraEngine `src/SkeletalTrapezoidation.cpp`, `SkeletalTrapezoidationGraph`,
 `BeadingStrategy/`, `WallToolPaths` (read for algorithms, port no code — AGPL
-is fine here anyway, see PLAN decision log).
+is fine here anyway, see PLAN decision log). *[2026-06-12 audit note: the
+implementation ended up a structural port of the Cura code, not a clean
+reimplementation — now attributed to UltiMaker in `skeletal.rs`'s file
+header; see the completion report below and the PLAN decision log.]*
 
 1. **Segment Voronoi diagram** of the layer polygon (sites = boundary segments
    + vertices, diagram restricted to the interior = medial axis).
@@ -114,9 +117,11 @@ Everything downstream is already done and tested:
 
 ## Completion report (2026-06-10)
 
-Implemented as planned in `engine/src/skeletal.rs` (~1700 lines), a clean
-reimplementation of CuraEngine's `SkeletalTrapezoidation` adapted to the
-wall.rs scheme. Step-by-step outcome against the plan above:
+Implemented in `engine/src/skeletal.rs` (~1700 lines), a structural port of
+CuraEngine's `SkeletalTrapezoidation` adapted to the wall.rs scheme (the
+2026-06-12 provenance audit found it closer to a port than the "port no code"
+plan above — UltiMaker attribution added to the file header). Step-by-step
+outcome against the plan above:
 
 1. **Voronoi**: `boostvoronoi 0.12` worked as hoped — integer µm input
    (nm/1000), `Builder::<i64>::with_segments`. Two input-hygiene passes were
