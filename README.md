@@ -46,7 +46,7 @@ Daily-driven on a Sovol Zero (profiles included for Sovol Zero, Voron 2.4, and a
 
 ## What doesn't exist yet
 
-Multi-material, tree supports, multi-plate, paint-on anything, an installer, a settings search, most QoL you're used to. Expect rough edges and breaking profile changes. Issues are welcome — just know the maintainer will probably hand your bug report to the machine that wrote the bug.
+Multi-material, tree supports, multi-plate, paint-on anything, an installer, a settings search, most QoL you're used to. Expect rough edges and breaking profile changes. Issues and PR's are welcome.
 
 ## Building
 
