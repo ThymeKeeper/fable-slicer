@@ -1,3 +1,5 @@
+<img width="2812" height="1655" alt="screenshot" src="https://github.com/user-attachments/assets/9009384e-69a0-43cd-9d27-a62bbffc2640" />
+
 Fable Slicer
 
 A from-scratch FDM slicer in Rust. GUI-first (egui + wgpu), Klipper-flavored g-code out, and a deliberately small settings surface.
