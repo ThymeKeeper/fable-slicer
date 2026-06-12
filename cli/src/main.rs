@@ -13,7 +13,7 @@ use engine::{generate, to_gcode, LayerPlan, PathKind};
 use geo2d::{Aabb, Point, UNITS_PER_MM};
 
 #[derive(Parser)]
-#[command(name = "slicer", version, about = "From-scratch FDM slicer")]
+#[command(name = "fable-slicer", version, about = "Fable Slicer — from-scratch FDM slicer")]
 struct Args {
     /// Input mesh (STL, binary or ASCII). Optional with --list-profiles.
     input: Option<PathBuf>,

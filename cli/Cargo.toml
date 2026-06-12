@@ -1,12 +1,12 @@
 [package]
 name = "cli"
-description = "Command-line front-end for the slicer."
+description = "Fable Slicer command-line front-end."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "slicer-cli"
+name = "fable-slicer-cli"
 path = "src/main.rs"
 
 [dependencies]

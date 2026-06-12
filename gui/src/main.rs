@@ -281,7 +281,7 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    eframe::run_native("slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("Fable Slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
 /// What the last slice produced — rendered, together with the one-line
@@ -302,6 +302,13 @@ struct App {
     printer: String,
     filament: String,
     process: String,
+    /// Program state as last written to the dotfile folder — compared each
+    /// frame, so every path that changes a selection persists it.
+    saved_state: config::AppState,
+    /// Where the STL import dialog last picked a file.
+    last_model_dir: Option<std::path::PathBuf>,
+    /// Where the g-code export dialog last saved.
+    last_export_dir: Option<std::path::PathBuf>,
     settings: Settings,
     /// Settings as resolved from the selected profiles — panel edits are
     /// compared against this for the per-tier "modified" indicators.
@@ -407,9 +414,30 @@ impl App {
             Err(e) => status = format!("User profiles: {e}"),
             _ => {}
         }
-        let (printer, filament, process) =
-            ("voron24".to_string(), "pla".to_string(), "standard".to_string());
-        let mut settings = profiles.resolve(&printer, &filament, &process).unwrap_or_default();
+        // Restore the last session's selections from the dotfile state where
+        // they still exist — a deleted profile falls back tier by tier, and a
+        // restored triple that no longer resolves falls back entirely.
+        let state = config::AppState::load();
+        let pick = |saved: &str, names: Vec<&str>, default: &str| {
+            if !saved.is_empty() && names.contains(&saved) {
+                saved.to_string()
+            } else {
+                default.to_string()
+            }
+        };
+        let (mut printer, mut filament, mut process) = (
+            pick(&state.printer, profiles.printer_names(), "voron24"),
+            pick(&state.filament, profiles.filament_names(), "pla"),
+            pick(&state.process, profiles.process_names(), "standard"),
+        );
+        let mut settings = match profiles.resolve(&printer, &filament, &process) {
+            Ok(s) => s,
+            Err(_) => {
+                (printer, filament, process) =
+                    ("voron24".to_string(), "pla".to_string(), "standard".to_string());
+                profiles.resolve(&printer, &filament, &process).unwrap_or_default()
+            }
+        };
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         let baseline = settings.clone();
         let pins = match (
@@ -430,6 +458,11 @@ impl App {
             printer,
             filament,
             process,
+            // Seed with the file's content as-loaded: if the fallbacks above
+            // corrected anything, the first persist pass rewrites the file.
+            last_model_dir: state.last_model_dir.clone(),
+            last_export_dir: state.last_export_dir.clone(),
+            saved_state: state,
             settings,
             baseline,
             profile_dialog: None,
@@ -1033,18 +1066,39 @@ impl App {
 
     fn export(&mut self) {
         let Some(layers) = self.sliced.as_ref() else { return };
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("g-code", &["gcode"])
-            .set_file_name("out.gcode")
-            .save_file()
-        else {
+            .set_file_name("out.gcode");
+        if let Some(dir) = &self.last_export_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
+        self.last_export_dir = path.parent().map(|d| d.to_path_buf());
         let gcode = engine::to_gcode(layers, &self.settings);
         self.status = match std::fs::write(&path, gcode) {
             Ok(()) => format!("Wrote {}", path.display()),
             Err(e) => format!("Write failed: {e}"),
         };
+    }
+
+    /// Write the program state to the dotfile folder when it changed —
+    /// convenience memory only, so a failed save never blocks anything.
+    fn persist_state(&mut self) {
+        let cur = config::AppState {
+            printer: self.printer.clone(),
+            filament: self.filament.clone(),
+            process: self.process.clone(),
+            last_model_dir: self.last_model_dir.clone(),
+            last_export_dir: self.last_export_dir.clone(),
+        };
+        if cur != self.saved_state {
+            if let Err(e) = cur.save() {
+                eprintln!("warning: program state not saved: {e}");
+            }
+            self.saved_state = cur;
+        }
     }
 
     /// Upload filename: the first object's name with a .gcode extension.
@@ -1231,7 +1285,7 @@ impl eframe::App for App {
         // if a future row overflows, that band is the symptom to look for.
         egui::Panel::left("controls").resizable(false).exact_size(320.0).show_inside(ui, |ui| {
             ui.spacing_mut().slider_width = 90.0;
-            ui.heading("slicer");
+            ui.heading("Fable Slicer");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
@@ -1239,7 +1293,12 @@ impl eframe::App for App {
                     .on_hover_text("Load an STL file and add it to the bed as a new object.")
                     .clicked()
                 {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("STL", &["stl"]).pick_file() {
+                    let mut dialog = rfd::FileDialog::new().add_filter("STL", &["stl"]);
+                    if let Some(dir) = &self.last_model_dir {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        self.last_model_dir = path.parent().map(|d| d.to_path_buf());
                         self.import_stl(path);
                     }
                 }
@@ -1623,8 +1682,6 @@ impl eframe::App for App {
                         lh_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4), "first layer mm",
                         "Thickness of the first layer — often thicker for bed adhesion.");
-                    hslider(ui, true, egui::Slider::new(&mut s.speed_quality, -1.0..=1.0), "finish ↔ speed",
-                        "The one speed preference. Every print speed derives from the machine's rated motion (Machine & motion), the filament's melt ceiling, and heat control — this dial biases the result between surface finish (−1, 60% of rated) and speed (+1, the full rating).");
                     hslider(ui, true, egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5), "resolution mm",
                         "Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
@@ -1719,9 +1776,9 @@ impl eframe::App for App {
                         );
                     hslider(ui, s.heat_control, egui::Slider::new(&mut s.smooth_extra_time_pct, 0.0..=50.0), "extra time %",
                         "Heat control's budget: the most extra print time smoothing may spend, as a % of the un-smoothed estimate. The transition gradient is bisected to the gentlest that fits and reported after slicing; 0 still does everything free (warming cold dips, capping at the filament's ceiling).");
-                    ui.weak("speeds and temperatures are chosen by the system: machine rating × \
-                             finish↔speed (Quality) under the filament's melt ceiling, then heat \
-                             control governs the result");
+                    ui.weak("speeds and temperatures are chosen by the system: the machine \
+                             rating under the filament's melt ceiling, then heat control \
+                             governs the result");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
                     let vase = s.spiral_vase;
@@ -1758,60 +1815,18 @@ impl eframe::App for App {
                         "Loops attached around the first layer for adhesion. 0 = off.");
                 });
                 tier_section(ui, "Filament", TierKind::Filament, false, |ui| {
-                    // The packaging card: type in what the box says; the
-                    // material class supplies everything else until a
-                    // calibration value pins it.
-                    let before_mat = s.material;
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("material_class")
-                            .selected_text(s.material.label())
-                            .show_ui(ui, |ui| {
-                                for m in [
-                                    config::Material::Pla,
-                                    config::Material::Petg,
-                                    config::Material::Abs,
-                                    config::Material::Tpu,
-                                    config::Material::Other,
-                                ] {
-                                    ui.selectable_value(&mut s.material, m, m.label());
-                                }
-                            });
-                        ui.label("material").on_hover_text(
-                            "The material class off the box. Drives density, cooling, melt \
-                             ceiling, heat ceiling, and bed default — all visible under \
-                             calibration, all overridable there.",
-                        );
-                    });
-                    if s.material != before_mat {
-                        // A new class repopulates its data-driven fields once;
-                        // calibration edits after this stick.
-                        let m = s.material;
-                        let (tmin, tmax) = m.packaging_temp_c();
-                        s.nozzle_temp_min_c = tmin;
-                        s.nozzle_temp_max_c = tmax;
-                        s.bed_temp_c = m.bed_temp_c();
-                        s.filament_density_g_cm3 = m.density_g_cm3();
-                        s.max_volumetric_speed_mm3_s = m.max_flow_mm3_s();
-                        s.max_flow_derate_per_c = m.max_flow_derate_per_c();
-                        let (fan, bridge_fan, off) = m.fan();
-                        s.fan_speed = fan;
-                        s.bridge_fan_speed = bridge_fan;
-                        s.fan_off_layers = off;
-                        let (aux, exhaust) = m.aux_exhaust();
-                        s.aux_fan_speed = aux;
-                        s.exhaust_fan_speed = exhaust;
-                        pins.max_heat = false;
-                    }
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "packaging min °C",
+                    // The packaging card: what the box says. The material
+                    // class itself is profile data — switching filament
+                    // profiles changes it — and supplies every derived value
+                    // here until a calibration entry pins it.
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "nozzle min °C",
                         "The low end of the temperature range printed on the spool. Heat control's schedules never go below it.");
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "packaging max °C",
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "nozzle max °C",
                         "The high end of the range on the spool. Heat control's schedules never go above it.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
                         "Bed temperature from the packaging.");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
                         "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
-                    hslider(ui, true, egui::Slider::new(&mut s.temp_bias, -1.0..=1.0), "cold ↔ hot bias",
-                        "Where in the packaging range the system centers its operating temperature (shown below). Cold = matte, dimensional, less stringing; hot = glossy, stronger bonding, more flow headroom. Heat control still uses the whole range around it.");
                     ui.weak(format!(
                         "operating point: {} °C (first layer {} °C) — chosen by the system",
                         s.nozzle_temp_c, s.first_layer_nozzle_temp_c
@@ -1869,7 +1884,7 @@ impl eframe::App for App {
                     hslider(ui, true, egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2), "nozzle mm",
                         "Nozzle diameter.");
                     hslider(ui, true, egui::Slider::new(&mut s.machine_speed_mm_s, 10.0..=700.0), "rated mm/s",
-                        "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine; the finish↔speed dial (Quality) chooses where below it to run.");
+                        "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine.");
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0), "1st layer mm/s",
                         "Speed for the first layer — slower improves bed adhesion.");
                     hslider(ui, true, egui::Slider::new(&mut s.travel_speed_mm_s, 20.0..=600.0), "travel mm/s",
@@ -2480,6 +2495,11 @@ impl eframe::App for App {
                 self.profile_dialog = Some(dlg);
             }
         }
+
+        // Whatever changed the selections this frame — combo switch, save
+        // dialog, calibration move, delete fallback — lands in the dotfile
+        // state, so the next launch starts where this one left off.
+        self.persist_state();
     }
 }
 

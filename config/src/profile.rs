@@ -496,19 +496,10 @@ impl Profiles {
         Ok(())
     }
 
-    /// The platform's per-user profile directory (`<config>/slicer/profiles`).
+    /// The per-user profile directory: `profiles/` inside the app's dotfile
+    /// folder (see [`crate::config_dir`]), which also carries `state.toml`.
     pub fn default_user_dir() -> Option<std::path::PathBuf> {
-        let base = if cfg!(target_os = "windows") {
-            std::env::var_os("APPDATA").map(std::path::PathBuf::from)
-        } else if cfg!(target_os = "macos") {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join("Library/Application Support"))
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        };
-        base.map(|b| b.join("slicer").join("profiles"))
+        crate::config_dir().map(|d| d.join("profiles"))
     }
 
     /// Load user profiles from `dir` (or the platform default) and remember it

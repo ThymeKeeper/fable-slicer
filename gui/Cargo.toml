@@ -1,12 +1,12 @@
 [package]
 name = "gui"
-description = "Desktop GUI for the slicer (egui + wgpu 3D viewport)."
+description = "Fable Slicer desktop GUI (egui + wgpu 3D viewport)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "slicer"
+name = "fable-slicer"
 path = "src/main.rs"
 
 [dependencies]
