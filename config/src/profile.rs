@@ -69,6 +69,10 @@ pub struct PrinterProfile {
     pub aux_fan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaust_fan: Option<bool>,
+    /// Klipper `temperature_sensor` name of the chamber thermistor
+    /// ("" / unset = the machine has none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chamber_sensor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_gcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +125,10 @@ pub struct FilamentProfile {
     pub aux_fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaust_fan_speed: Option<f64>,
+    /// Chamber pre-soak target (°C, 0 = off) on machines with a chamber
+    /// sensor. Auto: the material class's value (ABS/ASA 50, others 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chamber_temp_c: Option<u32>,
 }
 
 /// Process (print) tier: quality/geometry knobs.
@@ -239,7 +247,7 @@ impl Tier for PrinterProfile {
             outer_wall_accel, first_layer_accel, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             heat_rate_c_s, cool_rate_c_s, heat_rate_fan_c_s, cool_rate_fan_c_s,
-            aux_fan, exhaust_fan, start_gcode, end_gcode)
+            aux_fan, exhaust_fan, chamber_sensor, start_gcode, end_gcode)
     }
 }
 
@@ -252,7 +260,8 @@ impl Tier for FilamentProfile {
             nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             max_heat_mw_mm2, pressure_advance,
-            fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed)
+            fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed,
+            chamber_temp_c)
     }
 }
 
@@ -317,6 +326,7 @@ impl PrinterProfile {
             cool_rate_fan_c_s: diff_field!(cur.cool_rate_fan_c_s, base.cool_rate_fan_c_s),
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
+            chamber_sensor: diff_field!(cur.chamber_sensor.clone(), base.chamber_sensor),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
             end_gcode: diff_field!(cur.end_gcode.clone(), base.end_gcode),
         }
@@ -350,6 +360,7 @@ impl FilamentProfile {
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
             aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
             exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
+            chamber_temp_c: diff_field!(cur.chamber_temp_c, base.chamber_temp_c),
         }
     }
 
@@ -468,6 +479,7 @@ impl Profiles {
         p.filaments.insert("pla".into(), parse("filament/pla", include_str!("../profiles/filament/pla.toml")));
         p.filaments.insert("petg".into(), parse("filament/petg", include_str!("../profiles/filament/petg.toml")));
         p.filaments.insert("pla-hf".into(), parse("filament/pla_hf", include_str!("../profiles/filament/pla_hf.toml")));
+        p.filaments.insert("asa".into(), parse("filament/asa", include_str!("../profiles/filament/asa.toml")));
         p.processes.insert("standard".into(), parse("process/standard", include_str!("../profiles/process/standard.toml")));
         p.processes.insert("fine".into(), parse("process/fine", include_str!("../profiles/process/fine.toml")));
         p.processes.insert("draft".into(), parse("process/draft", include_str!("../profiles/process/draft.toml")));
@@ -780,6 +792,8 @@ impl Profiles {
             has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
             aux_fan_speed: fl.aux_fan_speed.unwrap_or_else(|| material.aux_exhaust().0),
             exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or_else(|| material.aux_exhaust().1),
+            chamber_sensor: pr.chamber_sensor.unwrap_or_else(|| d.chamber_sensor.clone()),
+            chamber_temp_c: fl.chamber_temp_c.unwrap_or_else(|| material.chamber_temp_c()),
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })
@@ -938,6 +952,37 @@ mod tests {
         // The stock hotend is high-flow: pla-hf raises only the ceiling.
         let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
         assert_eq!(hf.max_volumetric_speed_mm3_s, 30.0);
+    }
+
+    #[test]
+    fn asa_rides_the_abs_class_with_chamber_presoak() {
+        let p = Profiles::builtin();
+        let s = p.resolve("sovol-zero", "asa", "standard").unwrap();
+        // The card's box values; density is ASA's own (the class default
+        // would be ABS's 1.04).
+        assert_eq!((s.nozzle_temp_min_c, s.nozzle_temp_max_c), (240, 270));
+        assert_eq!(s.bed_temp_c, 100);
+        assert_eq!(s.filament_density_g_cm3, 1.07);
+        // Class-derived cooling: near-off — moving air cracks ABS/ASA.
+        assert_eq!(s.fan_speed, 0.15);
+        assert_eq!(s.aux_fan_speed, 0.1);
+        // The chamber pre-soak pairing: the printer declares the sensor (its
+        // Klipper name, verified live on the machine), the class supplies
+        // the 50 °C soak.
+        assert_eq!(s.chamber_sensor, "chamber_temp");
+        assert_eq!(s.chamber_temp_c, 50);
+        // PLA on the same machine must never soak — a warm chamber means
+        // heat creep and sag.
+        let pla = p.resolve("sovol-zero", "pla", "standard").unwrap();
+        assert_eq!(pla.chamber_temp_c, 0);
+        // And the generic printer declares no sensor: soak stays locked out
+        // even for ASA.
+        let generic = p.resolve("generic", "asa", "standard").unwrap();
+        assert!(generic.chamber_sensor.is_empty());
+        assert_eq!(generic.chamber_temp_c, 50); // the wish survives; emission gates on the sensor
+        // The Voron spec wires [temperature_sensor chamber].
+        let voron = p.resolve("voron24", "asa", "standard").unwrap();
+        assert_eq!(voron.chamber_sensor, "chamber");
     }
 
     #[test]

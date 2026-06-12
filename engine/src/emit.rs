@@ -108,6 +108,24 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     g.raw("G90"); // absolute XYZ
     g.raw("M83"); // relative extrusion (Klipper-recommended)
     emit_template(&mut g, &s.start_gcode, s);
+    // Chamber pre-soak: the printer declared a chamber thermistor and the
+    // filament wants a warm chamber. The start sequence just brought the bed
+    // to temperature — the bed does the soaking; this only gates on the
+    // result before any plastic goes down. Start templates that handle the
+    // soak themselves (via the {chamber_temp} placeholder) coexist fine:
+    // an already-soaked chamber makes this wait pass instantly.
+    if !s.chamber_sensor.trim().is_empty() && s.chamber_temp_c > 0 {
+        g.raw(&format!(
+            "; chamber pre-soak: hold for {} >= {} C (the heated bed soaks the chamber)",
+            s.chamber_sensor.trim(),
+            s.chamber_temp_c
+        ));
+        g.raw(&format!(
+            "TEMPERATURE_WAIT SENSOR=\"temperature_sensor {}\" MINIMUM={}",
+            s.chamber_sensor.trim(),
+            s.chamber_temp_c
+        ));
+    }
     // Motion limits, set after PRINT_START so our values win. M204 S is understood
     // by Klipper and Marlin; SQUARE_CORNER_VELOCITY is Klipper's "jerk" equivalent.
     // Acceleration then follows the feature being printed (M204 per change).
@@ -429,6 +447,7 @@ fn substitute(template: &str, s: &Settings) -> String {
         .replace("{nozzle_temp}", &s.nozzle_temp_c.to_string())
         .replace("{first_layer_nozzle_temp}", &s.first_layer_nozzle_temp_c.to_string())
         .replace("{bed_temp}", &s.bed_temp_c.to_string())
+        .replace("{chamber_temp}", &s.chamber_temp_c.to_string())
         .replace("{bed_x}", &format!("{:.3}", s.bed_size_x_mm))
         .replace("{bed_y}", &format!("{:.3}", s.bed_size_y_mm))
         .replace("{bed_z}", &format!("{:.3}", s.bed_size_z_mm))
@@ -2277,6 +2296,27 @@ mod tests {
         let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
         assert!(g.contains("PRINT_START EXTRUDER=215 BED=65"), "macro substituted");
         assert!(!g.contains("{nozzle_temp}"), "no leftover placeholders");
+    }
+
+    #[test]
+    fn chamber_presoak_gates_on_sensor_and_target() {
+        let m = mesh::Mesh::cube(10.0);
+        // Sensor declared + filament wants a soak: the wait lands after the
+        // start sequence (bed already hot), before any layer.
+        let mut s = Settings::default();
+        s.chamber_sensor = "chamber_temp".into();
+        s.chamber_temp_c = 50;
+        let g = to_gcode(&generate(&m, &s), &s);
+        let wait = "TEMPERATURE_WAIT SENSOR=\"temperature_sensor chamber_temp\" MINIMUM=50";
+        let at = g.find(wait).expect("pre-soak emitted");
+        assert!(at < g.find("; LAYER 0 ").unwrap(), "soak precedes the first layer");
+        // No soak wanted (the PLA-class 0): nothing emitted.
+        s.chamber_temp_c = 0;
+        assert!(!to_gcode(&generate(&m, &s), &s).contains("TEMPERATURE_WAIT"));
+        // No sensor on the machine: locked out even when the filament asks.
+        s.chamber_temp_c = 50;
+        s.chamber_sensor = String::new();
+        assert!(!to_gcode(&generate(&m, &s), &s).contains("TEMPERATURE_WAIT"));
     }
 
     #[test]

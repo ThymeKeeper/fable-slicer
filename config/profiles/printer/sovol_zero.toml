@@ -36,6 +36,11 @@ retract_speed_mm_s = 40.0
 aux_fan = true
 exhaust_fan = true
 
+# Chamber thermistor, by its Klipper temperature_sensor name (verified live
+# against the machine's Moonraker object list). Filaments that want a warm
+# chamber (ABS/ASA) gate the print on a pre-soak after the start g-code.
+chamber_sensor = "chamber_temp"
+
 # Printer connection (Moonraker): uncomment to enable Send / Send & print.
 # host_url = "sovol-zero.local"
 # api_key = ""

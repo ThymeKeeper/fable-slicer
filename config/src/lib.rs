@@ -156,6 +156,15 @@ impl Material {
             Self::Other => (0.5, 0.5),
         }
     }
+    /// Chamber pre-soak target (°C; 0 = none) for machines that declare a
+    /// chamber thermistor. ABS/ASA wants a warm chamber before the first
+    /// layer (warping/splitting); PLA must NOT soak (heat creep, sag).
+    pub fn chamber_temp_c(self) -> u32 {
+        match self {
+            Self::Abs => 50,
+            _ => 0,
+        }
+    }
 }
 
 /// Where the start/end seam of each closed wall loop is placed.
@@ -548,6 +557,15 @@ pub struct Settings {
     /// Exhaust duty 0.0..=1.0 for the whole print — vents chamber heat
     /// (PLA wants it high, ABS low or zero). 0 = off.
     pub exhaust_fan_speed: f64,
+    /// The machine's chamber thermistor, by its Klipper `temperature_sensor`
+    /// name (e.g. "chamber_temp" on the Sovol Zero, "chamber" on a Voron).
+    /// Empty = no sensor; gates all chamber pre-soak emission.
+    pub chamber_sensor: String,
+    /// Chamber pre-soak (°C, 0 = off): after the start g-code — bed already
+    /// hot, radiating into the chamber — emit a `TEMPERATURE_WAIT` on the
+    /// chamber sensor before printing. Auto: the material class's value
+    /// (ABS/ASA soak at 50, everything else 0).
+    pub chamber_temp_c: u32,
     /// Heat control, the automatic: keep every island's heat load inside the
     /// filament's allowable ranges and smooth layer-to-layer transitions —
     /// the banding/shrinkage killer — spending at most
@@ -677,6 +695,8 @@ impl Default for Settings {
             aux_fan_speed: 0.0,
             has_exhaust_fan: false,
             exhaust_fan_speed: 0.0,
+            chamber_sensor: String::new(),
+            chamber_temp_c: Material::Pla.chamber_temp_c(),
             heat_control: true,
             // Calibrated on the Benchy: lone towers / chimneys / arch pillars
             // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.

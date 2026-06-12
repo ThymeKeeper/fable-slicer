@@ -1,0 +1,12 @@
+# Generic ASA packaging card. ASA rides the ABS/ASA material class, which
+# supplies cooling (part fan low, aux/exhaust near-off — drafts crack it),
+# the heat ceiling, and a 50 °C chamber pre-soak on machines that declare a
+# chamber sensor. The density below is ASA's (the class default is ABS's).
+material = "asa"
+filament_diameter_mm = 1.75
+nozzle_temp_min_c = 240
+nozzle_temp_max_c = 270
+bed_temp_c = 100
+
+# --- calibration ---
+density_g_cm3 = 1.07

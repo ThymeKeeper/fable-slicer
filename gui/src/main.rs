@@ -2222,6 +2222,13 @@ impl eframe::App for App {
                         "The high end of the range on the spool. Heat control's schedules never go above it.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
                         "Bed temperature from the packaging.");
+                    hslider_lockout(ui, !s.chamber_sensor.trim().is_empty(), egui::Slider::new(&mut s.chamber_temp_c, 0..=70), "chamber soak °C",
+                        "Hold after the start g-code until the chamber reaches this (the heated \
+                         bed does the soaking — TEMPERATURE_WAIT on the printer's chamber sensor). \
+                         0 = off. Auto: the material class's value — ABS/ASA soak at 50 against \
+                         warping and layer splits; PLA must stay 0 (a hot chamber means heat \
+                         creep and sag).",
+                        "Needs a chamber sensor declared under Machine & motion.");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
                         "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
                     ui.weak(format!(
@@ -2326,6 +2333,15 @@ impl eframe::App for App {
                         .on_hover_text("The machine has an auxiliary side part-cooling fan (Sovol Zero, Bambu-style). Unlocks the filament's aux-fan duty; off = M106 P2 is never emitted (vanilla firmware reads it as the primary fan).");
                     ui.checkbox(&mut s.has_exhaust_fan, "exhaust fan (M106 P3)")
                         .on_hover_text("The machine has a chamber-exhaust fan. Unlocks the filament's exhaust duty; off = M106 P3 is never emitted.");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut s.chamber_sensor).desired_width(120.0).hint_text("none"));
+                        ui.label("chamber sensor").on_hover_text(
+                            "The chamber thermistor's Klipper temperature_sensor name — \
+                             \"chamber_temp\" on the Sovol Zero, \"chamber\" on a spec Voron \
+                             (check Fluidd/Mainsail or `SENSORS` in the console). Empty = the \
+                             machine has none; the filament's chamber soak stays locked out.",
+                        );
+                    });
                 });
                 tier_section(ui, "Connection", TierKind::Printer, false, |ui| {
                     ui.label("printer host").on_hover_text(
