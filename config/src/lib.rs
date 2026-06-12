@@ -336,9 +336,6 @@ pub struct Settings {
     /// Thickness of the first layer (often thicker for bed adhesion).
     pub first_layer_height_mm: f64,
     pub line_width_mm: f64,
-    /// Merge contour points whose deviation is below this (mm) before planning —
-    /// removes sub-resolution mesh-facet noise. 0 disables.
-    pub max_resolution_mm: f64,
     /// Fit circular arcs to curved toolpath runs and emit G2/G3 (smaller g-code,
     /// smoother motion). Needs firmware arc support (Klipper `[gcode_arcs]`).
     pub arc_fitting: bool,
@@ -614,7 +611,6 @@ impl Default for Settings {
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             line_width_mm: 0.45,
-            max_resolution_mm: 0.05,
             arc_fitting: false,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
@@ -818,6 +814,17 @@ pub fn bead_spacing_mm(width_mm: f64, height_mm: f64) -> f64 {
     bead_area_mm2(width_mm, height_mm) / height_mm.max(1.0e-9)
 }
 
+/// Contour-cleanup threshold (mm) — derived from the bead, no knob. Points
+/// whose deviation falls under ~1/9 of the line width are below what the
+/// bead can physically render (nozzle pressure smooths them) and only carry
+/// mesh-facet noise into planning: over-dense walls, slow passes, bloated
+/// g-code. At the stock 0.45 bead this derives the proven 0.05 mm floor
+/// (measured on the Benchy, commit abb2511); finer nozzles tighten it,
+/// fatter nozzles relax it.
+pub fn contour_resolution_mm(line_width_mm: f64) -> f64 {
+    line_width_mm / 9.0
+}
+
 /// Flow multiplier for a brick-lifted bead — derived from the stadium model,
 /// no knob. Aligned columns are spaced ([`bead_spacing_mm`]) so the lens
 /// overlap of facing cap circles exactly feeds the cusps and the wall tiles
@@ -851,6 +858,15 @@ pub fn brick_flow_factor(line_width_mm: f64, layer_height_mm: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contour_resolution_derives_from_the_bead() {
+        // The stock 0.45 bead reproduces the proven 0.05 mm noise floor
+        // exactly; finer beads tighten, fatter beads relax.
+        assert!((contour_resolution_mm(0.45) - 0.05).abs() < 1e-12);
+        assert!(contour_resolution_mm(0.25) < 0.05);
+        assert!(contour_resolution_mm(0.9) > 0.05);
+    }
 
     #[test]
     fn brick_flow_derives_from_the_bead_geometry() {

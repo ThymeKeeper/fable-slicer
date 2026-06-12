@@ -2081,8 +2081,6 @@ impl eframe::App for App {
                         lh_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4), "first layer mm",
                         "Thickness of the first layer — often thicker for bed adhesion.");
-                    hslider(ui, true, egui::Slider::new(&mut s.max_resolution_mm, 0.0..=0.5), "resolution mm",
-                        "Merge contour points closer than this to drop mesh noise. 0 = off.");
                     seam_combo(ui, &mut s.seam_mode)
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
                     ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")

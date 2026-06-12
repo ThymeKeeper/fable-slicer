@@ -186,13 +186,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         },
     );
     // Contour-resolution cleanup: drop sub-resolution mesh-facet noise so walls
-    // aren't over-dense (cleaner preview, faster planning, smaller g-code). Then
-    // dimensional compensation: XY grow/shrink on every layer, and the first
-    // layer pulled in to counter squish (elephant foot).
+    // aren't over-dense (cleaner preview, faster planning, smaller g-code). The
+    // threshold is derived from the bead — see config::contour_resolution_mm.
+    // Then dimensional compensation: XY grow/shrink on every layer, and the
+    // first layer pulled in to counter squish (elephant foot).
+    let res = config::contour_resolution_mm(settings.line_width_mm);
     layers.par_iter_mut().for_each(|layer| {
-        if settings.max_resolution_mm > 0.0 {
-            layer.polygons = simplify(&layer.polygons, settings.max_resolution_mm);
-        }
+        layer.polygons = simplify(&layer.polygons, res);
         if settings.xy_compensation_mm != 0.0 {
             layer.polygons = offset(&layer.polygons, settings.xy_compensation_mm);
         }
@@ -218,9 +218,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let processed: Vec<Polygons> = sliced
                 .into_par_iter()
                 .map(|(_, mut p)| {
-                    if settings.max_resolution_mm > 0.0 {
-                        p = simplify(&p, settings.max_resolution_mm);
-                    }
+                    p = simplify(&p, res);
                     if settings.xy_compensation_mm != 0.0 {
                         p = offset(&p, settings.xy_compensation_mm);
                     }

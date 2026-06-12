@@ -3,7 +3,6 @@
 # heat control.
 layer_height_mm = 0.2
 first_layer_height_mm = 0.2
-max_resolution_mm = 0.05
 wall_count = 2
 top_layers = 4
 bottom_layers = 4

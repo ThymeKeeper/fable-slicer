@@ -142,8 +142,6 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_layer_height_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_resolution_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_fitting: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_tolerance_mm: Option<f64>,
@@ -271,7 +269,7 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm,
-            max_resolution_mm, arc_fitting, arc_tolerance_mm, wall_count, wall_mode, top_layers, bottom_layers,
+            arc_fitting, arc_tolerance_mm, wall_count, wall_mode, top_layers, bottom_layers,
             half_height_outer_walls, brick_layers,
             infill_density, sparse_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
@@ -377,7 +375,6 @@ impl ProcessProfile {
             inherits: None,
             layer_height_mm: diff_field!(cur.layer_height_mm, base.layer_height_mm),
             first_layer_height_mm: diff_field!(cur.first_layer_height_mm, base.first_layer_height_mm),
-            max_resolution_mm: diff_field!(cur.max_resolution_mm, base.max_resolution_mm),
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
             arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
             wall_count: diff_field!(cur.wall_count, base.wall_count),
@@ -695,7 +692,6 @@ impl Profiles {
             layer_height_mm: layer_h,
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
             line_width_mm: line_w,
-            max_resolution_mm: pc.max_resolution_mm.unwrap_or(d.max_resolution_mm),
             arc_fitting: pc.arc_fitting.unwrap_or(d.arc_fitting),
             arc_tolerance_mm: pc.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
