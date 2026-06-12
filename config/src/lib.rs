@@ -562,8 +562,9 @@ pub struct Settings {
     /// live feedback; cooled layers derate the flow ceiling via
     /// `max_flow_derate_per_c`), and per-island slowing plus park-and-wait
     /// dwells supply what temperature can't reach — never below
-    /// `min_print_speed_mm_s` without saying so. Off restores the user's
-    /// speeds and temperatures exactly.
+    /// `min_print_speed_mm_s` without saying so. ON BY DEFAULT — it is part
+    /// of the derived surface, not an opt-in extra; a profile may still set
+    /// `heat_control = false` to print raw derived speeds and temperatures.
     pub heat_control: bool,
     /// The filament's allowable heat-load ceiling (mW/mm², per island) — a
     /// material range bound, not a tuning target. Auto: the material class's
@@ -679,7 +680,7 @@ impl Default for Settings {
             aux_fan_speed: 0.0,
             has_exhaust_fan: false,
             exhaust_fan_speed: 0.0,
-            heat_control: false,
+            heat_control: true,
             // Calibrated on the Benchy: lone towers / chimneys / arch pillars
             // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
             max_heat_mw_mm2: Material::Pla.max_heat_mw_mm2(),

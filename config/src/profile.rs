@@ -901,7 +901,7 @@ mod tests {
         let p = Profiles::builtin();
         let s = p.resolve("voron24", "pla", "standard").unwrap();
         assert_eq!(s.max_heat_mw_mm2, crate::Material::Pla.max_heat_mw_mm2());
-        assert!(!s.heat_control, "off by default");
+        assert!(s.heat_control, "heat control is on by default");
     }
 
     #[test]

@@ -2283,6 +2283,7 @@ mod tests {
     fn first_layer_temp_drops_after_first_layer() {
         let m = mesh::Mesh::cube(10.0);
         let mut s = Settings::default();
+        s.heat_control = false; // the bare one-shot drop, not the schedule
         s.first_layer_nozzle_temp_c = 230;
         s.nozzle_temp_c = 210;
         let g = to_gcode(&generate(&m, &s), &s);
@@ -2328,6 +2329,7 @@ mod tests {
     fn per_layer_stats_match_totals() {
         let m = mesh::Mesh::cube(20.0);
         let mut s = Settings::default();
+        s.heat_control = false; // single shared temp — the energy check below
         s.first_layer_nozzle_temp_c = s.nozzle_temp_c;
         let layers = generate(&m, &s);
         let stats = per_layer_stats(&layers, &s);
@@ -2390,6 +2392,7 @@ mod tests {
         let m = mesh::Mesh::from_triangle_soup(&soup);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0; // isolate heat control from the layer-time pacing
+        s.heat_control = false; // opt out (the default is on) for the baseline
         let plain = generate(&m, &s);
         assert!(plain.iter().all(|l| l.path_speed_scale.is_empty()), "off = untouched");
 
