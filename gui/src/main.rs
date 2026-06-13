@@ -461,8 +461,10 @@ impl SceneObject {
 
 /// An in-flight camera glide: when bed focus changes, the orbit target
 /// travels to the new bed instead of teleporting — the motion is what tells
-/// you where you went — and the distance eases to frame the whole plate, so
-/// focus always lands on a readable view of the bed.
+/// you where you went. Distance and orientation are left exactly as the user
+/// had them (a pure translation) unless the current zoom is so far off that
+/// the target bed wouldn't be legible, in which case `dist_to` eases it back
+/// just into the comfortable band (see `FLY_ZOOM_MIN`/`FLY_ZOOM_MAX`).
 struct CameraGlide {
     from: glam::Vec3,
     to: glam::Vec3,
@@ -473,6 +475,14 @@ struct CameraGlide {
 
 /// Glide duration (ease-out cubic — brisk start, soft landing).
 const GLIDE_SECS: f32 = 0.4;
+
+/// Bed-focus flies keep the current zoom (and always the orientation) as long
+/// as the distance frames the target bed reasonably — within these multiples
+/// of the ideal one-bed framing distance. Outside the band (zoomed into a
+/// feature, or pulled back to see every bed) the fly eases distance only to
+/// the nearest edge: the least change that restores a usable view.
+const FLY_ZOOM_MIN: f32 = 0.5;
+const FLY_ZOOM_MAX: f32 = 2.5;
 
 /// Gap between adjacent print beds in the world layout (mm). Beds line up
 /// along +X; an object's world position decides which bed it belongs to, so
@@ -1712,9 +1722,13 @@ impl eframe::App for App {
             self.recenter_camera = false;
             let c = self.bed_center(self.active_bed);
             let to = glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0);
-            // Frame the whole plate on arrival (the same distance
-            // Camera::frame would pick for one bed).
-            let dist_to = ((bed.0.max(bed.1) as f32) * 1.25).max(20.0);
+            // Pure translation by default: keep the current zoom (orientation
+            // is never touched). Only when the distance is outside the band
+            // that frames a bed legibly do we ease it — to the nearest edge,
+            // the least change. `ideal` is the distance Camera::frame picks
+            // for one bed.
+            let ideal = ((bed.0.max(bed.1) as f32) * 1.25).max(20.0);
+            let dist_to = self.camera.distance.clamp(ideal * FLY_ZOOM_MIN, ideal * FLY_ZOOM_MAX);
             // Travel, don't teleport (trivial moves snap — no point
             // animating a recenter onto itself).
             if (to - self.camera.target).length() > 1.0
