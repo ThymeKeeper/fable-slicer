@@ -631,10 +631,13 @@ struct App {
     objects: Vec<SceneObject>,
     selected: Option<usize>,
     /// The active bed: slicing operates on its objects, the camera pivots on
-    /// it, and the viewport draws it highlighted. Beds exist on demand —
-    /// imports land on fresh ones, and one trailing empty bed is always
-    /// reachable as a drag target.
+    /// it, and the viewport draws it highlighted.
     active_bed: usize,
+    /// How many beds exist — explicit state, not derived from occupancy.
+    /// Grows when objects land beyond the current set (import/duplicate/drag)
+    /// or via the bed card's `+`; shrinks only when the user removes a bed
+    /// with `−`. Empty beds persist across navigation.
+    bed_count: usize,
     /// World X origin of the bed that was active when `sliced` was produced —
     /// the preview renders there even if the active bed changes afterward.
     sliced_origin_x: f64,
@@ -803,6 +806,7 @@ impl App {
             accent,
             accent_rebake: false,
             active_bed: 0,
+            bed_count: 1,
             sliced_origin_x: 0.0,
             camera_glide: None,
             settings,
@@ -1290,8 +1294,8 @@ impl App {
         } else {
             Some(i.min(self.objects.len() - 1))
         };
-        // No re-arrange: the survivors keep their places and beds.
-        self.active_bed = self.active_bed.min(self.n_beds() - 1);
+        // No re-arrange and no bed removal: survivors keep their places, and
+        // a bed left empty by the delete persists (only `−` removes a bed).
         self.scene_dirty();
     }
 
@@ -1300,14 +1304,21 @@ impl App {
         bed_of_pos(obj.pos[0], self.settings.bed_size_x_mm)
     }
 
-    /// How many beds exist: every occupied one, the active one, plus one
-    /// trailing empty bed reachable as a drag/import target.
+    /// How many beds exist (explicit — see `bed_count`).
     fn n_beds(&self) -> usize {
-        let occupied = self.objects.iter().map(|o| self.bed_of(o) + 1).max().unwrap_or(1);
-        occupied.max(self.active_bed + 1)
+        self.bed_count
     }
 
-    /// The lowest bed with nothing on it (where imports land).
+    /// Grow the bed count so every object has a bed under it — never shrinks
+    /// (empty beds persist until explicitly removed). Run whenever objects
+    /// move; cheap, so `scene_dirty` calls it unconditionally.
+    fn grow_beds_to_fit(&mut self) {
+        let need = self.objects.iter().map(|o| self.bed_of(o) + 1).max().unwrap_or(0);
+        self.bed_count = self.bed_count.max(need).max(1);
+    }
+
+    /// The lowest bed with nothing on it (where imports land) — an existing
+    /// empty bed if there is one, else a brand-new index past the last bed.
     fn first_empty_bed(&self) -> usize {
         let mut k = 0;
         while self.objects.iter().any(|o| self.bed_of(o) == k) {
@@ -1343,6 +1354,7 @@ impl App {
 
     /// Invalidate slice/preview and refresh the scene after objects changed.
     fn scene_dirty(&mut self) {
+        self.grow_beds_to_fit();
         self.sliced = None;
         self.slice_summary = None;
         self.view_preview = false;
@@ -2706,6 +2718,9 @@ impl eframe::App for App {
                             if let Some(xy) = ray_plane_z0(o, d) {
                                 self.objects[i].pos =
                                     [xy.x as f64 + self.drag_grab[0], xy.y as f64 + self.drag_grab[1]];
+                                // Dragging a part rightward past the last bed
+                                // creates the bed under it (and it persists).
+                                self.grow_beds_to_fit();
                                 self.needs_rebuild = true;
                                 self.sliced = None;
                                 self.slice_summary = None;
@@ -2861,7 +2876,10 @@ impl eframe::App for App {
                     self.set_active_bed(k);
                 }
                 if add {
-                    self.set_active_bed(self.n_beds());
+                    // A new empty bed at the end, made active. It persists
+                    // (navigation never removes it) until `−`.
+                    self.bed_count += 1;
+                    self.set_active_bed(self.bed_count - 1);
                 }
                 if remove {
                     // Slide everything right of the removed bed one pitch
@@ -2875,9 +2893,8 @@ impl eframe::App for App {
                             o.pos[0] -= bx + BED_GAP_MM;
                         }
                     }
-                    let occupied =
-                        self.objects.iter().map(|o| self.bed_of(o) + 1).max().unwrap_or(1);
-                    self.active_bed = k.min(occupied - 1);
+                    self.bed_count -= 1; // guarded: − only enabled when bed_count > 1
+                    self.active_bed = k.min(self.bed_count - 1);
                     self.recenter_camera = true;
                     self.scene_dirty();
                 }
