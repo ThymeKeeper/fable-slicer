@@ -47,9 +47,16 @@ chamber_sensor = "chamber_temp"
 
 # Stock firmware defines bare START_PRINT / END_PRINT macros that take no
 # parameters and do no heating — heat explicitly around them, mirroring Sovol's
-# own Orca profile: bed → home → START_PRINT → home → park front-left → nozzle.
-# Nozzle heats only after homing/probing so it doesn't ooze onto the bed mesh.
-# The double G28 is vendor-shipped; keep the known-good sequence verbatim.
+# own Orca profile: bed → home → START_PRINT → home → park front-left → chamber
+# soak → nozzle. Nozzle heats only after homing/probing AND after the chamber
+# soak, so it never oozes onto the bed mesh and never idles hot over the bed
+# while the chamber catches up. The double G28 is vendor-shipped; keep the
+# known-good sequence verbatim.
+#
+# {chamber_soak} expands to a TEMPERATURE_WAIT on the chamber sensor when the
+# filament wants a warm chamber (ABS/ASA), and to nothing for PLA. A machine
+# with no such sensor aborts there — and the slicer also pings Moonraker before
+# sending (when a soak is needed) to catch that with a clear message first.
 start_gcode = """
 M140 S{bed_temp}
 M190 S{bed_temp}
@@ -59,6 +66,7 @@ G28
 G90
 G1 X0 Y0 F12000
 G1 Z0.300 F600
+{chamber_soak}
 M104 S{first_layer_nozzle_temp}
 M109 S{first_layer_nozzle_temp}
 """

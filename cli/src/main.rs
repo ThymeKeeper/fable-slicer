@@ -298,6 +298,14 @@ fn main() -> Result<()> {
             anyhow::bail!("no printer host: set host_url in the printer profile or pass --host");
         }
         let client = printhost::Client::new(&host, &settings.api_key);
+        // A chamber soak waits on the printer's chamber sensor; verify it's
+        // really there before sending, so a missing/misnamed sensor fails here
+        // with a clear message instead of aborting mid-startup on the machine.
+        if settings.chamber_temp_c > 0 {
+            client
+                .ensure_chamber_sensor(&settings.chamber_sensor, settings.chamber_temp_c)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
         let filename = args
             .output
             .file_name()

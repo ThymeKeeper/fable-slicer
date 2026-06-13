@@ -142,6 +142,53 @@ impl Client {
     pub fn set_extruder_temp(&self, c: f64) -> Result<(), String> {
         self.run_gcode(&format!("M104 S{c:.0}"))
     }
+
+    /// Every Klipper config object Moonraker exposes, by name — e.g.
+    /// `"temperature_sensor chamber_temp"`, `"heater_bed"`, `"extruder"`.
+    pub fn objects(&self) -> Result<Vec<String>, String> {
+        let v = self.call("GET", "/printer/objects/list")?;
+        let arr = v["result"]["objects"].as_array().ok_or("no objects list in the response")?;
+        Ok(arr.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+    }
+
+    /// Pre-flight for a chamber soak: a slice that soaks the chamber waits on
+    /// `temperature_sensor <name>`, and Klipper aborts the print if that object
+    /// isn't configured. Calling this before upload turns that late, cryptic
+    /// abort into a clear message up front. `sensor` is the bare Klipper name
+    /// (e.g. `"chamber_temp"`) from the printer profile; empty means the profile
+    /// declares none. Only call it when the slice actually soaks (`soak_c > 0`).
+    pub fn ensure_chamber_sensor(&self, sensor: &str, soak_c: u32) -> Result<(), String> {
+        let sensor = sensor.trim();
+        if sensor.is_empty() {
+            return Err(format!(
+                "This slice soaks the chamber to {soak_c} °C, but the printer profile names no \
+                 chamber sensor — the print would abort at the soak. Set the filament's chamber \
+                 soak to 0, or declare the sensor (Machine & motion → chamber sensor)."
+            ));
+        }
+        let want = format!("temperature_sensor {sensor}");
+        let objects = self.objects()?;
+        if objects.iter().any(|o| o == &want) {
+            return Ok(());
+        }
+        // List the chamber-ish objects the machine *does* expose, to make the
+        // fix obvious (wrong name? wired as a temperature_fan?).
+        let candidates: Vec<&str> = objects
+            .iter()
+            .filter(|o| {
+                o.starts_with("temperature_sensor ")
+                    || o.starts_with("temperature_fan ")
+                    || o.starts_with("heater_generic ")
+            })
+            .map(String::as_str)
+            .collect();
+        Err(format!(
+            "This slice soaks the chamber to {soak_c} °C and waits on [{want}], but the printer \
+             has no such object — the print would abort at the soak. Sensors it does expose: {}. \
+             Fix the printer profile's chamber sensor name, or set the filament's chamber soak to 0.",
+            if candidates.is_empty() { "(none)".to_string() } else { candidates.join(", ") }
+        ))
+    }
 }
 
 /// The hotend's measured thermal response near printing temperature, with the
@@ -557,5 +604,30 @@ mod tests {
         client.start_print("my part v2.gcode").unwrap();
         let req = server.join().unwrap();
         assert!(req.starts_with("POST /printer/print/start?filename=my%20part%20v2.gcode"), "got: {}", &req[..80]);
+    }
+
+    #[test]
+    fn chamber_sensor_preflight() {
+        // Present → ok, and it queries the object-list endpoint.
+        let (addr, server) =
+            one_shot("{\"result\": {\"objects\": [\"extruder\", \"heater_bed\", \"temperature_sensor chamber_temp\"]}}");
+        let client = Client::new(&addr, "");
+        client.ensure_chamber_sensor("chamber_temp", 50).expect("sensor present");
+        let req = server.join().unwrap();
+        assert!(req.starts_with("GET /printer/objects/list"), "got: {}", &req[..40]);
+
+        // Absent → error names the sensor we wanted and the ones that exist.
+        let (addr, server) =
+            one_shot("{\"result\": {\"objects\": [\"extruder\", \"temperature_sensor mcu_temp\"]}}");
+        let client = Client::new(&addr, "");
+        let err = client.ensure_chamber_sensor("chamber_temp", 50).unwrap_err();
+        assert!(err.contains("temperature_sensor chamber_temp"), "names the target: {err}");
+        assert!(err.contains("temperature_sensor mcu_temp"), "names what exists: {err}");
+        server.join().unwrap();
+
+        // No sensor named in the profile → clear error, returned before any network call.
+        let client = Client::new("127.0.0.1:1", "");
+        let err = client.ensure_chamber_sensor("  ", 50).unwrap_err();
+        assert!(err.contains("names no chamber sensor"), "{err}");
     }
 }

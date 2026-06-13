@@ -971,11 +971,14 @@ mod tests {
         // heat creep and sag.
         let pla = p.resolve("sovol-zero", "pla", "standard").unwrap();
         assert_eq!(pla.chamber_temp_c, 0);
-        // And the generic printer declares no sensor: soak stays locked out
-        // even for ASA.
+        // And the generic printer declares no sensor: the ASA soak wish still
+        // rides through (50 C). The emitter gates on the temp (not the sensor),
+        // so the slice carries a TEMPERATURE_WAIT that aborts on a sensorless
+        // machine rather than printing ASA cold — the pre-send Moonraker check
+        // turns that into a legible message.
         let generic = p.resolve("generic", "asa", "standard").unwrap();
         assert!(generic.chamber_sensor.is_empty());
-        assert_eq!(generic.chamber_temp_c, 50); // the wish survives; emission gates on the sensor
+        assert_eq!(generic.chamber_temp_c, 50); // the wish survives; a sensorless machine errors at print time
         // The Voron spec wires [temperature_sensor chamber].
         let voron = p.resolve("voron24", "asa", "standard").unwrap();
         assert_eq!(voron.chamber_sensor, "chamber");

@@ -2644,13 +2644,14 @@ impl eframe::App for App {
                         "The high end of the range on the spool. Heat control's schedules never go above it.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
                         "Bed temperature from the packaging.");
-                    hslider_lockout(ui, !s.chamber_sensor.trim().is_empty(), egui::Slider::new(&mut s.chamber_temp_c, 0..=70), "chamber soak °C",
-                        "Hold after the start g-code until the chamber reaches this (the heated \
-                         bed does the soaking — TEMPERATURE_WAIT on the printer's chamber sensor). \
-                         0 = off. Auto: the material class's value — ABS/ASA soak at 50 against \
-                         warping and layer splits; PLA must stay 0 (a hot chamber means heat \
-                         creep and sag).",
-                        "Needs a chamber sensor declared under Machine & motion.");
+                    hslider(ui, true, egui::Slider::new(&mut s.chamber_temp_c, 0..=70), "chamber soak °C",
+                        "Hold during the start g-code — after the bed soak, before the nozzle \
+                         finishes heating — until the chamber reaches this (the heated bed does \
+                         the soaking, via TEMPERATURE_WAIT on the chamber sensor). Needs a chamber \
+                         sensor declared under Machine & motion; Send pings the printer for it \
+                         first and won't start a soak it can't honor. 0 = off. Auto: the material \
+                         class's value — ABS/ASA soak at 50 against warping and layer splits; PLA \
+                         must stay 0 (a hot chamber means heat creep and sag).");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
                         "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
                     ui.weak(format!(
@@ -3402,7 +3403,18 @@ impl eframe::App for App {
                     if let Some(layers) = self.sliced.as_ref() {
                         let gcode = engine::to_gcode(layers, &self.settings);
                         let filename = self.upload_filename();
+                        // A chamber soak waits on the printer's chamber sensor —
+                        // confirm it's there before sending, so a missing/misnamed
+                        // sensor fails with a clear message instead of aborting
+                        // mid-startup on the machine.
+                        let chamber_temp = self.settings.chamber_temp_c;
+                        let chamber_sensor = self.settings.chamber_sensor.clone();
                         self.spawn_host_op(&ctx, false, move |c| {
+                            if chamber_temp > 0 {
+                                if let Err(e) = c.ensure_chamber_sensor(&chamber_sensor, chamber_temp) {
+                                    return HostReply::SendDone { ok: false, msg: e };
+                                }
+                            }
                             match c.upload(&filename, gcode.as_bytes(), start) {
                                 Ok(()) if start => HostReply::SendDone { ok: true, msg: format!("Printing {filename}.") },
                                 Ok(()) => HostReply::SendDone { ok: true, msg: format!("Uploaded {filename}.") },

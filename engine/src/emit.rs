@@ -107,24 +107,20 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     g.raw("G21"); // millimeters
     g.raw("G90"); // absolute XYZ
     g.raw("M83"); // relative extrusion (Klipper-recommended)
+    // Chamber pre-soak. A start template positions it precisely with the
+    // {chamber_soak} placeholder — the Sovol template puts it after the bed
+    // soak but *before* the nozzle reaches temp, so the hot nozzle never idles
+    // over the bed oozing a blob while the chamber catches up. Templates that
+    // don't place it get the block appended after the start sequence (still
+    // correct, just not ooze-optimal). Either way the soak is filament-gated
+    // (chamber_temp_c) and emitted as a plain TEMPERATURE_WAIT — see
+    // chamber_soak_block.
+    let positioned_soak = s.start_gcode.contains("{chamber_soak}");
     emit_template(&mut g, &s.start_gcode, s);
-    // Chamber pre-soak: the printer declared a chamber thermistor and the
-    // filament wants a warm chamber. The start sequence just brought the bed
-    // to temperature — the bed does the soaking; this only gates on the
-    // result before any plastic goes down. Start templates that handle the
-    // soak themselves (via the {chamber_temp} placeholder) coexist fine:
-    // an already-soaked chamber makes this wait pass instantly.
-    if !s.chamber_sensor.trim().is_empty() && s.chamber_temp_c > 0 {
-        g.raw(&format!(
-            "; chamber pre-soak: hold for {} >= {} C (the heated bed soaks the chamber)",
-            s.chamber_sensor.trim(),
-            s.chamber_temp_c
-        ));
-        g.raw(&format!(
-            "TEMPERATURE_WAIT SENSOR=\"temperature_sensor {}\" MINIMUM={}",
-            s.chamber_sensor.trim(),
-            s.chamber_temp_c
-        ));
+    if !positioned_soak {
+        for line in chamber_soak_block(s).lines() {
+            g.raw(line);
+        }
     }
     // Motion limits, set after PRINT_START so our values win. M204 S is understood
     // by Klipper and Marlin; SQUARE_CORNER_VELOCITY is Klipper's "jerk" equivalent.
@@ -442,12 +438,38 @@ fn emit_template(g: &mut GcodeBuilder, template: &str, s: &Settings) {
     }
 }
 
+/// The chamber pre-soak block for the current settings, or empty when the
+/// filament wants no soak (`chamber_temp_c == 0`, e.g. PLA — which then needs
+/// no chamber sensor at all, so the slice references none).
+///
+/// A plain `TEMPERATURE_WAIT` on the named sensor *is* the requirement: Klipper
+/// waits when the sensor exists and aborts the print ("Unknown sensor …") when
+/// it doesn't — exactly the fail-on-missing we want, with no printer-side macro
+/// to install. The friendly version of that failure is raised *before* sending,
+/// by pinging Moonraker for the sensor (see
+/// `printhost::Client::ensure_chamber_sensor`); this g-code line is the backstop
+/// for a file sliced and run by hand. A profile that names no sensor at all
+/// waits on an empty name and still aborts — the pre-send check turns that into
+/// a clear message.
+fn chamber_soak_block(s: &Settings) -> String {
+    if s.chamber_temp_c == 0 {
+        return String::new();
+    }
+    format!(
+        "; chamber pre-soak: hold until the bed drives the chamber to {temp} C\n\
+         TEMPERATURE_WAIT SENSOR=\"temperature_sensor {sensor}\" MINIMUM={temp}",
+        sensor = s.chamber_sensor.trim(),
+        temp = s.chamber_temp_c
+    )
+}
+
 fn substitute(template: &str, s: &Settings) -> String {
     template
         .replace("{nozzle_temp}", &s.nozzle_temp_c.to_string())
         .replace("{first_layer_nozzle_temp}", &s.first_layer_nozzle_temp_c.to_string())
         .replace("{bed_temp}", &s.bed_temp_c.to_string())
         .replace("{chamber_temp}", &s.chamber_temp_c.to_string())
+        .replace("{chamber_soak}", &chamber_soak_block(s))
         .replace("{bed_x}", &format!("{:.3}", s.bed_size_x_mm))
         .replace("{bed_y}", &format!("{:.3}", s.bed_size_y_mm))
         .replace("{bed_z}", &format!("{:.3}", s.bed_size_z_mm))
@@ -2299,10 +2321,12 @@ mod tests {
     }
 
     #[test]
-    fn chamber_presoak_gates_on_sensor_and_target() {
+    fn chamber_presoak_emits_temperature_wait() {
         let m = mesh::Mesh::cube(10.0);
-        // Sensor declared + filament wants a soak: the wait lands after the
-        // start sequence (bed already hot), before any layer.
+        // Filament wants a soak + the printer declares its sensor: a plain
+        // TEMPERATURE_WAIT on the sensor lands before the first layer. No macro
+        // — Klipper aborts natively if the sensor is missing (the friendly
+        // version of that error is the pre-send Moonraker ping).
         let mut s = Settings::default();
         s.chamber_sensor = "chamber_temp".into();
         s.chamber_temp_c = 50;
@@ -2310,13 +2334,37 @@ mod tests {
         let wait = "TEMPERATURE_WAIT SENSOR=\"temperature_sensor chamber_temp\" MINIMUM=50";
         let at = g.find(wait).expect("pre-soak emitted");
         assert!(at < g.find("; LAYER 0 ").unwrap(), "soak precedes the first layer");
-        // No soak wanted (the PLA-class 0): nothing emitted.
+        // No soak wanted (the PLA-class 0): nothing emitted, no sensor referenced.
         s.chamber_temp_c = 0;
         assert!(!to_gcode(&generate(&m, &s), &s).contains("TEMPERATURE_WAIT"));
-        // No sensor on the machine: locked out even when the filament asks.
+        // Soak wanted but the profile names no sensor: the wait is still emitted
+        // (empty name) so the print aborts at the soak rather than running cold —
+        // the pre-send check is what makes that legible.
         s.chamber_temp_c = 50;
         s.chamber_sensor = String::new();
-        assert!(!to_gcode(&generate(&m, &s), &s).contains("TEMPERATURE_WAIT"));
+        let g = to_gcode(&generate(&m, &s), &s);
+        assert!(g.contains("TEMPERATURE_WAIT SENSOR=\"temperature_sensor \" MINIMUM=50"));
+    }
+
+    #[test]
+    fn chamber_soak_placeholder_precedes_nozzle_heat() {
+        // A template that positions {chamber_soak} gets the soak inline, before
+        // its own nozzle heat — the anti-ooze ordering — and not also appended.
+        let m = mesh::Mesh::cube(10.0);
+        let mut s = Settings::default();
+        s.chamber_sensor = "chamber_temp".into();
+        s.chamber_temp_c = 50;
+        s.start_gcode =
+            "M190 S{bed_temp}\nG28\n{chamber_soak}\nM104 S{first_layer_nozzle_temp}\nM109 S{first_layer_nozzle_temp}"
+                .into();
+        let g = to_gcode(&generate(&m, &s), &s);
+        let wait = "TEMPERATURE_WAIT SENSOR=\"temperature_sensor chamber_temp\" MINIMUM=50";
+        let soak = g.find(wait).expect("soak emitted in place");
+        let nozzle = g
+            .find(&format!("M109 S{}", s.first_layer_nozzle_temp_c))
+            .expect("nozzle heat emitted");
+        assert!(soak < nozzle, "soak waits before the nozzle reaches temp");
+        assert_eq!(g.matches(wait).count(), 1, "placeholder consumes it; no double append");
     }
 
     #[test]
