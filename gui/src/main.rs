@@ -447,6 +447,19 @@ impl SceneObject {
         b
     }
 
+    /// Printed height (mm): the z-span of the rotated/scaled mesh. The object
+    /// rests on z=0 (its transform drops it there), so it occupies [0, h].
+    fn height(&self) -> f64 {
+        let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for &v in &self.mesh.vertices {
+            let z = lin.apply_linear(v)[2];
+            lo = lo.min(z);
+            hi = hi.max(z);
+        }
+        (hi - lo).max(0.0)
+    }
+
     /// Bake the placement into an affine transform: footprint centered on `pos`,
     /// bottom dropped to z=0.
     fn transform(&self) -> mesh::Transform {
@@ -497,6 +510,14 @@ fn bed_origin_x(k: usize, bed_x: f64) -> f64 {
 /// Which bed a world X belongs to: the nearest bed center, never negative.
 fn bed_of_pos(x: f64, bed_x: f64) -> usize {
     ((x - bed_x / 2.0) / (bed_x + BED_GAP_MM)).round().max(0.0) as usize
+}
+
+/// Do two world XY axis-aligned boxes `[minx, miny, maxx, maxy]` overlap by
+/// more than a hair? (A small epsilon so exactly-touching footprints — what
+/// the auto-arrange leaves — don't read as collisions.)
+fn aabb_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
+    const EPS: f64 = 0.05;
+    a[0] < b[2] - EPS && a[2] > b[0] + EPS && a[1] < b[3] - EPS && a[3] > b[1] + EPS
 }
 
 /// Shelf-pack footprint rectangles onto beds: tallest-first fills shelves
@@ -602,6 +623,19 @@ struct SliceSummary {
     heat_target_mw: f64,
 }
 
+/// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
+/// the bounds/collision checks (run for tinting, the transform card, and the
+/// Send gate) don't re-walk mesh vertices every frame.
+#[derive(Clone, Copy)]
+struct ObjBounds {
+    /// World XY axis-aligned bounds: `[minx, miny, maxx, maxy]`.
+    aabb: [f64; 4],
+    /// Printed height (mm); the object rests on z=0, occupying `[0, height]`.
+    height: f64,
+    /// Bed index (by world X), so collisions only pair same-bed objects.
+    bed: usize,
+}
+
 struct App {
     profiles: Profiles,
     printer: String,
@@ -638,6 +672,9 @@ struct App {
     /// or via the bed card's `+`; shrinks only when the user removes a bed
     /// with `−`. Empty beds persist across navigation.
     bed_count: usize,
+    /// Per-object cached world bounds (parallel to `objects`), rebuilt by
+    /// `rebuild_scene`. Drives the build-volume and collision checks.
+    obj_bounds: Vec<ObjBounds>,
     /// World X origin of the bed that was active when `sliced` was produced —
     /// the preview renders there even if the active bed changes afterward.
     sliced_origin_x: f64,
@@ -807,6 +844,7 @@ impl App {
             accent_rebake: false,
             active_bed: 0,
             bed_count: 1,
+            obj_bounds: Vec::new(),
             sliced_origin_x: 0.0,
             camera_glide: None,
             settings,
@@ -1343,13 +1381,61 @@ impl App {
         [bed_origin_x(k, bx) + bx / 2.0, by / 2.0]
     }
 
-    /// True if the object's footprint hangs past its own bed's edges.
+    /// True if the object's footprint hangs past its own bed's XY edges.
     fn off_its_bed(&self, obj: &SceneObject) -> bool {
         let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
         let ox = bed_origin_x(self.bed_of(obj), bx);
         let (minx, miny, maxx, maxy, _) = obj.footprint();
         let (w, h) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
         obj.pos[0] - w < ox || obj.pos[0] + w > ox + bx || obj.pos[1] - h < 0.0 || obj.pos[1] + h > by
+    }
+
+    /// Why object `i` can't be printed — out of its bed's build volume (the
+    /// offending axes) and/or overlapping another object on the same bed.
+    /// None = printable. Reads the cached bounds (`rebuild_scene` keeps them
+    /// fresh), so it's cheap to call per frame.
+    fn obj_problem(&self, i: usize) -> Option<String> {
+        let Some(b) = self.obj_bounds.get(i) else { return None };
+        const EPS: f64 = 1.0e-3;
+        let (bx, by, bz) = (
+            self.settings.bed_size_x_mm,
+            self.settings.bed_size_y_mm,
+            self.settings.bed_size_z_mm,
+        );
+        let ox = bed_origin_x(b.bed, bx);
+        let mut axes = Vec::new();
+        if b.aabb[0] < ox - EPS || b.aabb[2] > ox + bx + EPS {
+            axes.push("X");
+        }
+        if b.aabb[1] < -EPS || b.aabb[3] > by + EPS {
+            axes.push("Y");
+        }
+        if b.height > bz + EPS {
+            axes.push("Z");
+        }
+        let mut parts = Vec::new();
+        if !axes.is_empty() {
+            parts.push(format!("outside build volume ({})", axes.join("/")));
+        }
+        // Footprint (AABB) overlap with any other object sharing this bed.
+        let collides = self
+            .obj_bounds
+            .iter()
+            .enumerate()
+            .any(|(j, bj)| j != i && bj.bed == b.bed && aabb_overlap(b.aabb, bj.aabb));
+        if collides {
+            parts.push("overlapping another object".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// Names of active-bed objects that can't be printed (off the bed or
+    /// overlapping). Empty = the bed is printable.
+    fn active_bed_violations(&self) -> Vec<String> {
+        (0..self.objects.len())
+            .filter(|&i| self.bed_of(&self.objects[i]) == self.active_bed && self.obj_problem(i).is_some())
+            .map(|i| self.objects[i].name.clone())
+            .collect()
     }
 
     /// Invalidate slice/preview and refresh the scene after objects changed.
@@ -1660,12 +1746,31 @@ impl App {
         let by = self.settings.bed_size_y_mm as f32;
         self.scene.set_beds(&rs.device, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
 
-        // The selected object is flagged so the renderer highlights it.
-        let objs: Vec<(&mesh::Mesh, mesh::Transform, bool)> = self
+        // Refresh the world-bounds cache from the meshes (the one place that
+        // walks vertices), then derive per-object state from it.
+        let bx_cache = self.settings.bed_size_x_mm;
+        self.obj_bounds = self
+            .objects
+            .iter()
+            .map(|o| {
+                let (minx, miny, maxx, maxy, _) = o.footprint();
+                let (hw, hh) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+                ObjBounds {
+                    aabb: [o.pos[0] - hw, o.pos[1] - hh, o.pos[0] + hw, o.pos[1] + hh],
+                    height: o.height(),
+                    bed: bed_of_pos(o.pos[0], bx_cache),
+                }
+            })
+            .collect();
+
+        // The selected object is flagged for highlight; unprintable objects
+        // (off the bed or overlapping, any bed) get the warning tint.
+        let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
+        let objs: Vec<(&mesh::Mesh, mesh::Transform, bool, bool)> = self
             .objects
             .iter()
             .enumerate()
-            .map(|(i, o)| (o.mesh.as_ref(), o.transform(), self.selected == Some(i)))
+            .map(|(i, o)| (o.mesh.as_ref(), o.transform(), self.selected == Some(i), blocked[i]))
             .collect();
         let bounds = self.scene.set_mesh(&rs.device, &objs);
         // Only re-frame on scene changes (import/duplicate/delete/arrange/profile),
@@ -2110,13 +2215,25 @@ impl eframe::App for App {
                     self.export();
                 }
             });
+            // An object off the active bed's build volume or overlapping
+            // another can't be printed — block both send buttons and name it.
+            let violations = self.active_bed_violations();
+            let bed_printable = violations.is_empty();
+            let send_disabled_hover = if bed_printable {
+                "Needs a sliced model and a printer host (Connection section).".to_string()
+            } else {
+                format!(
+                    "Not printable: {} (off the bed or overlapping another object) — fix before printing.",
+                    violations.join(", ")
+                )
+            };
             ui.horizontal(|ui| {
-                let can_send = self.sliced.is_some() && host_set && !host_busy;
+                let can_send = self.sliced.is_some() && host_set && !host_busy && bed_printable;
                 let send_btn = egui::Button::new(egui::RichText::new("Send").size(15.0)).min_size(big);
                 if ui
                     .add_enabled(can_send, send_btn)
                     .on_hover_text("Upload the g-code to the printer's storage (host under Connection).")
-                    .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
+                    .on_disabled_hover_text(send_disabled_hover.as_str())
                     .clicked()
                 {
                     host_op = Some(HostOp::Send { start: false });
@@ -2125,12 +2242,26 @@ impl eframe::App for App {
                 if ui
                     .add_enabled(can_send, print_btn)
                     .on_hover_text("Upload the g-code and start printing it immediately.")
-                    .on_disabled_hover_text("Needs a sliced model and a printer host (Connection section).")
+                    .on_disabled_hover_text(send_disabled_hover.as_str())
                     .clicked()
                 {
                     host_op = Some(HostOp::Send { start: true });
                 }
             });
+            if !bed_printable {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} — not printable (off bed or overlapping)",
+                        violations.join(", ")
+                    ))
+                    .color(palette::ERROR),
+                )
+                .on_hover_text(
+                    "Each highlighted object hangs past the bed (in X/Y, or taller than the \
+                     build height) or overlaps another object. Move or rescale it — it's \
+                     tinted in the view.",
+                );
+            }
             ui.separator();
 
             // Prominent Model / Preview toggle (Preview enabled once sliced).
@@ -2906,6 +3037,8 @@ impl eframe::App for App {
                 let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
                 let mut changed = false;
                 let (mut dup, mut del) = (false, false);
+                // Checked before the mutable borrow below (reads the cache).
+                let problem = self.obj_problem(i);
                 let area = egui::Area::new(egui::Id::new("transform_overlay"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
@@ -2916,6 +3049,13 @@ impl eframe::App for App {
                                 ui.set_max_width(210.0);
                                 let obj = &mut self.objects[i];
                                 ui.label(egui::RichText::new(obj.name.as_str()).strong());
+                                if let Some(reason) = &problem {
+                                    ui.label(
+                                        egui::RichText::new(reason)
+                                            .color(palette::ERROR)
+                                            .strong(),
+                                    );
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label("move");
                                     changed |= ui.add(egui::DragValue::new(&mut obj.pos[0]).speed(0.5).prefix("X ")).changed();
