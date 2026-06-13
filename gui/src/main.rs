@@ -459,6 +459,78 @@ impl SceneObject {
     }
 }
 
+/// Gap between adjacent print beds in the world layout (mm). Beds line up
+/// along +X; an object's world position decides which bed it belongs to, so
+/// dragging a part across the gap moves it between beds.
+const BED_GAP_MM: f64 = 25.0;
+
+/// World X origin of bed `k`.
+fn bed_origin_x(k: usize, bed_x: f64) -> f64 {
+    k as f64 * (bed_x + BED_GAP_MM)
+}
+
+/// Which bed a world X belongs to: the nearest bed center, never negative.
+fn bed_of_pos(x: f64, bed_x: f64) -> usize {
+    ((x - bed_x / 2.0) / (bed_x + BED_GAP_MM)).round().max(0.0) as usize
+}
+
+/// Shelf-pack footprint rectangles onto beds: tallest-first fills shelves
+/// left-to-right, `margin` apart, and each bed's finished layout is centered
+/// on its plate. Each part takes its own footprint — no uniform worst-case
+/// cells — so mixed sizes pack tight. Overflow flows onto the next bed; a
+/// part bigger than the plate gets a bed to itself (centered, hanging over).
+/// Returns `(bed, center_x, center_y)` per input rect, bed-local, input
+/// order preserved.
+fn shelf_pack(sizes: &[(f64, f64)], bx: f64, by: f64, margin: f64) -> Vec<(usize, f64, f64)> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|&a, &b| sizes[b].1.total_cmp(&sizes[a].1)); // tallest first
+    let mut out = vec![(0usize, 0.0, 0.0); sizes.len()];
+
+    let mut bed = 0usize;
+    // Corner-anchored placements on the current bed: (input idx, x, y).
+    let mut placed: Vec<(usize, f64, f64)> = Vec::new();
+    let (mut cur_x, mut cur_y, mut shelf_h) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut used_w, mut used_h) = (0.0f64, 0.0f64);
+
+    // Emit the current bed's placements, centered on the plate (a negative
+    // offset = centered overflow for oversized parts).
+    macro_rules! flush_bed {
+        () => {
+            let (ox, oy) = ((bx - used_w) / 2.0, (by - used_h) / 2.0);
+            for &(i, x, y) in &placed {
+                let (w, h) = sizes[i];
+                out[i] = (bed, ox + x + w / 2.0, oy + y + h / 2.0);
+            }
+            placed.clear();
+        };
+    }
+
+    for &i in &order {
+        let (w, h) = sizes[i];
+        if cur_x > 0.0 && cur_x + w > bx {
+            // Next shelf.
+            cur_y += shelf_h + margin;
+            cur_x = 0.0;
+            shelf_h = 0.0;
+        }
+        if cur_x == 0.0 && cur_y > 0.0 && cur_y + h > by {
+            // Bed full — flush and start the next one.
+            flush_bed!();
+            bed += 1;
+            cur_y = 0.0;
+            used_w = 0.0;
+            used_h = 0.0;
+        }
+        placed.push((i, cur_x, cur_y));
+        used_w = used_w.max(cur_x + w);
+        used_h = used_h.max(cur_y + h);
+        cur_x += w + margin;
+        shelf_h = shelf_h.max(h);
+    }
+    flush_bed!();
+    out
+}
+
 /// Rotation matrix for Euler angles (degrees), applied X then Y then Z (R = Rz·Ry·Rx).
 fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
     let (sx, cx) = deg[0].to_radians().sin_cos();
@@ -533,6 +605,14 @@ struct App {
     pins: Pins,
     objects: Vec<SceneObject>,
     selected: Option<usize>,
+    /// The active bed: slicing operates on its objects, the camera pivots on
+    /// it, and the viewport draws it highlighted. Beds exist on demand —
+    /// imports land on fresh ones, and one trailing empty bed is always
+    /// reachable as a drag target.
+    active_bed: usize,
+    /// World X origin of the bed that was active when `sliced` was produced —
+    /// the preview renders there even if the active bed changes afterward.
+    sliced_origin_x: f64,
     scene: Scene,
     camera: Camera,
     status: String,
@@ -598,6 +678,8 @@ struct App {
     drag_grab: [f64; 2],
     /// Screen rect of the transform overlay (so viewport input ignores clicks on it).
     overlay_rect: Option<egui::Rect>,
+    /// Screen rect of the floating bed card (same input-blocking purpose).
+    bed_overlay_rect: Option<egui::Rect>,
     /// Screen rect of the messages pane (same input-blocking purpose).
     msgs_overlay_rect: Option<egui::Rect>,
     /// Set when the messages pane is dismissed: the (status, slice generation)
@@ -693,6 +775,8 @@ impl App {
             saved_state: state,
             accent,
             accent_rebake: false,
+            active_bed: 0,
+            sliced_origin_x: 0.0,
             settings,
             baseline,
             profile_dialog: None,
@@ -714,6 +798,7 @@ impl App {
             printer_status: None,
             last_status_poll: None,
             print_overlay_rect: None,
+            bed_overlay_rect: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
@@ -1072,6 +1157,10 @@ impl App {
                 Ok(items) => {
                     let n = items.len();
                     let tris: usize = items.iter().map(|it| it.mesh.triangles.len()).sum();
+                    // Imports land on a fresh bed; existing beds are never
+                    // disturbed.
+                    let dest = self.first_empty_bed();
+                    let first_new = self.objects.len();
                     for (k, it) in items.into_iter().enumerate() {
                         let name = if !it.name.is_empty() {
                             it.name
@@ -1081,13 +1170,32 @@ impl App {
                             format!("{file} #{}", k + 1)
                         };
                         let mut obj = SceneObject::new(name, it.mesh);
-                        // Keep the file's plate layout: pos = the baked
-                        // footprint center reproduces the build placement
-                        // (SceneObject::transform recenters the footprint
-                        // on pos).
+                        // pos = the baked footprint center reproduces the
+                        // file's build placement (SceneObject::transform
+                        // recenters the footprint on pos).
                         let (minx, miny, maxx, maxy, _) = obj.footprint();
                         obj.pos = [(minx + maxx) / 2.0, (miny + maxy) / 2.0];
                         self.objects.push(obj);
+                    }
+                    // The build's own layout wins while it fits one bed:
+                    // shift the whole group onto the destination. Otherwise
+                    // (multi-plate projects span virtual plates far wider
+                    // than any bed) grid the newcomers across fresh beds.
+                    let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+                    let fits = self.objects[first_new..].iter().all(|o| {
+                        let (minx, miny, maxx, maxy, _) = o.footprint();
+                        let (w, h) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+                        let c = o.pos;
+                        c[0] - w >= 0.0 && c[1] - h >= 0.0 && c[0] + w <= bx && c[1] + h <= by
+                    });
+                    if fits {
+                        let ox = bed_origin_x(dest, bx);
+                        for o in &mut self.objects[first_new..] {
+                            o.pos[0] += ox;
+                        }
+                    } else {
+                        let idx: Vec<usize> = (first_new..self.objects.len()).collect();
+                        self.arrange_from(dest, &idx);
                     }
                     self.selected = Some(self.objects.len() - 1);
                     self.status = if n == 1 {
@@ -1095,25 +1203,9 @@ impl App {
                     } else {
                         format!("Imported {file}: {n} objects ({tris} triangles)")
                     };
-                    // The build's own layout wins while it fits our bed
-                    // (it was arranged for *some* plate); re-grid only when
-                    // something hangs off.
-                    let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
-                    let off_bed = self.objects.iter().any(|o| {
-                        let (minx, miny, maxx, maxy, _) = o.footprint();
-                        let c = o.pos;
-                        let (w, h) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
-                        c[0] - w < 0.0 || c[1] - h < 0.0 || c[0] + w > bx || c[1] + h > by
-                    });
-                    if off_bed {
-                        self.after_scene_change();
-                    } else {
-                        self.sliced = None;
-                        self.slice_summary = None;
-                        self.view_preview = false;
-                        self.needs_rebuild = true;
-                        self.refit_camera = true;
-                    }
+                    self.set_active_bed(dest);
+                    self.scene_dirty();
+                    self.refit_camera = true;
                 }
                 Err(e) => self.status = format!("Load failed: {e}"),
             }
@@ -1122,9 +1214,14 @@ impl App {
         match mesh::Mesh::load_stl(&path) {
             Ok(m) => {
                 self.status = format!("Imported {file} ({} triangles)", m.triangles.len());
-                self.objects.push(SceneObject::new(file, m));
+                let mut obj = SceneObject::new(file, m);
+                let dest = self.first_empty_bed();
+                obj.pos = self.bed_center(dest);
+                self.objects.push(obj);
                 self.selected = Some(self.objects.len() - 1);
-                self.after_scene_change();
+                self.set_active_bed(dest);
+                self.scene_dirty();
+                self.refit_camera = true;
             }
             Err(e) => self.status = format!("Load failed: {e}"),
         }
@@ -1133,16 +1230,26 @@ impl App {
     fn duplicate_selected(&mut self) {
         let Some(i) = self.selected else { return };
         let src = &self.objects[i];
+        let (minx, _, maxx, _, _) = src.footprint();
+        let w = maxx - minx;
+        // Beside the source if its bed has room to the right; otherwise the
+        // copy gets a fresh bed. Nothing else moves.
+        let bx = self.settings.bed_size_x_mm;
+        let bed_right = bed_origin_x(self.bed_of(src), bx) + bx;
+        let mut pos = [src.pos[0] + w + 5.0, src.pos[1]];
+        if pos[0] + w / 2.0 > bed_right {
+            pos = self.bed_center(self.first_empty_bed());
+        }
         let copy = SceneObject {
             name: format!("{} copy", src.name),
             mesh: Arc::clone(&src.mesh),
             rot_deg: src.rot_deg,
             scale: src.scale,
-            pos: src.pos,
+            pos,
         };
         self.objects.push(copy);
         self.selected = Some(self.objects.len() - 1);
-        self.after_scene_change();
+        self.scene_dirty();
     }
 
     fn delete_selected(&mut self) {
@@ -1153,53 +1260,107 @@ impl App {
         } else {
             Some(i.min(self.objects.len() - 1))
         };
-        self.after_scene_change();
+        // No re-arrange: the survivors keep their places and beds.
+        self.active_bed = self.active_bed.min(self.n_beds() - 1);
+        self.scene_dirty();
     }
 
-    /// Invalidate slice/preview and re-layout after the object set changed.
-    fn after_scene_change(&mut self) {
-        self.arrange();
+    /// Which bed an object sits on (by its world position).
+    fn bed_of(&self, obj: &SceneObject) -> usize {
+        bed_of_pos(obj.pos[0], self.settings.bed_size_x_mm)
+    }
+
+    /// How many beds exist: every occupied one, the active one, plus one
+    /// trailing empty bed reachable as a drag/import target.
+    fn n_beds(&self) -> usize {
+        let occupied = self.objects.iter().map(|o| self.bed_of(o) + 1).max().unwrap_or(1);
+        occupied.max(self.active_bed + 1)
+    }
+
+    /// The lowest bed with nothing on it (where imports land).
+    fn first_empty_bed(&self) -> usize {
+        let mut k = 0;
+        while self.objects.iter().any(|o| self.bed_of(o) == k) {
+            k += 1;
+        }
+        k
+    }
+
+    /// Make bed `k` active: the camera pivots onto it, the highlight moves,
+    /// and slicing targets it.
+    fn set_active_bed(&mut self, k: usize) {
+        if self.active_bed != k {
+            self.active_bed = k;
+            self.recenter_camera = true;
+            self.needs_rebuild = true; // bed highlight
+        }
+    }
+
+    /// World center of bed `k`.
+    fn bed_center(&self, k: usize) -> [f64; 2] {
+        let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+        [bed_origin_x(k, bx) + bx / 2.0, by / 2.0]
+    }
+
+    /// True if the object's footprint hangs past its own bed's edges.
+    fn off_its_bed(&self, obj: &SceneObject) -> bool {
+        let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+        let ox = bed_origin_x(self.bed_of(obj), bx);
+        let (minx, miny, maxx, maxy, _) = obj.footprint();
+        let (w, h) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+        obj.pos[0] - w < ox || obj.pos[0] + w > ox + bx || obj.pos[1] - h < 0.0 || obj.pos[1] + h > by
+    }
+
+    /// Invalidate slice/preview and refresh the scene after objects changed.
+    fn scene_dirty(&mut self) {
         self.sliced = None;
         self.slice_summary = None;
         self.view_preview = false;
         self.needs_rebuild = true;
-        self.refit_camera = true;
     }
 
-    /// Lay all objects out in a grid centered on the bed (each footprint centered
-    /// in its cell). Objects always sit on z=0 via their baked transform.
+    /// Re-layout every object, flowing across beds (shelf packing — see
+    /// `shelf_pack`).
     fn arrange(&mut self) {
-        let n = self.objects.len();
-        if n == 0 {
+        let all: Vec<usize> = (0..self.objects.len()).collect();
+        self.arrange_from(0, &all);
+    }
+
+    /// Shelf-pack just `idx`, starting at `first_bed` and flowing onto
+    /// subsequent beds as they fill. Objects always sit on z=0 via their
+    /// baked transform.
+    fn arrange_from(&mut self, first_bed: usize, idx: &[usize]) {
+        if idx.is_empty() {
             return;
         }
-        let foot: Vec<(f64, f64, f64, f64, f64)> = self.objects.iter().map(SceneObject::footprint).collect();
-        let cell_w = foot.iter().map(|f| f.2 - f.0).fold(0.0, f64::max) + 5.0;
-        let cell_h = foot.iter().map(|f| f.3 - f.1).fold(0.0, f64::max) + 5.0;
-        let cols = (n as f64).sqrt().ceil() as usize;
-        let rows = n.div_ceil(cols);
-        let x0 = self.settings.bed_size_x_mm / 2.0 - cols as f64 * cell_w / 2.0;
-        let y0 = self.settings.bed_size_y_mm / 2.0 - rows as f64 * cell_h / 2.0;
-        for (i, obj) in self.objects.iter_mut().enumerate() {
-            obj.pos = [
-                x0 + (i % cols) as f64 * cell_w + cell_w / 2.0,
-                y0 + (i / cols) as f64 * cell_h + cell_h / 2.0,
-            ];
+        let sizes: Vec<(f64, f64)> = idx
+            .iter()
+            .map(|&i| {
+                let f = self.objects[i].footprint();
+                (f.2 - f.0, f.3 - f.1)
+            })
+            .collect();
+        let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+        for (j, (bed, cx, cy)) in shelf_pack(&sizes, bx, by, 5.0).into_iter().enumerate() {
+            self.objects[idx[j]].pos = [bed_origin_x(first_bed + bed, bx) + cx, cy];
         }
     }
 
-    /// Bake every object's placement into one mesh, in bed coordinates.
+    /// Bake the ACTIVE bed's objects into one mesh, in that bed's local
+    /// coordinates (the engine plans in [0, bed] space).
     fn combined_mesh(&self) -> Option<mesh::Mesh> {
-        if self.objects.is_empty() {
-            return None;
-        }
+        let ox = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
         let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
-        for obj in &self.objects {
-            let t = obj.transform();
+        for obj in self.objects.iter().filter(|o| self.bed_of(o) == self.active_bed) {
+            let mut t = obj.transform();
+            t.translation[0] -= ox;
             for i in 0..obj.mesh.triangles.len() {
                 let tri = obj.mesh.triangle(i);
                 tris.push([t.apply(tri[0]), t.apply(tri[1]), t.apply(tri[2])]);
             }
+        }
+        if tris.is_empty() {
+            return None;
         }
         Some(mesh::Mesh::from_triangle_soup(&tris))
     }
@@ -1226,6 +1387,10 @@ impl App {
         self.layer_stats = engine::per_layer_stats(&layers, &self.settings);
         self.layer_islands = engine::per_layer_islands(&layers, &self.settings);
         self.sliced = Some(layers);
+        // The preview belongs to the bed that was active at slice time —
+        // instances bake its world offset, so it stays put if the user
+        // switches beds afterward.
+        self.sliced_origin_x = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
         self.set_preview_instances(rs);
         self.preview_layer = n.max(1);
         self.view_preview = true;
@@ -1242,8 +1407,13 @@ impl App {
             self.settings.z_hop_mm
         };
         let layer_colors = self.layer_color_table();
-        let (verts, ends, joints, joint_ends) =
-            build_instances(layers, hop as f32, layer_colors.as_deref(), accent_hsl(self.accent));
+        let (verts, ends, joints, joint_ends) = build_instances(
+            layers,
+            hop as f32,
+            layer_colors.as_deref(),
+            accent_hsl(self.accent),
+            self.sliced_origin_x as f32,
+        );
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
         self.layer_ends = ends;
@@ -1396,11 +1566,13 @@ impl App {
         }
     }
 
-    /// Upload filename: the first object's name with a .gcode extension.
+    /// Upload filename: the active bed's first object name with a .gcode
+    /// extension (uploads carry the last slice, which is per-bed).
     fn upload_filename(&self) -> String {
         let base = self
             .objects
-            .first()
+            .iter()
+            .find(|o| self.bed_of(o) == self.active_bed)
             .map(|o| {
                 o.name
                     .trim_end_matches(".stl")
@@ -1444,7 +1616,7 @@ impl App {
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         let bx = self.settings.bed_size_x_mm as f32;
         let by = self.settings.bed_size_y_mm as f32;
-        self.scene.set_bed(&rs.device, bx, by);
+        self.scene.set_beds(&rs.device, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
 
         // The selected object is flagged so the renderer highlights it.
         let objs: Vec<(&mesh::Mesh, mesh::Transform, bool)> = self
@@ -1465,7 +1637,10 @@ impl App {
                         span * 0.5 + 1.0,
                     );
                 }
-                None => self.camera.frame(glam::Vec3::new(bx / 2.0, by / 2.0, 0.0), bx.max(by) * 0.5),
+                None => {
+                    let c = self.bed_center(self.active_bed);
+                    self.camera.frame(glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0), bx.max(by) * 0.5)
+                }
             }
             self.refit_camera = false;
         }
@@ -1481,20 +1656,25 @@ impl eframe::App for App {
         // plate, whatever path it arrived by.
         let bed = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
         if bed != self.last_bed {
+            let old_bx = self.last_bed.0;
             self.last_bed = bed;
             self.needs_rebuild = true;
             self.recenter_camera = true;
+            // The bed pitch changed: re-pin every object to the same bed
+            // index + relative offset under the new layout, so membership
+            // survives resizes.
+            for o in &mut self.objects {
+                let k = bed_of_pos(o.pos[0], old_bx);
+                let local = o.pos[0] - bed_origin_x(k, old_bx);
+                o.pos[0] = bed_origin_x(k, bed.0) + local;
+            }
             // Objects placed for the old plate may not fit the new one —
-            // re-grid them onto it. Only when something actually hangs off:
-            // manual placements that still fit are left alone. (Without this,
-            // a 350→152 mm switch leaves the model far outside the plate and
+            // re-grid only when something actually hangs off: manual
+            // placements that still fit are left alone. (Without this, a
+            // 350→152 mm switch leaves the model far outside the plate and
             // the freshly recentered pivot FEELS broken — you orbit an empty
             // bed while the part sweeps in the distance.)
-            let off_bed = self.objects.iter().any(|o| {
-                let (minx, miny, maxx, maxy, _) = o.footprint();
-                minx < 0.0 || miny < 0.0 || maxx > bed.0 || maxy > bed.1
-            });
-            if off_bed {
+            if self.objects.iter().any(|o| self.off_its_bed(o)) {
                 self.arrange();
                 self.sliced = None;
                 self.slice_summary = None;
@@ -1510,8 +1690,8 @@ impl eframe::App for App {
         // are untouched (it's a pivot move, not a re-frame).
         if self.recenter_camera {
             self.recenter_camera = false;
-            self.camera.target =
-                glam::Vec3::new((bed.0 / 2.0) as f32, (bed.1 / 2.0) as f32, 0.0);
+            let c = self.bed_center(self.active_bed);
+            self.camera.target = glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0);
         }
         // Unpinned auto settings track their masters every frame, before
         // anything (incl. the Slice button) reads them.
@@ -1693,60 +1873,25 @@ impl eframe::App for App {
             ui.painter().galley(able_pos, able_galley, egui::Color32::WHITE);
             ui.painter().galley(slicer_pos, slicer_galley, egui::Color32::WHITE);
             ui.add_space(8.0);
-            // Object actions as one even row — same grid the Slice/Export
-            // rows use, so the panel's top reads as aligned blocks.
-            let third = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
-            ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new("Import…").min_size(egui::vec2(third, 26.0)))
-                    .on_hover_text("Load an STL or 3MF file and add it to the bed (a 3MF build's objects each arrive separately).")
-                    .clicked()
-                {
-                    let mut dialog =
-                        rfd::FileDialog::new().add_filter("models (STL, 3MF)", &["stl", "3mf"]);
-                    if let Some(dir) = &self.last_model_dir {
-                        dialog = dialog.set_directory(dir);
-                    }
-                    if let Some(path) = dialog.pick_file() {
-                        self.last_model_dir = path.parent().map(|d| d.to_path_buf());
-                        self.import_model(path);
-                    }
+            // Import is the panel's one object action — selection, duplicate
+            // and delete live on the viewport's floating cards, and the bed
+            // controls float over the 3D view.
+            if ui
+                .add(egui::Button::new("Import…").min_size(egui::vec2(ui.available_width(), 26.0)))
+                .on_hover_text(
+                    "Load an STL or 3MF onto a fresh bed (a 3MF build's objects each \
+                     arrive separately, keeping their plate layout when it fits).",
+                )
+                .clicked()
+            {
+                let mut dialog =
+                    rfd::FileDialog::new().add_filter("models (STL, 3MF)", &["stl", "3mf"]);
+                if let Some(dir) = &self.last_model_dir {
+                    dialog = dialog.set_directory(dir);
                 }
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Duplicate").min_size(egui::vec2(third, 26.0)),
-                    )
-                    .on_hover_text("Add a copy of the selected object (shares geometry; re-arranged on the bed).")
-                    .clicked()
-                {
-                    self.duplicate_selected();
-                }
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Delete").min_size(egui::vec2(third, 26.0)),
-                    )
-                    .on_hover_text("Remove the selected object from the bed.")
-                    .clicked()
-                {
-                    self.delete_selected();
-                }
-            });
-            if self.objects.is_empty() {
-                ui.weak("Import an STL to begin.");
-            } else {
-                for i in 0..self.objects.len() {
-                    let sel = self.selected == Some(i);
-                    let name = self.objects[i].name.clone();
-                    if ui
-                        .selectable_label(sel, name)
-                        .on_hover_text("Click to select. Drag it in the 3D view to move it; rotate/scale via the on-screen panel.")
-                        .clicked()
-                    {
-                        self.selected = Some(i);
-                        self.needs_rebuild = true; // refresh highlight (camera stays put)
-                    }
+                if let Some(path) = dialog.pick_file() {
+                    self.last_model_dir = path.parent().map(|d| d.to_path_buf());
+                    self.import_model(path);
                 }
             }
 
@@ -1860,8 +2005,9 @@ impl eframe::App for App {
             let big = egui::vec2(half, 32.0);
             ui.horizontal(|ui| {
                 // Slice is the hero action: printed in reverse — cream plate,
-                // ink text — the one inverted block in the panel.
-                let can_slice = !self.objects.is_empty();
+                // ink text — the one inverted block in the panel. It slices
+                // the ACTIVE bed.
+                let can_slice = self.objects.iter().any(|o| self.bed_of(o) == self.active_bed);
                 let mut label = egui::RichText::new("Slice").size(15.0).strong();
                 if can_slice {
                     label = label.color(palette::INK);
@@ -1872,8 +2018,8 @@ impl eframe::App for App {
                 }
                 if ui
                     .add_enabled(can_slice, slice_btn)
-                    .on_hover_text("Slice all objects on the bed into toolpaths using the current settings.")
-                    .on_disabled_hover_text("Import a model first.")
+                    .on_hover_text("Slice the active bed's objects into toolpaths using the current settings.")
+                    .on_disabled_hover_text("Nothing on the active bed — import a model, or step beds with ◀ ▶.")
                     .clicked()
                 {
                     self.slice(&rs);
@@ -2468,6 +2614,7 @@ impl eframe::App for App {
             let pointer = ui.ctx().pointer_interact_pos();
             let over = |r: Option<egui::Rect>| matches!((r, pointer), (Some(r), Some(p)) if r.contains(p));
             let blocked = over(self.overlay_rect)
+                || over(self.bed_overlay_rect)
                 || over(self.print_overlay_rect)
                 || over(self.msgs_overlay_rect);
 
@@ -2513,11 +2660,26 @@ impl eframe::App for App {
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
             }
-            // A plain click selects the object under the cursor, or deselects on empty.
+            // A plain click selects the object under the cursor (its bed
+            // becomes active), or — on empty space — deselects and activates
+            // the bed nearest the click.
             if edit && !blocked && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
                     self.selected = self.pick(o, d);
+                    match self.selected {
+                        Some(i) => {
+                            let k = self.bed_of(&self.objects[i]);
+                            self.set_active_bed(k);
+                        }
+                        None => {
+                            if let Some(xy) = ray_plane_z0(o, d) {
+                                let k = bed_of_pos(xy.x as f64, self.settings.bed_size_x_mm)
+                                    .min(self.n_beds() - 1);
+                                self.set_active_bed(k);
+                            }
+                        }
+                    }
                     self.needs_rebuild = true;
                 }
             }
@@ -2564,11 +2726,100 @@ impl eframe::App for App {
                 egui::Color32::WHITE,
             );
 
+            // Floating bed card, top-center: step/select the active bed, add
+            // a fresh one, remove an empty one. Always visible — bed
+            // switching matters in Preview too (it re-aims Slice).
+            {
+                let n = self.n_beds();
+                let active_empty =
+                    !self.objects.iter().any(|o| self.bed_of(o) == self.active_bed);
+                let mut go: Option<usize> = None;
+                let (mut add, mut remove) = (false, false);
+                let area = egui::Area::new(egui::Id::new("bed_overlay"))
+                    .order(egui::Order::Foreground)
+                    .pivot(egui::Align2::CENTER_TOP)
+                    .fixed_pos(egui::pos2(rect.center().x, rect.top() + 10.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 196))
+                            .show(ui, |ui| {
+                                // Natural sizing only (Area stale-rect gotcha).
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(self.active_bed > 0, egui::Button::new("◀"))
+                                        .on_hover_text("Previous bed.")
+                                        .clicked()
+                                    {
+                                        go = Some(self.active_bed - 1);
+                                    }
+                                    ui.label(format!("bed {} / {}", self.active_bed + 1, n));
+                                    if ui
+                                        .add_enabled(self.active_bed + 1 < n, egui::Button::new("▶"))
+                                        .on_hover_text("Next bed.")
+                                        .clicked()
+                                    {
+                                        go = Some(self.active_bed + 1);
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .button("+")
+                                        .on_hover_text(
+                                            "Add a fresh bed and make it active. Slicing targets \
+                                             the active bed, the camera orbits it, and imports \
+                                             land on the first empty one.",
+                                        )
+                                        .clicked()
+                                    {
+                                        add = true;
+                                    }
+                                    if ui
+                                        .add_enabled(n > 1 && active_empty, egui::Button::new("−"))
+                                        .on_hover_text(
+                                            "Remove the active bed; beds to the right slide over.",
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Only an empty bed can be removed (and the last bed stays).",
+                                        )
+                                        .clicked()
+                                    {
+                                        remove = true;
+                                    }
+                                });
+                            });
+                    });
+                self.bed_overlay_rect = Some(area.response.rect);
+                if let Some(k) = go {
+                    self.set_active_bed(k);
+                }
+                if add {
+                    self.set_active_bed(self.n_beds());
+                }
+                if remove {
+                    // Slide everything right of the removed bed one pitch
+                    // left; bed indices follow position, so that's the whole
+                    // operation. The preview's world offset may now be stale —
+                    // invalidate.
+                    let bx = self.settings.bed_size_x_mm;
+                    let k = self.active_bed;
+                    for o in &mut self.objects {
+                        if bed_of_pos(o.pos[0], bx) > k {
+                            o.pos[0] -= bx + BED_GAP_MM;
+                        }
+                    }
+                    let occupied =
+                        self.objects.iter().map(|o| self.bed_of(o) + 1).max().unwrap_or(1);
+                    self.active_bed = k.min(occupied - 1);
+                    self.recenter_camera = true;
+                    self.scene_dirty();
+                }
+            }
+
             // Floating translucent transform panel — only while an object is selected
             // and we're in Model view (Preview is read-only).
             if let (Some(i), false) = (self.selected, self.view_preview) {
                 let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
                 let mut changed = false;
+                let (mut dup, mut del) = (false, false);
                 let area = egui::Area::new(egui::Id::new("transform_overlay"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
@@ -2593,12 +2844,33 @@ impl eframe::App for App {
                                 changed |= ui.add(egui::Slider::new(&mut obj.scale, 0.1..=5.0).text("scale")).changed();
                                 ui.horizontal(|ui| {
                                     if ui.button("Center").clicked() {
-                                        obj.pos = [bx / 2.0, by / 2.0];
+                                        // Center on the object's OWN bed.
+                                        let ox = bed_origin_x(bed_of_pos(obj.pos[0], bx), bx);
+                                        obj.pos = [ox + bx / 2.0, by / 2.0];
                                         changed = true;
                                     }
                                     if ui.button("Reset rot").clicked() {
                                         obj.rot_deg = [0.0; 3];
                                         changed = true;
+                                    }
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("Duplicate")
+                                        .on_hover_text(
+                                            "Add a copy beside this object (a fresh bed when its bed is full).",
+                                        )
+                                        .clicked()
+                                    {
+                                        dup = true;
+                                    }
+                                    if ui
+                                        .button("Delete")
+                                        .on_hover_text("Remove this object from the bed.")
+                                        .clicked()
+                                    {
+                                        del = true;
                                     }
                                 });
                             });
@@ -2609,6 +2881,12 @@ impl eframe::App for App {
                     self.sliced = None;
                     self.slice_summary = None;
                     self.view_preview = false;
+                }
+                if dup {
+                    self.duplicate_selected();
+                }
+                if del {
+                    self.delete_selected();
                 }
             } else {
                 self.overlay_rect = None;
@@ -3093,6 +3371,7 @@ fn build_instances(
     z_hop_mm: f32,
     path_colors: Option<&[Vec<[f32; 3]>]>,
     accent: (f32, f32, f32),
+    origin_x: f32,
 ) -> Instances {
     let mut inst: Vec<[f32; 13]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
@@ -3121,7 +3400,7 @@ fn build_instances(
                 let zc = if tr.hop { z_top + z_hop_mm } else { z_top } - travel_dim * 0.5;
                 let mut from = pe;
                 for &pt in &tr.points {
-                    push_inst(&mut inst, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
+                    push_inst(&mut inst, origin_x, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
                     from = pt;
                 }
             }
@@ -3148,10 +3427,10 @@ fn build_instances(
             };
             let n_pts = path.points.len();
             for k in 0..n_pts - 1 {
-                push_inst(&mut inst, path.points[k], path.points[k + 1], zc, seg_w(k), bh, c, layer_id, cat);
+                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, seg_w(k), bh, c, layer_id, cat);
             }
             if path.closed {
-                push_inst(&mut inst, path.points[n_pts - 1], path.points[0], zc, seg_w(n_pts - 1), bh, c, layer_id, cat);
+                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, seg_w(n_pts - 1), bh, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
             for (k, p) in path.points.iter().enumerate() {
@@ -3160,7 +3439,7 @@ fn build_instances(
                     None => w,
                 };
                 joints.push([
-                    p.x_mm() as f32, p.y_mm() as f32, zc,
+                    p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
                     jw, bh,
                     c[0], c[1], c[2],
                     layer_id, cat,
@@ -3175,7 +3454,7 @@ fn build_instances(
             if path.kind == engine::PathKind::ExternalPerimeter && path.closed {
                 let s = path.points[0];
                 joints.push([
-                    s.x_mm() as f32, s.y_mm() as f32, zc,
+                    s.x_mm() as f32 + origin_x, s.y_mm() as f32, zc,
                     w * 2.5, h * 2.5,
                     seam_color[0], seam_color[1], seam_color[2],
                     layer_id, CAT_SEAM,
@@ -3196,6 +3475,7 @@ fn build_instances(
 #[allow(clippy::too_many_arguments)]
 fn push_inst(
     v: &mut Vec<[f32; 13]>,
+    origin_x: f32,
     a: geo2d::Point,
     b: geo2d::Point,
     z_center: f32,
@@ -3205,8 +3485,8 @@ fn push_inst(
     layer: f32,
     cat: f32,
 ) {
-    let (ax, ay) = (a.x_mm() as f32, a.y_mm() as f32);
-    let (bx, by) = (b.x_mm() as f32, b.y_mm() as f32);
+    let (ax, ay) = (a.x_mm() as f32 + origin_x, a.y_mm() as f32);
+    let (bx, by) = (b.x_mm() as f32 + origin_x, b.y_mm() as f32);
     let (dx, dy) = (bx - ax, by - ay);
     let len = (dx * dx + dy * dy).sqrt();
     if len < 1.0e-4 {
@@ -3280,6 +3560,49 @@ mod tests {
         let t = ray_triangle(glam::Vec3::new(2.0, 2.0, 5.0), down, a, b, c).unwrap();
         assert!((t - 5.0).abs() < 1e-4, "t={t}");
         assert!(ray_triangle(glam::Vec3::new(20.0, 20.0, 5.0), down, a, b, c).is_none());
+    }
+
+    #[test]
+    fn shelf_packing_fills_a_bed_before_overflowing() {
+        // The Gridfinity shape of the problem: 30 small gauges plus one long
+        // holder. Uniform worst-case cells needed 8 beds; shelves fit it all
+        // on one 350 mm plate.
+        let mut sizes: Vec<(f64, f64)> = vec![(48.0, 40.0); 30];
+        sizes.push((170.0, 45.0));
+        let placed = shelf_pack(&sizes, 350.0, 350.0, 5.0);
+        assert!(placed.iter().all(|&(bed, _, _)| bed == 0), "everything on one bed");
+        // No two parts overlap (the margin keeps them separated).
+        for a in 0..sizes.len() {
+            for b in a + 1..sizes.len() {
+                let ((wa, ha), (wb, hb)) = (sizes[a], sizes[b]);
+                let ((_, ax, ay), (_, bx, by)) = (placed[a], placed[b]);
+                let apart =
+                    (ax - bx).abs() * 2.0 >= wa + wb || (ay - by).abs() * 2.0 >= ha + hb;
+                assert!(apart, "parts {a} and {b} overlap");
+            }
+        }
+        // A flood of 100 mm parts: 9 fit a 350 plate (3 x 3), the rest
+        // overflow onto bed 1 — and every part stays inside its plate.
+        let many: Vec<(f64, f64)> = vec![(100.0, 100.0); 12];
+        let placed = shelf_pack(&many, 350.0, 350.0, 5.0);
+        assert_eq!(placed.iter().filter(|p| p.0 == 0).count(), 9);
+        assert_eq!(placed.iter().filter(|p| p.0 == 1).count(), 3);
+        for (&(w, h), &(_, cx, cy)) in many.iter().zip(&placed) {
+            assert!(cx - w / 2.0 >= -1e-9 && cx + w / 2.0 <= 350.0 + 1e-9, "x inside");
+            assert!(cy - h / 2.0 >= -1e-9 && cy + h / 2.0 <= 350.0 + 1e-9, "y inside");
+        }
+    }
+
+    #[test]
+    fn bed_world_layout_roundtrips() {
+        let bx = 152.4;
+        for k in 0..5 {
+            let o = bed_origin_x(k, bx);
+            assert_eq!(bed_of_pos(o + bx / 2.0, bx), k, "center maps to bed {k}");
+            assert_eq!(bed_of_pos(o + 1.0, bx), k, "left edge stays on bed {k}");
+            assert_eq!(bed_of_pos(o + bx - 1.0, bx), k, "right edge stays on bed {k}");
+        }
+        assert_eq!(bed_of_pos(-50.0, bx), 0, "left of bed 0 clamps to 0");
     }
 
     #[test]

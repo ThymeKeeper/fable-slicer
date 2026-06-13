@@ -405,31 +405,46 @@ impl Scene {
         Some((lo, hi))
     }
 
-    /// Build the bed grid (gray lines on z=0 plus a brighter border).
-    pub fn set_bed(&mut self, device: &wgpu::Device, bed_x: f32, bed_y: f32) {
-        // Warm ink grid with a cream plate border.
-        let grid = [0.28, 0.25, 0.20];
-        let border = [0.64, 0.60, 0.51];
+    /// Build the bed grids: `n` beds in a row along +X, `gap` apart. The
+    /// active bed gets the cream border and full-strength grid; the others
+    /// recede into the ink.
+    pub fn set_beds(
+        &mut self,
+        device: &wgpu::Device,
+        bed_x: f32,
+        bed_y: f32,
+        n: usize,
+        gap: f32,
+        active: usize,
+    ) {
         let step = 20.0_f32;
         let mut v = Vec::new();
-        let mut x = 0.0;
-        while x <= bed_x + 0.01 {
-            v.push(LineVertex { pos: [x, 0.0, 0.0], color: grid });
-            v.push(LineVertex { pos: [x, bed_y, 0.0], color: grid });
-            x += step;
-        }
-        let mut y = 0.0;
-        while y <= bed_y + 0.01 {
-            v.push(LineVertex { pos: [0.0, y, 0.0], color: grid });
-            v.push(LineVertex { pos: [bed_x, y, 0.0], color: grid });
-            y += step;
-        }
-        let corners = [[0.0, 0.0], [bed_x, 0.0], [bed_x, bed_y], [0.0, bed_y]];
-        for k in 0..4 {
-            let a = corners[k];
-            let b = corners[(k + 1) % 4];
-            v.push(LineVertex { pos: [a[0], a[1], 0.0], color: border });
-            v.push(LineVertex { pos: [b[0], b[1], 0.0], color: border });
+        for k in 0..n.max(1) {
+            let ox = k as f32 * (bed_x + gap);
+            let (grid, border) = if k == active {
+                ([0.28, 0.25, 0.20], [0.64, 0.60, 0.51]) // warm ink + cream
+            } else {
+                ([0.14, 0.125, 0.10], [0.34, 0.31, 0.26]) // receded
+            };
+            let mut x = 0.0;
+            while x <= bed_x + 0.01 {
+                v.push(LineVertex { pos: [ox + x, 0.0, 0.0], color: grid });
+                v.push(LineVertex { pos: [ox + x, bed_y, 0.0], color: grid });
+                x += step;
+            }
+            let mut y = 0.0;
+            while y <= bed_y + 0.01 {
+                v.push(LineVertex { pos: [ox, y, 0.0], color: grid });
+                v.push(LineVertex { pos: [ox + bed_x, y, 0.0], color: grid });
+                y += step;
+            }
+            let corners = [[ox, 0.0], [ox + bed_x, 0.0], [ox + bed_x, bed_y], [ox, bed_y]];
+            for c in 0..4 {
+                let a = corners[c];
+                let b = corners[(c + 1) % 4];
+                v.push(LineVertex { pos: [a[0], a[1], 0.0], color: border });
+                v.push(LineVertex { pos: [b[0], b[1], 0.0], color: border });
+            }
         }
         self.line_count = v.len() as u32;
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
