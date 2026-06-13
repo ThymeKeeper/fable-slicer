@@ -3067,7 +3067,21 @@ impl eframe::App for App {
                                     changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[1]).speed(1.0).prefix("Y ")).changed();
                                     changed |= ui.add(egui::DragValue::new(&mut obj.rot_deg[2]).speed(1.0).prefix("Z ")).changed();
                                 });
-                                changed |= ui.add(egui::Slider::new(&mut obj.scale, 0.1..=5.0).text("scale")).changed();
+                                ui.horizontal(|ui| {
+                                    ui.label("scale");
+                                    // DragValue, not a slider: 1%/px drag and
+                                    // type-to-set give fine control (the slider
+                                    // over 0.1..5 was ~5% per pixel). Matches
+                                    // the move/rot fields above.
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut obj.scale)
+                                                .speed(0.01)
+                                                .range(0.1..=5.0)
+                                                .fixed_decimals(2),
+                                        )
+                                        .changed();
+                                });
                                 ui.horizontal(|ui| {
                                     if ui.button("Center").clicked() {
                                         // Center on the object's OWN bed.
