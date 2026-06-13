@@ -1777,7 +1777,7 @@ pub fn apply_heat_control_speed(layers: &mut [LayerPlan], s: &Settings) {
             }
         }
         if dwell_needed > 0.05 {
-            layer.dwell_s = dwell_needed.min(max_dwell_s(s));
+            layer.dwell_s = dwell_needed.min(MAX_PROTECTIVE_DWELL_S);
         }
     }
     // Second pass: smooth the realized aggregate. Every surface in a layer
@@ -1815,7 +1815,7 @@ pub fn apply_heat_control_speed(layers: &mut [LayerPlan], s: &Settings) {
         let raise = |layers: &mut [LayerPlan], times: &mut [f64], i: usize, to: f64| {
             let deficit = to - times[i];
             if deficit > 0.05 {
-                let dwell = (layers[i].dwell_s + deficit).min(max_dwell_s(s));
+                let dwell = (layers[i].dwell_s + deficit).min(MAX_SMOOTHING_DWELL_S);
                 times[i] += dwell - layers[i].dwell_s;
                 layers[i].dwell_s = dwell;
             }
@@ -1841,23 +1841,17 @@ pub fn apply_heat_control_speed(layers: &mut [LayerPlan], s: &Settings) {
     }
 }
 
-/// Cap on the per-layer cooling dwell — a backstop against pathological
-/// geometry demanding minutes of parking; the audit flags what the cap leaves
-/// hot.
-const MAX_DWELL_S: f64 = 20.0;
+/// Per-layer cap on PROTECTIVE cooling dwell — the parking that holds a layer
+/// under the heat-load cap. A backstop, not a budget: past this the part needs
+/// cooling hardware, not more dead time, and the audit flags what stays hot.
+/// Independent of the extra-time dial — protection is physics.
+const MAX_PROTECTIVE_DWELL_S: f64 = 20.0;
 
-/// The smoothing dwell cap. A positive time budget exists to trade time for
-/// evenness, and
-/// the cap is what sets how low the level can reach (tiny layers need long
-/// parks to match a cold deck) — so it gets a far bigger budget than the
-/// protective cap-mode backstop.
-const MAX_DWELL_EVEN_S: f64 = 90.0;
-
-/// The dwell budget in force for the current mode — the uniformity modes
-/// exist to trade time for evenness, so they get the big budget.
-fn max_dwell_s(s: &Settings) -> f64 {
-    if s.smooth_extra_time_pct > 0.0 { MAX_DWELL_EVEN_S } else { MAX_DWELL_S }
-}
+/// Per-layer cap on total park time once smoothing is in play — tiny layers
+/// need long parks to match a cold deck. *How much* smoothing spends is the
+/// time budget's call (`smooth_extra_time_pct`); this only bounds any single
+/// layer.
+const MAX_SMOOTHING_DWELL_S: f64 = 90.0;
 
 /// How high the nozzle lifts while spending a cooling dwell.
 const DWELL_LIFT_MM: f64 = 5.0;
