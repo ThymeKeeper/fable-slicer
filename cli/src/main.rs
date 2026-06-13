@@ -15,7 +15,7 @@ use geo2d::{Aabb, Point, UNITS_PER_MM};
 #[derive(Parser)]
 #[command(name = "fable-slicer", version, about = "Fable Slicer — from-scratch FDM slicer")]
 struct Args {
-    /// Input mesh (STL, binary or ASCII). Optional with --list-profiles.
+    /// Input model (STL binary/ASCII, or 3MF). Optional with --list-profiles.
     input: Option<PathBuf>,
 
     /// Output g-code file.
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
     let input = args
         .input
         .clone()
-        .context("no input STL given (use --list-profiles to see profiles)")?;
+        .context("no input model given (use --list-profiles to see profiles)")?;
 
     let mut settings = profiles
         .resolve(&args.printer, &args.filament, &args.process)
@@ -257,8 +257,22 @@ fn main() -> Result<()> {
         settings.layer_height_mm
     );
 
-    let mesh = mesh::Mesh::load_stl(&input)
-        .with_context(|| format!("loading STL {}", input.display()))?;
+    let is_3mf = input.extension().map(|e| e.eq_ignore_ascii_case("3mf")).unwrap_or(false);
+    let mesh = if is_3mf {
+        // The CLI slices one plate: a 3MF build's objects merge into it with
+        // their build placement baked.
+        let items = mesh::load_3mf(&input)
+            .map_err(|e| anyhow::anyhow!(e))
+            .with_context(|| format!("loading 3MF {}", input.display()))?;
+        let mut m = mesh::Mesh::default();
+        for it in &items {
+            m.append(&it.mesh);
+        }
+        println!("Loaded {}: {} object(s)", input.display(), items.len());
+        m
+    } else {
+        mesh::Mesh::load_stl(&input).with_context(|| format!("loading STL {}", input.display()))?
+    };
     println!("Loaded {}: {} triangles", input.display(), mesh.triangles.len());
 
     let layers = generate(&mesh, &settings);

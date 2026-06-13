@@ -1,8 +1,11 @@
-//! Triangle mesh: indexed storage, STL I/O, and a few primitives.
+//! Triangle mesh: indexed storage, STL/3MF I/O, and a few primitives.
 //!
 //! Vertices are stored once and referenced by index (welded on load), which gives
 //! us implicit edge sharing — useful later for topology-aware repair. For M0 the
 //! slicer only needs the triangle list and the z-range.
+
+mod threemf;
+pub use threemf::{load_3mf, load_3mf_reader, ThreeMfItem};
 
 use std::collections::HashMap;
 use std::fs;
@@ -98,6 +101,15 @@ impl Mesh {
         }
 
         Mesh { vertices, triangles }
+    }
+
+    /// Append another mesh, re-basing its indices — merging build items into
+    /// one plate (CLI) or components into one object.
+    pub fn append(&mut self, other: &Mesh) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&other.vertices);
+        self.triangles
+            .extend(other.triangles.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
     }
 
     /// The three world-space vertices of triangle `i`.

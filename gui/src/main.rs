@@ -1,5 +1,6 @@
-//! `slicer-gui` — desktop GUI: import STLs as a multi-object scene, lay them out
-//! on the bed, choose profiles, slice, preview toolpaths in 3D, and export g-code.
+//! `slicer-gui` — desktop GUI: import STL/3MF models as a multi-object scene,
+//! lay them out on the bed, choose profiles, slice, preview toolpaths in 3D,
+//! and export g-code.
 
 mod camera;
 mod render;
@@ -1054,12 +1055,74 @@ impl App {
     }
 
     /// Load an STL and add it to the scene as a new object.
-    fn import_stl(&mut self, path: std::path::PathBuf) {
+    fn import_model(&mut self, path: std::path::PathBuf) {
+        let file = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "object".into());
+        let is_3mf = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("3mf"))
+            .unwrap_or(false);
+        if is_3mf {
+            // A 3MF build can carry several objects — each becomes its own
+            // scene object (named from the file, or its own name), and the
+            // grid arrange in after_scene_change lays the plate out.
+            match mesh::load_3mf(&path) {
+                Ok(items) if items.is_empty() => {
+                    self.status = format!("{file}: no printable objects in the build");
+                }
+                Ok(items) => {
+                    let n = items.len();
+                    let tris: usize = items.iter().map(|it| it.mesh.triangles.len()).sum();
+                    for (k, it) in items.into_iter().enumerate() {
+                        let name = if !it.name.is_empty() {
+                            it.name
+                        } else if n == 1 {
+                            file.clone()
+                        } else {
+                            format!("{file} #{}", k + 1)
+                        };
+                        let mut obj = SceneObject::new(name, it.mesh);
+                        // Keep the file's plate layout: pos = the baked
+                        // footprint center reproduces the build placement
+                        // (SceneObject::transform recenters the footprint
+                        // on pos).
+                        let (minx, miny, maxx, maxy, _) = obj.footprint();
+                        obj.pos = [(minx + maxx) / 2.0, (miny + maxy) / 2.0];
+                        self.objects.push(obj);
+                    }
+                    self.selected = Some(self.objects.len() - 1);
+                    self.status = if n == 1 {
+                        format!("Imported {file} ({tris} triangles)")
+                    } else {
+                        format!("Imported {file}: {n} objects ({tris} triangles)")
+                    };
+                    // The build's own layout wins while it fits our bed
+                    // (it was arranged for *some* plate); re-grid only when
+                    // something hangs off.
+                    let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
+                    let off_bed = self.objects.iter().any(|o| {
+                        let (minx, miny, maxx, maxy, _) = o.footprint();
+                        let c = o.pos;
+                        let (w, h) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+                        c[0] - w < 0.0 || c[1] - h < 0.0 || c[0] + w > bx || c[1] + h > by
+                    });
+                    if off_bed {
+                        self.after_scene_change();
+                    } else {
+                        self.sliced = None;
+                        self.slice_summary = None;
+                        self.view_preview = false;
+                        self.needs_rebuild = true;
+                        self.refit_camera = true;
+                    }
+                }
+                Err(e) => self.status = format!("Load failed: {e}"),
+            }
+            return;
+        }
         match mesh::Mesh::load_stl(&path) {
             Ok(m) => {
-                let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "object".into());
-                self.status = format!("Imported {name} ({} triangles)", m.triangles.len());
-                self.objects.push(SceneObject::new(name, m));
+                self.status = format!("Imported {file} ({} triangles)", m.triangles.len());
+                self.objects.push(SceneObject::new(file, m));
                 self.selected = Some(self.objects.len() - 1);
                 self.after_scene_change();
             }
@@ -1338,7 +1401,14 @@ impl App {
         let base = self
             .objects
             .first()
-            .map(|o| o.name.trim_end_matches(".stl").trim_end_matches(".STL").to_string())
+            .map(|o| {
+                o.name
+                    .trim_end_matches(".stl")
+                    .trim_end_matches(".STL")
+                    .trim_end_matches(".3mf")
+                    .trim_end_matches(".3MF")
+                    .to_string()
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "print".into());
         format!("{base}.gcode")
@@ -1628,17 +1698,18 @@ impl eframe::App for App {
             let third = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
             ui.horizontal(|ui| {
                 if ui
-                    .add(egui::Button::new("Import STL…").min_size(egui::vec2(third, 26.0)))
-                    .on_hover_text("Load an STL file and add it to the bed as a new object.")
+                    .add(egui::Button::new("Import…").min_size(egui::vec2(third, 26.0)))
+                    .on_hover_text("Load an STL or 3MF file and add it to the bed (a 3MF build's objects each arrive separately).")
                     .clicked()
                 {
-                    let mut dialog = rfd::FileDialog::new().add_filter("STL", &["stl"]);
+                    let mut dialog =
+                        rfd::FileDialog::new().add_filter("models (STL, 3MF)", &["stl", "3mf"]);
                     if let Some(dir) = &self.last_model_dir {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(path) = dialog.pick_file() {
                         self.last_model_dir = path.parent().map(|d| d.to_path_buf());
-                        self.import_stl(path);
+                        self.import_model(path);
                     }
                 }
                 if ui

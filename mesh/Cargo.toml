@@ -1,8 +1,12 @@
 [package]
 name = "mesh"
-description = "Triangle mesh storage and STL I/O for the slicer."
+description = "Triangle mesh storage and STL/3MF I/O for the slicer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# 3MF is a zip of XML parts. Default zip features pull bzip2/zstd/aes —
+# real-world 3MFs are deflate-compressed.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"

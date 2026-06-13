@@ -12,7 +12,7 @@ the core testable and is what structurally keeps us independent of a monolith.
 
 ```
               ┌─────────┐
-   STL/3MF ──▶│  mesh   │ indexed triangles, STL I/O
+   STL/3MF ──▶│  mesh   │ indexed triangles, STL/3MF I/O
               └────┬────┘
                    ▼
               ┌─────────┐     ┌────────┐
@@ -81,8 +81,8 @@ robustness upgrade for messy inputs (see PLAN.md → M0 robustness pass).
 - **rayon** for per-layer parallelism — slicing is embarrassingly parallel and
   this is where a from-scratch Rust engine can beat the C++ incumbents.
 - **clap / anyhow** for the CLI ergonomics.
-- Later: **egui + wgpu** (GUI/preview), **zip + quick-xml** (3MF), **serde**
-  (profiles).
+- **zip + quick-xml** for 3MF import — the container is a zip of XML parts.
+- **egui + wgpu** (GUI/preview), **serde** (profiles).
 
 ## Determinism
 
