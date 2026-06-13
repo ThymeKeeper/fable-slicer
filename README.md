@@ -4,8 +4,6 @@
 
 # Fable Slicer
 
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![Status](https://img.shields.io/badge/status-work_in_progress-yellow.svg)
 
 A from-scratch FDM slicer in Rust. GUI-first (egui + wgpu), Klipper-flavored
