@@ -2941,6 +2941,18 @@ impl eframe::App for App {
                 egui::Color32::WHITE,
             );
 
+            // Front-edge marker: which edge is the printer's front (the origin
+            // edge, y=0) is otherwise ambiguous. Lay "Front" — the wordmark
+            // Playfair with the sliced "F" — flat on the active bed's plane
+            // just outside its near edge, foreshortened with the grid.
+            {
+                let bx = self.settings.bed_size_x_mm;
+                let ox = bed_origin_x(self.active_bed, bx);
+                // A dim warm taupe — a quiet annotation just above the grid's tone.
+                let label = egui::Color32::from_rgb(104, 98, 86);
+                draw_front_label(ui, vp, rect, ox, bx, self.settings.bed_size_y_mm, label);
+            }
+
             // Floating bed card, top-center: step/select the active bed, add
             // a fresh one, remove an empty one. Always visible — bed
             // switching matters in Preview too (it re-aims Slice).
@@ -3519,6 +3531,131 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
 }
 
 /// World-space ray (origin, normalized dir) through a screen position in `rect`.
+/// Project a world point to a screen position in `rect`, or None if it's
+/// behind the camera. Inverse of `pointer_ray`'s NDC↔screen mapping.
+fn world_to_screen(vp: glam::Mat4, rect: egui::Rect, p: glam::Vec3) -> Option<egui::Pos2> {
+    let clip = vp * p.extend(1.0);
+    if clip.w <= 1.0e-6 {
+        return None; // behind the camera
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(egui::pos2(
+        rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
+        rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+    ))
+}
+
+/// Paint the word "Front" — the wordmark's Playfair with the sliced "F",
+/// like the logo — lying flat on the bed plane (z=0) just outside the active
+/// bed's near (y=0) edge, so it foreshortens with the grid. Real glyphs: lay
+/// out a galley, then project each glyph's quad from the bed plane to the
+/// screen; the F is split into three offset horizontal slices.
+fn draw_front_label(
+    ui: &mut egui::Ui,
+    vp: glam::Mat4,
+    rect: egui::Rect,
+    ox: f64,
+    bed_x: f64,
+    bed_y: f64,
+    color: egui::Color32,
+) {
+    let wordmark = egui::FontFamily::Name("wordmark".into());
+    let galley = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap("Front".to_owned(), egui::FontId::new(64.0, wordmark), color));
+    let Some(row) = galley.rows.first() else { return };
+    let src = &row.visuals.mesh;
+    let (tw, th) = (galley.size().x, galley.size().y);
+    if src.vertices.len() < 4 || tw <= 0.0 || th <= 0.0 {
+        return;
+    }
+    // Galley meshes carry uv in atlas *texels*; a raw Shape::Mesh samples uv as
+    // normalized [0,1], so divide through by the atlas size.
+    let [aw, ah] = ui.ctx().fonts(|f| f.font_image_size());
+    let (aw, ah) = (aw as f32, ah as f32);
+    let nuv = |uv: egui::Pos2| egui::pos2(uv.x / aw, uv.y / ah);
+
+    // galley px → world on z=0, sized to a fraction of the bed and laid just
+    // OUTSIDE the near (y=0) edge — in front of the plate, off the build
+    // volume — so it never sits under a part: x along +X (reading), the tops
+    // toward the edge and the baseline toward the viewer, reading upright from
+    // the front-facing default camera.
+    let (bx, by) = (bed_x as f32, bed_y as f32);
+    let h_world = (bx.min(by) * 0.05).clamp(8.0, 14.0);
+    let scale = h_world / th;
+    let x0 = ox as f32 + bx * 0.5 - tw * scale * 0.5;
+    let pad = 0.01 * by + 2.0; // small gap in front of the edge
+    let to_screen = |gx: f32, gy: f32| {
+        world_to_screen(vp, rect, glam::Vec3::new(x0 + gx * scale, -pad - gy * scale, 0.0))
+    };
+
+    let mut out = egui::epaint::Mesh::with_texture(src.texture_id);
+    let mut add_quad = |corners: [Option<egui::Pos2>; 4], uv: [egui::Pos2; 4]| {
+        let [Some(a), Some(b), Some(c), Some(d)] = corners else { return };
+        let base = out.vertices.len() as u32;
+        for (p, t) in [(a, uv[0]), (b, uv[1]), (c, uv[2]), (d, uv[3])] {
+            out.vertices.push(egui::epaint::Vertex { pos: p, uv: t, color });
+        }
+        out.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    // The F is the first glyph (first 4 vertices): an axis-aligned quad in
+    // galley px with a matching atlas-uv box.
+    let f = &src.vertices[0..4];
+    let (mut px0, mut py0, mut px1, mut py1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let (mut u0, mut v0, mut u1, mut v1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for vert in f {
+        px0 = px0.min(vert.pos.x);
+        py0 = py0.min(vert.pos.y);
+        px1 = px1.max(vert.pos.x);
+        py1 = py1.max(vert.pos.y);
+        u0 = u0.min(vert.uv.x);
+        v0 = v0.min(vert.uv.y);
+        u1 = u1.max(vert.uv.x);
+        v1 = v1.max(vert.uv.y);
+    }
+    // Three slices across the cap height (= the F's ink box), middle pushed
+    // along +X — the logo's cuts: 0–0.307, 0.360–0.727, 0.779–1.0, shift 0.083.
+    let unit = py1 - py0;
+    for (fa, fb, shift) in [(0.0_f32, 0.307_f32, 0.0_f32), (0.360, 0.727, 0.083), (0.779, 1.0, 0.0)] {
+        let sx = shift * unit;
+        let (ya, yb) = (py0 + unit * fa, py0 + unit * fb);
+        let (va, vb) = (v0 + (v1 - v0) * fa, v0 + (v1 - v0) * fb);
+        add_quad(
+            [
+                to_screen(px0 + sx, ya),
+                to_screen(px1 + sx, ya),
+                to_screen(px1 + sx, yb),
+                to_screen(px0 + sx, yb),
+            ],
+            [nuv(egui::pos2(u0, va)), nuv(egui::pos2(u1, va)), nuv(egui::pos2(u1, vb)), nuv(egui::pos2(u0, vb))],
+        );
+    }
+
+    // The rest ("ront"): project each vertex past the F and keep its triangles.
+    let mut map = vec![None; src.vertices.len()];
+    for vi in 4..src.vertices.len() {
+        let vert = &src.vertices[vi];
+        if let Some(sp) = to_screen(vert.pos.x, vert.pos.y) {
+            map[vi] = Some(out.vertices.len() as u32);
+            out.vertices.push(egui::epaint::Vertex { pos: sp, uv: nuv(vert.uv), color: vert.color });
+        }
+    }
+    for tri in src.indices.chunks_exact(3) {
+        if tri.iter().all(|&i| i as usize >= 4) {
+            if let (Some(a), Some(b), Some(c)) =
+                (map[tri[0] as usize], map[tri[1] as usize], map[tri[2] as usize])
+            {
+                out.indices.extend([a, b, c]);
+            }
+        }
+    }
+
+    if !out.indices.is_empty() {
+        ui.painter().add(egui::Shape::mesh(out));
+    }
+}
+
 fn pointer_ray(vp: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> (glam::Vec3, glam::Vec3) {
     let ndc_x = 2.0 * (pos.x - rect.left()) / rect.width().max(1.0) - 1.0;
     let ndc_y = 1.0 - 2.0 * (pos.y - rect.top()) / rect.height().max(1.0);
