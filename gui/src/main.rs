@@ -459,6 +459,21 @@ impl SceneObject {
     }
 }
 
+/// An in-flight camera glide: when bed focus changes, the orbit target
+/// travels to the new bed instead of teleporting — the motion is what tells
+/// you where you went — and the distance eases to frame the whole plate, so
+/// focus always lands on a readable view of the bed.
+struct CameraGlide {
+    from: glam::Vec3,
+    to: glam::Vec3,
+    dist_from: f32,
+    dist_to: f32,
+    started: std::time::Instant,
+}
+
+/// Glide duration (ease-out cubic — brisk start, soft landing).
+const GLIDE_SECS: f32 = 0.4;
+
 /// Gap between adjacent print beds in the world layout (mm). Beds line up
 /// along +X; an object's world position decides which bed it belongs to, so
 /// dragging a part across the gap moves it between beds.
@@ -613,6 +628,8 @@ struct App {
     /// World X origin of the bed that was active when `sliced` was produced —
     /// the preview renders there even if the active bed changes afterward.
     sliced_origin_x: f64,
+    /// In-flight camera travel to a newly focused bed (None = settled).
+    camera_glide: Option<CameraGlide>,
     scene: Scene,
     camera: Camera,
     status: String,
@@ -777,6 +794,7 @@ impl App {
             accent_rebake: false,
             active_bed: 0,
             sliced_origin_x: 0.0,
+            camera_glide: None,
             settings,
             baseline,
             profile_dialog: None,
@@ -1204,8 +1222,10 @@ impl App {
                         format!("Imported {file}: {n} objects ({tris} triangles)")
                     };
                     self.set_active_bed(dest);
+                    // Glide-frame the destination bed (even when it was
+                    // already active) — no instant refit pop.
+                    self.recenter_camera = true;
                     self.scene_dirty();
-                    self.refit_camera = true;
                 }
                 Err(e) => self.status = format!("Load failed: {e}"),
             }
@@ -1220,8 +1240,8 @@ impl App {
                 self.objects.push(obj);
                 self.selected = Some(self.objects.len() - 1);
                 self.set_active_bed(dest);
+                self.recenter_camera = true;
                 self.scene_dirty();
-                self.refit_camera = true;
             }
             Err(e) => self.status = format!("Load failed: {e}"),
         }
@@ -1691,7 +1711,37 @@ impl eframe::App for App {
         if self.recenter_camera {
             self.recenter_camera = false;
             let c = self.bed_center(self.active_bed);
-            self.camera.target = glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0);
+            let to = glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0);
+            // Frame the whole plate on arrival (the same distance
+            // Camera::frame would pick for one bed).
+            let dist_to = ((bed.0.max(bed.1) as f32) * 1.25).max(20.0);
+            // Travel, don't teleport (trivial moves snap — no point
+            // animating a recenter onto itself).
+            if (to - self.camera.target).length() > 1.0
+                || (dist_to - self.camera.distance).abs() > 1.0
+            {
+                self.camera_glide = Some(CameraGlide {
+                    from: self.camera.target,
+                    to,
+                    dist_from: self.camera.distance,
+                    dist_to,
+                    started: std::time::Instant::now(),
+                });
+            } else {
+                self.camera.target = to;
+            }
+        }
+        if let Some(g) = &self.camera_glide {
+            let t = (g.started.elapsed().as_secs_f32() / GLIDE_SECS).min(1.0);
+            let p = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+            self.camera.target = g.from.lerp(g.to, p);
+            self.camera.distance = g.dist_from + (g.dist_to - g.dist_from) * p;
+            if t >= 1.0 {
+                self.camera_glide = None;
+            } else {
+                // egui repaints on input only — keep frames coming mid-glide.
+                ui.ctx().request_repaint();
+            }
         }
         // Unpinned auto settings track their masters every frame, before
         // anything (incl. the Slice button) reads them.
@@ -2684,12 +2734,17 @@ impl eframe::App for App {
                 }
             }
             if response.dragged_by(egui::PointerButton::Secondary) {
+                // A manual pan takes the pivot back — cancel any glide so it
+                // doesn't fight the hand on the camera.
+                self.camera_glide = None;
                 let d = response.drag_delta();
                 self.camera.pan(d.x, d.y);
             }
             if response.hovered() && !blocked {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll != 0.0 {
+                    // Manual zoom takes the camera back mid-glide.
+                    self.camera_glide = None;
                     self.camera.zoom(scroll);
                 }
             }

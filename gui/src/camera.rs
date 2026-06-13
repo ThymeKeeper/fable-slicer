@@ -11,7 +11,11 @@ pub struct Camera {
 
 impl Camera {
     pub fn new() -> Self {
-        Self { target: Vec3::ZERO, yaw: 0.9, pitch: 0.6, distance: 300.0 }
+        // Three-quarter view from the printer's FRONT-right (negative yaw =
+        // eye on the −Y side): world +X runs screen-right, so the bed row
+        // grows rightward — matching the bed card's ▶. (Positive yaw views
+        // from behind, which mirrors X and made "next bed" land leftward.)
+        Self { target: Vec3::ZERO, yaw: -0.9, pitch: 0.6, distance: 300.0 }
     }
 
     pub fn eye(&self) -> Vec3 {
