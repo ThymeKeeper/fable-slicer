@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="2880" height="1715" alt="screenshot" src="https://github.com/user-attachments/assets/3b630965-92b3-4ed3-823e-752b82e4b798" />
+  <img width="2880" height="1713" alt="screenshot" src="https://github.com/user-attachments/assets/0a18f8ba-a109-4140-9574-11534120c39b" />
 </p>
 
 # Fable Slicer
