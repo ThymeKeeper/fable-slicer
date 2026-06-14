@@ -13,14 +13,18 @@ pub use profile::{tier_dirty, FilamentProfile, PrinterProfile, ProcessProfile, P
 mod state;
 pub use state::{config_dir, AppState};
 
-/// Default start g-code (generic, heats + homes directly). `{placeholders}` are
-/// substituted by the emitter. Used when a printer profile sets no `start_gcode`.
+/// Default start g-code. `{placeholders}` are substituted by the emitter; used
+/// when a printer profile sets no `start_gcode`. The order mirrors the presoak
+/// strategy — bed → home → chamber soak (`{chamber_soak}`, empty unless the
+/// filament wants one) → nozzle — so the nozzle reaches temp last and never
+/// idles hot over the bed (during homing, or while the chamber catches up).
 pub const GENERIC_START_GCODE: &str = "\
 M140 S{bed_temp}
-M104 S{first_layer_nozzle_temp}
 M190 S{bed_temp}
-M109 S{first_layer_nozzle_temp}
-G28";
+G28
+{chamber_soak}
+M104 S{first_layer_nozzle_temp}
+M109 S{first_layer_nozzle_temp}";
 
 /// Default end g-code (cool down, lift, disable steppers).
 pub const GENERIC_END_GCODE: &str = "\
@@ -544,12 +548,16 @@ pub struct Settings {
     /// Keep the fan off for this many initial layers (adhesion).
     pub fan_off_layers: usize,
     /// The machine has an auxiliary part-cooling fan addressed as `M106 P2`
-    /// (Sovol Zero / Bambu-style side fan). Gates all P2 emission: vanilla
-    /// Klipper/Marlin would read the P-form as the primary fan.
+    /// (Sovol Zero / Bambu-style side fan). Off by default — declare it per
+    /// printer (the GUI checkbox / `aux_fan = true`). Gates all P2 emission:
+    /// vanilla Klipper/Marlin read the P-form as the *primary* fan and there's
+    /// no non-breaking raw-g-code guard, so the slicer only emits it once the
+    /// hardware is confirmed.
     pub has_aux_fan: bool,
     /// Aux-fan duty 0.0..=1.0, flat once past `fan_off_layers`. 0 = off.
     pub aux_fan_speed: f64,
-    /// The machine has a chamber-exhaust fan addressed as `M106 P3`.
+    /// The machine has a chamber-exhaust fan addressed as `M106 P3`. Off by
+    /// default; declare per printer like the aux fan.
     pub has_exhaust_fan: bool,
     /// Exhaust duty 0.0..=1.0 for the whole print — vents chamber heat
     /// (PLA wants it high, ABS low or zero). 0 = off.
@@ -687,7 +695,7 @@ impl Default for Settings {
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,
             fan_off_layers: 1,
-            has_aux_fan: false,
+            has_aux_fan: false, // off until the printer declares it (GUI checkbox / aux_fan = true)
             aux_fan_speed: 0.0,
             has_exhaust_fan: false,
             exhaust_fan_speed: 0.0,

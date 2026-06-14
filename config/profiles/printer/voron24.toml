@@ -30,12 +30,22 @@ retract_speed_mm_s = 40.0
 # Comment out if your build skipped it.
 chamber_sensor = "chamber"
 
+# No aux part fan (M106 P2) or chamber exhaust (M106 P3) on a stock 2.4 — those
+# stay off by default (the slicer only emits the P-forms once a printer declares
+# the hardware), so nothing to set here.
+
 # Printer connection (Moonraker): uncomment to enable Send / Send & print.
 # host_url = "voron24.local"
 # api_key = ""
 
+# The whole start is delegated to PRINT_START (homing, QGL, mesh, purge, heat),
+# so there's no in-line sequence to slot the soak into — {chamber_soak} lands
+# right after it. For ABS/ASA that wait then sits after the macro already heated
+# the nozzle; fold the soak into PRINT_START (chamber before nozzle) if you want
+# it ooze-free. PLA expands {chamber_soak} to nothing.
 start_gcode = """
 PRINT_START EXTRUDER={first_layer_nozzle_temp} BED={bed_temp}
+{chamber_soak}
 """
 
 end_gcode = """

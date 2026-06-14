@@ -1,4 +1,6 @@
-# Generic FDM printer (Marlin/Klipper-compatible). Heats and homes directly.
+# Generic FDM printer (Marlin/Klipper-compatible). Heats the bed, homes, soaks
+# the chamber if asked, then heats the nozzle last (so it never oozes during
+# homing or the soak).
 bed_size_x_mm = 220.0
 bed_size_y_mm = 220.0
 bed_size_z_mm = 250.0
@@ -11,12 +13,18 @@ retract_speed_mm_s = 35.0
 # Lift over voids on travels that can't be combed.
 z_hop_mm = 0.4
 
+# {chamber_soak} expands to a TEMPERATURE_WAIT on the chamber sensor when the
+# filament wants a warm chamber, and to nothing otherwise. This profile declares
+# no chamber sensor, so a soak-class filament (ABS/ASA) errors here — caught up
+# front by the pre-send Moonraker check. (The wait is Klipper-only; bare-Marlin
+# users print PLA, where it expands to nothing.)
 start_gcode = """
 M140 S{bed_temp}
-M104 S{first_layer_nozzle_temp}
 M190 S{bed_temp}
-M109 S{first_layer_nozzle_temp}
 G28
+{chamber_soak}
+M104 S{first_layer_nozzle_temp}
+M109 S{first_layer_nozzle_temp}
 """
 
 end_gcode = """

@@ -2658,38 +2658,39 @@ impl eframe::App for App {
                         "operating point: {} °C (first layer {} °C) — chosen by the system",
                         s.nozzle_temp_c, s.first_layer_nozzle_temp_c
                     ));
-                    egui::CollapsingHeader::new("calibration")
-                        .id_salt("filament_calibration")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.weak("class defaults until you measure better numbers; saved with the filament");
-                            hslider(ui, true, egui::Slider::new(&mut s.filament_density_g_cm3, 0.8..=2.0), "density g/cm³",
-                                "Filament density — used for the weight estimate. Auto: the material class's value.");
-                            hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
-                                "Global extrusion multiplier — the per-spool flow calibration escape.");
-                            let mf_hint = format!(
-                                "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
-                                flow_ceiling_text(s)
-                            );
-                            hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
-                                mf_hint);
-                            hslider(ui, true, egui::Slider::new(&mut s.max_flow_derate_per_c, 0.0..=1.0), "flow derate /°C",
-                                "How much of the melt ceiling is lost per °C below the operating temperature. Heat control weighs this when cooling: once a zone's flow-bound paths would lose more time to the derate than the cooling saves in slowdowns, the schedule holds at that crossing instead of the cold rail — steep derates mean gentler cooling.");
-                            auto_slider(ui, &mut s.max_heat_mw_mm2, 2.0..=40.0, "max heat mW/mm²", &mut pins.max_heat, s.material.max_heat_mw_mm2(),
-                                "The material's allowable heat-load ceiling, per island — heat control never plans above it. Read natural values off the heat-load preview legend. Auto: the class's value.");
-                            hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
-                                "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
-                            hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
-                                "Part-cooling fan duty while printing. Auto: the class's policy.");
-                            hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
-                                "Fan duty on bridges and arc overhangs.");
-                            hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
-                                "Keep the fan off for this many first layers (bed adhesion).");
-                            hslider(ui, s.has_aux_fan, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
-                                "Auxiliary part-cooling duty (M106 P2). Needs the aux fan declared under Machine & motion.");
-                            hslider(ui, s.has_exhaust_fan, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
-                                "Chamber-exhaust duty (M106 P3), whole print. Needs the exhaust fan declared under Machine & motion.");
-                        });
+                    // Measured calibration — the slicer is blind to the true
+                    // output, so these are pinned from a test, not derived
+                    // (default 1.0 / conservative; nudge after a flow test or a
+                    // pressure-advance tower). Density, flow-derate and the heat
+                    // ceiling are material physics — class-derived, not knobs.
+                    hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
+                        "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a single-wall flow test.");
+                    let mf_hint = format!(
+                        "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
+                        flow_ceiling_text(s)
+                    );
+                    hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
+                        mf_hint);
+                    hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
+                        "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+                });
+                tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
+                    hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
+                        "Part-cooling fan duty while printing. Auto: the class's policy.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
+                        "Fan duty on bridges and arc overhangs.");
+                    hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
+                        "Keep the fan off for this many first layers (bed adhesion).");
+                    // Aux/exhaust duties appear only when the printer profile
+                    // declares the hardware — no fan, no knob, no M106 emitted.
+                    if s.has_aux_fan {
+                        hslider(ui, true, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
+                            "Auxiliary part-cooling duty (M106 P2).");
+                    }
+                    if s.has_exhaust_fan {
+                        hslider(ui, true, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
+                            "Chamber-exhaust duty (M106 P3), whole print.");
+                    }
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
                     hslider(ui, true, egui::Slider::new(&mut s.retract_len_mm, 0.0..=10.0), "length mm",
@@ -2752,17 +2753,24 @@ impl eframe::App for App {
                     }
                     hslider(ui, true, egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0), "jerk mm/s",
                         "Klipper square-corner-velocity — how briskly direction changes are taken.");
+                    // Hardware the printer either has or doesn't. Declared here
+                    // rather than via a printer.cfg macro so a downloaded slicer
+                    // is self-contained — no macros to install. Off by default:
+                    // M106 P2/P3 have no non-breaking guard (vanilla firmware
+                    // reads them as the primary fan), so they emit only once the
+                    // hardware is confirmed.
                     ui.checkbox(&mut s.has_aux_fan, "aux part fan (M106 P2)")
-                        .on_hover_text("The machine has an auxiliary side part-cooling fan (Sovol Zero, Bambu-style). Unlocks the filament's aux-fan duty; off = M106 P2 is never emitted (vanilla firmware reads it as the primary fan).");
+                        .on_hover_text("Tick if the machine has an auxiliary side part-cooling fan (Sovol Zero / Bambu-style). Off by default and gated — vanilla Klipper/Marlin read M106 P2 as the *primary* fan, so the slicer emits it only once you confirm the hardware. Its duty lives in the Cooling section.");
                     ui.checkbox(&mut s.has_exhaust_fan, "exhaust fan (M106 P3)")
-                        .on_hover_text("The machine has a chamber-exhaust fan. Unlocks the filament's exhaust duty; off = M106 P3 is never emitted.");
+                        .on_hover_text("Tick if the machine has a chamber-exhaust fan (M106 P3). Off by default for the same reason as the aux fan; its duty lives in the Cooling section.");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut s.chamber_sensor).desired_width(120.0).hint_text("none"));
                         ui.label("chamber sensor").on_hover_text(
                             "The chamber thermistor's Klipper temperature_sensor name — \
                              \"chamber_temp\" on the Sovol Zero, \"chamber\" on a spec Voron \
-                             (check Fluidd/Mainsail or `SENSORS` in the console). Empty = the \
-                             machine has none; the filament's chamber soak stays locked out.",
+                             (check Fluidd/Mainsail or `SENSORS`). Empty = none; a filament that \
+                             wants a soak then fails the pre-send check (and would abort at the \
+                             printer).",
                         );
                     });
                 });

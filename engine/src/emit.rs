@@ -2390,10 +2390,10 @@ mod tests {
         let mut s = Settings::default();
         s.aux_fan_speed = 0.75;
         s.exhaust_fan_speed = 0.8;
-        // Without the hardware flags the P-forms must never appear — vanilla
-        // Klipper/Marlin would read them as the primary fan.
+        // Off by default (no declared hardware): the P-forms must never appear —
+        // vanilla Klipper/Marlin would read them as the primary fan.
         let g = to_gcode(&generate(&m, &s), &s);
-        assert!(!g.contains("M106 P"), "no P-fans without the hardware flags");
+        assert!(!g.contains("M106 P"), "no P-fans until the hardware is declared");
 
         s.has_aux_fan = true;
         s.has_exhaust_fan = true;
