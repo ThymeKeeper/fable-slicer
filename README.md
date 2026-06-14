@@ -2,6 +2,8 @@
   <img width="2880" height="1713" alt="screenshot" src="https://github.com/user-attachments/assets/0a18f8ba-a109-4140-9574-11534120c39b" />
 </p>
 
+<img width="2880" height="1715" alt="screenshot2" src="https://github.com/user-attachments/assets/1884f89a-81d1-4818-9ffe-87b4d4575eb6" />
+
 # Fable Slicer
 
 ![Status](https://img.shields.io/badge/status-work_in_progress-yellow.svg)
