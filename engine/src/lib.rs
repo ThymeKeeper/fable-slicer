@@ -10,12 +10,15 @@
 //! supports, variable layers, etc.
 
 mod arc;
+mod calibrate;
 mod emit;
 mod fill;
 mod plan;
 mod skeletal;
 mod slice;
 mod wall;
+
+pub use calibrate::{flow_from_wall, flow_test_gcode, FLOW_TEST_MM};
 
 pub use emit::{
     audit_combing, audit_flow_clamps, audit_heat_control_speed, audit_heat_control_temp,

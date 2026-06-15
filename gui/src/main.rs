@@ -657,6 +657,12 @@ struct App {
     /// Thermal calibration runs heaters and motion — the button arms this
     /// confirmation dialog instead of firing directly.
     confirm_calibration: bool,
+    /// Flow calibration: the Filament-panel button arms this; the dispatch
+    /// generates the single-wall test cube and sends it to the printer.
+    start_flow_cal: bool,
+    /// Measured wall thickness (mm) entered after the flow-cal print; "apply"
+    /// turns it into the filament's `extrusion_multiplier`.
+    flow_cal_mm: f64,
     /// A profile switch requested while settings carry unsaved (*) edits —
     /// held here until the user confirms discarding them.
     pending_switch: Option<(String, String, String)>,
@@ -851,6 +857,8 @@ impl App {
             baseline,
             profile_dialog: None,
             confirm_calibration: false,
+            start_flow_cal: false,
+            flow_cal_mm: 0.0,
             pending_switch: None,
             pins,
             objects: Vec::new(),
@@ -2665,6 +2673,40 @@ impl eframe::App for App {
                     // ceiling are material physics — class-derived, not knobs.
                     hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
                         "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a single-wall flow test.");
+                    // Guided flow calibration: print a single-wall cube at the
+                    // current settings, caliper a wall, enter it → pin flow ×.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(host_set && !host_busy, egui::Button::new("⟲ print flow test"))
+                            .on_hover_text("Print a single-wall 20 mm cube at your current settings, then caliper a side wall's thickness — the ~line-width dimension, on a flat face mid-height, away from the seam (not the height or the 20 mm width) — and enter it below to pin flow ×. Clear the bed first.")
+                            .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
+                            .clicked()
+                        {
+                            self.start_flow_cal = true;
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut self.flow_cal_mm)
+                                .speed(0.01)
+                                .range(0.0..=2.0)
+                                .fixed_decimals(2)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text(format!("Wall *thickness* off the cube — a flat side, mid-height, away from the seam (not the height or the 20 mm width). Should read ≈{:.2} mm (your line width); thicker = over-extruding.", s.line_width_mm));
+                        if ui
+                            .button("apply")
+                            .on_hover_text("Pin flow × = current × line width ÷ measured wall thickness.")
+                            .clicked()
+                            && self.flow_cal_mm > 0.0
+                        {
+                            let before = s.extrusion_multiplier;
+                            s.extrusion_multiplier =
+                                engine::flow_from_wall(before, s.line_width_mm, self.flow_cal_mm);
+                            self.status = format!(
+                                "flow × {before:.3} → {:.3} (wall {:.2} mm vs {:.2} target)",
+                                s.extrusion_multiplier, self.flow_cal_mm, s.line_width_mm
+                            );
+                        }
+                    });
                     let mf_hint = format!(
                         "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
                         flow_ceiling_text(s)
@@ -3455,6 +3497,24 @@ impl eframe::App for App {
                 }
                 HostOp::CalibrateThermal => self.spawn_thermal_calibration(&ctx),
             }
+        }
+
+        // Flow calibration: the Filament-panel button armed `start_flow_cal`.
+        // Generate the single-wall test from the current settings and send it;
+        // the user calipers a wall and applies the result back in the panel.
+        if std::mem::take(&mut self.start_flow_cal) {
+            let gcode = engine::flow_test_gcode(&self.settings);
+            let lw = self.settings.line_width_mm;
+            let ctx = ui.ctx().clone();
+            self.spawn_host_op(&ctx, false, move |c| {
+                match c.upload("flow-cal.gcode", gcode.as_bytes(), true) {
+                    Ok(()) => HostReply::SendDone {
+                        ok: true,
+                        msg: format!("Printing the flow cube — when it's done, caliper a side wall's THICKNESS (mid-height, away from the seam; should read ≈{lw:.2} mm) and enter it in the Filament panel."),
+                    },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-cal upload failed: {e}") },
+                }
+            });
         }
 
         // Save / delete profile dialog (floats over the viewport).
