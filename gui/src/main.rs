@@ -2662,10 +2662,6 @@ impl eframe::App for App {
                          must stay 0 (a hot chamber means heat creep and sag).");
                     hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
                         "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
-                    ui.weak(format!(
-                        "operating point: {} °C (first layer {} °C) — chosen by the system",
-                        s.nozzle_temp_c, s.first_layer_nozzle_temp_c
-                    ));
                     // Measured calibration — the slicer is blind to the true
                     // output, so these are pinned from a test, not derived
                     // (default 1.0 / conservative; nudge after a flow test or a
