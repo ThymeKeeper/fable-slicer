@@ -1,5 +1,5 @@
 # PLA through a high-flow hotend (e.g. Sovol Zero, Revo HF, Rapido) — a
-# higher measured melt ceiling and a warmer bias. Pair with fast machines.
+# higher measured melt ceiling and a warmer operating temperature. Pair with fast machines.
 inherits = "pla"
-temp_bias = 0.25
+nozzle_temp_c = 215
 max_volumetric_speed_mm3_s = 30.0

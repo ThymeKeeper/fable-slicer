@@ -58,14 +58,6 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub heat_rate_c_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cool_rate_c_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heat_rate_fan_c_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cool_rate_fan_c_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub aux_fan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exhaust_fan: Option<bool>,
@@ -93,14 +85,9 @@ pub struct FilamentProfile {
     pub filament_diameter_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub density_g_cm3: Option<f64>,
-    /// The packaging temperature range printed on the spool.
+    /// Operating nozzle °C from the spool.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nozzle_temp_min_c: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nozzle_temp_max_c: Option<u32>,
-    /// Cold ↔ hot preference (−1..+1) inside the packaging range.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temp_bias: Option<f64>,
+    pub nozzle_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bed_temp_c: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,7 +231,6 @@ impl Tier for PrinterProfile {
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
-            heat_rate_c_s, cool_rate_c_s, heat_rate_fan_c_s, cool_rate_fan_c_s,
             aux_fan, exhaust_fan, chamber_sensor, start_gcode, end_gcode)
     }
 }
@@ -254,8 +240,8 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, material, filament_diameter_mm, density_g_cm3, temp_bias,
-            nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_c,
+        merge_fields!(self, base, material, filament_diameter_mm, density_g_cm3,
+            nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             max_heat_mw_mm2, pressure_advance,
             fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed,
@@ -318,10 +304,6 @@ impl PrinterProfile {
             wipe_mm: diff_field!(cur.wipe_mm, base.wipe_mm),
             host_url: diff_field!(cur.host_url.clone(), base.host_url),
             api_key: diff_field!(cur.api_key.clone(), base.api_key),
-            heat_rate_c_s: diff_field!(cur.heat_rate_c_s, base.heat_rate_c_s),
-            cool_rate_c_s: diff_field!(cur.cool_rate_c_s, base.cool_rate_c_s),
-            heat_rate_fan_c_s: diff_field!(cur.heat_rate_fan_c_s, base.heat_rate_fan_c_s),
-            cool_rate_fan_c_s: diff_field!(cur.cool_rate_fan_c_s, base.cool_rate_fan_c_s),
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             chamber_sensor: diff_field!(cur.chamber_sensor.clone(), base.chamber_sensor),
@@ -344,9 +326,7 @@ impl FilamentProfile {
             filament_diameter_mm: diff_field!(cur.filament_diameter_mm, base.filament_diameter_mm),
             density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
             material: diff_field!(cur.material.label().to_string(), base.material.label().to_string()),
-            temp_bias: diff_field!(cur.temp_bias, base.temp_bias),
-            nozzle_temp_min_c: diff_field!(cur.nozzle_temp_min_c, base.nozzle_temp_min_c),
-            nozzle_temp_max_c: diff_field!(cur.nozzle_temp_max_c, base.nozzle_temp_max_c),
+            nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
@@ -657,12 +637,8 @@ impl Profiles {
         // The material class off the box drives every filament default a
         // calibration entry doesn't pin.
         let material = fl.material.as_deref().and_then(crate::Material::parse).unwrap_or(d.material);
-        // Packaging range + cold↔hot bias → the operating temperatures.
-        let (class_min, class_max) = material.packaging_temp_c();
-        let temp_min = fl.nozzle_temp_min_c.unwrap_or(class_min);
-        let temp_max = fl.nozzle_temp_max_c.unwrap_or(class_max);
-        let bias = fl.temp_bias.unwrap_or(d.temp_bias);
-        let nozzle_temp = crate::derived_nozzle_temp_c(temp_min, temp_max, bias);
+        // The operating nozzle temperature: the spool's value, else the class.
+        let nozzle_temp = fl.nozzle_temp_c.unwrap_or_else(|| material.nozzle_temp_c());
         // The machine's rating × the finish↔speed dial → the nominal speed.
         let machine_v = pr.print_speed_mm_s.unwrap_or(d.machine_speed_mm_s);
         let quality = pc.speed_quality.unwrap_or(d.speed_quality);
@@ -742,20 +718,8 @@ impl Profiles {
             api_key: pr.api_key.unwrap_or(d.api_key),
             material,
             nozzle_temp_c: nozzle_temp,
-            first_layer_nozzle_temp_c: crate::derived_first_layer_temp_c(temp_min, temp_max, bias, material),
-            nozzle_temp_min_c: temp_min,
-            nozzle_temp_max_c: temp_max,
-            temp_bias: bias,
+            first_layer_nozzle_temp_c: crate::derived_first_layer_temp_c(nozzle_temp, material),
             bed_temp_c: fl.bed_temp_c.unwrap_or_else(|| material.bed_temp_c()),
-            heat_rate_c_s: pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s),
-            cool_rate_c_s: pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s),
-            // Auto: un-measured fan-on rates follow the fan-off ones.
-            heat_rate_fan_c_s: pr
-                .heat_rate_fan_c_s
-                .unwrap_or_else(|| pr.heat_rate_c_s.unwrap_or(d.heat_rate_c_s)),
-            cool_rate_fan_c_s: pr
-                .cool_rate_fan_c_s
-                .unwrap_or_else(|| pr.cool_rate_c_s.unwrap_or(d.cool_rate_c_s)),
             machine_speed_mm_s: machine_v,
             speed_quality: quality,
             print_speed_mm_s: print_v,
@@ -954,9 +918,9 @@ mod tests {
     fn asa_rides_the_abs_class_with_chamber_presoak() {
         let p = Profiles::builtin();
         let s = p.resolve("sovol-zero", "asa", "standard").unwrap();
-        // The card's box values; density is ASA's own (the class default
+        // The card's operating temp; density is ASA's own (the class default
         // would be ABS's 1.04).
-        assert_eq!((s.nozzle_temp_min_c, s.nozzle_temp_max_c), (240, 270));
+        assert_eq!(s.nozzle_temp_c, 255);
         assert_eq!(s.bed_temp_c, 100);
         assert_eq!(s.filament_density_g_cm3, 1.07);
         // Class-derived cooling: near-off — moving air cracks ABS/ASA.
@@ -1004,18 +968,17 @@ mod tests {
     }
 
     #[test]
-    fn temperatures_derive_from_packaging() {
-        // petg's packaging card says 230–250: the operating point lands at
-        // the center, and the first layer adds the class bump clipped by the
-        // packaging max.
+    fn nozzle_and_first_layer_temps() {
+        // The card sets the operating nozzle temp directly; the first layer
+        // adds the material class's adhesion bump on top.
         let p = Profiles::builtin();
         let s = p.resolve("generic", "petg", "standard").unwrap();
         assert_eq!(s.nozzle_temp_c, 240);
-        assert_eq!(s.first_layer_nozzle_temp_c, 250); // +10 PETG bump, fits
-        // pla-hf biases warm: 190–230 at +0.25 → 215, first layer clipped 230.
+        assert_eq!(s.first_layer_nozzle_temp_c, 250); // +10 PETG bump
+        // pla-hf runs warmer: 215 °C operating, +20 PLA bump first layer.
         let s = p.resolve("generic", "pla-hf", "standard").unwrap();
         assert_eq!(s.nozzle_temp_c, 215);
-        assert_eq!(s.first_layer_nozzle_temp_c, 230);
+        assert_eq!(s.first_layer_nozzle_temp_c, 235);
     }
 
     #[test]
@@ -1059,7 +1022,7 @@ mod tests {
         let base = Settings::default();
         let mut cur = base.clone();
         cur.wall_count = 5; // process
-        cur.temp_bias = 0.5; // filament
+        cur.nozzle_temp_c = 245; // filament
         cur.machine_speed_mm_s = 120.0; // printer (datasheet)
         cur.bed_size_x_mm = 300.0; // printer
 
@@ -1068,7 +1031,7 @@ mod tests {
         assert!(pc.layer_height_mm.is_none(), "untouched fields stay unset");
 
         let fl = FilamentProfile::diff(&cur, &base);
-        assert_eq!(fl.temp_bias, Some(0.5));
+        assert_eq!(fl.nozzle_temp_c, Some(245));
         assert!(fl.bed_temp_c.is_none());
 
         let pr = PrinterProfile::diff(&cur, &base);
@@ -1087,9 +1050,9 @@ mod tests {
         let mut p = Profiles::builtin();
         p.load_user_profiles(Some(dir.clone())).unwrap();
 
-        // Save a filament diff inheriting petg with a hotter nozzle.
-        // bias 0.5 over petg's 230-250 packaging range derives exactly 245.
-        let fl = FilamentProfile { inherits: Some("petg".into()), temp_bias: Some(0.5), ..Default::default() };
+        // Save a filament diff inheriting petg with a hotter nozzle (245 °C,
+        // over petg's 240).
+        let fl = FilamentProfile { inherits: Some("petg".into()), nozzle_temp_c: Some(245), ..Default::default() };
         p.save_user_filament("my-petg", fl).unwrap();
         assert!(p.is_user(TierKind::Filament, "my-petg"));
         assert!(!p.is_builtin(TierKind::Filament, "my-petg"));
@@ -1097,7 +1060,7 @@ mod tests {
         // The saved file is a minimal diff (only inherits + the changed field).
         let text = fs::read_to_string(dir.join("filament/my-petg.toml")).unwrap();
         assert!(text.contains("inherits = \"petg\""), "saved: {text}");
-        assert!(text.contains("temp_bias = 0.5"));
+        assert!(text.contains("nozzle_temp_c = 245"));
         assert!(!text.contains("bed_temp_c"), "unchanged fields must not be written");
 
         // It resolves over its parent, and a fresh registry loads it from disk.

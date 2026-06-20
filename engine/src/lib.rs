@@ -21,10 +21,9 @@ mod wall;
 pub use calibrate::{flow_from_wall, flow_test_gcode, FLOW_TEST_MM};
 
 pub use emit::{
-    audit_combing, audit_flow_clamps, audit_heat_control_speed, audit_heat_control_temp,
+    audit_combing, audit_flow_clamps, audit_heat_control_speed,
     audit_smoothing, effective_heat_target, estimate_filament, estimate_seconds, format_duration,
-    kind_label, per_layer_islands, per_layer_stats, to_gcode, IslandStats, LayerIslands,
-    LayerStats, SlowdownRange, SmoothingReport, TempZone,
+    kind_label, per_layer_stats, to_gcode, LayerStats, SlowdownRange, SmoothingReport,
 };
 pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};

@@ -81,14 +81,14 @@ impl Material {
             Self::Other => 1.24,
         }
     }
-    /// Packaging temperature range fallback when the box wasn't entered.
-    pub fn packaging_temp_c(self) -> (u32, u32) {
+    /// Operating nozzle °C fallback when a profile doesn't set one.
+    pub fn nozzle_temp_c(self) -> u32 {
         match self {
-            Self::Pla => (190, 220),
-            Self::Petg => (230, 260),
-            Self::Abs => (240, 270),
-            Self::Tpu => (210, 240),
-            Self::Other => (190, 220),
+            Self::Pla => 205,
+            Self::Petg => 245,
+            Self::Abs => 255,
+            Self::Tpu => 225,
+            Self::Other => 205,
         }
     }
     pub fn bed_temp_c(self) -> u32 {
@@ -140,7 +140,7 @@ impl Material {
             _ => 0.3,
         }
     }
-    /// Allowable heat-load ceiling (mW/mm², per island) for heat control.
+    /// Allowable heat-load ceiling (mW/mm², per layer) for heat control.
     pub fn max_heat_mw_mm2(self) -> f64 {
         match self {
             Self::Pla => 15.0,
@@ -455,36 +455,12 @@ pub struct Settings {
     /// The material class off the spool's box — drives every filament-side
     /// default until calibration pins one.
     pub material: Material,
-    /// Operating nozzle °C — DERIVED: the packaging range's center, shifted
-    /// by `temp_bias`. Never a slider; heat control owns it from there.
+    /// Operating nozzle °C — set directly, held fixed for the whole print.
     pub nozzle_temp_c: u32,
-    /// First-layer nozzle °C — DERIVED: operating + the class's adhesion
-    /// bump, clipped by the packaging max.
+    /// First-layer nozzle °C — DERIVED: operating + the material class's
+    /// adhesion bump, clipped to the hotend ceiling.
     pub first_layer_nozzle_temp_c: u32,
-    /// The packaging range printed on the box: heat control's full authority
-    /// — schedules never leave [min, max].
-    pub nozzle_temp_min_c: u32,
-    pub nozzle_temp_max_c: u32,
-    /// Cold ↔ hot preference (−1..+1): where in the packaging range the
-    /// operating point sits. Cold = matte/dimensional, hot = glossy, strong
-    /// bonding, more flow headroom.
-    pub temp_bias: f64,
     pub bed_temp_c: u32,
-    /// Hotend heating rate near printing temps (°C/s) — sets how early
-    /// the temp schedule must issue warming M104s. Conservatively low until
-    /// measured (a Moonraker calibration routine will fill it in).
-    pub heat_rate_c_s: f64,
-    /// Passive cooling rate near printing temps (°C/s) — far slower than
-    /// heating; sets the long lead times for cooling into a zone.
-    pub cool_rate_c_s: f64,
-    /// Heating rate with the part fan at 100% (°C/s) — fan spillover steals
-    /// heater power, so this is ≤ `heat_rate_c_s`. Auto: follows the fan-off
-    /// rate until measured. The temp scheduler interpolates between the
-    /// off/on pairs by the filament's fan duty.
-    pub heat_rate_fan_c_s: f64,
-    /// Cooling rate with the part fan at 100% (°C/s) — the realistic in-print
-    /// case, faster than passive. Auto: follows the fan-off rate until measured.
-    pub cool_rate_fan_c_s: f64,
 
     // --- speeds (mm/s) ---
     /// The machine's rated print speed (printer datasheet) — the hard cap
@@ -527,9 +503,10 @@ pub struct Settings {
     /// header, CLI, and GUI all report what got clamped). ≤ 0 disables.
     pub max_volumetric_speed_mm3_s: f64,
     /// How much of that ceiling is lost per °C below `nozzle_temp_c`
-    /// (mm³/s/°C): when heat control cools a zone, its flow cap — and
-    /// therefore its clamped speeds — derate by this. Never raised on warmer
-    /// layers (the profile cap is the calibrated number).
+    /// (mm³/s/°C): a cooler nozzle melts slower, so any layer whose planned
+    /// temperature dips below base derates its flow cap — and therefore its
+    /// clamped speeds — by this. Never raised on warmer layers (the profile
+    /// cap is the calibrated number).
     pub max_flow_derate_per_c: f64,
     /// Global extrusion multiplier (filament-specific flow tuning). 1.0 = nominal.
     pub extrusion_multiplier: f64,
@@ -571,23 +548,19 @@ pub struct Settings {
     /// chamber sensor before printing. Auto: the material class's value
     /// (ABS/ASA soak at 50, everything else 0).
     pub chamber_temp_c: u32,
-    /// Heat control, the automatic: keep every island's heat load inside the
-    /// filament's allowable ranges and smooth layer-to-layer transitions —
+    /// Heat control, the automatic: keep every layer's heat load inside the
+    /// filament's allowable ceiling and smooth layer-to-layer transitions —
     /// the banding/shrinkage killer — spending at most
     /// `smooth_extra_time_pct` extra print time. One gradient-limited target
     /// curve is derived per print (the gentlest the budget affords; the
-    /// achieved %/layer is reported) and both levers serve it with no
-    /// per-lever knobs: the nozzle-temperature schedule warms cold dips and
-    /// cools hot ranges inside the filament window (free in print time;
-    /// ramps lead per the printer's measured rates, plain async M104s, no
-    /// live feedback; cooled layers derate the flow ceiling via
-    /// `max_flow_derate_per_c`), and per-island slowing plus park-and-wait
-    /// dwells supply what temperature can't reach — never below
-    /// `min_print_speed_mm_s` without saying so. ON BY DEFAULT — it is part
-    /// of the derived surface, not an opt-in extra; a profile may still set
-    /// `heat_control = false` to print raw derived speeds and temperatures.
+    /// achieved %/layer is reported) and one lever serves it with no knobs:
+    /// each layer's speed is paced onto the curve, never below
+    /// `min_print_speed_mm_s` (a layer too hot to slow that far is left there
+    /// and reported). The nozzle holds its derived temperature throughout. ON
+    /// BY DEFAULT — it is part of the derived surface, not an opt-in extra; a
+    /// profile may still set `heat_control = false` to print raw derived speeds.
     pub heat_control: bool,
-    /// The filament's allowable heat-load ceiling (mW/mm², per island) — a
+    /// The filament's allowable heat-load ceiling (mW/mm², per layer) — a
     /// material range bound, not a tuning target. Auto: the material class's
     /// value; a calibration entry pins it. Heat control's temperature
     /// authority is the packaging range itself.
@@ -664,15 +637,8 @@ impl Default for Settings {
             host_url: String::new(),
             api_key: String::new(),
             material: Material::Pla,
-            nozzle_temp_c: derived_nozzle_temp_c(185, 215, 0.0),
-            first_layer_nozzle_temp_c: derived_first_layer_temp_c(185, 215, 0.0, Material::Pla),
-            nozzle_temp_min_c: 185,
-            nozzle_temp_max_c: 215,
-            temp_bias: 0.0,
-            heat_rate_c_s: 2.0,
-            cool_rate_c_s: 0.7,
-            heat_rate_fan_c_s: 2.0,
-            cool_rate_fan_c_s: 0.7,
+            nozzle_temp_c: 210,
+            first_layer_nozzle_temp_c: derived_first_layer_temp_c(210, Material::Pla),
             bed_temp_c: 60,
             machine_speed_mm_s: 60.0,
             speed_quality: 0.0,
@@ -725,20 +691,15 @@ impl Settings {
 // when a profile leaves the field unset, and the GUI recomputes them live for
 // unpinned fields (so dragging the master visibly moves its dependents).
 
-/// Auto line width: 112.5% of the nozzle bore — wide enough to squeeze a solid
-/// bead, narrow enough to hold detail (0.4 mm nozzle → 0.45 mm).
-/// The operating nozzle temperature: the packaging range's center shifted by
-/// the cold↔hot bias (−1 = the box's minimum, +1 = its maximum).
-pub fn derived_nozzle_temp_c(min_c: u32, max_c: u32, bias: f64) -> u32 {
-    let (lo, hi) = (min_c.min(max_c) as f64, max_c.max(min_c) as f64);
-    (lo + (hi - lo) * (0.5 + 0.5 * bias.clamp(-1.0, 1.0))).round() as u32
-}
+/// The nozzle-temperature slider bounds (°C); the upper bound also caps the
+/// derived first-layer temperature.
+pub const NOZZLE_TEMP_MIN_C: u32 = 150;
+pub const NOZZLE_TEMP_MAX_C: u32 = 320;
 
-/// First-layer temperature: operating + the material's adhesion bump,
-/// clipped by the packaging max.
-pub fn derived_first_layer_temp_c(min_c: u32, max_c: u32, bias: f64, material: Material) -> u32 {
-    (derived_nozzle_temp_c(min_c, max_c, bias) + material.first_layer_bump_c())
-        .min(max_c.max(min_c))
+/// First-layer temperature: the operating temperature + the material's
+/// adhesion bump, clipped to the hotend ceiling.
+pub fn derived_first_layer_temp_c(nozzle_temp_c: u32, material: Material) -> u32 {
+    (nozzle_temp_c + material.first_layer_bump_c()).min(NOZZLE_TEMP_MAX_C)
 }
 
 /// Nominal print speed: the machine's rated speed × the finish↔speed factor
@@ -747,6 +708,8 @@ pub fn derived_print_speed_mm_s(machine_speed_mm_s: f64, speed_quality: f64) -> 
     machine_speed_mm_s * (0.8 + 0.2 * speed_quality.clamp(-1.0, 1.0))
 }
 
+/// Auto line width: 112.5% of the nozzle bore — wide enough to squeeze a solid
+/// bead, narrow enough to hold detail (0.4 mm nozzle → 0.45 mm).
 pub fn derived_line_width_mm(nozzle_diameter_mm: f64) -> f64 {
     nozzle_diameter_mm * 1.125
 }

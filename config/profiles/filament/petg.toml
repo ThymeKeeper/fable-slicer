@@ -2,8 +2,7 @@
 # heat ceiling; the melt ceiling below is a measured-conservative value.
 material = "petg"
 filament_diameter_mm = 1.75
-nozzle_temp_min_c = 230
-nozzle_temp_max_c = 250
+nozzle_temp_c = 240
 bed_temp_c = 80
 
 # --- calibration ---

@@ -124,9 +124,6 @@ enum HostOp {
     Resume,
     Cancel,
     Status,
-    /// One-shot thermal profiling: measure the hotend's heat/cool rates and
-    /// save them into the printer profile. Manual only — never part of slicing.
-    CalibrateThermal,
 }
 
 /// What a finished host operation reports back to the UI thread.
@@ -138,12 +135,6 @@ enum HostReply {
     /// A quiet interval poll feeding the live-print overlay — never touches
     /// the status line.
     Status(Result<printhost::PrintStatus, String>),
-    /// A mid-operation progress line (thermal calibration streams these);
-    /// updates the status line but keeps the operation running.
-    Progress(String),
-    /// Thermal calibration finished; on success the rates go to the printer
-    /// profile via `persist_thermal_rates`.
-    Rates(Result<printhost::ThermalRates, String>),
 }
 
 /// What the preview colors encode.
@@ -157,9 +148,6 @@ enum ColorBy {
     /// Per-layer heat load: deposited energy ÷ (time × footprint). Red = lots
     /// of hot plastic delivered quickly to a small area.
     Heat,
-    /// Planned nozzle temperature per layer — heat control's temp schedule
-    /// made visible. One flat color = nothing scheduled.
-    Temp,
 }
 
 /// Which derivable settings the user has pinned to manual values. Unpinned
@@ -654,9 +642,6 @@ struct App {
     baseline: Settings,
     /// Open save/delete-profile dialog, if any.
     profile_dialog: Option<ProfileDialog>,
-    /// Thermal calibration runs heaters and motion — the button arms this
-    /// confirmation dialog instead of firing directly.
-    confirm_calibration: bool,
     /// Flow calibration: the Filament-panel button arms this; the dispatch
     /// generates the single-wall test cube and sends it to the printer.
     start_flow_cal: bool,
@@ -694,8 +679,6 @@ struct App {
     slice_summary: Option<SliceSummary>,
     /// Per-layer time/heat numbers behind the preview color modes.
     layer_stats: Vec<engine::LayerStats>,
-    /// Per-island split of the heat numbers (parallel to `layer_stats`).
-    layer_islands: Vec<engine::LayerIslands>,
     /// What the preview colors encode.
     color_by: ColorBy,
     /// The 3D view's accent: model tint, feature palette, and heat ramps are
@@ -856,7 +839,6 @@ impl App {
             settings,
             baseline,
             profile_dialog: None,
-            confirm_calibration: false,
             start_flow_cal: false,
             flow_cal_mm: 0.0,
             pending_switch: None,
@@ -869,7 +851,6 @@ impl App {
             sliced: None,
             slice_summary: None,
             layer_stats: Vec::new(),
-            layer_islands: Vec::new(),
             color_by: ColorBy::Feature,
             host_rx: None,
             sent_to_printer: false,
@@ -990,19 +971,13 @@ impl App {
     /// print speed (or changing the nozzle) visibly moves its dependents.
     fn apply_auto(&mut self) {
         let s = &mut self.settings;
-        // The data-driven chain: bead from the nozzle, temperatures from the
-        // packaging range + bias, nominal speed from the machine rating ×
-        // the finish↔speed dial, features from the nominal under the melt
-        // ceiling. No speed or temperature is a slider anywhere.
+        // The data-driven chain: bead from the nozzle, first-layer temp from
+        // the operating temperature + the material's adhesion bump, nominal
+        // speed from the machine rating × the finish↔speed dial, features from
+        // the nominal under the melt ceiling.
         s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
-        s.nozzle_temp_c =
-            config::derived_nozzle_temp_c(s.nozzle_temp_min_c, s.nozzle_temp_max_c, s.temp_bias);
-        s.first_layer_nozzle_temp_c = config::derived_first_layer_temp_c(
-            s.nozzle_temp_min_c,
-            s.nozzle_temp_max_c,
-            s.temp_bias,
-            s.material,
-        );
+        s.first_layer_nozzle_temp_c =
+            config::derived_first_layer_temp_c(s.nozzle_temp_c, s.material);
         if !self.pins.max_heat {
             s.max_heat_mw_mm2 = s.material.max_heat_mw_mm2();
         }
@@ -1111,91 +1086,6 @@ impl App {
         }
         self.refresh_baseline();
         Ok(())
-    }
-
-    /// Measured thermal rates land in the live settings *and* the printer
-    /// profile on disk — that is the whole point of profiling once: every
-    /// future slice reads them. A selected user profile is updated in place;
-    /// a built-in (read-only) gets/extends its `<name>-custom` copy and the
-    /// selection moves there. Returns the status-line message.
-    fn persist_thermal_rates(&mut self, r: printhost::ThermalRates) -> String {
-        self.settings.heat_rate_c_s = r.heat_rate_c_s;
-        self.settings.cool_rate_c_s = r.cool_rate_c_s;
-        self.settings.heat_rate_fan_c_s = r.heat_rate_fan_c_s;
-        self.settings.cool_rate_fan_c_s = r.cool_rate_fan_c_s;
-        let sel = self.printer.clone();
-        let name = if self.profiles.is_user(TierKind::Printer, &sel) {
-            sel.clone()
-        } else {
-            format!("{sel}-custom")
-        };
-        let mut pr = self.profiles.get_printer(&name).cloned().unwrap_or_default();
-        if pr.inherits.is_none() && name != sel {
-            pr.inherits = Some(sel.clone());
-        }
-        pr.heat_rate_c_s = Some(r.heat_rate_c_s);
-        pr.cool_rate_c_s = Some(r.cool_rate_c_s);
-        pr.heat_rate_fan_c_s = Some(r.heat_rate_fan_c_s);
-        pr.cool_rate_fan_c_s = Some(r.cool_rate_fan_c_s);
-        let summary = format!(
-            "heating ≈{:.1}/{:.1} °C/s, cooling ≈{:.1}/{:.1} °C/s (fan off/on)",
-            r.heat_rate_c_s, r.heat_rate_fan_c_s, r.cool_rate_c_s, r.cool_rate_fan_c_s
-        );
-        match self.profiles.save_user_printer(&name, pr) {
-            Ok(()) => {
-                self.printer = name.clone();
-                self.refresh_baseline();
-                format!("Thermal response: {summary} — saved to printer profile '{name}'.")
-            }
-            Err(e) => format!("Measured {summary} (set for this session), but saving the profile failed: {e}"),
-        }
-    }
-
-    /// The temperatures and pose thermal calibration will use — shared by the
-    /// confirmation dialog (which describes them) and the runner, so the
-    /// prompt can never drift from what actually happens.
-    fn calibration_plan(&self) -> (f64, f64, (f64, f64, f64)) {
-        let base = self.settings.nozzle_temp_c as f64;
-        let step = (self.settings.nozzle_temp_max_c as f64 - base).min(20.0).max(10.0);
-        let park = (
-            self.settings.bed_size_x_mm / 2.0,
-            self.settings.bed_size_y_mm / 2.0,
-            (self.settings.bed_size_z_mm * 0.5).clamp(20.0, 50.0),
-        );
-        (base, base + step, park)
-    }
-
-    /// Kick off the one-shot thermal profiling on a worker thread: steps the
-    /// idle hotend around the printing temperature over Moonraker and fits
-    /// the heat/cool rates. Progress streams into the status line.
-    fn spawn_thermal_calibration(&mut self, ctx: &egui::Context) {
-        let host = self.settings.host_url.trim().to_string();
-        if host.is_empty() {
-            self.status = "No printer host configured (Connection section).".into();
-            return;
-        }
-        let client = printhost::Client::new(&host, &self.settings.api_key);
-        let (base, top, park) = self.calibration_plan();
-        let step = top - base;
-        // A pinned, repeatable pose: bed center, high enough to clear a part
-        // left on the plate; bed controlled at the filament's temperature.
-        let setup = printhost::CalibrationSetup {
-            park_xyz: park,
-            bed_c: self.settings.bed_temp_c as f64,
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.host_rx = Some(rx);
-        self.status = "Thermal calibration: contacting printer…".into();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let mut progress = |m: String| {
-                let _ = tx.send(HostReply::Progress(m));
-                ctx.request_repaint();
-            };
-            let res = printhost::measure_thermal_rates(&client, base, step, &setup, &mut progress);
-            let _ = tx.send(HostReply::Rates(res));
-            ctx.request_repaint();
-        });
     }
 
     /// Delete a user profile; the selection falls back to a built-in default.
@@ -1521,7 +1411,6 @@ impl App {
         self.status.clear();
         self.slice_gen += 1;
         self.layer_stats = engine::per_layer_stats(&layers, &self.settings);
-        self.layer_islands = engine::per_layer_islands(&layers, &self.settings);
         self.sliced = Some(layers);
         // The preview belongs to the bed that was active at slice time —
         // instances bake its world offset, so it stays put if the user
@@ -1558,8 +1447,8 @@ impl App {
 
     /// The active metric mapped to ramp colors, per path — or None in feature
     /// mode (`build_instances` then colors by path kind). Layer time is one
-    /// color per layer broadcast to its paths; heat load is scored per island,
-    /// so a skinny chimney can't hide inside a big layer's average.
+    /// color per layer broadcast to its paths; heat load is also scored per
+    /// layer (its joules over the layer's print time and footprint).
     fn layer_color_table(&self) -> Option<Vec<Vec<[f32; 3]>>> {
         if self.color_by == ColorBy::Feature || self.layer_stats.is_empty() {
             return None;
@@ -1584,52 +1473,25 @@ impl App {
                         .collect(),
                 )
             }
-            ColorBy::Temp => {
-                // The temp schedule itself: a diverging map centered on the
-                // printing temperature — cooler zones toward blue, warmer
-                // toward red. (The first layer's adhesion temperature is its
-                // own mechanism and stays out of this view.)
-                let base = self.settings.nozzle_temp_c as f64;
-                let span = layers
-                    .iter()
-                    .filter_map(|l| l.planned_temp_c)
-                    .map(|t| (t - base).abs())
-                    .fold(2.0_f64, f64::max);
-                Some(
-                    layers
-                        .iter()
-                        .map(|layer| {
-                            let t = layer.planned_temp_c.unwrap_or(base);
-                            let u = 0.5 + ((t - base) / (2.0 * span)) as f32;
-                            vec![heat_ramp(u, acc); layer.paths.len()]
-                        })
-                        .collect(),
-                )
-            }
             ColorBy::Heat => {
-                if self.layer_islands.len() != layers.len() {
+                if self.layer_stats.len() != layers.len() {
                     return None;
                 }
                 // FIXED absolute log scale: colors mean the same thing in
                 // every slice regardless of settings, so before/after slider
-                // comparisons are honest. (Both the relative and the
-                // target-anchored ramps re-stretched with the data/settings —
-                // two screenshots of different configs were incomparable,
-                // which misled real tuning.)
+                // comparisons are honest. (A relative or target-anchored ramp
+                // re-stretches with the data/settings — two screenshots of
+                // different configs become incomparable, which misled tuning.)
                 let lo = HEAT_SCALE_LO_MW.ln();
                 let span = HEAT_SCALE_HI_MW.ln() - lo;
                 Some(
-                    self.layer_islands
+                    layers
                         .iter()
                         .enumerate()
-                        .map(|(li, l)| {
-                            l.path_island
-                                .iter()
-                                .map(|&k| {
-                                    let q = (self.island_heat(li, &l.islands[k]) * 1e3).max(1e-6).ln();
-                                    heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32, acc)
-                                })
-                                .collect()
+                        .map(|(li, layer)| {
+                            let q = (self.layer_heat(li) * 1e3).max(1e-6).ln();
+                            let c = heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32, acc);
+                            vec![c; layer.paths.len()]
                         })
                         .collect(),
                 )
@@ -1638,11 +1500,11 @@ impl App {
         }
     }
 
-    /// Heat-load metric for one island (W/mm²): its deposited energy over the
-    /// whole layer's time (an island keeps cooling while the nozzle is
-    /// elsewhere) and its own footprint.
-    fn island_heat(&self, li: usize, isl: &engine::IslandStats) -> f64 {
-        isl.joules / (self.layer_stats[li].secs.max(1e-9) * isl.footprint_mm2.max(1e-9))
+    /// Per-layer heat-load metric (W/mm²): the layer's deposited energy over
+    /// its print time and footprint — what the speed lever paces against.
+    fn layer_heat(&self, li: usize) -> f64 {
+        let st = &self.layer_stats[li];
+        st.joules / (st.secs.max(1e-9) * st.footprint_mm2.max(1e-9))
     }
 
     /// The one-line status plus the last slice's summary — the body of the
@@ -1888,14 +1750,11 @@ impl eframe::App for App {
 
         // 320 wide fits the longest slider row (90 slider + value + 19-char
         // A printer-host operation reports back; quiet status polls feed the
-        // live-print overlay, thermal calibration streams Progress lines (the
-        // channel stays open), everything else lands in the status line.
-        let mut rates: Option<Result<printhost::ThermalRates, String>> = None;
+        // live-print overlay, everything else lands in the status line.
         let mut op_done = false;
         if let Some(rx) = &self.host_rx {
             while let Ok(reply) = rx.try_recv() {
                 match reply {
-                    HostReply::Progress(msg) => self.status = msg,
                     HostReply::Message(msg) => {
                         self.status = msg;
                         // Pause/resume/cancel just changed the printer's state:
@@ -1915,20 +1774,11 @@ impl eframe::App for App {
                         self.printer_status = Some(st);
                         op_done = true;
                     }
-                    HostReply::Rates(r) => {
-                        rates = Some(r);
-                        op_done = true;
-                    }
                 }
             }
         }
         if op_done {
             self.host_rx = None;
-        }
-        match rates {
-            Some(Ok(r)) => self.status = self.persist_thermal_rates(r),
-            Some(Err(e)) => self.status = format!("Thermal calibration failed: {e}"),
-            None => {}
         }
         // Host actions requested from inside the panel closure (which borrows
         // settings) run after it returns.
@@ -2348,10 +2198,8 @@ impl eframe::App for App {
                         "What the preview colors encode. Feature type is the classic view. The two heat \
                          maps spot overheating: layer time shows where the nozzle returns quickly (little \
                          cooling time), and heat load also weighs how much hot plastic is deposited and \
-                         how much footprint it has to cool through — scored per island, i.e. per \
-                         disconnected region of each layer. Nozzle °C shows the planned temp \
-                         schedule directly. All views reflect the last slice — re-slice after \
-                         changing toggles.",
+                         how much footprint it has to cool through — both scored per layer. All \
+                         views reflect the last slice — re-slice after changing toggles.",
                     );
                     let before = self.color_by;
                     egui::ComboBox::from_id_salt("preview_color_by")
@@ -2359,13 +2207,11 @@ impl eframe::App for App {
                             ColorBy::Feature => "feature type",
                             ColorBy::LayerTime => "layer time",
                             ColorBy::Heat => "heat load",
-                            ColorBy::Temp => "nozzle °C",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.color_by, ColorBy::Feature, "feature type");
                             ui.selectable_value(&mut self.color_by, ColorBy::LayerTime, "layer time");
                             ui.selectable_value(&mut self.color_by, ColorBy::Heat, "heat load");
-                            ui.selectable_value(&mut self.color_by, ColorBy::Temp, "nozzle °C");
                         });
                     if self.color_by != before {
                         self.set_preview_instances(&rs);
@@ -2375,13 +2221,11 @@ impl eframe::App for App {
                     let mut vals: Vec<f64> = Vec::new();
                     match self.color_by {
                         ColorBy::LayerTime => vals.extend(self.layer_stats.iter().map(|st| st.secs)),
-                        ColorBy::Temp => {} // the temp legend computes its own ends
                         _ => {
-                            for (li, l) in self.layer_islands.iter().enumerate() {
-                                for isl in &l.islands {
-                                    if isl.joules > 0.0 {
-                                        vals.push(self.island_heat(li, isl));
-                                    }
+                            for li in 0..self.layer_stats.len() {
+                                let q = self.layer_heat(li);
+                                if q > 0.0 {
+                                    vals.push(q);
                                 }
                             }
                         }
@@ -2401,26 +2245,6 @@ impl eframe::App for App {
                              slowdown under Feature speeds is the usual fix."
                                 .to_string(),
                         ),
-                        ColorBy::Temp => {
-                            let base = self.settings.nozzle_temp_c as f64;
-                            let span = self.sliced.as_ref().map_or(2.0, |layers| {
-                                layers
-                                    .iter()
-                                    .filter_map(|l| l.planned_temp_c)
-                                    .map(|t| (t - base).abs())
-                                    .fold(2.0_f64, f64::max)
-                            });
-                            (
-                                format!("{:.0} °C", base - span),
-                                format!("{:.0} °C", base + span),
-                                "Heat control's temp schedule: the planned nozzle temperature of every \
-                                 layer, centered on the printing temperature — dark = scheduled cooler \
-                                 (hot zones), bright = scheduled warmer (cold bands). One flat color means \
-                                 nothing is scheduled (heat control off, or nothing to do). The first \
-                                 layer's adhesion temperature is separate and not shown."
-                                    .to_string(),
-                            )
-                        }
                         _ => {
                             let target_note = if anchored {
                                 let target_mw = self
@@ -2551,7 +2375,7 @@ impl eframe::App for App {
                             .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
                         ui.label("wall mode");
                     });
-                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 1..=6), "walls",
+                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 1..=99), "walls",
                         "Number of perimeter loops (shell wall thickness).",
                         "Spiral vase forces a single wall.");
                     hslider_lockout(ui, !vase, egui::Slider::new(&mut s.top_layers, 0..=10), "top layers",
@@ -2588,24 +2412,20 @@ impl eframe::App for App {
                 tier_section(ui, "Heat control", TierKind::Process, false, |ui| {
                     ui.checkbox(&mut s.heat_control, "heat control")
                         .on_hover_text(
-                            "The automatic: keeps every island's heat load inside the filament's \
-                             allowable ranges and smooths layer-to-layer transitions — the \
+                            "The automatic: keeps every layer's heat load inside the filament's \
+                             allowable ceiling and smooths layer-to-layer transitions — the \
                              banding/shrinkage killer. One gradient-limited heat curve is derived \
-                             per print, the gentlest the time budget below affords, and both \
-                             levers serve it: the nozzle-temperature schedule warms cold dips and \
-                             cools hot ranges inside the filament's packaging range (free in \
-                             print time, and never past the point where the flow derate would \
-                             cost more than the cooling saves), per-island slowing and \
-                             park-and-wait dwells supply what temperature can't reach. The \
-                             schedule only ever FADES — a few °C per millimetre of height — so \
-                             temperature itself never draws a line on the surface. Off restores \
-                             the derived speeds and temperatures exactly.",
+                             per print, the gentlest the time budget below affords, and the nozzle \
+                             holds its derived temperature throughout: each layer's speed is paced \
+                             onto the curve, never below the minimum print speed (a layer too hot \
+                             to slow that far is left there and reported). Off restores the derived \
+                             speeds exactly.",
                         );
                     hslider(ui, s.heat_control, egui::Slider::new(&mut s.smooth_extra_time_pct, 0.0..=50.0), "extra time %",
                         "Heat control's budget: the most extra print time smoothing may spend, as a % of the un-smoothed estimate. The transition gradient is bisected to the gentlest that fits and reported after slicing; 0 still does everything free (warming cold dips, capping at the filament's ceiling).");
                     ui.weak("speeds and temperatures are chosen by the system: the machine \
                              rating under the filament's melt ceiling, then heat control \
-                             governs the result");
+                             paces the speeds");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
                     let vase = s.spiral_vase;
@@ -2646,10 +2466,8 @@ impl eframe::App for App {
                     // class itself is profile data — switching filament
                     // profiles changes it — and supplies every derived value
                     // here until a calibration entry pins it.
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_min_c, 150..=300), "nozzle min °C",
-                        "The low end of the temperature range printed on the spool. Heat control's schedules never go below it.");
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_max_c, 150..=320), "nozzle max °C",
-                        "The high end of the range on the spool. Heat control's schedules never go above it.");
+                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_c, config::NOZZLE_TEMP_MIN_C..=config::NOZZLE_TEMP_MAX_C), "nozzle °C",
+                        "Operating nozzle temperature from the spool. The first layer adds the material's adhesion bump on top.");
                     hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
                         "Bed temperature from the packaging.");
                     hslider(ui, true, egui::Slider::new(&mut s.chamber_temp_c, 0..=70), "chamber soak °C",
@@ -2763,32 +2581,6 @@ impl eframe::App for App {
                     auto_slider(ui, &mut s.first_layer_accel_mm_s2, 100.0..=20000.0, "1st layer accel",
                         &mut pins.first_layer_accel, config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2),
                         "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
-                    hslider(ui, true, egui::Slider::new(&mut s.heat_rate_c_s, 0.2..=10.0), "heat °C/s",
-                        "How fast the hotend heats near printing temperatures. Heat control's temp schedule starts warming ramps this much ahead so the nozzle arrives on temperature. Conservative default — a Moonraker calibration routine will measure the real value.");
-                    hslider(ui, true, egui::Slider::new(&mut s.cool_rate_c_s, 0.1..=5.0), "cool °C/s",
-                        "Passive cooling rate near printing temperatures — far slower than heating; this sets the long lead times for cooling into a zone. Conservative default until measured.");
-                    hslider(ui, true, egui::Slider::new(&mut s.heat_rate_fan_c_s, 0.2..=10.0), "heat °C/s (fan)",
-                        "Heating rate with the part fan at 100% — spillover steals heater power. The temp schedule interpolates between the fan-off and fan-on pairs by the filament's fan duty. Follows the fan-off rate until measured.");
-                    hslider(ui, true, egui::Slider::new(&mut s.cool_rate_fan_c_s, 0.1..=10.0), "cool °C/s (fan)",
-                        "Cooling rate with the part fan at 100% — the realistic in-print case, faster than passive. Follows the fan-off rate until measured.");
-                    if ui
-                        .add_enabled(host_set && !host_busy, egui::Button::new("⟲ measure thermal response"))
-                        .on_hover_text(
-                            "Profile the hotend once: homes if needed, parks over bed center at a \
-                             clearance height with the bed at the filament's temperature (a pinned, \
-                             repeatable environment — bed proximity changes the answer), then steps \
-                             the nozzle target around the printing temperature — fan off and at \
-                             100% — and fits all four heating/cooling rates. Saves them into the \
-                             printer profile. Takes a few minutes; clear the bed first. Never runs \
-                             on its own: the temp schedule just reads the saved rates at slice time.",
-                        )
-                        .on_disabled_hover_text(
-                            "Needs a printer host (Connection section) and no other printer operation in flight.",
-                        )
-                        .clicked()
-                    {
-                        self.confirm_calibration = true;
-                    }
                     hslider(ui, true, egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0), "jerk mm/s",
                         "Klipper square-corner-velocity — how briskly direction changes are taken.");
                     // Hardware the printer either has or doesn't. Declared here
@@ -3391,49 +3183,6 @@ impl eframe::App for App {
             }
         }
 
-        // Thermal calibration runs heaters and motion — describe exactly what
-        // is about to happen and ask before doing any of it.
-        if self.confirm_calibration {
-            let (base, top, park) = self.calibration_plan();
-            let bed = self.settings.bed_temp_c;
-            let mut open = true;
-            egui::Window::new("Measure thermal response?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label("This operates the printer for a few minutes:");
-                    if bed > 0 {
-                        ui.label(format!(
-                            "• heats the bed to {bed} °C and the nozzle between {base:.0} and {top:.0} °C"
-                        ));
-                    } else {
-                        ui.label(format!("• heats the nozzle between {base:.0} and {top:.0} °C"));
-                    }
-                    ui.label(format!(
-                        "• homes if needed, then parks over bed center at Z {:.0} mm",
-                        park.2
-                    ));
-                    ui.label("• runs the part fan at 100% for half the run");
-                    ui.label("The nozzle may ooze a little if filament is loaded.");
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("Clear the bed and make sure the printer is idle.").strong(),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Start calibration").clicked() {
-                            host_op = Some(HostOp::CalibrateThermal);
-                            open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
-                });
-            self.confirm_calibration = open;
-        }
-
         // Dispatch host actions after both panels have run — the left panel
         // and the live-print overlay both request them via `host_op`.
         if let Some(op) = host_op {
@@ -3491,7 +3240,6 @@ impl eframe::App for App {
                     self.last_status_poll = Some(std::time::Instant::now());
                     self.spawn_host_op(&ctx, true, |c| HostReply::Status(c.print_status()));
                 }
-                HostOp::CalibrateThermal => self.spawn_thermal_calibration(&ctx),
             }
         }
 
@@ -3857,7 +3605,7 @@ fn build_instances(
                     from = pt;
                 }
             }
-            // Heat-map modes override the feature palette per path (per island).
+            // Heat-map modes override the feature palette per path (per layer).
             let c = path_colors.map_or_else(|| color_for(path.kind, accent), |t| t[li][pi]);
             let cat = category_of(path.kind);
             // Brick-layered perimeters render half a layer up (z_offset) and a touch

@@ -4,8 +4,7 @@
 # chamber sensor. The density below is ASA's (the class default is ABS's).
 material = "asa"
 filament_diameter_mm = 1.75
-nozzle_temp_min_c = 240
-nozzle_temp_max_c = 270
+nozzle_temp_c = 255
 bed_temp_c = 100
 
 # --- calibration ---

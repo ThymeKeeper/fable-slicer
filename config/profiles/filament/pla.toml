@@ -1,11 +1,10 @@
-# Generic PLA, as a packaging card: the range and bed below are what a
+# Generic PLA, as a packaging card: the temperature and bed below are what a
 # typical PLA box says (matched to the Orca pairing used on the Sovol Zero —
-# center 210 °C operating, +20 first-layer bump = 230). Calibration entries
+# 210 °C operating, +20 first-layer bump = 230). Calibration entries
 # carry the measured numbers; everything else follows the material class.
 material = "pla"
 filament_diameter_mm = 1.75
-nozzle_temp_min_c = 190
-nozzle_temp_max_c = 230
+nozzle_temp_c = 210
 bed_temp_c = 65
 
 # --- calibration (measured on the Zero's stock hotend / Orca-matched) ---

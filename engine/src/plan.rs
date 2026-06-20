@@ -115,32 +115,22 @@ pub struct LayerPlan {
     pub travels: Vec<Travel>,
     /// The layer's solid outline (bed-centered), used for combing decisions.
     pub outline: Polygons,
-    /// Speed multiplier (≤1) applied to this layer for min-layer-time cooling.
+    /// Speed multiplier (≤1) applied to this layer: min-layer-time cooling and
+    /// heat control's slowdown combined (what the g-code and estimates use).
     pub speed_scale: f64,
-    /// Per-path speed multipliers (≤1) from heat control's speed lever, parallel to
-    /// `paths`; empty = all 1.0. Multiplies on top of `speed_scale`.
-    pub path_speed_scale: Vec<f64>,
-    /// Park-and-wait cooling dwell (s) appended after this layer: when an
-    /// island is over the heat target with every path already at the speed
-    /// floor, tiny layers run out of path to slow — time without extrusion
-    /// is the one unbounded lever. Emitted retracted and lifted clear.
-    pub dwell_s: f64,
+    /// Heat control's share of `speed_scale` (≤1, 1.0 = unslowed) — kept apart
+    /// so the audit can report how much heat control slowed each layer,
+    /// distinct from the min-layer-time pacing.
+    pub heat_scale: f64,
     /// The heat target (W/mm²) pinned at plan time — computed once on the raw
-    /// plan and stored so both levers, the audits, and the GUI all
-    /// chase the same number (recomputing on the governed plan drifts).
+    /// plan and stored so the speed lever, the audits, and the GUI all chase
+    /// the same number (recomputing on the governed plan drifts).
     pub planned_heat_target: Option<f64>,
-    /// Layer-time floor (s) pinned with the targets: the shared clock every
-    /// island's cooling window divides by must ramp as smoothly as the
-    /// targets, or dwell boundaries and hot-island changes step it between
-    /// neighbors and band every cold island. 0 = no floor. The speed pass
-    /// tops any deficit up with dwell.
-    pub planned_floor_secs: f64,
-    /// Nozzle °C the temp schedule plans for this layer (None = the profile
+    /// A per-layer nozzle °C override for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
-    /// Emit `M104 S<this>` at the layer's start — the temp schedule's
-    /// lead-adjusted setpoint staircase. Asynchronous by design: planned at
-    /// slice time from the printer's ramp rates, no live feedback.
+    /// Emit `M104 S<this>` at the layer's start (None = no change). A plain
+    /// asynchronous setpoint — set without waiting, no live feedback.
     pub temp_command_c: Option<f64>,
 }
 
@@ -706,10 +696,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // separate islands that then can't be combed.
             outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
-            path_speed_scale: Vec::new(),
-            dwell_s: 0.0,
+            heat_scale: 1.0,
             planned_heat_target: None,
-            planned_floor_secs: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }
@@ -744,15 +732,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Pin per-layer heat targets on the raw plan — both heat-control levers
     // change the very quantities the targets are computed from, so everything
     // downstream must chase the same frozen numbers.
-    let (heat_targets, floor_secs) = crate::emit::plan_heat_targets(&plans, settings);
-    for ((plan, t), fs) in plans.iter_mut().zip(heat_targets).zip(floor_secs) {
+    let heat_targets = crate::emit::plan_heat_targets(&plans, settings);
+    for (plan, t) in plans.iter_mut().zip(heat_targets) {
         plan.planned_heat_target = Some(t);
-        plan.planned_floor_secs = fs;
     }
-    // The temperature lever first (it lowers deposited energy and flow caps in
-    // the zones it cools), then the speed lever mops up what remains —
-    // both stack on the min-layer-time pacing.
-    crate::emit::apply_heat_control_temp(&mut plans, settings);
+    // Heat control governs through one lever now: it paces each layer's speed
+    // (down to the min print speed) to hold the layer's whole-layer heat load
+    // under the target. No dwell, no per-island split. The nozzle holds its
+    // derived temperature throughout — there is no temperature lever.
     crate::emit::apply_heat_control_speed(&mut plans, settings);
     plans
 }
