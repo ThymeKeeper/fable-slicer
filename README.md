@@ -1,8 +1,7 @@
-<p align="center">
-  <img width="2880" height="1713" alt="screenshot" src="https://github.com/user-attachments/assets/0a18f8ba-a109-4140-9574-11534120c39b" />
-</p>
+<img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/a2f4ff3c-3402-451b-8259-bbc7f6a9b606" />
 
-<img width="2880" height="1715" alt="screenshot2" src="https://github.com/user-attachments/assets/1884f89a-81d1-4818-9ffe-87b4d4575eb6" />
+<img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/24ff77b1-d16d-428f-8704-418b6e8d649e" />
+
 
 # Fable Slicer
 
