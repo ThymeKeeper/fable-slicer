@@ -193,6 +193,7 @@ pub struct Scene {
     size: (u32, u32),
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    resolve_view: wgpu::TextureView,
     tex_id: TextureId,
     mesh_vbuf: Option<wgpu::Buffer>,
     mesh_count: u32,
@@ -319,10 +320,10 @@ impl Scene {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let (color_view, depth_view) = make_targets(device, format, 1, 1);
+        let (color_view, depth_view, resolve_view) = make_targets(device, format, 1, 1);
         let tex_id = rs.renderer.write().register_native_texture(
             device,
-            &color_view,
+            &resolve_view,
             wgpu::FilterMode::Linear,
         );
 
@@ -336,6 +337,7 @@ impl Scene {
             size: (1, 1),
             color_view,
             depth_view,
+            resolve_view,
             tex_id,
             mesh_vbuf: None,
             mesh_count: 0,
@@ -362,13 +364,14 @@ impl Scene {
         if self.size == (w, h) {
             return;
         }
-        let (color_view, depth_view) = make_targets(&rs.device, self.format, w, h);
+        let (color_view, depth_view, resolve_view) = make_targets(&rs.device, self.format, w, h);
         self.color_view = color_view;
         self.depth_view = depth_view;
+        self.resolve_view = resolve_view;
         self.size = (w, h);
         rs.renderer.write().update_egui_texture_from_wgpu_texture(
             &rs.device,
-            &self.color_view,
+            &self.resolve_view,
             wgpu::FilterMode::Linear,
             self.tex_id,
         );
@@ -504,7 +507,7 @@ impl Scene {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: Some(&self.resolve_view),
                     ops: wgpu::Operations {
                         // The viewport stage: ink a step deeper than the
                         // panels, so the chrome floats on it.
@@ -644,15 +647,42 @@ fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     }
 }
 
+/// MSAA sample count for the offscreen scene — smooths the dense thin beads,
+/// which otherwise alias into a moiré / screen-door pattern. 4× is the baseline
+/// every renderable format is guaranteed to support.
+const SAMPLES: u32 = 4;
+
 fn make_targets(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     w: u32,
     h: u32,
-) -> (wgpu::TextureView, wgpu::TextureView) {
+) -> (wgpu::TextureView, wgpu::TextureView, wgpu::TextureView) {
     let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    // Multisampled color + depth are the render targets; the pass resolves into
+    // `resolve` (single-sample), which is the texture egui samples.
     let color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene_color"),
+        label: Some("scene_color_msaa"),
+        size,
+        mip_level_count: 1,
+        sample_count: SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene_depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let resolve = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene_resolve"),
         size,
         mip_level_count: 1,
         sample_count: 1,
@@ -661,19 +691,10 @@ fn make_targets(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene_depth"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
     (
         color.create_view(&wgpu::TextureViewDescriptor::default()),
         depth.create_view(&wgpu::TextureViewDescriptor::default()),
+        resolve.create_view(&wgpu::TextureViewDescriptor::default()),
     )
 }
 
@@ -723,7 +744,7 @@ fn make_pipeline(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState {
-            count: 1,
+            count: SAMPLES,
             mask: !0,
             alpha_to_coverage_enabled: false,
         },

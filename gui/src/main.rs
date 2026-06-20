@@ -718,6 +718,12 @@ struct App {
     show_gap_fill: bool,
     show_ironing: bool,
     needs_rebuild: bool,
+    /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
+    /// render-skip below can tell a content change from a static frame.
+    content_version: u64,
+    /// The scene inputs at the last actual render; the scene re-renders only when
+    /// these change (see `RenderSig`).
+    last_render_sig: Option<RenderSig>,
     /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
     refit_camera: bool,
     /// Move the orbit pivot to the bed center next frame — set on printer
@@ -872,6 +878,8 @@ impl App {
             show_gap_fill: true,
             show_ironing: true,
             needs_rebuild: true,
+            content_version: 0,
+            last_render_sig: None,
             refit_camera: true,
             recenter_camera: false,
             last_bed,
@@ -1441,6 +1449,7 @@ impl App {
         );
         self.scene.set_toolpaths(&rs.device, &verts);
         self.scene.set_joints(&rs.device, &joints);
+        self.content_version += 1;
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
     }
@@ -1612,6 +1621,7 @@ impl App {
     }
 
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        self.content_version += 1;
         let bx = self.settings.bed_size_x_mm as f32;
         let by = self.settings.bed_size_y_mm as f32;
         self.scene.set_beds(&rs.device, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
@@ -1662,6 +1672,20 @@ impl App {
             self.refit_camera = false;
         }
     }
+}
+
+/// A snapshot of everything the 3D scene render depends on. The scene is
+/// re-rendered only when this changes — egui repaints on every input, and a
+/// large slice shouldn't redraw all its beads just because the pointer moved.
+#[derive(PartialEq)]
+struct RenderSig {
+    vp: glam::Mat4,
+    show_mesh: bool,
+    /// (count, joint_count, current_layer bits, dim bits, mask), or None in model mode.
+    preview: Option<(u32, u32, u32, u32, u32)>,
+    accent: egui::Color32,
+    size: (u32, u32),
+    content: u64,
 }
 
 impl eframe::App for App {
@@ -2375,8 +2399,8 @@ impl eframe::App for App {
                             .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
                         ui.label("wall mode");
                     });
-                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 1..=99), "walls",
-                        "Number of perimeter loops (shell wall thickness).",
+                    hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 0..=99), "walls",
+                        "Number of perimeter loops (shell wall thickness). 0 = infill only, no perimeters.",
                         "Spiral vase forces a single wall.");
                     hslider_lockout(ui, !vase, egui::Slider::new(&mut s.top_layers, 0..=10), "top layers",
                         "Number of solid layers on top surfaces.",
@@ -2770,8 +2794,26 @@ impl eframe::App for App {
             } else {
                 None
             };
-            let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
-            self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel);
+            // Re-render the 3D scene only when something it depends on changed —
+            // camera, layer, mask, contents, accent, size. egui repaints on every
+            // input (a mouse-move over the panel included); without this a big
+            // slice redrew all its beads on each of those frames.
+            let preview_sig = preview.as_ref().map(|p| {
+                (p.count, p.joint_count, p.current_layer.to_bits(), p.dim.to_bits(), p.mask)
+            });
+            let sig = RenderSig {
+                vp,
+                show_mesh,
+                preview: preview_sig,
+                accent: self.accent,
+                size: (w, h),
+                content: self.content_version,
+            };
+            if self.last_render_sig.as_ref() != Some(&sig) {
+                let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
+                self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel);
+                self.last_render_sig = Some(sig);
+            }
 
             ui.painter().image(
                 self.scene.texture_id(),
