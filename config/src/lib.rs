@@ -371,7 +371,11 @@ pub struct Settings {
     pub infill_density: f64,
     /// Pattern for sparse (interior) infill.
     pub sparse_pattern: InfillPattern,
-    /// Pattern for solid (top/bottom) interior infill.
+    /// Pattern for the top skin (the visible top surface) layers.
+    pub top_pattern: InfillPattern,
+    /// Pattern for the bottom skin (the visible bottom surface) layers.
+    pub bottom_pattern: InfillPattern,
+    /// Pattern for buried solid infill (between the sparse infill and the skins).
     pub solid_pattern: InfillPattern,
     /// How far infill lines push into the innermost wall bead, as a fraction of
     /// the line width (0..~0.5). A little overlap bonds infill to the walls.
@@ -610,6 +614,8 @@ impl Default for Settings {
             bottom_layers: 4,
             infill_density: 0.15,
             sparse_pattern: InfillPattern::default(),
+            top_pattern: InfillPattern::default(),
+            bottom_pattern: InfillPattern::default(),
             solid_pattern: InfillPattern::default(),
             infill_overlap: 0.25,
             monotonic_solid: true,

@@ -149,6 +149,10 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_infill: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_infill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom_infill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub solid_infill: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skirt_loops: Option<usize>,
@@ -257,7 +261,7 @@ impl Tier for ProcessProfile {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm,
             arc_fitting, arc_tolerance_mm, wall_count, wall_mode, top_layers, bottom_layers,
             half_height_outer_walls, brick_layers,
-            infill_density, sparse_infill, solid_infill,
+            infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm,
@@ -365,6 +369,8 @@ impl ProcessProfile {
             brick_layers: diff_field!(cur.brick_layers, base.brick_layers),
             infill_density: diff_field!(cur.infill_density, base.infill_density),
             sparse_infill: diff_field!(cur.sparse_pattern, base.sparse_pattern).map(|p| p.label().to_string()),
+            top_infill: diff_field!(cur.top_pattern, base.top_pattern).map(|p| p.label().to_string()),
+            bottom_infill: diff_field!(cur.bottom_pattern, base.bottom_pattern).map(|p| p.label().to_string()),
             solid_infill: diff_field!(cur.solid_pattern, base.solid_pattern).map(|p| p.label().to_string()),
             skirt_loops: diff_field!(cur.skirt_loops, base.skirt_loops),
             skirt_gap_mm: diff_field!(cur.skirt_gap_mm, base.skirt_gap_mm),
@@ -682,6 +688,12 @@ impl Profiles {
             brick_layers: pc.brick_layers.unwrap_or(d.brick_layers),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
+            top_pattern: pc.top_infill.as_deref().and_then(InfillPattern::parse)
+                .or_else(|| pc.solid_infill.as_deref().and_then(InfillPattern::parse))
+                .unwrap_or(d.top_pattern),
+            bottom_pattern: pc.bottom_infill.as_deref().and_then(InfillPattern::parse)
+                .or_else(|| pc.solid_infill.as_deref().and_then(InfillPattern::parse))
+                .unwrap_or(d.bottom_pattern),
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
             infill_overlap: pc.infill_overlap.unwrap_or(d.infill_overlap),
             monotonic_solid: pc.monotonic_solid.unwrap_or(d.monotonic_solid),

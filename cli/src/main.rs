@@ -72,7 +72,13 @@ struct Args {
     /// Sparse infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
     #[arg(long)]
     sparse_infill: Option<String>,
-    /// Solid infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
+    /// Top skin pattern: lines | aligned | grid | triangles | concentric | gyroid.
+    #[arg(long)]
+    top_infill: Option<String>,
+    /// Bottom skin pattern: lines | aligned | grid | triangles | concentric | gyroid.
+    #[arg(long)]
+    bottom_infill: Option<String>,
+    /// Buried solid infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
     #[arg(long)]
     solid_infill: Option<String>,
     /// Support mode: none | grid | arc.
@@ -185,6 +191,14 @@ fn main() -> Result<()> {
     }
     if let Some(s) = &args.sparse_infill {
         settings.sparse_pattern = config::InfillPattern::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
+    }
+    if let Some(s) = &args.top_infill {
+        settings.top_pattern = config::InfillPattern::parse(s)
+            .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
+    }
+    if let Some(s) = &args.bottom_infill {
+        settings.bottom_pattern = config::InfillPattern::parse(s)
             .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
     }
     if let Some(s) = &args.solid_infill {

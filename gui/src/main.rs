@@ -2451,8 +2451,12 @@ impl eframe::App for App {
                         pattern_combo(ui, "sparse fill", &mut s.sparse_pattern)
                             .on_hover_text("Pattern for the sparse interior infill.");
                     });
+                    pattern_combo(ui, "top", &mut s.top_pattern)
+                        .on_hover_text("Pattern for the top skin (the visible top surface) layers.");
+                    pattern_combo(ui, "bottom", &mut s.bottom_pattern)
+                        .on_hover_text("Pattern for the bottom skin (the visible bottom surface) layers.");
                     pattern_combo(ui, "solid fill", &mut s.solid_pattern)
-                        .on_hover_text("Pattern for the solid top/bottom layers.");
+                        .on_hover_text("Pattern for buried solid fill, between the sparse infill and the skins.");
                     hslider(ui, true, egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5), "wall overlap",
                         "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
                 });

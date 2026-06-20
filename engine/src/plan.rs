@@ -615,8 +615,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         difference(&core, &internal_bridge)
                     };
                     if !fill.is_empty() {
+                        let pattern = match kind {
+                            PathKind::TopSkin => settings.top_pattern,
+                            PathKind::BottomSkin => settings.bottom_pattern,
+                            _ => settings.solid_pattern,
+                        };
                         fill_region(
-                            &fill, settings.solid_pattern, sp, pat_angle(settings.solid_pattern), lw, kind,
+                            &fill, pattern, sp, pat_angle(pattern), lw, kind,
                             settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
                         );
                     }
