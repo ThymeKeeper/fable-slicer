@@ -724,6 +724,12 @@ struct App {
     /// The scene inputs at the last actual render; the scene re-renders only when
     /// these change (see `RenderSig`).
     last_render_sig: Option<RenderSig>,
+    /// The "Front" bed label laid out once: flat triangle verts (local galley-px
+    /// position, normalized atlas uv) plus the galley size (tw, th). Mapped to the
+    /// bed plane and uploaded as depth-tested scene geometry.
+    front_label: Option<(Vec<([f32; 2], [f32; 2])>, f32, f32)>,
+    /// Bed key (x, y, active) the label geometry was last built for.
+    last_label_bed: Option<(f64, f64, usize)>,
     /// Re-frame the camera on the next rebuild (set on scene changes, not selection).
     refit_camera: bool,
     /// Move the orbit pivot to the bed center next frame — set on printer
@@ -880,6 +886,8 @@ impl App {
             needs_rebuild: true,
             content_version: 0,
             last_render_sig: None,
+            front_label: None,
+            last_label_bed: None,
             refit_camera: true,
             recenter_camera: false,
             last_bed,
@@ -2811,7 +2819,10 @@ impl eframe::App for App {
             };
             if self.last_render_sig.as_ref() != Some(&sig) {
                 let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
-                self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel);
+                // The dim taupe the egui overlay used, in the scene's perceptual
+                // space (mesh/grid shaders don't linearize either).
+                let label_color = [104.0 / 255.0, 98.0 / 255.0, 86.0 / 255.0, 1.0];
+                self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel, label_color);
                 self.last_render_sig = Some(sig);
             }
 
@@ -2823,15 +2834,51 @@ impl eframe::App for App {
             );
 
             // Front-edge marker: which edge is the printer's front (the origin
-            // edge, y=0) is otherwise ambiguous. Lay "Front" — the wordmark
-            // Playfair with the sliced "F" — flat on the active bed's plane
-            // just outside its near edge, foreshortened with the grid.
+            // edge, y=0) is otherwise ambiguous. The "Front" wordmark (Playfair,
+            // sliced "F") is laid out once, then mapped onto the active bed's
+            // front edge as depth-tested scene geometry (see render.rs) so the
+            // model occludes it per-pixel instead of painting over it.
             {
                 let bx = self.settings.bed_size_x_mm;
-                let ox = bed_origin_x(self.active_bed, bx);
-                // A dim warm taupe — a quiet annotation just above the grid's tone.
-                let label = egui::Color32::from_rgb(104, 98, 86);
-                draw_front_label(ui, vp, rect, ox, bx, self.settings.bed_size_y_mm, label);
+                let by = self.settings.bed_size_y_mm;
+                if self.front_label.is_none() {
+                    if let Some(local) = front_label_local(ui) {
+                        // Snapshot egui's font atlas into an R8 coverage texture.
+                        let img = ui.ctx().fonts(|f| f.image());
+                        let (aw, ah) = (img.size[0] as u32, img.size[1] as u32);
+                        let gray = img.pixels.iter().all(|p| p.a() == 255);
+                        let coverage: Vec<u8> =
+                            img.pixels.iter().map(|p| if gray { p.r() } else { p.a() }).collect();
+                        self.scene.set_label_atlas(&rs.device, &rs.queue, aw, ah, &coverage);
+                        self.front_label = Some(local);
+                        self.last_label_bed = None;
+                    }
+                }
+                let key = (bx, by, self.active_bed);
+                if self.front_label.is_some() && self.last_label_bed != Some(key) {
+                    let (local, tw, th) = {
+                        let (l, tw, th) = self.front_label.as_ref().unwrap();
+                        (l.clone(), *tw, *th)
+                    };
+                    // galley px → world on z=0, laid just outside the near (y=0)
+                    // edge, sized to a fraction of the bed (matches the old overlay).
+                    let ox = bed_origin_x(self.active_bed, bx) as f32;
+                    let (bxf, byf) = (bx as f32, by as f32);
+                    let h_world = (bxf.min(byf) * 0.05).clamp(8.0, 14.0);
+                    let scale = h_world / th;
+                    let x0 = ox + bxf * 0.5 - tw * scale * 0.5;
+                    let pad = 0.01 * byf + 2.0;
+                    let verts: Vec<[f32; 5]> = local
+                        .iter()
+                        .map(|&([gx, gy], [u, v])| [x0 + gx * scale, -pad - gy * scale, 0.0, u, v])
+                        .collect();
+                    self.scene.set_label_geom(&rs.device, &verts);
+                    self.last_label_bed = Some(key);
+                    self.content_version += 1;
+                    // Geometry uploaded after this frame's render — make sure the
+                    // next frame (which re-renders on the content bump) happens.
+                    ui.ctx().request_repaint();
+                }
             }
 
             // Floating bed card, top-center: step/select the active bed, add
@@ -3400,74 +3447,42 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
 /// World-space ray (origin, normalized dir) through a screen position in `rect`.
 /// Project a world point to a screen position in `rect`, or None if it's
 /// behind the camera. Inverse of `pointer_ray`'s NDC↔screen mapping.
-fn world_to_screen(vp: glam::Mat4, rect: egui::Rect, p: glam::Vec3) -> Option<egui::Pos2> {
-    let clip = vp * p.extend(1.0);
-    if clip.w <= 1.0e-6 {
-        return None; // behind the camera
-    }
-    let ndc = clip.truncate() / clip.w;
-    Some(egui::pos2(
-        rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
-        rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
-    ))
-}
-
 /// Paint the word "Front" — the wordmark's Playfair with the sliced "F",
 /// like the logo — lying flat on the bed plane (z=0) just outside the active
 /// bed's near (y=0) edge, so it foreshortens with the grid. Real glyphs: lay
 /// out a galley, then project each glyph's quad from the bed plane to the
 /// screen; the F is split into three offset horizontal slices.
-fn draw_front_label(
-    ui: &mut egui::Ui,
-    vp: glam::Mat4,
-    rect: egui::Rect,
-    ox: f64,
-    bed_x: f64,
-    bed_y: f64,
-    color: egui::Color32,
-) {
+/// The "Front" wordmark laid out once: a flat list of triangle vertices, each
+/// (local galley-px (x, y), normalized atlas uv), plus the galley size (tw, th).
+/// The caller maps the local px onto the bed plane and uploads it as depth-tested
+/// scene geometry, so the model — via the depth buffer — occludes it per-pixel.
+fn front_label_local(ui: &mut egui::Ui) -> Option<(Vec<([f32; 2], [f32; 2])>, f32, f32)> {
     let wordmark = egui::FontFamily::Name("wordmark".into());
-    let galley = ui
-        .ctx()
-        .fonts_mut(|f| f.layout_no_wrap("Front".to_owned(), egui::FontId::new(64.0, wordmark), color));
-    let Some(row) = galley.rows.first() else { return };
+    // Coverage only; the tint is applied in the shader.
+    let galley = ui.ctx().fonts_mut(|f| {
+        f.layout_no_wrap("Front".to_owned(), egui::FontId::new(64.0, wordmark), egui::Color32::WHITE)
+    });
+    let row = galley.rows.first()?;
     let src = &row.visuals.mesh;
     let (tw, th) = (galley.size().x, galley.size().y);
     if src.vertices.len() < 4 || tw <= 0.0 || th <= 0.0 {
-        return;
+        return None;
     }
-    // Galley meshes carry uv in atlas *texels*; a raw Shape::Mesh samples uv as
-    // normalized [0,1], so divide through by the atlas size.
+    // Galley uv is in atlas texels; normalize to [0,1] for a plain texture sample.
     let [aw, ah] = ui.ctx().fonts(|f| f.font_image_size());
     let (aw, ah) = (aw as f32, ah as f32);
-    let nuv = |uv: egui::Pos2| egui::pos2(uv.x / aw, uv.y / ah);
+    let nuv = |uv: egui::Pos2| [uv.x / aw, uv.y / ah];
 
-    // galley px → world on z=0, sized to a fraction of the bed and laid just
-    // OUTSIDE the near (y=0) edge — in front of the plate, off the build
-    // volume — so it never sits under a part: x along +X (reading), the tops
-    // toward the edge and the baseline toward the viewer, reading upright from
-    // the front-facing default camera.
-    let (bx, by) = (bed_x as f32, bed_y as f32);
-    let h_world = (bx.min(by) * 0.05).clamp(8.0, 14.0);
-    let scale = h_world / th;
-    let x0 = ox as f32 + bx * 0.5 - tw * scale * 0.5;
-    let pad = 0.01 * by + 2.0; // small gap in front of the edge
-    let to_screen = |gx: f32, gy: f32| {
-        world_to_screen(vp, rect, glam::Vec3::new(x0 + gx * scale, -pad - gy * scale, 0.0))
-    };
-
-    let mut out = egui::epaint::Mesh::with_texture(src.texture_id);
-    let mut add_quad = |corners: [Option<egui::Pos2>; 4], uv: [egui::Pos2; 4]| {
-        let [Some(a), Some(b), Some(c), Some(d)] = corners else { return };
-        let base = out.vertices.len() as u32;
-        for (p, t) in [(a, uv[0]), (b, uv[1]), (c, uv[2]), (d, uv[3])] {
-            out.vertices.push(egui::epaint::Vertex { pos: p, uv: t, color });
+    let mut out: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    // Two triangles (0,1,2),(0,2,3) for a corner+uv quad.
+    let mut quad = |c: [[f32; 2]; 4], uv: [[f32; 2]; 4]| {
+        for &i in &[0usize, 1, 2, 0, 2, 3] {
+            out.push((c[i], uv[i]));
         }
-        out.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     };
 
-    // The F is the first glyph (first 4 vertices): an axis-aligned quad in
-    // galley px with a matching atlas-uv box.
+    // The F (first glyph, first 4 vertices): a px box sliced into three offset
+    // bands — the logo's cut F: 0–0.307, 0.360–0.727 (shift +0.083), 0.779–1.0.
     let f = &src.vertices[0..4];
     let (mut px0, mut py0, mut px1, mut py1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let (mut u0, mut v0, mut u1, mut v1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -3481,46 +3496,28 @@ fn draw_front_label(
         u1 = u1.max(vert.uv.x);
         v1 = v1.max(vert.uv.y);
     }
-    // Three slices across the cap height (= the F's ink box), middle pushed
-    // along +X — the logo's cuts: 0–0.307, 0.360–0.727, 0.779–1.0, shift 0.083.
     let unit = py1 - py0;
     for (fa, fb, shift) in [(0.0_f32, 0.307_f32, 0.0_f32), (0.360, 0.727, 0.083), (0.779, 1.0, 0.0)] {
         let sx = shift * unit;
         let (ya, yb) = (py0 + unit * fa, py0 + unit * fb);
         let (va, vb) = (v0 + (v1 - v0) * fa, v0 + (v1 - v0) * fb);
-        add_quad(
-            [
-                to_screen(px0 + sx, ya),
-                to_screen(px1 + sx, ya),
-                to_screen(px1 + sx, yb),
-                to_screen(px0 + sx, yb),
-            ],
+        quad(
+            [[px0 + sx, ya], [px1 + sx, ya], [px1 + sx, yb], [px0 + sx, yb]],
             [nuv(egui::pos2(u0, va)), nuv(egui::pos2(u1, va)), nuv(egui::pos2(u1, vb)), nuv(egui::pos2(u0, vb))],
         );
     }
 
-    // The rest ("ront"): project each vertex past the F and keep its triangles.
-    let mut map = vec![None; src.vertices.len()];
-    for vi in 4..src.vertices.len() {
-        let vert = &src.vertices[vi];
-        if let Some(sp) = to_screen(vert.pos.x, vert.pos.y) {
-            map[vi] = Some(out.vertices.len() as u32);
-            out.vertices.push(egui::epaint::Vertex { pos: sp, uv: nuv(vert.uv), color: vert.color });
-        }
-    }
+    // The rest ("ront"): keep each glyph triangle (all vertices past the F's 4).
     for tri in src.indices.chunks_exact(3) {
         if tri.iter().all(|&i| i as usize >= 4) {
-            if let (Some(a), Some(b), Some(c)) =
-                (map[tri[0] as usize], map[tri[1] as usize], map[tri[2] as usize])
-            {
-                out.indices.extend([a, b, c]);
+            for &i in tri {
+                let vert = &src.vertices[i as usize];
+                out.push(([vert.pos.x, vert.pos.y], nuv(vert.uv)));
             }
         }
     }
 
-    if !out.indices.is_empty() {
-        ui.painter().add(egui::Shape::mesh(out));
-    }
+    Some((out, tw, th))
 }
 
 fn pointer_ray(vp: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> (glam::Vec3, glam::Vec3) {

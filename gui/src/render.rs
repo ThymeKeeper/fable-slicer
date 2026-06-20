@@ -29,6 +29,7 @@ struct U {
     // Accent-derived model tints (rgb; w unused).
     mesh_unsel: vec4<f32>,
     mesh_sel: vec4<f32>,
+    label_color: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -131,6 +132,22 @@ struct BeadOut {
     o.cat = lc.y;
     return o;
 }
+
+// --- bed label ("Front"): textured glyph quads laid on z=0, depth-tested so
+// the model occludes them per-pixel; the atlas is egui's font coverage (R8). ---
+@group(1) @binding(0) var lbl_tex: texture_2d<f32>;
+@group(1) @binding(1) var lbl_samp: sampler;
+struct LabelOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_label(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>) -> LabelOut {
+    var o: LabelOut;
+    o.clip = u.mvp * vec4<f32>(p, 1.0);
+    o.uv = uv;
+    return o;
+}
+@fragment fn fs_label(i: LabelOut) -> @location(0) vec4<f32> {
+    let cov = textureSample(lbl_tex, lbl_samp, i.uv).r;
+    return vec4<f32>(u.label_color.rgb, u.label_color.a * cov);
+}
 "#;
 
 #[repr(C)]
@@ -167,6 +184,7 @@ struct Uniforms {
     ctrl: [f32; 4],
     mesh_unsel: [f32; 4],
     mesh_sel: [f32; 4],
+    label_color: [f32; 4],
 }
 
 /// How to draw the toolpaths this frame.
@@ -208,6 +226,12 @@ pub struct Scene {
     blob_count: u32,
     joint_vbuf: Option<wgpu::Buffer>,
     joint_count: u32,
+    label_pipeline: wgpu::RenderPipeline,
+    label_bgl: wgpu::BindGroupLayout,
+    label_sampler: wgpu::Sampler,
+    label_bind_group: Option<wgpu::BindGroup>,
+    label_vbuf: Option<wgpu::Buffer>,
+    label_count: u32,
 }
 
 impl Scene {
@@ -264,6 +288,8 @@ impl Scene {
                 attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32],
             }],
             wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
@@ -273,6 +299,8 @@ impl Scene {
                 attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
             }],
             wgpu::PrimitiveTopology::LineList,
+            wgpu::BlendState::REPLACE,
+            true,
         );
         let bead_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_bead", "fs_bead",
@@ -289,6 +317,8 @@ impl Scene {
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
         );
         let joint_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_joint", "fs_bead",
@@ -305,6 +335,69 @@ impl Scene {
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
+        );
+
+        // Bed-label pass: group(1) = its R8 font-atlas texture + sampler; alpha
+        // blended and depth-tested (no depth write — it's a flat decal on z=0).
+        let label_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("label_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let label_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("label_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let label_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("label_layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&label_bgl)],
+            immediate_size: 0,
+        });
+        let label_pipeline = make_pipeline(
+            device, &label_layout, &shader, format, "vs_label", "fs_label",
+            &[wgpu::VertexBufferLayout {
+                // LabelVertex = [pos.xyz, uv.xy]
+                array_stride: (5 * 4) as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+            }],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
         );
 
         let box_verts = bead_vertices();
@@ -352,6 +445,12 @@ impl Scene {
             blob_count: blob_verts.len() as u32,
             joint_vbuf: None,
             joint_count: 0,
+            label_pipeline,
+            label_bgl,
+            label_sampler,
+            label_bind_group: None,
+            label_vbuf: None,
+            label_count: 0,
         }
     }
 
@@ -476,6 +575,54 @@ impl Scene {
         self.joint_vbuf = make_vbuf(device, "joint_instances", bytemuck::cast_slice(joints));
     }
 
+    /// Upload the font-atlas coverage (R8) the bed label samples, and (re)build
+    /// its bind group. Called once — the "Front" glyphs never change.
+    pub fn set_label_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        coverage: &[u8],
+    ) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("label_atlas"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            coverage,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.label_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("label_bg"),
+            layout: &self.label_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.label_sampler) },
+            ],
+        }));
+    }
+
+    /// Upload the label's world-space glyph triangles (rebuilt when the bed changes).
+    pub fn set_label_geom(&mut self, device: &wgpu::Device, verts: &[[f32; 5]]) {
+        self.label_count = verts.len() as u32;
+        self.label_vbuf = make_vbuf(device, "label", bytemuck::cast_slice(verts));
+    }
+
     pub fn render(
         &self,
         rs: &RenderState,
@@ -484,6 +631,7 @@ impl Scene {
         preview: Option<Preview>,
         mesh_unsel: [f32; 3],
         mesh_sel: [f32; 3],
+        label_color: [f32; 4],
     ) {
         let ctrl = match &preview {
             Some(p) => [p.current_layer, p.dim, p.mask as f32, 0.0],
@@ -495,6 +643,7 @@ impl Scene {
             ctrl,
             mesh_unsel: [mesh_unsel[0], mesh_unsel[1], mesh_unsel[2], 0.0],
             mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
+            label_color,
         };
         rs.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -561,6 +710,18 @@ impl Scene {
                     pass.set_pipeline(&self.mesh_pipeline);
                     pass.set_vertex_buffer(0, buf.slice(..));
                     pass.draw(0..self.mesh_count, 0..1);
+                }
+            }
+
+            // The bed label LAST, so it depth-tests against the model/beads and
+            // is hidden per-pixel where they stand in front of it.
+            if self.label_count > 0 {
+                if let (Some(bg), Some(vbuf)) = (&self.label_bind_group, &self.label_vbuf) {
+                    pass.set_pipeline(&self.label_pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                    pass.draw(0..self.label_count, 0..1);
                 }
             }
         }
@@ -707,6 +868,8 @@ fn make_pipeline(
     fs: &str,
     buffers: &[wgpu::VertexBufferLayout],
     topology: wgpu::PrimitiveTopology,
+    blend: wgpu::BlendState,
+    depth_write: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("scene_pipeline"),
@@ -722,7 +885,7 @@ fn make_pipeline(
             entry_point: Some(fs),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -738,7 +901,7 @@ fn make_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
+            depth_write_enabled: Some(depth_write),
             depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
