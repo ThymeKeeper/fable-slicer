@@ -14,6 +14,7 @@ mod calibrate;
 mod distributed;
 mod emit;
 mod fill;
+mod peel;
 mod plan;
 mod skeletal;
 mod slice;

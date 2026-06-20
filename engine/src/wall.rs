@@ -63,15 +63,32 @@ pub(crate) fn variable_walls(
         }
         return vw;
     }
-    if std::env::var("ARACHNE_GRID").is_err() {
+    // Arachne (hybrid): the exact skeletal trapezoidation (skeletal.rs) is the
+    // primary path — it merges beads natively into continuous variable-width
+    // paths, which minimises toolpaths/backtracking. Where its Voronoi
+    // construction panics on degenerate input (after the jitter retries), fall
+    // back to the offset-peel (peel.rs): robust concentric loops, far cleaner
+    // than the old grid scribble. A/B overrides: ARACHNE_PEEL forces the peel
+    // everywhere; ARACHNE_GRID forces the grid field.
+    if std::env::var("ARACHNE_GRID").is_ok() {
+        return variable_walls_grid(outer, inner, lw, sp, max_inner);
+    }
+    if std::env::var("ARACHNE_PEEL").is_err() {
         if let Some(vw) = crate::skeletal::variable_walls_exact(outer, inner, lw, sp, max_inner) {
             return vw;
         }
         if std::env::var("ARACHNE_DBG").is_ok() {
-            eprintln!("  skeletal: voronoi path bailed, grid fallback");
+            eprintln!("  skeletal: voronoi path bailed — offset-peel fallback");
         }
     }
-    variable_walls_grid(outer, inner, lw, sp, max_inner)
+    let mut vw = VariableWalls {
+        inner: crate::peel::peel_beads(inner, lw, sp, max_inner),
+        thin_outer: Vec::new(),
+    };
+    if let Some(f) = Field::build(outer, lw, sp, 1) {
+        vw.thin_outer = f.thin_ridge_beads(lw, sp);
+    }
+    vw
 }
 
 /// The distance-field fallback (see module docs above).
@@ -90,6 +107,19 @@ fn variable_walls_grid(
     }
     if let Some(f) = Field::build(outer, lw, sp, 1) {
         out.thin_outer = f.thin_ridge_beads(lw, sp);
+    }
+    out
+}
+
+/// Centerline beads for a region that is at most one bead thick — the terminal
+/// case of the offset peeler (peel.rs), where adjacent beads have merged into a
+/// single medial run. Reuses the grid skeleton (small, simple regions, so it is
+/// fast and robust); the peeler smooths the result.
+pub(crate) fn region_terminal_beads(region: &Polygons, lw: f64, sp: f64) -> Vec<Bead> {
+    let mut out = Vec::new();
+    if let Some(f) = Field::build(region, lw, sp, 1) {
+        out.extend(f.beads(lw, sp, 1));
+        out.extend(f.thin_ridge_beads(lw, sp));
     }
     out
 }
