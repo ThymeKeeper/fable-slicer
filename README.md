@@ -7,8 +7,7 @@
 ![Status](https://img.shields.io/badge/status-work_in_progress-yellow.svg)
 
 A from-scratch FDM slicer written in Rust. GUI-first (egui + wgpu), Klipper-flavored
-g-code out, and a deliberately small settings surface — most of what other slicers
-expose as a knob, Fable derives.
+g-code out, and a deliberately small settings surface.
 
 ## Why another slicer
 
@@ -85,7 +84,7 @@ breaking profile changes. Issues and PRs welcome.
 ## Building
 
 ```sh
-cargo run --release -p gui                 # the app (binary: fable-slicer)
+cargo run --release                        # the app (binary: fable-slicer)
 cargo run --release -p cli -- model.stl    # the CLI (fable-slicer-cli)
 ```
 
