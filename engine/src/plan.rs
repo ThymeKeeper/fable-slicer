@@ -805,12 +805,12 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
             let iface_here = intersection(&here, &iface_region);
             let body_here = difference(&here, &iface_here);
             if !body_here.is_empty() {
-                fill_region(&body_here, InfillPattern::Lines, spacing, angle, lw,
-                    PathKind::Support, settings.seam_mode, i, layers[i].z_mm, false, &mut plans[i].paths);
+                add_support_region(&mut plans[i].paths, &body_here, spacing, angle, lw,
+                    settings.seam_mode, i, layers[i].z_mm);
             }
             if !iface_here.is_empty() {
-                fill_region(&iface_here, InfillPattern::Lines, sp, angle, lw,
-                    PathKind::Support, settings.seam_mode, i, layers[i].z_mm, false, &mut plans[i].paths);
+                add_support_region(&mut plans[i].paths, &iface_here, sp, angle, lw,
+                    settings.seam_mode, i, layers[i].z_mm);
             }
         }
         accum = difference(&accum, &layers[i].polygons);
@@ -819,6 +819,36 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
         if i + gap < n {
             accum = union(&accum, &overhang[i + gap]);
         }
+    }
+}
+
+/// Draw one support region: a perimeter loop first — so thin and tiny sections
+/// become continuous, self-supporting tubes and the interior fill anchors to an
+/// edge instead of floating as one-direction lines — then the pattern fill
+/// tucked a line-width inside it.
+fn add_support_region(
+    paths: &mut Vec<ToolPath>,
+    region: &Polygons,
+    spacing: f64,
+    angle: f64,
+    lw: f64,
+    seam_mode: SeamMode,
+    layer_index: usize,
+    z_mm: f64,
+) {
+    let perim = offset(region, -lw * 0.5);
+    for c in perim.contours {
+        if c.points.len() >= 3 {
+            let points = place_seam(c.points, seam_mode, layer_index);
+            paths.push(ToolPath::new(PathKind::Support, true, lw, points));
+        }
+    }
+    // Inset by a full line so the fill meets the perimeter rather than doubling
+    // it; a section thinner than that is covered by the perimeter bead alone.
+    let inner = offset(region, -lw);
+    if !inner.is_empty() {
+        fill_region(&inner, InfillPattern::Lines, spacing, angle, lw,
+            PathKind::Support, seam_mode, layer_index, z_mm, false, paths);
     }
 }
 
