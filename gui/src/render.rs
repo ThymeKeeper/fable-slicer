@@ -17,6 +17,7 @@ use eframe::egui::TextureId;
 use eframe::egui_wgpu::RenderState;
 use eframe::wgpu;
 use eframe::wgpu::util::DeviceExt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -238,6 +239,7 @@ impl Scene {
     pub fn new(rs: &RenderState) -> Self {
         let device = &rs.device;
         let format = rs.target_format;
+        SAMPLES.store(pick_samples(rs, format), Ordering::Relaxed);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene_shader"),
@@ -809,9 +811,37 @@ fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 }
 
 /// MSAA sample count for the offscreen scene — smooths the dense thin beads,
-/// which otherwise alias into a moiré / screen-door pattern. 4× is the baseline
-/// every renderable format is guaranteed to support.
-const SAMPLES: u32 = 4;
+/// which otherwise alias into a moiré / screen-door pattern. Resolved once at
+/// startup (`pick_samples`) to the most the device supports, capped at 8×:
+/// counts above the WebGPU-guaranteed 4× aren't universal (software backends
+/// cap at 4), so requesting 8× unconditionally panics on those.
+static SAMPLES: AtomicU32 = AtomicU32::new(4);
+
+/// Highest MSAA count in {8, 4, 2, 1} the device supports for both the color
+/// and depth attachments.
+fn pick_samples(rs: &RenderState, color: wgpu::TextureFormat) -> u32 {
+    // A device only accepts sample counts above the WebGPU-guaranteed 4× when it
+    // was created with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES (requested in
+    // main.rs). The adapter's format flags describe the *hardware*, not what this
+    // device will allow — so cap at 4× unless the device actually has the
+    // feature, otherwise an 8× target panics even on a GPU that can do it.
+    let cap = if rs
+        .device
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    {
+        8
+    } else {
+        4
+    };
+    let cf = rs.adapter.get_texture_format_features(color).flags;
+    let df = rs.adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    [8, 4, 2, 1]
+        .into_iter()
+        .filter(|&s| s <= cap)
+        .find(|&s| cf.sample_count_supported(s) && df.sample_count_supported(s))
+        .unwrap_or(1)
+}
 
 fn make_targets(
     device: &wgpu::Device,
@@ -826,7 +856,7 @@ fn make_targets(
         label: Some("scene_color_msaa"),
         size,
         mip_level_count: 1,
-        sample_count: SAMPLES,
+        sample_count: SAMPLES.load(Ordering::Relaxed),
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -836,7 +866,7 @@ fn make_targets(
         label: Some("scene_depth"),
         size,
         mip_level_count: 1,
-        sample_count: SAMPLES,
+        sample_count: SAMPLES.load(Ordering::Relaxed),
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -907,7 +937,7 @@ fn make_pipeline(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState {
-            count: SAMPLES,
+            count: SAMPLES.load(Ordering::Relaxed),
             mask: !0,
             alpha_to_coverage_enabled: false,
         },

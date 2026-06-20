@@ -587,8 +587,25 @@ fn main() -> eframe::Result<()> {
         width: 128,
         height: 128,
     };
+    // Enable the adapter's full format features on the device where the adapter
+    // has them, so MSAA can exceed the WebGPU-baseline 4× (8× on this GPU).
+    // Without it the device rejects an 8× target and panics. Wrap eframe's
+    // default device descriptor so its limits and other features are preserved.
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut wgpu_options.wgpu_setup {
+        let base = std::sync::Arc::clone(&create.device_descriptor);
+        create.device_descriptor = std::sync::Arc::new(move |adapter: &eframe::wgpu::Adapter| {
+            let mut dd = base(adapter);
+            let f = eframe::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+            if adapter.features().contains(f) {
+                dd.required_features |= f;
+            }
+            dd
+        });
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
             .with_min_inner_size([1024.0, 640.0])
