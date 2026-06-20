@@ -70,21 +70,64 @@ pub(crate) fn variable_walls_exact(
     sp: f64,
     max_inner: usize,
 ) -> Option<VariableWalls> {
-    // The walk must never take a slice down with it (a panic inside the rayon
-    // layer pool aborts the whole process): treat any panic as "this layer is
-    // degenerate", which falls back to the grid extractor.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        variable_walls_exact_inner(outer, inner, lw, sp, max_inner)
-    }));
-    match result {
-        Ok(vw) => vw,
-        Err(_) => {
-            if std::env::var("ARACHNE_DBG").is_ok() {
-                eprintln!("  skeletal: panic caught — grid fallback");
+    // boostvoronoi is coordinate-sensitive: a near-degenerate site configuration
+    // trips its robust-float predicates and panics. Such failures almost always
+    // clear once the configuration is nudged, so on a failure jitter every vertex
+    // a few µm — far below any printable feature, and deterministic so the slice
+    // stays reproducible — and retry before conceding to the grid fallback. The
+    // walk must never take a slice down with it (a panic in the rayon layer pool
+    // aborts the whole process), so every attempt is caught.
+    for attempt in 0..6u64 {
+        let result = if attempt == 0 {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                variable_walls_exact_inner(outer, inner, lw, sp, max_inner)
+            }))
+        } else {
+            let (o, i) = (jitter(outer, attempt), jitter(inner, attempt));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                variable_walls_exact_inner(&o, &i, lw, sp, max_inner)
+            }))
+        };
+        match result {
+            Ok(Some(vw)) => {
+                if attempt > 0 && std::env::var("ARACHNE_DBG").is_ok() {
+                    eprintln!("  skeletal: recovered on jitter attempt {attempt}");
+                }
+                return Some(vw);
             }
-            None
+            // A `None` that survives a couple of nudges is a genuinely degenerate
+            // region — jitter can't conjure walls there, so stop wasting retries
+            // on it. A panic keeps retrying to the end (it's a real failure worth
+            // clearing).
+            Ok(None) if attempt >= 2 => return None,
+            _ => {}
         }
     }
+    if std::env::var("ARACHNE_DBG").is_ok() {
+        eprintln!("  skeletal: jitter exhausted — grid fallback");
+    }
+    None
+}
+
+/// Deterministically nudge every vertex by a few µm (growing with `attempt`) to
+/// break the near-degenerate configuration the Voronoi rejected. The offset is
+/// thousands of nanometers — well below a printable feature — and a hash of the
+/// vertex keeps it reproducible and per-vertex (so collinear/coincident sites
+/// actually separate, unlike a global translation).
+fn jitter(polys: &Polygons, attempt: u64) -> Polygons {
+    let amp = 5_000 * attempt as i64; // nm: ±5 µm at attempt 1, up to ±25 µm
+    let span = (2 * amp + 1) as u64;
+    let mut out = polys.clone();
+    for c in &mut out.contours {
+        for p in &mut c.points {
+            let h = (p.x as u64 ^ (p.y as u64).rotate_left(32))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(attempt.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            p.x += (h % span) as i64 - amp;
+            p.y += ((h >> 32) % span) as i64 - amp;
+        }
+    }
+    out
 }
 
 fn variable_walls_exact_inner(
