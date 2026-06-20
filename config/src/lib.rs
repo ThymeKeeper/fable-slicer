@@ -267,6 +267,11 @@ pub enum WallMode {
     /// centerline tracking); grid-based with an exact-skeleton upgrade path.
     #[default]
     Arachne,
+    /// Distributed beading: the same distance-field even-distribution that
+    /// arachne falls back to, used directly — no Voronoi skeleton, so it's
+    /// robust on geometry the exact path rejects, and it spreads every gap
+    /// evenly across the inner beads instead of into the one nearest it.
+    Distributed,
     /// Fixed-width concentric offsets everywhere (gaps go to gap fill).
     Classic,
 }
@@ -275,6 +280,7 @@ impl WallMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "arachne" | "variable" | "adaptive" => Some(Self::Arachne),
+            "distributed" | "even" | "uniform" => Some(Self::Distributed),
             "classic" | "fixed" | "concentric" => Some(Self::Classic),
             _ => None,
         }
@@ -282,6 +288,7 @@ impl WallMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Arachne => "arachne",
+            Self::Distributed => "distributed",
             Self::Classic => "classic",
         }
     }

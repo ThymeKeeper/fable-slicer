@@ -84,7 +84,7 @@ struct Args {
     /// Support mode: none | grid | arc.
     #[arg(long)]
     support: Option<String>,
-    /// Wall generation: arachne (variable width, default) | classic.
+    /// Wall generation: arachne (variable width, default) | distributed | classic.
     #[arg(long)]
     wall_mode: Option<String>,
     /// Spiral vase mode: one continuously rising wall, no infill above the bottom.
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
     }
     if let Some(s) = &args.wall_mode {
         settings.wall_mode = config::WallMode::parse(s)
-            .ok_or_else(|| anyhow::anyhow!("unknown wall mode '{s}' (use arachne | classic)"))?;
+            .ok_or_else(|| anyhow::anyhow!("unknown wall mode '{s}' (use arachne | distributed | classic)"))?;
     }
     if let Some(s) = &args.support {
         settings.support_mode = config::SupportMode::parse(s)

@@ -2415,10 +2415,11 @@ impl eframe::App for App {
                             .selected_text(s.wall_mode.label())
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut s.wall_mode, config::WallMode::Arachne, "arachne");
+                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Distributed, "distributed");
                                 ui.selectable_value(&mut s.wall_mode, config::WallMode::Classic, "classic");
                             })
                             .response
-                            .on_hover_text("How gaps are handled is binary: arachne walls vary their width with the local thickness, absorbing every gap into the beads (thin cores become tapered walls). Classic uses fixed offsets and patches the leftovers with gap fill.")
+                            .on_hover_text("Arachne varies bead width via the exact skeletal trapezoidation, absorbing every gap into the beads. Distributed does the same from a grid distance field — no Voronoi, so it's robust where the exact path fails, and it spreads gaps evenly across the inner beads. Classic uses fixed offsets and patches the leftovers with gap fill.")
                             .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
                         ui.label("wall mode");
                     });

@@ -161,8 +161,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         // Brick masonry needs uniform rings; the vase loop is classic too.
         norm_settings.wall_mode = WallMode::Classic;
     }
-    if norm_settings.wall_mode == WallMode::Arachne {
-        // Binary model: arachne absorbs every gap into the walls (stretch /
+    if matches!(norm_settings.wall_mode, WallMode::Arachne | WallMode::Distributed) {
+        // Both variable-width modes absorb every gap into the walls (stretch /
         // absorb regimes), so gap fill is a classic-mode companion only.
         norm_settings.gap_fill = false;
     }
@@ -261,7 +261,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // Adjacent beads are placed at the stadium spacing: rounded
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
-            let arachne = settings.wall_mode == WallMode::Arachne;
+            let arachne = matches!(settings.wall_mode, WallMode::Arachne | WallMode::Distributed);
+            // Distributed mode skips the Voronoi skeleton and uses the grid
+            // distance-field beading directly (robust, no exact-path panics).
+            let grid_only = settings.wall_mode == WallMode::Distributed;
             // With half-height outer walls, interior geometry must stay inside
             // *both* half contours (on a shallow slope the layer-midpoint
             // outline is wider than the upper pass — inner walls based on it
@@ -269,9 +272,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // core; without halves it's just the layer outline.
             let interior_owned = halves.as_ref().map(|(lo, up)| intersection(lo, up));
             let interior: &Polygons = interior_owned.as_ref().unwrap_or(&layer.polygons);
-            let mut walls = Vec::new();
-            let mut gaps = Polygons::new();
-            // Material remaining at depth w·lw — eroded wall by wall to find
             // Carve the exposed surface out of the inner-wall region: the outer
             // wall still hugs the full outline, but the inner walls — and the gap
             // and infill regions derived from them — stop at the surface, leaving
@@ -280,6 +280,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let core = difference(interior, surf);
             let surf_inside = intersection(surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
+            let mut walls = Vec::new();
+            let mut gaps = Polygons::new();
+            // Material remaining at depth w·lw — eroded wall by wall to find
             // where the next wall failed to fit (the gap-fill regions).
             let mut at_depth = if settings.gap_fill { interior.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
@@ -387,20 +390,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     // contour, so inner beads track the surface like the outer
                     // wall does (each pass contained in its own phase).
                     Some((lower, upper)) => {
-                        let vw = crate::wall::variable_walls(interior, &offset(lower, -lw), lw, sp, cap);
+                        let vw = crate::wall::variable_walls(interior, &offset(lower, -lw), lw, sp, cap, grid_only);
                         for b in vw.inner {
                             push_bead(b, PathKind::Perimeter, -0.5 * layer.height_mm, 0.5, &mut walls);
                         }
                         for b in vw.thin_outer {
                             push_bead(b, PathKind::ExternalPerimeter, 0.0, 1.0, &mut walls);
                         }
-                        let vw = crate::wall::variable_walls(&Polygons::new(), &offset(upper, -lw), lw, sp, cap);
+                        let vw = crate::wall::variable_walls(&Polygons::new(), &offset(upper, -lw), lw, sp, cap, grid_only);
                         for b in vw.inner {
                             push_bead(b, PathKind::Perimeter, 0.0, 0.5, &mut walls);
                         }
                     }
                     None => {
-                        let vw = crate::wall::variable_walls(interior, &offset(interior, -lw), lw, sp, cap);
+                        let vw = crate::wall::variable_walls(interior, &offset(interior, -lw), lw, sp, cap, grid_only);
                         for b in vw.inner {
                             push_bead(b, PathKind::Perimeter, 0.0, 1.0, &mut walls);
                         }
@@ -430,12 +433,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 offset(interior, -wall_depth)
             };
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
-            if settings.gap_fill {
-                // Plus the slivers the morphological open dropped from the
-                // infill region (thin necks between walls).
             // The surface rejoins the infill region so the skin claims it (the
             // inner walls were kept clear of it above).
             let opened = union(&opened, &surf_inside);
+            if settings.gap_fill {
+                // Plus the slivers the morphological open dropped from the
+                // infill region (thin necks between walls).
                 let base = if !arachne && settings.wall_count > 0 { &at_depth } else { &inset };
                 gaps = union(&gaps, &difference(base, &opened));
             }

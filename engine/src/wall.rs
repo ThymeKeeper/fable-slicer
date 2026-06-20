@@ -49,7 +49,20 @@ pub(crate) fn variable_walls(
     lw: f64,
     sp: f64,
     max_inner: usize,
+    grid_only: bool,
 ) -> VariableWalls {
+    if grid_only {
+        // Distributed mode: offset-native "piping" rings (distributed.rs), with
+        // the grid's ridge beads still covering sub-line-width features.
+        let mut vw = VariableWalls {
+            inner: crate::distributed::distributed_rings(inner, lw, sp, max_inner),
+            thin_outer: Vec::new(),
+        };
+        if let Some(f) = Field::build(outer, lw, sp, 1) {
+            vw.thin_outer = f.thin_ridge_beads(lw, sp);
+        }
+        return vw;
+    }
     if std::env::var("ARACHNE_GRID").is_err() {
         if let Some(vw) = crate::skeletal::variable_walls_exact(outer, inner, lw, sp, max_inner) {
             return vw;
@@ -629,14 +642,10 @@ impl Field {
         let mut widths = Vec::with_capacity(line.len());
         for &(x, y) in &line {
             let w = match self.cell_at(x, y) {
-                Some(c) if self.inside[c] => {
-                    if snap {
-                        // Center bead: width is the measured local thickness.
-                        width_of(2.0 * self.d[c])
-                    } else {
-                        width_of(self.scheme(c, sp, cap).pitch)
-                    }
-                }
+                // Every bead — the center/ridge bead included — takes the even
+                // pitch of its local scheme, so the slack is shared evenly across
+                // all rings instead of swelling one fat bead at the spine.
+                Some(c) if self.inside[c] => width_of(self.scheme(c, sp, cap).pitch),
                 _ => width_of(sp),
             };
             points.push(Point::from_mm(x, y));

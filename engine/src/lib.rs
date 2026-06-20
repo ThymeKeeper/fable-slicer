@@ -11,6 +11,7 @@
 
 mod arc;
 mod calibrate;
+mod distributed;
 mod emit;
 mod fill;
 mod plan;
@@ -36,7 +37,7 @@ pub fn dbg_variable_walls_full(
     sp: f64,
     cap: usize,
 ) -> Vec<(Vec<(f64, f64)>, Vec<f64>, bool)> {
-    let vw = wall::variable_walls(outer, inner, lw, sp, cap);
+    let vw = wall::variable_walls(outer, inner, lw, sp, cap, false);
     vw.inner
         .iter()
         .chain(vw.thin_outer.iter())
@@ -59,7 +60,7 @@ pub fn dbg_variable_walls(
     sp: f64,
     cap: usize,
 ) -> Vec<(f64, bool, f64)> {
-    let vw = wall::variable_walls(outer, inner, lw, sp, cap);
+    let vw = wall::variable_walls(outer, inner, lw, sp, cap, false);
     vw.inner
         .iter()
         .chain(vw.thin_outer.iter())
