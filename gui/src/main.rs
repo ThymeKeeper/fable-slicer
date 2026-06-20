@@ -3346,6 +3346,7 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
         .selected_text(current.label())
         .show_ui(ui, |ui| {
             ui.selectable_value(current, Lines, "lines");
+            ui.selectable_value(current, AlignedLines, "aligned lines");
             ui.selectable_value(current, Grid, "grid");
             ui.selectable_value(current, Triangles, "triangles");
             ui.selectable_value(current, Concentric, "concentric");

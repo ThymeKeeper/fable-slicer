@@ -213,9 +213,13 @@ impl SeamMode {
 /// Infill pattern for a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InfillPattern {
-    /// Parallel lines (rectilinear), alternating direction per layer.
+    /// Parallel lines (rectilinear), alternating direction per layer for
+    /// cross-hatching.
     #[default]
     Lines,
+    /// Parallel lines at one fixed direction every layer — they stack into
+    /// continuous walls (strong and fast along Z, weak across the lines).
+    AlignedLines,
     /// Two perpendicular sets of lines.
     Grid,
     /// Three sets of lines at 60° to each other.
@@ -231,6 +235,9 @@ impl InfillPattern {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "lines" | "line" | "rectilinear" => Some(Self::Lines),
+            "aligned" | "aligned-lines" | "aligned_lines" | "aligned lines" => {
+                Some(Self::AlignedLines)
+            }
             "grid" => Some(Self::Grid),
             "triangles" | "triangle" => Some(Self::Triangles),
             "concentric" => Some(Self::Concentric),
@@ -241,6 +248,7 @@ impl InfillPattern {
     pub fn label(self) -> &'static str {
         match self {
             Self::Lines => "lines",
+            Self::AlignedLines => "aligned lines",
             Self::Grid => "grid",
             Self::Triangles => "triangles",
             Self::Concentric => "concentric",

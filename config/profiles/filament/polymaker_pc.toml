@@ -1,0 +1,14 @@
+# Polymaker PolyLite PC (including the transparent grade), as a packaging card.
+# PC has no material class of its own, so it rides ABS/ASA for what matters —
+# low part fan (cooling ruins PC layer bonding), a chamber pre-soak, and a hot
+# bed — with PC's own temperature, density, and flow below. The 3.3 mm3/s
+# ceiling is Polymaker's 40 mm/s spec at a 0.45 x 0.2 bead; PC prints best slow
+# (warping, layer adhesion). An enclosure helps, especially for clear parts.
+material = "abs"
+filament_diameter_mm = 1.75
+nozzle_temp_c = 260
+bed_temp_c = 100
+
+# --- calibration ---
+density_g_cm3 = 1.2
+max_volumetric_speed_mm3_s = 3.3

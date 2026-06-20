@@ -457,6 +457,8 @@ impl Profiles {
         p.filaments.insert("petg".into(), parse("filament/petg", include_str!("../profiles/filament/petg.toml")));
         p.filaments.insert("pla-hf".into(), parse("filament/pla_hf", include_str!("../profiles/filament/pla_hf.toml")));
         p.filaments.insert("asa".into(), parse("filament/asa", include_str!("../profiles/filament/asa.toml")));
+        p.filaments.insert("abs".into(), parse("filament/abs", include_str!("../profiles/filament/abs.toml")));
+        p.filaments.insert("polymaker-pc".into(), parse("filament/polymaker_pc", include_str!("../profiles/filament/polymaker_pc.toml")));
         p.processes.insert("standard".into(), parse("process/standard", include_str!("../profiles/process/standard.toml")));
         p.processes.insert("fine".into(), parse("process/fine", include_str!("../profiles/process/fine.toml")));
         p.processes.insert("draft".into(), parse("process/draft", include_str!("../profiles/process/draft.toml")));

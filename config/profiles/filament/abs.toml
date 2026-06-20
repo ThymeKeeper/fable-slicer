@@ -1,0 +1,8 @@
+# Generic ABS packaging card. ABS rides the ABS/ASA material class — low part
+# fan, the heat ceiling, density, and a 50 °C chamber pre-soak on machines that
+# declare a chamber sensor. Print in an enclosure: ABS warps and cracks in a
+# draft.
+material = "abs"
+filament_diameter_mm = 1.75
+nozzle_temp_c = 245
+bed_temp_c = 100

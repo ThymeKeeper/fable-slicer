@@ -517,8 +517,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let sparse = difference(&difference(inner, solid_all), &bridged);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
 
-            // Alternate fill direction per layer for cross-hatching.
-            let angle = if i % 2 == 0 { 45.0 } else { 135.0 };
+            // Alternate fill direction per layer for cross-hatching; aligned-lines
+            // infill instead keeps one orientation every layer, so its globally
+            // anchored lines stack into continuous walls.
+            let alt_angle = if i % 2 == 0 { 45.0 } else { 135.0 };
+            let pat_angle = |pat: InfillPattern| {
+                if pat == InfillPattern::AlignedLines { 45.0 } else { alt_angle }
+            };
 
             // Internal bridges: where this layer's solid sits on sparse infill
             // (the first shell layer over the core), the beads span open cells
@@ -611,7 +616,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     };
                     if !fill.is_empty() {
                         fill_region(
-                            &fill, settings.solid_pattern, sp, angle, lw, kind,
+                            &fill, settings.solid_pattern, sp, pat_angle(settings.solid_pattern), lw, kind,
                             settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
                         );
                     }
@@ -621,7 +626,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let spacing = sp / settings.infill_density;
                 let sparse_fill = if ov > 0.0 { offset(&sparse, ov) } else { sparse.clone() };
                 fill_region(
-                    &sparse_fill, settings.sparse_pattern, spacing, angle, lw, PathKind::Infill,
+                    &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
             }
@@ -1330,7 +1335,7 @@ fn fill_region(
         }
     };
     match pattern {
-        InfillPattern::Lines => scan(&[(angle, spacing)], out),
+        InfillPattern::Lines | InfillPattern::AlignedLines => scan(&[(angle, spacing)], out),
         InfillPattern::Grid => scan(&[(angle, spacing * 2.0), (angle + 90.0, spacing * 2.0)], out),
         InfillPattern::Triangles => scan(
             &[(angle, spacing * 3.0), (angle + 60.0, spacing * 3.0), (angle + 120.0, spacing * 3.0)],

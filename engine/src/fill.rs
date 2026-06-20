@@ -51,7 +51,11 @@ pub fn infill_lines(
 
     let mut out = Vec::new();
     let mut row = 0usize;
-    let mut y = ymin + spacing_mm * 0.5;
+    // Anchor scan lines to a GLOBAL grid (multiples of `spacing_mm`) rather than
+    // the region's own lower edge, so the same angle on different layers lands
+    // at the same coordinates. Sparse infill and grid support then stack into
+    // continuous walls instead of drifting as the region changes shape.
+    let mut y = ((ymin - spacing_mm * 0.5) / spacing_mm).ceil() * spacing_mm + spacing_mm * 0.5;
     while y < ymax {
         let mut xs: Vec<f64> = Vec::new();
         for &(ax, ay, bx, by) in &edges {

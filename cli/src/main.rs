@@ -69,10 +69,10 @@ struct Args {
     /// Seam placement: nearest | aligned | sharpest | random.
     #[arg(long)]
     seam: Option<String>,
-    /// Sparse infill pattern: lines | grid | triangles | concentric | gyroid.
+    /// Sparse infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
     #[arg(long)]
     sparse_infill: Option<String>,
-    /// Solid infill pattern: lines | grid | triangles | concentric | gyroid.
+    /// Solid infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
     #[arg(long)]
     solid_infill: Option<String>,
     /// Support mode: none | grid | arc.
