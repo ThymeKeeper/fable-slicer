@@ -228,6 +228,30 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             vec![None; n]
         };
 
+    // A region with nothing immediately above (or below) is a top (or bottom)
+    // surface, and a surface overrides a wall — it must be skinned even when the
+    // wall count alone would otherwise fill the whole cross-section. Precompute
+    // the exposed faces from the full outlines so pass 1 keeps the inner walls
+    // clear of them and the skin can claim them.
+    let surface_per_layer: Vec<Polygons> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let here = &layers[i].polygons;
+            let top = if i + 1 < n {
+                difference(here, &offset(&layers[i + 1].polygons, 0.05))
+            } else {
+                here.clone()
+            };
+            let bot = if i > 0 {
+                difference(here, &offset(&layers[i - 1].polygons, 0.05))
+            } else {
+                here.clone()
+            };
+            // Open at half a line to drop ribbons too thin to skin or carve out.
+            offset(&offset(&union(&top, &bot), -lw * 0.5), lw * 0.5)
+        })
+        .collect();
+
     // Pass 1: walls + the infill region (inside the innermost wall) per layer,
     // plus the gap regions too thin for any wall or infill to cover.
     let per_layer: Vec<(Vec<ToolPath>, Polygons, Polygons)> = layers
@@ -248,6 +272,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let mut walls = Vec::new();
             let mut gaps = Polygons::new();
             // Material remaining at depth w·lw — eroded wall by wall to find
+            // Carve the exposed surface out of the inner-wall region: the outer
+            // wall still hugs the full outline, but the inner walls — and the gap
+            // and infill regions derived from them — stop at the surface, leaving
+            // it for the skin. `surf_inside` is the slice the skin reclaims.
+            let surf = &surface_per_layer[layer.index];
+            let core = difference(interior, surf);
+            let surf_inside = intersection(surf, &offset(&layer.polygons, -lw));
+            let interior: &Polygons = &core;
             // where the next wall failed to fit (the gap-fill regions).
             let mut at_depth = if settings.gap_fill { interior.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
@@ -401,6 +433,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             if settings.gap_fill {
                 // Plus the slivers the morphological open dropped from the
                 // infill region (thin necks between walls).
+            // The surface rejoins the infill region so the skin claims it (the
+            // inner walls were kept clear of it above).
+            let opened = union(&opened, &surf_inside);
                 let base = if !arachne && settings.wall_count > 0 { &at_depth } else { &inset };
                 gaps = union(&gaps, &difference(base, &opened));
             }
