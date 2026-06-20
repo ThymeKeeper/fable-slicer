@@ -63,6 +63,26 @@ const TRANSITIONING_ANGLE: f64 = 45.0 * std::f64::consts::PI / 180.0;
 /// (Cura's `wall_transition_filter_distance`).
 const TRANSITION_FILTER_DIST: i64 = 100_000;
 
+/// Install (once) a panic hook that drops boostvoronoi's own degeneracy panics
+/// — they are always caught by the `catch_unwind` in `variable_walls_exact` and
+/// handled by retry/fallback, so printing them is pure noise. Any panic from
+/// outside the boostvoronoi crate still goes to the default hook.
+fn quiet_voronoi_panics() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_voronoi = info
+                .location()
+                .is_some_and(|l| l.file().contains("boostvoronoi"));
+            if !from_voronoi {
+                default(info);
+            }
+        }));
+    });
+}
+
 pub(crate) fn variable_walls_exact(
     outer: &Polygons,
     inner: &Polygons,
@@ -70,6 +90,10 @@ pub(crate) fn variable_walls_exact(
     sp: f64,
     max_inner: usize,
 ) -> Option<VariableWalls> {
+    // boostvoronoi panics on degenerate input are caught below and retried /
+    // fallen back; silence the default hook for *those* so a normal slice does
+    // not spew "thread panicked" to stderr (real panics still surface).
+    quiet_voronoi_panics();
     // boostvoronoi is coordinate-sensitive: a near-degenerate site configuration
     // trips its robust-float predicates and panics. Such failures almost always
     // clear once the configuration is nudged, so on a failure jitter every vertex
@@ -1152,12 +1176,15 @@ impl St {
                 }
                 let dead_node = self.edges[quad_mid].to;
                 self.nodes[dead_node].dead = true;
+                // Unlink quad_mid and its twin from the doubly-linked edge ring.
+                // A boundary edge has a NIL neighbour, so guard each write (the
+                // NIL sentinel is usize::MAX — writing it indexed out of bounds).
                 let (mp, mn) = (self.edges[quad_mid].prev, self.edges[quad_mid].next);
-                self.edges[mp].next = mn;
-                self.edges[mn].prev = mp;
+                if mp != NIL { self.edges[mp].next = mn; }
+                if mn != NIL { self.edges[mn].prev = mp; }
                 let (tp, tn) = (self.edges[mid_twin].prev, self.edges[mid_twin].next);
-                self.edges[tn].prev = tp;
-                self.edges[tp].next = tn;
+                if tn != NIL { self.edges[tn].prev = tp; }
+                if tp != NIL { self.edges[tp].next = tn; }
                 self.edges[quad_mid].dead = true;
                 self.edges[mid_twin].dead = true;
             }
