@@ -2210,10 +2210,8 @@ impl eframe::App for App {
                 self.set_preview_instances(&rs);
             }
             if self.view_preview && n_layers > 0 {
-                hslider(ui, true, egui::Slider::new(&mut self.preview_layer, 1..=n_layers), "layer",
-                    "Highest layer shown; lower layers are dimmed.");
-                ui.label(format!("showing layers 1–{}/{}", self.preview_layer, n_layers));
-                ui.add_space(2.0);
+                // The layer slider itself lives on the right edge of the 3D pane
+                // (vertical); here in the panel are just the feature toggles.
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
                     ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
@@ -2968,6 +2966,39 @@ impl eframe::App for App {
                     self.active_bed = k.min(self.bed_count - 1);
                     self.recenter_camera = true;
                     self.scene_dirty();
+                }
+            }
+
+            // Vertical layer slider on the right edge of the viewport — drag to
+            // set the highest layer shown (lower layers dim). Preview only.
+            if self.view_preview && self.sliced.is_some() {
+                let n = self.layer_ends.len();
+                if n > 0 {
+                    egui::Area::new(egui::Id::new("layer_slider"))
+                        .order(egui::Order::Foreground)
+                        .pivot(egui::Align2::RIGHT_CENTER)
+                        .fixed_pos(egui::pos2(rect.right() - 12.0, rect.center().y))
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style())
+                                .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 196))
+                                .show(ui, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        // Slider length keys off the viewport rect (an
+                                        // external rect — no Area stale-rect feedback).
+                                        ui.spacing_mut().slider_width =
+                                            (rect.height() * 0.62).clamp(140.0, 640.0);
+                                        ui.add(
+                                            egui::Slider::new(&mut self.preview_layer, 1..=n)
+                                                .vertical()
+                                                .show_value(false),
+                                        )
+                                        .on_hover_text(
+                                            "Highest layer shown; lower layers are dimmed.",
+                                        );
+                                        ui.label(format!("{} / {}", self.preview_layer, n));
+                                    });
+                                });
+                        });
                 }
             }
 
