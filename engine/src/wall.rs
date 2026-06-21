@@ -52,10 +52,12 @@ pub(crate) fn variable_walls(
     grid_only: bool,
 ) -> VariableWalls {
     if grid_only {
-        // Distributed mode: offset-native "piping" rings (distributed.rs), with
-        // the grid's ridge beads still covering sub-line-width features.
+        // Distributed mode: the offset-peel fork/merge engine (peel.rs) — concentric
+        // rings that merge to a centerline where the band thins to one bead, with
+        // per-vertex width thinning/fattening to an integer count, so flanks fill.
+        // Grid ridge beads still cover sub-line-width features.
         let mut vw = VariableWalls {
-            inner: crate::distributed::distributed_rings(inner, lw, sp, max_inner),
+            inner: crate::peel::peel_beads(inner, lw, sp, max_inner),
             thin_outer: Vec::new(),
         };
         if let Some(f) = Field::build(outer, lw, sp, 1) {

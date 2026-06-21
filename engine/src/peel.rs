@@ -42,6 +42,7 @@ pub(crate) fn peel_beads(region: &Polygons, lw: f64, sp: f64, max_inner: usize) 
     for comp in components(region) {
         emit_region(&comp, lw, sp, max_inner.min(MAX_DEPTH), &mut beads);
     }
+    let beads = clip_beads_to_region(beads, region, sp);
     if std::env::var("PEEL_DUMP").is_ok() {
         dump_coverage(region, &beads);
     }
@@ -131,6 +132,142 @@ fn dist_to_edges(px: f64, py: f64, polys: &Polygons) -> f64 {
     best
 }
 
+/// True if `(x,y)` lies in the printable region: inside some outer contour and
+/// not inside any hole.
+fn point_in_region(region: &Polygons, x: f64, y: f64) -> bool {
+    let p = Point::from_mm(x, y);
+    let mut outer = false;
+    let mut hole = false;
+    for c in &region.contours {
+        if c.points.len() < 3 {
+            continue;
+        }
+        if c.contains(p) {
+            if c.signed_area_mm2() > 0.0 {
+                outer = true;
+            } else {
+                hole = true;
+            }
+        }
+    }
+    outer && !hole
+}
+
+/// Guard against any extrusion leaving the part: split a bead wherever a *long*
+/// segment's midpoint lands outside the region (an offset spike, or a terminal
+/// centerline bridging an internal void / chording a curved flank) so the path
+/// simply breaks there instead of drawing across. Short boundary-hugging edges
+/// are never tested, so this is cheap and can't fragment normal rings.
+fn clip_beads_to_region(beads: Vec<Bead>, region: &Polygons, sp: f64) -> Vec<Bead> {
+    let thresh = sp * 1.6;
+    let mut out = Vec::new();
+    for b in beads {
+        let n = b.points.len();
+        if n < 2 {
+            continue;
+        }
+        let segs = if b.closed { n } else { n - 1 };
+        let mut cut = vec![false; segs];
+        let mut any = false;
+        for i in 0..segs {
+            let a = b.points[i];
+            let c = b.points[(i + 1) % n];
+            if (a.x_mm() - c.x_mm()).hypot(a.y_mm() - c.y_mm()) > thresh
+                && !point_in_region(region, 0.5 * (a.x_mm() + c.x_mm()), 0.5 * (a.y_mm() + c.y_mm()))
+            {
+                cut[i] = true;
+                any = true;
+            }
+        }
+        if !any {
+            out.push(b);
+            continue;
+        }
+        let start = if b.closed {
+            cut.iter().position(|&c| c).map(|p| (p + 1) % n).unwrap_or(0)
+        } else {
+            0
+        };
+        let order: Vec<usize> = (0..n).map(|k| (start + k) % n).collect();
+        let mut rp: Vec<Point> = Vec::new();
+        let mut rw: Vec<f64> = Vec::new();
+        for (k, &idx) in order.iter().enumerate() {
+            rp.push(b.points[idx]);
+            rw.push(b.widths.get(idx).copied().unwrap_or(sp));
+            let cut_after = idx < segs && cut[idx];
+            if cut_after || k == order.len() - 1 {
+                if rp.len() >= 2 {
+                    out.push(Bead { points: std::mem::take(&mut rp), widths: std::mem::take(&mut rw), closed: false });
+                } else {
+                    rp.clear();
+                    rw.clear();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Distance from `p` along unit `dir` to the nearest boundary crossing of `region`.
+fn raycast(p: (f64, f64), dir: (f64, f64), region: &Polygons) -> f64 {
+    let mut best = f64::INFINITY;
+    for c in &region.contours {
+        let m = c.points.len();
+        if m < 2 {
+            continue;
+        }
+        for k in 0..m {
+            let a = (c.points[k].x_mm(), c.points[k].y_mm());
+            let b = (c.points[(k + 1) % m].x_mm(), c.points[(k + 1) % m].y_mm());
+            let e = (b.0 - a.0, b.1 - a.1);
+            let denom = dir.0 * e.1 - dir.1 * e.0;
+            if denom.abs() < 1e-12 {
+                continue; // ray parallel to edge
+            }
+            let q = (a.0 - p.0, a.1 - p.1);
+            let t = (q.0 * e.1 - q.1 * e.0) / denom; // along the ray
+            let u = (q.0 * dir.1 - q.1 * dir.0) / denom; // along the edge
+            if t > 1e-6 && (0.0..=1.0).contains(&u) && t < best {
+                best = t;
+            }
+        }
+    }
+    best
+}
+
+/// Local perpendicular thickness of `region` at vertex `i` of the closed ring
+/// `pts`: rays normal to the local tangent, both ways, to the region boundary —
+/// their sum is the cross-section (or annular-band) thickness there.
+fn perp_thickness(pts: &[Point], i: usize, region: &Polygons) -> f64 {
+    let n = pts.len();
+    if n < 3 {
+        return f64::INFINITY;
+    }
+    let prev = pts[(i + n - 1) % n];
+    let next = pts[(i + 1) % n];
+    let (tx, ty) = (next.x_mm() - prev.x_mm(), next.y_mm() - prev.y_mm());
+    let tl = tx.hypot(ty);
+    if tl < 1e-9 {
+        return f64::INFINITY;
+    }
+    let (nx, ny) = (-ty / tl, tx / tl);
+    let p = (pts[i].x_mm(), pts[i].y_mm());
+    raycast(p, (nx, ny), region) + raycast(p, (-nx, -ny), region)
+}
+
+/// Width at ring vertex `i` chosen so a whole number of beads tiles the local
+/// perpendicular thickness — fattening OR thinning to land on an integer count
+/// (`T/round(T/sp)`), which is how a narrowing flank fills without a leftover
+/// sliver. Falls back to `fallback` where the probe is unreliable.
+fn adaptive_width(pts: &[Point], i: usize, region: &Polygons, lw: f64, sp: f64, fallback: f64) -> f64 {
+    let t = perp_thickness(pts, i, region);
+    if !t.is_finite() || t <= sp * 0.25 {
+        return fallback;
+    }
+    let bn = (t / sp).round().max(1.0);
+    (t / bn + (lw - sp)).clamp(lw * 0.5, lw * 1.75)
+}
+
 /// One ring level: lay the (widened) ring, peel a full bead, recurse per piece.
 fn emit_region(region: &Polygons, lw: f64, sp: f64, budget: usize, beads: &mut Vec<Bead>) {
     if budget == 0 {
@@ -142,8 +279,11 @@ fn emit_region(region: &Polygons, lw: f64, sp: f64, budget: usize, beads: &mut V
     };
     let span = (bb.max.x_mm() - bb.min.x_mm()).min(bb.max.y_mm() - bb.min.y_mm());
     let t = max_inradius(region, 0.5 * span + sp);
-    if t < sp * 0.35 {
-        return; // nothing printable
+    // Floor at one minimum-printable bead: the thinnest line the beads clamp to is
+    // `lw*0.5`, so a band down to that thickness (half-thickness `lw*0.25`) still
+    // gets a thinned centerline — thinner than that, a nozzle can't lay it.
+    if t < lw * 0.25 {
+        return;
     }
 
     // Beads across the full local thickness; one ring level covers two of them
@@ -159,25 +299,18 @@ fn emit_region(region: &Polygons, lw: f64, sp: f64, budget: usize, beads: &mut V
     let inner = offset(region, -pitch);
     let ring = offset(region, -0.5 * pitch);
 
-    // Ring vertices widen toward the gap to the next ring inward so a bead
-    // extends to fill a divergence — but never thin below the nominal width,
-    // since a thinned ring opens a gap against its neighbour (the fixed outer
-    // wall or the previous ring). Deep even cores skip the probe entirely.
+    // Each ring vertex chooses a width that makes a whole number of beads tile
+    // the local perpendicular thickness — fattening through a divergence, or
+    // thinning where the band narrows so a flank fills without a leftover sliver.
+    // Deep even cores skip the probe (every gap is already nominal there).
     let nominal = (pitch + (lw - sp)).clamp(lw * 0.5, lw * 1.75);
     let variable = n <= VARIABLE_WIDTH_MAX_N && inner.net_area_mm2() > 0.0;
     for c in &ring.contours {
         if c.points.len() < 3 {
             continue;
         }
-        let widths = if variable {
-            c.points
-                .iter()
-                .map(|p| {
-                    let g = dist_to_edges(p.x_mm(), p.y_mm(), &inner);
-                    let g = if g.is_finite() { g } else { 0.5 * pitch };
-                    (2.0 * g + (lw - sp)).clamp(nominal, lw * 1.8)
-                })
-                .collect()
+        let widths: Vec<f64> = if variable {
+            (0..c.points.len()).map(|i| adaptive_width(&c.points, i, region, lw, sp, nominal)).collect()
         } else {
             vec![nominal; c.points.len()]
         };
@@ -255,7 +388,7 @@ fn terminal_beads(region: &Polygons, lw: f64, sp: f64) -> Vec<Bead> {
             let pts = resample(&sm, b.closed, sp * 0.4);
             let widths = pts
                 .iter()
-                .map(|p| (2.0 * dist_to_edges(p.x_mm(), p.y_mm(), region)).clamp(lw * 0.7, lw * 1.8))
+                .map(|p| (2.0 * dist_to_edges(p.x_mm(), p.y_mm(), region)).clamp(lw * 0.5, lw * 1.8))
                 .collect();
             Bead { points: pts, widths, closed: b.closed }
         })
@@ -320,7 +453,7 @@ fn analytic_centerline(contour: &Contour, lw: f64, sp: f64) -> Option<Bead> {
         let b = arc_point(&side2, t);
         points.push(Point::from_mm(0.5 * (a.x_mm() + b.x_mm()), 0.5 * (a.y_mm() + b.y_mm())));
         let w = (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm());
-        widths.push(w.clamp(lw * 0.7, lw * 1.8));
+        widths.push(w.clamp(lw * 0.5, lw * 1.8));
     }
     let points = chaikin(&points, false);
     // Re-derive widths after smoothing (the midpoint count changed).
@@ -353,7 +486,7 @@ fn annular_centerline(outer: &Contour, hole: &Contour, lw: f64, sp: f64) -> Opti
             }
         }
         points.push(Point::from_mm(0.5 * (p.x_mm() + q.x_mm()), 0.5 * (p.y_mm() + q.y_mm())));
-        widths.push(best.clamp(lw * 0.7, lw * 1.8));
+        widths.push(best.clamp(lw * 0.5, lw * 1.8));
     }
     let points = chaikin(&points, true);
     let widths = resample_widths(&widths, points.len());

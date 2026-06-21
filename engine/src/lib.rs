@@ -11,7 +11,6 @@
 
 mod arc;
 mod calibrate;
-mod distributed;
 mod emit;
 mod fill;
 mod peel;

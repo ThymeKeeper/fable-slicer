@@ -78,8 +78,9 @@ pub fn run(a: &Args) -> Result<(), String> {
     let view = Mat4::look_at_rh(eye, center, Vec3::Z);
     let view_proj = proj * view;
 
-    // Show every fill category, hide travels (bit 4).
-    let mask = 0x1FFu32 & !(1 << 4);
+    // Show every fill category, hide travels (bit 4). CAT_MASK (decimal) overrides
+    // for diagnostics — e.g. CAT_MASK=2 = walls only (bit 1), 128 = gap fill (bit 7).
+    let mask = std::env::var("CAT_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0x1FFu32 & !(1 << 4));
     let preview = crate::render::Preview {
         count,
         joint_count,
