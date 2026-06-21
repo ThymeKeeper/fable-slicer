@@ -60,7 +60,10 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mut scene = Scene::new_core(&device, format, 4);
     scene.resize_core(&device, a.width, a.height);
     scene.set_toolpaths(&device, &inst);
-    scene.set_joints(&device, &joints);
+    let joint_count = if std::env::var("NO_JOINTS").is_ok() { 0 } else { joint_count };
+    if joint_count > 0 {
+        scene.set_joints(&device, &joints);
+    }
 
     // Camera: frame the geometry visible through this layer, from a high front
     // angle (like the GUI's default orbit) so bead-surface detail reads.

@@ -62,6 +62,14 @@ const TRANSITIONING_ANGLE: f64 = 45.0 * std::f64::consts::PI / 180.0;
 /// Dissolve opposing transitions closer together than this along the skeleton
 /// (Cura's `wall_transition_filter_distance`).
 const TRANSITION_FILTER_DIST: i64 = 100_000;
+/// Laplacian passes that low-pass the radius field before counting beads, so
+/// `round(2r/sp)` stops flickering N↔N+1 on facet-noisy spines (jitter root).
+const RADIUS_SMOOTH_PASSES: u32 = 4;
+/// Taubin iterations fitting a smooth macro curve to each inner bead path.
+const TAUBIN_ITERS: usize = 14;
+/// Cap (mm) on how far path smoothing may move a bead vertex — the slack the
+/// bead width can absorb, which also keeps the bead inside the outer wall.
+const MAX_PATH_DISP_MM: f64 = 0.18;
 
 /// Install (once) a panic hook that drops boostvoronoi's own degeneracy panics
 /// — they are always caught by the `catch_unwind` in `variable_walls_exact` and
@@ -172,7 +180,112 @@ fn variable_walls_exact_inner(
             out.thin_outer = st.thin_beads(lw, sp);
         }
     }
+    // The beading emits a bead vertex per medial rib, so the path carries the
+    // rib-resolution ripple of the (faceted) medial axis. Fit a smooth macro
+    // curve to each inner bead (Taubin, non-shrinking) — the nozzle traces a
+    // clean curve and the variable width takes up the fill — then decimate the
+    // now-redundant points. The path is bounded to the width's slack inside
+    // `taubin_bead`, so it stays within the outer wall.
+    for b in out.inner.iter_mut().chain(out.thin_outer.iter_mut()) {
+        *b = rdp_bead(&taubin_bead(b, TAUBIN_ITERS), lw * 0.08);
+    }
     Some(out)
+}
+
+/// Taubin (λ/μ) smoothing of a bead — a strong low-pass that fits the macro
+/// curve of the path WITHOUT the loop-shrink of plain Laplacian smoothing, so
+/// the nozzle traces a clean mathematical curve and the (variable) width takes
+/// up the fill. Positions and per-vertex widths move together. Open beads pin
+/// their endpoints (the join points); closed loops wrap.
+fn taubin_bead(b: &Bead, iters: usize) -> Bead {
+    let n = b.points.len();
+    if n < 5 || b.widths.len() != n {
+        return Bead { points: b.points.clone(), widths: b.widths.clone(), closed: b.closed };
+    }
+    // (x, y, w) in mm; keep the originals to bound the displacement.
+    let orig: Vec<[f64; 2]> = (0..n).map(|i| [b.points[i].x_mm(), b.points[i].y_mm()]).collect();
+    let mut p: Vec<[f64; 3]> = (0..n).map(|i| [orig[i][0], orig[i][1], b.widths[i]]).collect();
+    let lambda = 0.5;
+    let mu = -0.53; // |μ| > λ → passband below the shrink frequency; net zero shrink
+    for _ in 0..iters {
+        for &fac in &[lambda, mu] {
+            let src = p.clone();
+            let lo = if b.closed { 0 } else { 1 };
+            let hi = if b.closed { n } else { n - 1 };
+            for i in lo..hi {
+                let a = src[(i + n - 1) % n];
+                let c = src[(i + 1) % n];
+                for k in 0..3 {
+                    let avg = 0.5 * (a[k] + c[k]);
+                    p[i][k] += fac * (avg - src[i][k]);
+                }
+            }
+        }
+    }
+    // The path may only move within the slack the bead width can fill (and that
+    // keeps it inside the outer wall): clamp each vertex to MAX_DISP of where it
+    // started. This is what makes "smooth path, width fills the rest" sound.
+    let max_disp = MAX_PATH_DISP_MM;
+    for i in 0..n {
+        let (dx, dy) = (p[i][0] - orig[i][0], p[i][1] - orig[i][1]);
+        let d = dx.hypot(dy);
+        if d > max_disp {
+            let s = max_disp / d;
+            p[i][0] = orig[i][0] + dx * s;
+            p[i][1] = orig[i][1] + dy * s;
+        }
+    }
+    Bead {
+        points: p.iter().map(|q| geo2d::Point::from_mm(q[0], q[1])).collect(),
+        widths: p.iter().map(|q| q[2]).collect(),
+        closed: b.closed,
+    }
+}
+
+
+/// Ramer–Douglas–Peucker decimation that carries widths (keeps the width of
+/// each retained vertex), to undo Chaikin's point inflation without re-roughening.
+fn rdp_bead(b: &Bead, tol_mm: f64) -> Bead {
+    let n = b.points.len();
+    if n < 3 {
+        return Bead { points: b.points.clone(), widths: b.widths.clone(), closed: b.closed };
+    }
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((lo, hi)) = stack.pop() {
+        if hi <= lo + 1 {
+            continue;
+        }
+        let (a, c) = (b.points[lo], b.points[hi]);
+        let (ax, ay) = (a.x_mm(), a.y_mm());
+        let (dx, dy) = (c.x_mm() - ax, c.y_mm() - ay);
+        let len = dx.hypot(dy).max(1e-9);
+        let (mut best, mut bi) = (0.0, lo);
+        for i in (lo + 1)..hi {
+            let (px, py) = (b.points[i].x_mm(), b.points[i].y_mm());
+            let d = ((px - ax) * dy - (py - ay) * dx).abs() / len;
+            if d > best {
+                best = d;
+                bi = i;
+            }
+        }
+        if best > tol_mm {
+            keep[bi] = true;
+            stack.push((lo, bi));
+            stack.push((bi, hi));
+        }
+    }
+    let mut pts = Vec::new();
+    let mut ws = Vec::new();
+    for i in 0..n {
+        if keep[i] {
+            pts.push(b.points[i]);
+            ws.push(b.widths[i]);
+        }
+    }
+    Bead { points: pts, widths: ws, closed: b.closed }
 }
 
 // ===========================================================================
@@ -1401,6 +1514,39 @@ impl St {
         count > 2
     }
 
+    /// Laplacian low-pass of the radius field `r` along the central medial
+    /// graph: each central node blends toward the mean of its central neighbours,
+    /// erasing the facet-scale jitter that flickers the bead count. Endpoints and
+    /// non-central nodes are left to their measured radius.
+    fn smooth_radii(&mut self, passes: u32) {
+        let n = self.nodes.len();
+        for _ in 0..passes {
+            let mut sum = vec![0i64; n];
+            let mut cnt = vec![0i32; n];
+            for e in 0..self.edges.len() {
+                if self.edges[e].dead || !self.edges[e].is_central() {
+                    continue;
+                }
+                let (f, t) = (self.edges[e].from, self.edges[e].to);
+                if self.nodes[f].r >= 0 && self.nodes[t].r >= 0 {
+                    sum[f] += self.nodes[t].r;
+                    cnt[f] += 1;
+                    sum[t] += self.nodes[f].r;
+                    cnt[t] += 1;
+                }
+            }
+            // Only interior spine nodes (≥2 central neighbours) move — leaf
+            // nodes hold the true tip radius so terminal beads stay put.
+            let updated: Vec<(usize, i64)> = (0..n)
+                .filter(|&i| cnt[i] >= 2 && self.nodes[i].r >= 0)
+                .map(|i| (i, (self.nodes[i].r + sum[i] / cnt[i] as i64) / 2))
+                .collect();
+            for (i, r) in updated {
+                self.nodes[i].r = r;
+            }
+        }
+    }
+
     fn update_bead_count(&mut self) {
         for e in 0..self.edges.len() {
             if !self.edges[e].dead && self.edges[e].is_central() {
@@ -2013,6 +2159,12 @@ impl St {
 
     fn generate_toolpaths(&mut self, lw: f64, sp: f64) -> Vec<Bead> {
         self.update_is_central();
+        // Root fix for converging-zone jitter: the radius `r` (half local
+        // thickness) jitters along the spine from mesh-facet boundary noise, so
+        // `round(2r/sp)` flickers N↔N+1 and every bead shifts. Low-pass `r` along
+        // the central medial graph first — that stabilises the bead count, and
+        // (since pitch/width derive from `r` too) smooths positions and widths.
+        self.smooth_radii(RADIUS_SMOOTH_PASSES);
         self.update_bead_count();
         self.filter_noncentral_regions();
         self.generate_transitioning_ribs();
