@@ -213,7 +213,10 @@ pub struct Scene {
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
-    tex_id: TextureId,
+    /// The single-sample resolve texture (kept for headless read-back).
+    resolve_tex: wgpu::Texture,
+    /// egui texture handle — `None` in the headless (offscreen) path.
+    tex_id: Option<TextureId>,
     mesh_vbuf: Option<wgpu::Buffer>,
     mesh_count: u32,
     line_vbuf: Option<wgpu::Buffer>,
@@ -237,9 +240,20 @@ pub struct Scene {
 
 impl Scene {
     pub fn new(rs: &RenderState) -> Self {
-        let device = &rs.device;
-        let format = rs.target_format;
-        SAMPLES.store(pick_samples(rs, format), Ordering::Relaxed);
+        let samples = pick_samples(rs, rs.target_format);
+        let mut scene = Self::new_core(&rs.device, rs.target_format, samples);
+        scene.tex_id = Some(rs.renderer.write().register_native_texture(
+            &rs.device,
+            &scene.resolve_view,
+            wgpu::FilterMode::Linear,
+        ));
+        scene
+    }
+
+    /// GPU-only construction (no egui texture registration) — shared by the
+    /// interactive GUI (`new`) and the headless offscreen renderer.
+    pub fn new_core(device: &wgpu::Device, format: wgpu::TextureFormat, samples: u32) -> Self {
+        SAMPLES.store(samples, Ordering::Relaxed);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene_shader"),
@@ -415,12 +429,7 @@ impl Scene {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let (color_view, depth_view, resolve_view) = make_targets(device, format, 1, 1);
-        let tex_id = rs.renderer.write().register_native_texture(
-            device,
-            &resolve_view,
-            wgpu::FilterMode::Linear,
-        );
+        let (color_view, depth_view, resolve_view, resolve_tex) = make_targets(device, format, 1, 1);
 
         Self {
             format,
@@ -433,7 +442,8 @@ impl Scene {
             color_view,
             depth_view,
             resolve_view,
-            tex_id,
+            resolve_tex,
+            tex_id: None,
             mesh_vbuf: None,
             mesh_count: 0,
             line_vbuf: None,
@@ -457,25 +467,35 @@ impl Scene {
     }
 
     pub fn texture_id(&self) -> TextureId {
-        self.tex_id
+        self.tex_id.expect("texture_id() on a headless Scene")
     }
 
     pub fn resize(&mut self, rs: &RenderState, w: u32, h: u32) {
+        if self.resize_core(&rs.device, w, h) {
+            if let Some(id) = self.tex_id {
+                rs.renderer.write().update_egui_texture_from_wgpu_texture(
+                    &rs.device,
+                    &self.resolve_view,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
+            }
+        }
+    }
+
+    /// Resize the GPU render targets; returns true if they changed.
+    pub fn resize_core(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
         let (w, h) = (w.max(1), h.max(1));
         if self.size == (w, h) {
-            return;
+            return false;
         }
-        let (color_view, depth_view, resolve_view) = make_targets(&rs.device, self.format, w, h);
+        let (color_view, depth_view, resolve_view, resolve_tex) = make_targets(device, self.format, w, h);
         self.color_view = color_view;
         self.depth_view = depth_view;
         self.resolve_view = resolve_view;
+        self.resolve_tex = resolve_tex;
         self.size = (w, h);
-        rs.renderer.write().update_egui_texture_from_wgpu_texture(
-            &rs.device,
-            &self.resolve_view,
-            wgpu::FilterMode::Linear,
-            self.tex_id,
-        );
+        true
     }
 
     pub fn clear_mesh(&mut self) {
@@ -625,9 +645,27 @@ impl Scene {
         self.label_vbuf = make_vbuf(device, "label", bytemuck::cast_slice(verts));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         rs: &RenderState,
+        view_proj: glam::Mat4,
+        show_mesh: bool,
+        preview: Option<Preview>,
+        mesh_unsel: [f32; 3],
+        mesh_sel: [f32; 3],
+        label_color: [f32; 4],
+    ) {
+        self.render_to(&rs.device, &rs.queue, view_proj, show_mesh, preview, mesh_unsel, mesh_sel, label_color);
+    }
+
+    /// Device/queue render path — used directly by the headless offscreen
+    /// renderer; the GUI's `render` wraps it with the egui `RenderState`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         view_proj: glam::Mat4,
         show_mesh: bool,
         preview: Option<Preview>,
@@ -647,11 +685,10 @@ impl Scene {
             mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
             label_color,
         };
-        rs.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        let mut encoder = rs
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene_encoder") });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene_encoder") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene_pass"),
@@ -727,7 +764,56 @@ impl Scene {
                 }
             }
         }
-        rs.queue.submit(std::iter::once(encoder.finish()));
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Read the resolved color target back to tightly-packed RGBA8 (headless).
+    pub fn read_rgba(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32, Vec<u8>) {
+        let (w, h) = self.size;
+        // Copy rows are padded to 256 bytes per wgpu's COPY_BYTES_PER_ROW_ALIGNMENT.
+        let unpadded = w * 4;
+        let padded = unpadded.div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.resolve_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((unpadded * h) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            out.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        let swizzle = matches!(self.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        if swizzle {
+            for px in out.chunks_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        (w, h, out)
     }
 }
 
@@ -848,7 +934,7 @@ fn make_targets(
     format: wgpu::TextureFormat,
     w: u32,
     h: u32,
-) -> (wgpu::TextureView, wgpu::TextureView, wgpu::TextureView) {
+) -> (wgpu::TextureView, wgpu::TextureView, wgpu::TextureView, wgpu::Texture) {
     let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
     // Multisampled color + depth are the render targets; the pass resolves into
     // `resolve` (single-sample), which is the texture egui samples.
@@ -879,13 +965,17 @@ fn make_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
+    let resolve_view = resolve.create_view(&wgpu::TextureViewDescriptor::default());
     (
         color.create_view(&wgpu::TextureViewDescriptor::default()),
         depth.create_view(&wgpu::TextureViewDescriptor::default()),
-        resolve.create_view(&wgpu::TextureViewDescriptor::default()),
+        resolve_view,
+        resolve,
     )
 }
 

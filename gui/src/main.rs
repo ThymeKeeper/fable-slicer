@@ -3,6 +3,7 @@
 //! and export g-code.
 
 mod camera;
+mod offscreen;
 mod render;
 
 use camera::Camera;
@@ -578,6 +579,17 @@ fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
 }
 
 fn main() -> eframe::Result<()> {
+    // Headless one-shot render (no window): `--render-layer N [--walls W]
+    // [--mode arachne|distributed|classic] [--out p.png] [--size WxH] file.stl`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--render-layer") {
+        if let Err(e) = run_offscreen(&argv) {
+            eprintln!("offscreen render failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // The window/taskbar icon: a Playfair "F" sliced into offset layers on a
     // cream tile (generated from the wordmark font; raw RGBA so no image
     // decoder is needed). Wayland ignores per-window icons by design — there
@@ -613,6 +625,76 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("Fable Slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Parse the headless-render CLI and run it (see the `--render-layer` branch).
+fn run_offscreen(argv: &[String]) -> Result<(), String> {
+    let mut a = offscreen::Args {
+        stl: std::path::PathBuf::new(),
+        out: std::path::PathBuf::from("/tmp/offscreen.png"),
+        layer: 1,
+        walls: 99,
+        mode: config::WallMode::Arachne,
+        width: 1400,
+        height: 1000,
+        zoom: 1.15,
+        pitch: -0.45,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let next = |i: usize| -> Result<&String, String> {
+        argv.get(i + 1).ok_or_else(|| format!("missing value after {}", argv[i]))
+    };
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--render-layer" => {
+                a.layer = next(i)?.parse().map_err(|_| "bad --render-layer")?;
+                i += 2;
+            }
+            "--walls" => {
+                a.walls = next(i)?.parse().map_err(|_| "bad --walls")?;
+                i += 2;
+            }
+            "--mode" => {
+                a.mode = config::WallMode::parse(next(i)?).ok_or("bad --mode")?;
+                i += 2;
+            }
+            "--out" => {
+                a.out = std::path::PathBuf::from(next(i)?);
+                i += 2;
+            }
+            "--size" => {
+                let (w, h) = next(i)?.split_once('x').ok_or("--size wants WxH")?;
+                a.width = w.parse().map_err(|_| "bad --size width")?;
+                a.height = h.parse().map_err(|_| "bad --size height")?;
+                i += 2;
+            }
+            "--zoom" => {
+                a.zoom = next(i)?.parse().map_err(|_| "bad --zoom")?;
+                i += 2;
+            }
+            "--pitch" => {
+                a.pitch = next(i)?.parse().map_err(|_| "bad --pitch")?;
+                i += 2;
+            }
+            "--target" => {
+                let (x, y) = next(i)?.split_once(',').ok_or("--target wants X,Y")?;
+                a.tx = x.parse().map_err(|_| "bad --target x")?;
+                a.ty = y.parse().map_err(|_| "bad --target y")?;
+                i += 2;
+            }
+            s if !s.starts_with("--") => {
+                a.stl = std::path::PathBuf::from(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if a.stl.as_os_str().is_empty() {
+        return Err("no STL path given".into());
+    }
+    offscreen::run(&a)
 }
 
 /// What the last slice produced — rendered, together with the one-line

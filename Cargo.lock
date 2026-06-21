@@ -1213,6 +1213,7 @@ dependencies = [
  "geo2d",
  "glam",
  "mesh",
+ "pollster",
  "printhost",
  "rfd",
 ]
