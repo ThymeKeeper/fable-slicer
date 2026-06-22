@@ -19,6 +19,7 @@
 use geo2d::{Point, Polygons};
 
 /// One variable-width bead: points, per-vertex widths (mm), closed?
+#[derive(Clone)]
 pub(crate) struct Bead {
     pub points: Vec<Point>,
     pub widths: Vec<f64>,

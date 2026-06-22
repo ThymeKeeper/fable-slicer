@@ -363,7 +363,159 @@ fn components(polys: &Polygons) -> Vec<Polygons> {
 /// piece (a wedge, a flank sliver, a strip) gets a clean analytic centerline —
 /// one continuous tapering bead down its spine; anything with holes or odd
 /// topology falls back to the grid skeleton, smoothed.
-fn terminal_beads(region: &Polygons, lw: f64, sp: f64) -> Vec<Bead> {
+/// `(I + λ·DᵀD) v` for the second-difference operator `D`, written matrix-free.
+fn dtd_apply(v: &[f64], lambda: f64, out: &mut [f64]) {
+    let n = v.len();
+    let d = |k: i64| -> f64 {
+        if k < 0 || (k as usize) + 2 >= n {
+            0.0
+        } else {
+            let k = k as usize;
+            v[k] - 2.0 * v[k + 1] + v[k + 2]
+        }
+    };
+    for i in 0..n {
+        let ii = i as i64;
+        out[i] = v[i] + lambda * (d(ii - 2) - 2.0 * d(ii - 1) + d(ii));
+    }
+}
+
+/// Whittaker–Henderson smoothing of an open 1-D sequence: minimise
+/// `Σ(z−y)² + λ·Σ(2nd-diff z)²`, i.e. solve the SPD pentadiagonal system
+/// `(I + λ·DᵀD) z = y` by conjugate gradient. Large λ ⇒ stiffer. Unlike
+/// chaikin/averaging (which only blur toward the jittery samples and leave a
+/// structured wiggle) this penalises curvature directly, so a zig-zag bead end
+/// melts to a clean taper.
+fn whittaker_1d(y: &[f64], lambda: f64) -> Vec<f64> {
+    let n = y.len();
+    if n < 3 {
+        return y.to_vec();
+    }
+    let mut z = y.to_vec();
+    let mut ax = vec![0.0; n];
+    dtd_apply(&z, lambda, &mut ax);
+    let mut r: Vec<f64> = (0..n).map(|i| y[i] - ax[i]).collect();
+    let mut p = r.clone();
+    let mut rs: f64 = r.iter().map(|v| v * v).sum();
+    let mut ap = vec![0.0; n];
+    for _ in 0..n.min(200) {
+        if rs < 1e-10 {
+            break;
+        }
+        dtd_apply(&p, lambda, &mut ap);
+        let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
+        if pap.abs() < 1e-20 {
+            break;
+        }
+        let alpha = rs / pap;
+        for i in 0..n {
+            z[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+        }
+        let rs_new: f64 = r.iter().map(|v| v * v).sum();
+        let beta = rs_new / rs;
+        for i in 0..n {
+            p[i] = r[i] + beta * p[i];
+        }
+        rs = rs_new;
+    }
+    z
+}
+
+/// Resample an open polyline + a parallel per-vertex value array to evenly
+/// arc-spaced samples ~`step` apart. Decimating before the spline keeps the
+/// 2nd-difference penalty at the right scale (a dense path makes λ act far too
+/// fine and leaves a whisker comb).
+fn resample_with_vals(pts: &[Point], vals: &[f64], step: f64) -> (Vec<Point>, Vec<f64>) {
+    let n = pts.len();
+    if n < 2 {
+        return (pts.to_vec(), vals.to_vec());
+    }
+    let mut arc = vec![0.0f64; n];
+    for i in 1..n {
+        arc[i] = arc[i - 1]
+            + (pts[i].x_mm() - pts[i - 1].x_mm()).hypot(pts[i].y_mm() - pts[i - 1].y_mm());
+    }
+    let total = arc[n - 1];
+    let m = (total / step).floor() as usize;
+    if m < 2 {
+        return (pts.to_vec(), vals.to_vec());
+    }
+    let (mut op, mut ov) = (Vec::with_capacity(m + 1), Vec::with_capacity(m + 1));
+    let mut j = 0usize;
+    for k in 0..=m {
+        let target = k as f64 * total / m as f64;
+        while j + 2 < n && arc[j + 1] < target {
+            j += 1;
+        }
+        let span = arc[j + 1] - arc[j];
+        let f = if span > 1e-9 { ((target - arc[j]) / span).clamp(0.0, 1.0) } else { 0.0 };
+        op.push(Point::from_mm(
+            pts[j].x_mm() + f * (pts[j + 1].x_mm() - pts[j].x_mm()),
+            pts[j].y_mm() + f * (pts[j + 1].y_mm() - pts[j].y_mm()),
+        ));
+        ov.push(vals[j] + f * (vals[j + 1] - vals[j]));
+    }
+    (op, ov)
+}
+
+/// Drop sub-printable thin runs from the ENDS of a centerline. The strip pinches
+/// to nothing where it terminates, and the analytic centerline knuckles into a
+/// zig-zag there (the "W" that overshot the wall) — but that stretch is below a
+/// printable line width anyway, so trimming it both removes the knuckle and is
+/// physically correct. The (printable) middle is kept intact.
+pub(crate) fn trim_thin_ends(mut b: Bead, min_w: f64) -> Bead {
+    // Peel points off each end while they are sub-printable OR fold the path back
+    // on itself — a turn sharper than ~110° is the analytic's terminal knuckle
+    // (the "W"), not real geometry, so it goes.
+    let folds = |a: Point, m: Point, c: Point| -> bool {
+        let (ux, uy) = (m.x_mm() - a.x_mm(), m.y_mm() - a.y_mm());
+        let (vx, vy) = (c.x_mm() - m.x_mm(), c.y_mm() - m.y_mm());
+        let (lu, lv) = (ux.hypot(uy), vx.hypot(vy));
+        lu > 1e-9 && lv > 1e-9 && (ux * vx + uy * vy) / (lu * lv) < -0.34
+    };
+    while b.points.len() >= 3 {
+        let n = b.points.len();
+        if *b.widths.last().unwrap() < min_w || folds(b.points[n - 3], b.points[n - 2], b.points[n - 1]) {
+            b.points.pop();
+            b.widths.pop();
+        } else {
+            break;
+        }
+    }
+    while b.points.len() >= 3 {
+        if b.widths[0] < min_w || folds(b.points[2], b.points[1], b.points[0]) {
+            b.points.remove(0);
+            b.widths.remove(0);
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+/// Spline-smooth a centerline bead: decimate to ~sp/2, then Whittaker-smooth the
+/// path (gentle λ — follow the gap) and the widths (stiff λ — width jitter reads
+/// as "lumpy"), so the analytic centerline's bead-end zig-zag melts away.
+pub(crate) fn smooth_bead(bead: &Bead, lw: f64, sp: f64) -> Bead {
+    if bead.points.len() < 5 {
+        return bead.clone();
+    }
+    let (pts, widths) = resample_with_vals(&bead.points, &bead.widths, sp * 0.5);
+    if pts.len() < 5 {
+        return bead.clone();
+    }
+    let xs: Vec<f64> = pts.iter().map(|p| p.x_mm()).collect();
+    let ys: Vec<f64> = pts.iter().map(|p| p.y_mm()).collect();
+    let sx = whittaker_1d(&xs, 3.0);
+    let sy = whittaker_1d(&ys, 3.0);
+    let sw = whittaker_1d(&widths, 30.0);
+    let points: Vec<Point> = sx.iter().zip(&sy).map(|(&x, &y)| Point::from_mm(x, y)).collect();
+    let widths: Vec<f64> = sw.iter().map(|&w| w.clamp(lw * 0.5, lw * 1.75)).collect();
+    Bead { points, widths, closed: bead.closed }
+}
+
+pub(crate) fn terminal_beads(region: &Polygons, lw: f64, sp: f64) -> Vec<Bead> {
     let outers: Vec<&Contour> = region.contours.iter().filter(|c| c.signed_area_mm2() > 0.0 && c.points.len() >= 3).collect();
     let has_hole = region.contours.iter().any(|c| c.signed_area_mm2() < 0.0 && c.points.len() >= 3);
     let holes: Vec<&Contour> = region.contours.iter().filter(|c| c.signed_area_mm2() < 0.0 && c.points.len() >= 3).collect();
@@ -400,7 +552,7 @@ fn terminal_beads(region: &Polygons, lw: f64, sp: f64) -> Vec<Bead> {
 /// sides in lock-step by arc length and taking midpoints traces the spine, with
 /// each width = the gap between the sides (so a wedge tapers to its point). No
 /// skeleton, no Voronoi — just the boundary.
-fn analytic_centerline(contour: &Contour, lw: f64, sp: f64) -> Option<Bead> {
+pub(crate) fn analytic_centerline(contour: &Contour, lw: f64, sp: f64) -> Option<Bead> {
     let loop_pts = resample(&contour.points, true, sp * 0.25);
     let m = loop_pts.len();
     if m < 6 {

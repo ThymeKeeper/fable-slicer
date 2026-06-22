@@ -685,11 +685,22 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         } else {
             gaps
         };
+        // Don't fill gaps the solid shell already covers: a top/bottom (or buried-
+        // solid) layer fills its whole interior solid, so a gap bead inside that
+        // region just doubles up on the shell. Sparse infill, by contrast, leaves
+        // the thin slivers, so gaps there stay and get filled.
+        let gaps = if settings.gap_fill && !gaps.is_empty() && !solid_all_per_layer[i].is_empty() {
+            difference(&gaps, &solid_all_per_layer[i])
+        } else {
+            gaps
+        };
         if settings.gap_fill && !gaps.is_empty() {
             for island in islands(&gaps) {
                 let area = island.net_area_mm2();
-                if area < lw * lw {
-                    continue; // sub-bead-sized crumb — not worth a dab
+                if area < lw * lw * 4.0 {
+                    continue; // sub-bead speckle — bead squish closes it; filling
+                    // it just litters short messy hatch (the "W"). Keep only gaps
+                    // big enough to be worth a real stroke.
                 }
                 let perimeter: f64 = island
                     .contours
@@ -699,16 +710,84 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         (0..m).map(move |j| pt_dist_mm(c.points[j], c.points[(j + 1) % m]))
                     })
                     .sum();
-                // Long thin strip: width ≈ 2·area/perimeter. Match the stroke to it;
-                // anything thinner than a third of a line won't print usefully.
+                // Estimated mean width of the region (long thin strip: ≈ 2·area/perimeter).
                 let gw = 2.0 * area / perimeter.max(1.0e-6);
                 if gw < lw * 0.3 {
-                    continue;
+                    continue; // thinner than a third of a line — won't print usefully
                 }
-                let gw = gw.min(lw * 1.2);
-                let along = crate::fill::principal_angle_deg(&island);
-                for seg in crate::fill::infill_lines(&island, along, gw, false, 0.5) {
-                    paths.push(ToolPath::new(PathKind::GapFill, false, gw, seg));
+                let outers = island.contours.iter().filter(|c| c.signed_area_mm2() > 0.0).count();
+                let holes = island.contours.iter().filter(|c| c.signed_area_mm2() < 0.0).count();
+                // Aspect ≈ length/width (perimeter²/4·area). Only an ELONGATED strip
+                // has a meaningful spine; on a short stubby blob the analytic
+                // centerline's two ends sit close together and it folds back on
+                // itself (the zig-zag that overshot the wall), so those hatch.
+                let aspect = perimeter * perimeter / (4.0 * area.max(1.0e-6));
+                // A simple thin strip (one boundary, no hole, ~one line wide, and
+                // long) gets CENTER BEADING: a single clean bead traced down its
+                // medial spine by the analytic (boundary-paired) centerline — no
+                // skeleton, so no tangle — with per-vertex width tracking the local
+                // thickness and tapering out where it pinches. Anything wider, holed
+                // or stubby (a pocket, an annulus, a blob) still hatches.
+                let mut centerlined = false;
+                if outers == 1 && holes == 0 && gw <= lw * 1.4 && aspect > 6.0 {
+                    // Trace the spine with the analytic (boundary-paired) centerline
+                    // ONLY — no skeleton fallback (that's what tangled into the X
+                    // marks). A clean spine runs about the strip's length
+                    // (≈ perimeter/2); if `analytic_centerline` bails or folds back
+                    // (far longer), hatch instead.
+                    let outer = island.contours.iter().find(|c| c.signed_area_mm2() > 0.0);
+                    if let Some(b) = outer.and_then(|c| crate::peel::analytic_centerline(c, lw, sp)) {
+                        // Trim the sub-printable pinch ends (where the analytic
+                        // knuckled into the W) before measuring / smoothing.
+                        let b = crate::peel::trim_thin_ends(b, lw * 0.5);
+                        let clen: f64 = b.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum();
+                        // Reject a centerline that hairpins back on itself (any ~180°
+                        // turn): the analytic mis-traced a cross-strip as a fold-back
+                        // (the "W"). Hatch it instead — one clean stroke down the strip.
+                        let hairpin = b.points.windows(3).any(|w| {
+                            let (ux, uy) = (w[1].x_mm() - w[0].x_mm(), w[1].y_mm() - w[0].y_mm());
+                            let (vx, vy) = (w[2].x_mm() - w[1].x_mm(), w[2].y_mm() - w[1].y_mm());
+                            let (lu, lv) = (ux.hypot(uy), vx.hypot(vy));
+                            lu > 1e-9 && lv > 1e-9 && (ux * vx + uy * vy) / (lu * lv) < -0.87
+                        });
+                        if b.points.len() >= 2 && !hairpin && clen < 0.7 * perimeter {
+                            // Whittaker spline: melt the bead-end zig-zag + any
+                            // lumpiness into a clean, gently-curving stroke.
+                            let b = crate::peel::smooth_bead(&b, lw, sp);
+                            let max_w = b.widths.iter().cloned().fold(0.0f64, f64::max);
+                            paths.push(ToolPath {
+                                kind: PathKind::GapFill,
+                                closed: b.closed,
+                                width_mm: max_w,
+                                points: b.points,
+                                z_offset_mm: 0.0,
+                                flow: 1.0,
+                                group: None,
+                                height_scale: 1.0,
+                                widths: Some(b.widths),
+                            });
+                            centerlined = true;
+                        }
+                    }
+                }
+                // Whatever didn't centerline (a wide pocket, or a hairpin strip
+                // rejected above) gets hatched — but ONLY if the hatch makes a real
+                // stroke. A bent corner hatches into a clutter of short crossing
+                // segments that renders as a messy diamond; skip those (bead squish
+                // closes the sliver) and keep hatch for long strips / real pockets.
+                if !centerlined {
+                    let gw = gw.min(lw * 1.2);
+                    let along = crate::fill::principal_angle_deg(&island);
+                    let segs = crate::fill::infill_lines(&island, along, gw, false, 0.5);
+                    let longest = segs
+                        .iter()
+                        .map(|s| s.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum::<f64>())
+                        .fold(0.0f64, f64::max);
+                    if longest > lw * 6.0 {
+                        for seg in segs {
+                            paths.push(ToolPath::new(PathKind::GapFill, false, gw, seg));
+                        }
+                    }
                 }
             }
         }
