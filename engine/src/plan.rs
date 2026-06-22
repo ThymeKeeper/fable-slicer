@@ -221,12 +221,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         .into_par_iter()
         .map(|i| {
             let here = &layers[i].polygons;
-            let top = if i + 1 < n {
+            // A face is only reserved (carved out of the walls, skinned) if it will
+            // actually be skinned — gate each on its own shell count. With top and
+            // bottom layers both 0 there is no surface at all, so the walls fill the
+            // cross-section solid with no infill or shells anywhere.
+            let top = if settings.top_layers == 0 {
+                Polygons::new()
+            } else if i + 1 < n {
                 difference(here, &offset(&layers[i + 1].polygons, 0.05))
             } else {
                 here.clone()
             };
-            let bot = if i > 0 {
+            let bot = if settings.bottom_layers == 0 {
+                Polygons::new()
+            } else if i > 0 {
                 difference(here, &offset(&layers[i - 1].polygons, 0.05))
             } else {
                 here.clone()
@@ -263,7 +271,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // then demotes to sparse infill. So thinner surface stays in the wall
             // region and the inner walls fill it right out to the tip.
             let surf_owned = &surface_per_layer[layer.index];
-            let skinnable = offset(&offset(surf_owned, -lw), lw);
+            let skinnable = offset(&offset(surf_owned, -lw * 2.0), lw * 2.0);
             // Don't carve an over-air bottom surface the walls can close (a door
             // lintel) out of the wall region — otherwise the inner walls loop back
             // around the just-closed notch instead of crossing it. Keep the whole
@@ -278,13 +286,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     * settings.support_overhang_angle_deg.to_radians().tan();
                 let over_air =
                     difference(&layer.polygons, &offset(&layers[layer.index - 1].polygons, allowance));
-                // Keep only SMALL over-air spans (door lintels) in the wall region so
-                // the beads cross them. A large flat over-air face — a cabin roof
-                // underside — is a real bottom surface and must skin, not wall.
+                // Keep the WHOLE skinnable surface patch when it's a thin bridge the
+                // walls cross: it must be over air (a lintel, not a flat shelf) AND
+                // close under the span. Taking the whole patch — not just its steep
+                // over-air core — means the shallow allowance ring at the span ends
+                // becomes wall too, instead of a tiny solid pocket breaking the span.
+                // A large flat over-air face (a cabin roof) survives the erosion and
+                // stays surface, so it skins. The split is by width: a lintel erodes
+                // to nothing under a few mm, a roof slab doesn't.
                 let span = wd.min(settings.max_bridge_span_mm * 0.5).max(lw);
                 let mut keep = Polygons::new();
-                for isl in islands(&over_air) {
-                    if offset(&isl, -span).is_empty() {
+                for isl in islands(&skinnable) {
+                    if offset(&isl, -span).is_empty() && !intersection(&isl, &over_air).is_empty() {
                         keep.contours.extend(isl.contours);
                     }
                 }
@@ -327,6 +340,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
+                            // Drop sub-bead micro-loops on INNER walls — the offset
+                            // pinches these off at corners and junctions (a thin-wall
+                            // cusp, a spanned-lintel corner). The outer wall is never
+                            // touched, so no visible detail is lost.
+                            if kind == PathKind::Perimeter {
+                                let m = c.points.len();
+                                let perim: f64 =
+                                    (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
+                                if perim < lw * 5.0 {
+                                    continue;
+                                }
+                            }
                             let mut points = place_seam(c.points.clone(), settings.seam_mode, layer.index);
                             // Fuzzy skin: jitter the visible (outermost) wall — not on
                             // the first layer, which must stay flat on the bed.
@@ -501,6 +526,22 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 (union(&solid, &on_surf), difference(&sparse, &on_surf))
             };
 
+            // Close the wall↔skin seam. Inner walls offset from `core` starting at
+            // w=1, so the innermost ring stops ~one bead-spacing short of the
+            // surface boundary (nothing hugs that inner edge the way the outer wall
+            // hugs the outline), and the skin insets from the same boundary — a
+            // ~1-line void rings every inset top surface. Grow the skin out into the
+            // wall band so its perimeter loop overlaps the innermost bead and bonds.
+            // Bounded to the band — never past the outer wall, never into sparse — so
+            // it stays a thin seam, not a flood of the whole band.
+            let solid = if settings.wall_count > 0 && !solid.is_empty() {
+                let reach = sp + lw * 0.5;
+                let band = difference(&offset(&layers[i].polygons, -lw), inner);
+                union(&solid, &intersection(&offset(&solid, reach), &band))
+            } else {
+                solid
+            };
+
             // Alternate fill direction per layer for cross-hatching; aligned-lines
             // infill instead keeps one orientation every layer, so its globally
             // anchored lines stack into continuous walls.
@@ -558,6 +599,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // The loop and the fill both push `ov` into their neighbor so
                 // solid surfaces bond to the walls.
                 for (region, kind, _) in &regions {
+                    // No perimeter loop on top/bottom surfaces — the fill pattern is
+                    // extended out to cover that area instead (a clean monolithic
+                    // skin, no concentric ring). Buried Solid keeps its loop.
+                    if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
+                        continue;
+                    }
                     let region_loop = offset(region, -(lw * 0.5 - ov * 0.5));
                     for c in region_loop.contours {
                         if c.points.len() < 3 {
@@ -592,7 +639,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     if region.is_empty() {
                         continue;
                     }
-                    let core = offset(&region, -(0.5 * (lw + sp) - 0.5 * ov));
+                    // Top/bottom surfaces have no perimeter loop, so extend the fill
+                    // out to where that loop would have sat (half a bead in) — the
+                    // pattern covers the whole face. Buried Solid insets past its loop.
+                    let fill_inset = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
+                        lw * 0.5 - ov * 0.5
+                    } else {
+                        0.5 * (lw + sp) - 0.5 * ov
+                    };
+                    let core = offset(&region, -fill_inset);
                     let fill = if internal_bridge.is_empty() {
                         core
                     } else {
