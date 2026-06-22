@@ -257,43 +257,6 @@ impl InfillPattern {
     }
 }
 
-/// How wall toolpaths are generated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum WallMode {
-    /// Variable-width beading (Arachne-class): inner walls stretch, squeeze,
-    /// split and merge with the local feature thickness; thin features become
-    /// single tapered beads. The outer wall stays a fixed-width exact loop.
-    /// Validated on Benchy preview review 2026-06-09 (contiguity, junctions,
-    /// centerline tracking); grid-based with an exact-skeleton upgrade path.
-    #[default]
-    Arachne,
-    /// Distributed beading: the same distance-field even-distribution that
-    /// arachne falls back to, used directly — no Voronoi skeleton, so it's
-    /// robust on geometry the exact path rejects, and it spreads every gap
-    /// evenly across the inner beads instead of into the one nearest it.
-    Distributed,
-    /// Fixed-width concentric offsets everywhere (gaps go to gap fill).
-    Classic,
-}
-
-impl WallMode {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "arachne" | "variable" | "adaptive" => Some(Self::Arachne),
-            "distributed" | "even" | "uniform" => Some(Self::Distributed),
-            "classic" | "fixed" | "concentric" => Some(Self::Classic),
-            _ => None,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Arachne => "arachne",
-            Self::Distributed => "distributed",
-            Self::Classic => "classic",
-        }
-    }
-}
-
 /// How overhangs are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SupportMode {
@@ -361,8 +324,6 @@ pub struct Settings {
     /// Max deviation (mm) a point may have from a fitted arc to be folded into it.
     pub arc_tolerance_mm: f64,
     pub wall_count: usize,
-    /// Wall generation: variable-width (arachne) or fixed concentric (classic).
-    pub wall_mode: WallMode,
     pub top_layers: usize,
     pub bottom_layers: usize,
     /// Print the outer wall as two half-height passes per layer, each sliced at
@@ -390,9 +351,6 @@ pub struct Settings {
     /// Print solid-fill lines in monotonic order (strict sweep across each
     /// region) so top surfaces get an even sheen without overlap ridges.
     pub monotonic_solid: bool,
-    /// Fill gaps too thin for normal infill (between/inside walls) with single
-    /// width-matched strokes.
-    pub gap_fill: bool,
     /// Jitter external perimeters for a rough "fuzzy" surface texture.
     pub fuzzy_skin: bool,
     /// Total jitter band (mm) for fuzzy skin, centered on the wall line.
@@ -500,8 +458,6 @@ pub struct Settings {
     pub solid_speed_mm_s: f64,
     /// Speed (mm/s) for support structure.
     pub support_speed_mm_s: f64,
-    /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
-    pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for straight bridges (spans anchored on both sides).
     /// Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — each arc
     /// cantilevers off the previous ring, far more delicate than a bridge.
@@ -614,7 +570,6 @@ impl Default for Settings {
             arc_fitting: false,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
-            wall_mode: WallMode::default(),
             half_height_outer_walls: false,
             brick_layers: false,
             top_layers: 4,
@@ -626,7 +581,6 @@ impl Default for Settings {
             solid_pattern: InfillPattern::default(),
             infill_overlap: 0.25,
             monotonic_solid: true,
-            gap_fill: true,
             fuzzy_skin: false,
             fuzzy_skin_thickness_mm: 0.3,
             fuzzy_skin_point_dist_mm: 0.8,
@@ -669,7 +623,6 @@ impl Default for Settings {
             external_perimeter_speed_mm_s: 25.0,
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
-            gap_fill_speed_mm_s: 20.0,
             bridge_speed_mm_s: 50.0,
             overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
             min_layer_time_s: 8.0,
@@ -762,12 +715,6 @@ pub fn derived_solid_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f6
 /// never past the flow cap.
 pub fn derived_support_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
     (print_speed_mm_s * 0.9).min(flow_cap_mm_s)
-}
-
-/// Auto gap-fill speed: 40% of print speed, capped — gap strokes live in tight
-/// corners where the head is always turning; never past the flow cap.
-pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
-    (print_speed_mm_s * 0.4).min(40.0).min(flow_cap_mm_s)
 }
 
 /// Auto overhang-wall speed: same as bridges — both lay beads onto air.

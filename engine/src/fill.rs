@@ -345,34 +345,6 @@ fn in_region(polys: &Polygons, p: (f64, f64)) -> bool {
     inside
 }
 
-/// Principal direction (degrees) of a region's contour points — the long axis of
-/// an elongated sliver, used to orient gap-fill strokes.
-pub fn principal_angle_deg(polys: &Polygons) -> f64 {
-    let (mut n, mut mx, mut my) = (0.0f64, 0.0f64, 0.0f64);
-    for c in &polys.contours {
-        for p in &c.points {
-            n += 1.0;
-            mx += p.x_mm();
-            my += p.y_mm();
-        }
-    }
-    if n < 2.0 {
-        return 0.0;
-    }
-    mx /= n;
-    my /= n;
-    let (mut sxx, mut sxy, mut syy) = (0.0f64, 0.0f64, 0.0f64);
-    for c in &polys.contours {
-        for p in &c.points {
-            let (dx, dy) = (p.x_mm() - mx, p.y_mm() - my);
-            sxx += dx * dx;
-            sxy += dx * dy;
-            syy += dy * dy;
-        }
-    }
-    // Eigenvector of the larger eigenvalue of [[sxx, sxy], [sxy, syy]].
-    (0.5 * (2.0 * sxy).atan2(sxx - syy)).to_degrees()
-}
 
 #[cfg(test)]
 mod tests {
@@ -466,10 +438,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn principal_angle_finds_long_axis() {
-        let strip = rect(0.0, 0.0, 20.0, 0.4);
-        let a = principal_angle_deg(&strip).rem_euclid(180.0);
-        assert!(a < 5.0 || a > 175.0, "long axis should be ~0°, got {a}");
-    }
 }

@@ -634,7 +634,6 @@ fn run_offscreen(argv: &[String]) -> Result<(), String> {
         out: std::path::PathBuf::from("/tmp/offscreen.png"),
         layer: 1,
         walls: 99,
-        mode: config::WallMode::Arachne,
         width: 1400,
         height: 1000,
         zoom: 1.15,
@@ -654,10 +653,6 @@ fn run_offscreen(argv: &[String]) -> Result<(), String> {
             }
             "--walls" => {
                 a.walls = next(i)?.parse().map_err(|_| "bad --walls")?;
-                i += 2;
-            }
-            "--mode" => {
-                a.mode = config::WallMode::parse(next(i)?).ok_or("bad --mode")?;
                 i += 2;
             }
             "--out" => {
@@ -814,7 +809,6 @@ struct App {
     show_support: bool,
     show_travel: bool,
     show_seams: bool,
-    show_gap_fill: bool,
     show_ironing: bool,
     needs_rebuild: bool,
     /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
@@ -980,7 +974,6 @@ impl App {
             show_support: true,
             show_travel: false,
             show_seams: false,
-            show_gap_fill: true,
             show_ironing: true,
             needs_rebuild: true,
             content_version: 0,
@@ -1043,9 +1036,6 @@ impl App {
         if self.show_support {
             m |= 1 << 6;
         }
-        if self.show_gap_fill {
-            m |= 1 << 7;
-        }
         if self.show_ironing {
             m |= 1 << 8;
         }
@@ -1102,7 +1092,6 @@ impl App {
             config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
         s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
         s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
-        s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
         s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
         if !self.pins.outer_wall_accel {
             s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
@@ -2315,7 +2304,6 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
                     ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
                     ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
-                    ui.checkbox(&mut self.show_gap_fill, "gap fill").on_hover_text("Show thin gap-fill strokes between walls.");
                     ui.checkbox(&mut self.show_ironing, "ironing").on_hover_text("Show the top-surface ironing pass.");
                     ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
                     ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
@@ -2492,19 +2480,6 @@ impl eframe::App for App {
                 });
                 tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
-                    ui.add_enabled_ui(!vase && !s.brick_layers, |ui| {
-                        egui::ComboBox::from_id_salt("wall_mode")
-                            .selected_text(s.wall_mode.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Arachne, "arachne");
-                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Distributed, "distributed");
-                                ui.selectable_value(&mut s.wall_mode, config::WallMode::Classic, "classic");
-                            })
-                            .response
-                            .on_hover_text("Arachne varies bead width via the exact skeletal trapezoidation, absorbing every gap into the beads. Distributed does the same from a grid distance field — no Voronoi, so it's robust where the exact path fails, and it spreads gaps evenly across the inner beads. Classic uses fixed offsets and patches the leftovers with gap fill.")
-                            .on_disabled_hover_text("Brick layering and spiral vase need classic uniform rings.");
-                        ui.label("wall mode");
-                    });
                     hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 0..=99), "walls",
                         "Number of perimeter loops (shell wall thickness). 0 = infill only, no perimeters.",
                         "Spiral vase forces a single wall.");
@@ -2513,9 +2488,6 @@ impl eframe::App for App {
                         "Spiral vase prints no top shells.");
                     hslider(ui, true, egui::Slider::new(&mut s.bottom_layers, 0..=10), "bottom layers",
                         "Number of solid layers on bottom surfaces.");
-                    ui.add_enabled(!vase && s.wall_mode == config::WallMode::Classic, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
-                        .on_hover_text("Classic mode: fill gaps too thin for walls/infill with single width-matched strokes.")
-                        .on_disabled_hover_text("Arachne absorbs gaps into the walls themselves — gap fill only applies to classic mode (and is off in spiral vase).");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
                     ui.add_enabled(!vase && !s.brick_layers, egui::Checkbox::new(&mut s.half_height_outer_walls, "half-height outer wall"))
@@ -3733,7 +3705,6 @@ const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 const CAT_SEAM: f32 = 5.0;
 const CAT_SUPPORT: f32 = 6.0;
-const CAT_GAPFILL: f32 = 7.0;
 const CAT_IRONING: f32 = 8.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
@@ -3794,29 +3765,18 @@ fn build_instances(
                 (path.width_mm as f32, (base_h * path.flow as f32).max(0.04))
             };
             let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
-            // Variable-width (arachne) beads render their true per-segment width.
-            let seg_w = |k: usize| -> f32 {
-                match &path.widths {
-                    Some(ws) => (0.5 * (ws[k] + ws[(k + 1) % ws.len()])) as f32,
-                    None => w,
-                }
-            };
             let n_pts = path.points.len();
             for k in 0..n_pts - 1 {
-                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, seg_w(k), bh, c, layer_id, cat);
+                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, w, bh, c, layer_id, cat);
             }
             if path.closed {
-                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, seg_w(n_pts - 1), bh, c, layer_id, cat);
+                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
-            for (k, p) in path.points.iter().enumerate() {
-                let jw = match &path.widths {
-                    Some(ws) => ws[k] as f32,
-                    None => w,
-                };
+            for p in path.points.iter() {
                 joints.push([
                     p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
-                    jw, bh,
+                    w, bh,
                     c[0], c[1], c[2],
                     layer_id, cat,
                 ]);
@@ -3884,7 +3844,6 @@ fn category_of(kind: engine::PathKind) -> f32 {
         ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
         Solid | TopSkin | BottomSkin => CAT_SOLID,
         Infill => CAT_INFILL,
-        GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
         Support | Bridge | InternalBridge | ArcOverhang => CAT_SUPPORT,
     }
@@ -3911,7 +3870,6 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
         TopSkin => col(0.0, 0.90, 0.68),       // the crown — the accent at its brightest
         BottomSkin => col(0.0, 0.70, 0.36),    // dark underside
         Infill => col(40.0, 0.45, 0.54),       // analogous step one way — recedes
-        GapFill => col(-40.0, 0.55, 0.50),     // analogous step the other way
         Ironing => col(0.0, 0.30, 0.78),       // pale sheen over the top skin
         Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
         Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air

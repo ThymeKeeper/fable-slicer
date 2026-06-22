@@ -13,7 +13,6 @@ pub struct Args {
     pub out: std::path::PathBuf,
     pub layer: usize,
     pub walls: usize,
-    pub mode: config::WallMode,
     pub width: u32,
     pub height: u32,
     /// Camera distance multiplier (smaller = closer).
@@ -42,7 +41,6 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mesh = mesh::Mesh::load_stl(&a.stl).map_err(|e| format!("load {}: {e}", a.stl.display()))?;
     let mut settings = config::Settings::default();
     settings.wall_count = a.walls;
-    settings.wall_mode = a.mode;
     let layers = engine::generate(&mesh, &settings);
     if layers.is_empty() {
         return Err("slice produced no layers".into());
@@ -79,7 +77,7 @@ pub fn run(a: &Args) -> Result<(), String> {
     let view_proj = proj * view;
 
     // Show every fill category, hide travels (bit 4). CAT_MASK (decimal) overrides
-    // for diagnostics — e.g. CAT_MASK=2 = walls only (bit 1), 128 = gap fill (bit 7).
+    // for diagnostics — e.g. CAT_MASK=2 = walls only (bit 1).
     let mask = std::env::var("CAT_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0x1FFu32 & !(1 << 4));
     let preview = crate::render::Preview {
         count,
@@ -93,10 +91,9 @@ pub fn run(a: &Args) -> Result<(), String> {
     let (w, h, rgba) = scene.read_rgba(&device, &queue);
     write_png(&a.out, w, h, &rgba).map_err(|e| format!("write png: {e}"))?;
     eprintln!(
-        "offscreen: layer {layer}/{} walls={} {:?}  {w}x{h} -> {}",
+        "offscreen: layer {layer}/{} walls={}  {w}x{h} -> {}",
         layers.len(),
         a.walls,
-        a.mode,
         a.out.display()
     );
     Ok(())

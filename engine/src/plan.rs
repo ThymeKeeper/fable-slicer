@@ -9,7 +9,7 @@
 //! the previous `bottom_layers` below; otherwise it is within a shell and printed
 //! solid. Finally the whole model is translated to sit centered on the bed.
 
-use config::{InfillPattern, SeamMode, Settings, SupportMode, WallMode};
+use config::{InfillPattern, SeamMode, Settings, SupportMode};
 use geo2d::{difference, intersection, offset, simplify, to_units, union, Contour, Point, Polygons};
 use mesh::Mesh;
 use rayon::prelude::*;
@@ -46,8 +46,6 @@ pub enum PathKind {
     ArcOverhang,
     /// Sparse interior fill.
     Infill,
-    /// Single width-matched strokes in gaps too thin for normal fill.
-    GapFill,
     /// Low-flow smoothing pass over exposed top surfaces.
     Ironing,
     /// Removable support structure under overhangs.
@@ -78,15 +76,11 @@ pub struct ToolPath {
     /// Bead height as a fraction of the layer height (half-height outer walls
     /// print two 0.5 passes per layer). 1.0 = the full layer.
     pub height_scale: f64,
-    /// Per-vertex bead widths (mm), parallel to `points` — variable-width
-    /// (arachne) walls taper along the path. `None` = constant `width_mm`.
-    /// When set, `width_mm` holds the maximum (for the flow clamp).
-    pub widths: Option<Vec<f64>>,
 }
 
 impl ToolPath {
     fn new(kind: PathKind, closed: bool, width_mm: f64, points: Vec<Point>) -> Self {
-        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0, widths: None }
+        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0 }
     }
 }
 
@@ -149,22 +143,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         norm_settings.brick_layers = false;
         norm_settings.half_height_outer_walls = false; // the spiral *is* the outer wall
         norm_settings.ironing = false;
-        norm_settings.gap_fill = false;
         norm_settings.fuzzy_skin = false;
     }
     if norm_settings.half_height_outer_walls && norm_settings.brick_layers {
         // Mutually exclusive: their Z choreographies collide (the lower outer
         // pass would graze the previous layer's lifted brick beads).
         norm_settings.brick_layers = false;
-    }
-    if norm_settings.brick_layers || norm_settings.spiral_vase {
-        // Brick masonry needs uniform rings; the vase loop is classic too.
-        norm_settings.wall_mode = WallMode::Classic;
-    }
-    if matches!(norm_settings.wall_mode, WallMode::Arachne | WallMode::Distributed) {
-        // Both variable-width modes absorb every gap into the walls (stretch /
-        // absorb regimes), so gap fill is a classic-mode companion only.
-        norm_settings.gap_fill = false;
     }
     let settings = &norm_settings;
 
@@ -252,19 +236,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         })
         .collect();
 
-    // Pass 1: walls + the infill region (inside the innermost wall) per layer,
-    // plus the gap regions too thin for any wall or infill to cover.
-    let per_layer: Vec<(Vec<ToolPath>, Polygons, Polygons)> = layers
+    // Pass 1: walls + the infill region (inside the innermost wall) per layer.
+    let per_layer: Vec<(Vec<ToolPath>, Polygons)> = layers
         .par_iter()
         .zip(outer_halves.par_iter())
         .map(|(layer, halves)| {
             // Adjacent beads are placed at the stadium spacing: rounded
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
-            let arachne = matches!(settings.wall_mode, WallMode::Arachne | WallMode::Distributed);
-            // Distributed mode skips the Voronoi skeleton and uses the grid
-            // distance-field beading directly (robust, no exact-path panics).
-            let grid_only = settings.wall_mode == WallMode::Distributed;
             // With half-height outer walls, interior geometry must stay inside
             // *both* half contours (on a shallow slope the layer-midpoint
             // outline is wider than the upper pass — inner walls based on it
@@ -273,22 +252,52 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let interior_owned = halves.as_ref().map(|(lo, up)| intersection(lo, up));
             let interior: &Polygons = interior_owned.as_ref().unwrap_or(&layer.polygons);
             // Carve the exposed surface out of the inner-wall region: the outer
-            // wall still hugs the full outline, but the inner walls — and the gap
-            // and infill regions derived from them — stop at the surface, leaving
-            // it for the skin. `surf_inside` is the slice the skin reclaims.
-            let surf = &surface_per_layer[layer.index];
-            let core = difference(interior, surf);
-            let surf_inside = intersection(surf, &offset(&layer.polygons, -lw));
+            // wall still hugs the full outline, but the inner walls — and the
+            // infill region derived from them — stop at the surface, leaving it
+            // for the skin. `surf_inside` is the slice the skin reclaims.
+            //
+            // ...but only the SKINNABLE part of the surface — what survives a
+            // one-line morphological open. A surface sliver too thin to hold real
+            // skin (a bow tip, a tapering edge) prints cleaner as walls running
+            // into it than as stubby solid dabs that the solid/sparse rebalance
+            // then demotes to sparse infill. So thinner surface stays in the wall
+            // region and the inner walls fill it right out to the tip.
+            let surf_owned = &surface_per_layer[layer.index];
+            let skinnable = offset(&offset(surf_owned, -lw), lw);
+            // Don't carve an over-air bottom surface the walls can close (a door
+            // lintel) out of the wall region — otherwise the inner walls loop back
+            // around the just-closed notch instead of crossing it. Keep the whole
+            // spannable over-air span in the wall region so the wall beads run
+            // straight across; a wider bridge the walls can't close stays carved.
+            let wd = match settings.wall_count {
+                0 => 0.0,
+                wc => lw + (wc - 1) as f64 * sp,
+            };
+            let spannable_air = if layer.index > 0 && wd > 0.0 {
+                let allowance = settings.layer_height_mm
+                    * settings.support_overhang_angle_deg.to_radians().tan();
+                let over_air =
+                    difference(&layer.polygons, &offset(&layers[layer.index - 1].polygons, allowance));
+                // Keep only SMALL over-air spans (door lintels) in the wall region so
+                // the beads cross them. A large flat over-air face — a cabin roof
+                // underside — is a real bottom surface and must skin, not wall.
+                let span = wd.min(settings.max_bridge_span_mm * 0.5).max(lw);
+                let mut keep = Polygons::new();
+                for isl in islands(&over_air) {
+                    if offset(&isl, -span).is_empty() {
+                        keep.contours.extend(isl.contours);
+                    }
+                }
+                keep
+            } else {
+                Polygons::new()
+            };
+            let surf = difference(&skinnable, &spannable_air);
+            let core = difference(interior, &surf);
+            let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
             let mut walls = Vec::new();
-            let mut gaps = Polygons::new();
-            // Material remaining at depth w·lw — eroded wall by wall to find
-            // where the next wall failed to fit (the gap-fill regions).
-            let mut at_depth = if settings.gap_fill { interior.clone() } else { Polygons::new() };
             for w in 0..settings.wall_count {
-                if arachne && w > 0 {
-                    break; // inner walls come from the variable-width field
-                }
                 let inset = -(lw * 0.5 + w as f64 * sp);
                 let kind = if w == 0 {
                     PathKind::ExternalPerimeter
@@ -338,7 +347,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 flow,
                                 group: None,
                                 height_scale: hscale,
-                                widths: None,
                             });
                         }
                     }
@@ -356,63 +364,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     }
                     None => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
                 }
-                if settings.gap_fill && !arachne {
-                    // Where material remains at this wall's outer edge but the
-                    // wall bead (and everything deeper) is missing, it's a gap.
-                    // (Arachne has no between-wall gaps: beads stretch instead.)
-                    let covered = offset(&centers, lw * 0.5);
-                    if w > 0 {
-                        gaps = union(&gaps, &difference(&at_depth, &covered));
-                    }
-                    at_depth = offset(&centers, -lw * 0.5);
-                }
             }
 
-            // Variable-width (arachne) inner walls + thin-feature outer beads.
-            if arachne && settings.wall_count > 0 {
-                let push_bead = |b: crate::wall::Bead, kind: PathKind, z_off: f64, hs: f64, walls: &mut Vec<ToolPath>| {
-                    let max_w = b.widths.iter().cloned().fold(0.0f64, f64::max);
-                    walls.push(ToolPath {
-                        kind,
-                        closed: b.closed,
-                        width_mm: max_w,
-                        points: b.points,
-                        z_offset_mm: z_off,
-                        flow: 1.0,
-                        group: None,
-                        height_scale: hs,
-                        widths: Some(b.widths),
-                    });
-                };
-                let cap = settings.wall_count - 1;
-                match halves {
-                    // Half-height walls: the adaptive field runs per half
-                    // contour, so inner beads track the surface like the outer
-                    // wall does (each pass contained in its own phase).
-                    Some((lower, upper)) => {
-                        let vw = crate::wall::variable_walls(interior, &offset(lower, -lw), lw, sp, cap, grid_only);
-                        for b in vw.inner {
-                            push_bead(b, PathKind::Perimeter, -0.5 * layer.height_mm, 0.5, &mut walls);
-                        }
-                        for b in vw.thin_outer {
-                            push_bead(b, PathKind::ExternalPerimeter, 0.0, 1.0, &mut walls);
-                        }
-                        let vw = crate::wall::variable_walls(&Polygons::new(), &offset(upper, -lw), lw, sp, cap, grid_only);
-                        for b in vw.inner {
-                            push_bead(b, PathKind::Perimeter, 0.0, 0.5, &mut walls);
-                        }
-                    }
-                    None => {
-                        let vw = crate::wall::variable_walls(interior, &offset(interior, -lw), lw, sp, cap, grid_only);
-                        for b in vw.inner {
-                            push_bead(b, PathKind::Perimeter, 0.0, 1.0, &mut walls);
-                        }
-                        for b in vw.thin_outer {
-                            push_bead(b, PathKind::ExternalPerimeter, 0.0, 1.0, &mut walls);
-                        }
-                    }
-                }
-            }
             // Inset to the infill region (the inner edge of the last wall bead),
             // then morphologically "open" it (erode then dilate by half a line
             // width) to drop slivers narrower than a line — those only produce
@@ -421,27 +374,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 0 => 0.0,
                 wc => lw + (wc - 1) as f64 * sp,
             };
-            // Arachne's stretch/absorb regimes own everything thinner than the
-            // saturation threshold; the infill region must agree or solid fill
-            // collides with the widened beads. Morphological open at the same
-            // threshold keeps infill only where the scheme actually saturates.
-            let inset = if arachne && settings.wall_count > 0 {
-                let r = lw + (settings.wall_count - 1) as f64 * sp + 1.278 * sp;
-                let thick_enough = offset(&offset(interior, -r), r);
-                offset(&intersection(&thick_enough, interior), -wall_depth)
-            } else {
-                offset(interior, -wall_depth)
-            };
+            let inset = offset(interior, -wall_depth);
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
             // The surface rejoins the infill region so the skin claims it (the
             // inner walls were kept clear of it above).
             let opened = union(&opened, &surf_inside);
-            if settings.gap_fill {
-                // Plus the slivers the morphological open dropped from the
-                // infill region (thin necks between walls).
-                let base = if !arachne && settings.wall_count > 0 { &at_depth } else { &inset };
-                gaps = union(&gaps, &difference(base, &opened));
-            }
             // Wall stretches hanging past the layer below print slow with full
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
@@ -456,16 +393,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 walls
             };
-            (walls, opened, gaps)
+            (walls, opened)
         })
         .collect();
     let mut walls_per_layer: Vec<Vec<ToolPath>> = Vec::with_capacity(n);
     let mut inner_per_layer: Vec<Polygons> = Vec::with_capacity(n);
-    let mut gaps_per_layer: Vec<Polygons> = Vec::with_capacity(n);
-    for (w, inner, g) in per_layer {
+    for (w, inner) in per_layer {
         walls_per_layer.push(w);
         inner_per_layer.push(inner);
-        gaps_per_layer.push(g);
     }
 
     // Solid shells per layer (exposed to air above/below unless covered by the
@@ -495,9 +430,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Pass 2: assemble layers, splitting infill into solid shells + sparse core.
     let mut plans: Vec<LayerPlan> = walls_per_layer
         .into_par_iter()
-        .zip(gaps_per_layer.into_par_iter())
         .enumerate()
-        .map(|(i, (mut paths, gaps))| {
+        .map(|(i, mut paths)| {
         let inner = &inner_per_layer[i];
         let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
         let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
@@ -554,6 +488,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let solid = difference(solid_all, &bridged);
             let sparse = difference(&difference(inner, solid_all), &bridged);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
+            // Sparse infill never belongs on an exposed surface the model is
+            // skinning — it leaves holes in what must be a closed skin. Fold any
+            // such sliver back into solid (the rebalance demoted it for being thin;
+            // thin SOLID at least closes the surface, thin sparse just looks
+            // broken). Only where skin is actually laid: with top/bottom layers off
+            // (a hollow single-wall print) the surface is intentionally open.
+            let (solid, sparse) = if solid_all.is_empty() {
+                (solid, sparse)
+            } else {
+                let on_surf = intersection(&sparse, &surface_per_layer[i]);
+                (union(&solid, &on_surf), difference(&sparse, &on_surf))
+            };
 
             // Alternate fill direction per layer for cross-hatching; aligned-lines
             // infill instead keeps one orientation every layer, so its globally
@@ -672,123 +618,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
-            }
-        }
-
-        // Gap fill: single width-matched strokes along the spine of each sliver
-        // too thin for walls/infill (computed in pass 1). A small morphological
-        // open first: the gap regions come from comparing chained offsets, which
-        // leaves hair-thin numerical ribbons along curved walls — only gaps a
-        // nozzle can usefully fill (≳ a third of a line) survive.
-        let gaps = if settings.gap_fill && !gaps.is_empty() {
-            offset(&offset(&gaps, -lw * 0.15), lw * 0.15)
-        } else {
-            gaps
-        };
-        // Don't fill gaps the solid shell already covers: a top/bottom (or buried-
-        // solid) layer fills its whole interior solid, so a gap bead inside that
-        // region just doubles up on the shell. Sparse infill, by contrast, leaves
-        // the thin slivers, so gaps there stay and get filled.
-        let gaps = if settings.gap_fill && !gaps.is_empty() && !solid_all_per_layer[i].is_empty() {
-            difference(&gaps, &solid_all_per_layer[i])
-        } else {
-            gaps
-        };
-        if settings.gap_fill && !gaps.is_empty() {
-            for island in islands(&gaps) {
-                let area = island.net_area_mm2();
-                if area < lw * lw * 4.0 {
-                    continue; // sub-bead speckle — bead squish closes it; filling
-                    // it just litters short messy hatch (the "W"). Keep only gaps
-                    // big enough to be worth a real stroke.
-                }
-                let perimeter: f64 = island
-                    .contours
-                    .iter()
-                    .flat_map(|c| {
-                        let m = c.points.len();
-                        (0..m).map(move |j| pt_dist_mm(c.points[j], c.points[(j + 1) % m]))
-                    })
-                    .sum();
-                // Estimated mean width of the region (long thin strip: ≈ 2·area/perimeter).
-                let gw = 2.0 * area / perimeter.max(1.0e-6);
-                if gw < lw * 0.3 {
-                    continue; // thinner than a third of a line — won't print usefully
-                }
-                let outers = island.contours.iter().filter(|c| c.signed_area_mm2() > 0.0).count();
-                let holes = island.contours.iter().filter(|c| c.signed_area_mm2() < 0.0).count();
-                // Aspect ≈ length/width (perimeter²/4·area). Only an ELONGATED strip
-                // has a meaningful spine; on a short stubby blob the analytic
-                // centerline's two ends sit close together and it folds back on
-                // itself (the zig-zag that overshot the wall), so those hatch.
-                let aspect = perimeter * perimeter / (4.0 * area.max(1.0e-6));
-                // A simple thin strip (one boundary, no hole, ~one line wide, and
-                // long) gets CENTER BEADING: a single clean bead traced down its
-                // medial spine by the analytic (boundary-paired) centerline — no
-                // skeleton, so no tangle — with per-vertex width tracking the local
-                // thickness and tapering out where it pinches. Anything wider, holed
-                // or stubby (a pocket, an annulus, a blob) still hatches.
-                let mut centerlined = false;
-                if outers == 1 && holes == 0 && gw <= lw * 1.4 && aspect > 6.0 {
-                    // Trace the spine with the analytic (boundary-paired) centerline
-                    // ONLY — no skeleton fallback (that's what tangled into the X
-                    // marks). A clean spine runs about the strip's length
-                    // (≈ perimeter/2); if `analytic_centerline` bails or folds back
-                    // (far longer), hatch instead.
-                    let outer = island.contours.iter().find(|c| c.signed_area_mm2() > 0.0);
-                    if let Some(b) = outer.and_then(|c| crate::peel::analytic_centerline(c, lw, sp)) {
-                        // Trim the sub-printable pinch ends (where the analytic
-                        // knuckled into the W) before measuring / smoothing.
-                        let b = crate::peel::trim_thin_ends(b, lw * 0.5);
-                        let clen: f64 = b.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum();
-                        // Reject a centerline that hairpins back on itself (any ~180°
-                        // turn): the analytic mis-traced a cross-strip as a fold-back
-                        // (the "W"). Hatch it instead — one clean stroke down the strip.
-                        let hairpin = b.points.windows(3).any(|w| {
-                            let (ux, uy) = (w[1].x_mm() - w[0].x_mm(), w[1].y_mm() - w[0].y_mm());
-                            let (vx, vy) = (w[2].x_mm() - w[1].x_mm(), w[2].y_mm() - w[1].y_mm());
-                            let (lu, lv) = (ux.hypot(uy), vx.hypot(vy));
-                            lu > 1e-9 && lv > 1e-9 && (ux * vx + uy * vy) / (lu * lv) < -0.87
-                        });
-                        if b.points.len() >= 2 && !hairpin && clen < 0.7 * perimeter {
-                            // Whittaker spline: melt the bead-end zig-zag + any
-                            // lumpiness into a clean, gently-curving stroke.
-                            let b = crate::peel::smooth_bead(&b, lw, sp);
-                            let max_w = b.widths.iter().cloned().fold(0.0f64, f64::max);
-                            paths.push(ToolPath {
-                                kind: PathKind::GapFill,
-                                closed: b.closed,
-                                width_mm: max_w,
-                                points: b.points,
-                                z_offset_mm: 0.0,
-                                flow: 1.0,
-                                group: None,
-                                height_scale: 1.0,
-                                widths: Some(b.widths),
-                            });
-                            centerlined = true;
-                        }
-                    }
-                }
-                // Whatever didn't centerline (a wide pocket, or a hairpin strip
-                // rejected above) gets hatched — but ONLY if the hatch makes a real
-                // stroke. A bent corner hatches into a clutter of short crossing
-                // segments that renders as a messy diamond; skip those (bead squish
-                // closes the sliver) and keep hatch for long strips / real pockets.
-                if !centerlined {
-                    let gw = gw.min(lw * 1.2);
-                    let along = crate::fill::principal_angle_deg(&island);
-                    let segs = crate::fill::infill_lines(&island, along, gw, false, 0.5);
-                    let longest = segs
-                        .iter()
-                        .map(|s| s.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum::<f64>())
-                        .fold(0.0f64, f64::max);
-                    if longest > lw * 6.0 {
-                        for seg in segs {
-                            paths.push(ToolPath::new(PathKind::GapFill, false, gw, seg));
-                        }
-                    }
-                }
             }
         }
 
@@ -1143,13 +972,9 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
             let first = idxs[0];
             let count = idxs.len();
             let mut points = Vec::with_capacity(count + 1);
-            let mut widths = path.widths.as_ref().map(|_| Vec::with_capacity(count + 1));
             for j in 0..=count {
                 let idx = (first + j) % n;
                 points.push(path.points[idx]);
-                if let (Some(ws), Some(src)) = (widths.as_mut(), path.widths.as_ref()) {
-                    ws.push(src[idx]);
-                }
             }
             out.push(ToolPath {
                 kind: if over { PathKind::OverhangWall } else { path.kind },
@@ -1160,7 +985,6 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 flow: path.flow,
                 group: path.group,
                 height_scale: path.height_scale,
-                widths,
             });
         }
     }
@@ -1712,9 +1536,6 @@ fn align_seams(plans: &mut [LayerPlan], mode: SeamMode) {
                 }),
             };
             path.points.rotate_left(vi);
-            if let Some(ws) = path.widths.as_mut() {
-                ws.rotate_left(vi);
-            }
             match assigned[li] {
                 Some((_, ti)) => tracks[ti] = path.points[0],
                 None => tracks.push(path.points[0]),
@@ -2358,35 +2179,6 @@ mod tests {
     }
 
     #[test]
-    fn thin_fin_core_is_a_tapered_wall_not_a_bandaid() {
-        // A 1.2mm-wide fin with lw=0.45 and 2 walls: the 0.3mm core between the
-        // outer wall pair becomes a real variable-width Perimeter bead in
-        // arachne mode (no GapFill strokes), and a GapFill stroke in classic.
-        let m = box_mesh(1.2, 20.0, 5.0);
-        let s = Settings { wall_count: 2, skirt_loops: 0, wall_mode: config::WallMode::Arachne, ..Settings::default() };
-        let layers = generate(&m, &s);
-        let mid = &layers[10];
-        assert_eq!(count(mid, PathKind::GapFill), 0, "arachne: no gap-fill bandaids");
-        let bead = mid
-            .paths
-            .iter()
-            .find(|p| p.kind == PathKind::Perimeter && p.widths.is_some())
-            .expect("variable-width core bead");
-        let ws = bead.widths.as_ref().unwrap();
-        let mid_w = ws[ws.len() / 2];
-        assert!(
-            (0.2..=0.45).contains(&mid_w),
-            "core bead width {mid_w} should match the ~0.3mm core"
-        );
-        assert_eq!(count(mid, PathKind::Infill), 0, "no room for sparse infill");
-
-        // Classic mode keeps the old behavior: a GapFill stroke.
-        let s = Settings { wall_mode: config::WallMode::Classic, ..s };
-        let layers = generate(&m, &s);
-        assert!(count(&layers[10], PathKind::GapFill) > 0, "classic: gap-filled");
-    }
-
-    #[test]
     fn fuzzy_skin_roughens_outer_wall_only() {
         let m = Mesh::cube(20.0);
         let mut s = Settings { skirt_loops: 0, ..Settings::default() };
@@ -2563,75 +2355,13 @@ mod tests {
         // A 2.4 mm-wide bar: the interior pocket is ~4 mm² — far too small for
         // meaningful 15% sparse fill, so it must be promoted to solid.
         let m = box_mesh(2.4, 8.0, 5.0);
-        // Arachne (default): the pocket is below saturation — beads own it,
-        // no fill of any kind.
+        // The pocket is too small for meaningful 15% sparse fill, so it's
+        // promoted to solid instead.
         let s = Settings { skirt_loops: 0, ..Settings::default() };
         let layers = generate(&m, &s);
         let mid = &layers[10];
         assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
-        assert!(
-            mid.paths.iter().any(|p| p.kind == PathKind::Perimeter && p.widths.is_some()),
-            "arachne beads cover the pocket"
-        );
-        // Classic: the pocket is promoted to solid instead of 15% sparse.
-        let s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Classic, ..s };
-        let layers = generate(&m, &s);
-        let mid = &layers[10];
-        assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
         assert!(count(mid, PathKind::Solid) > 0, "pocket promoted to solid");
-    }
-
-    /// Prism with one vertical side and one shallow slope (run 3 per rise 1),
-    /// like the Benchy roof: inner rings must not lose their shallow-side arc.
-    fn wedge() -> Mesh {
-        let v = |x: f64, y: f64, z: f64| [x, y, z];
-        let verts = vec![
-            v(0.0, 0.0, 0.0), v(20.0, 0.0, 0.0), v(20.0, 10.0, 0.0), v(0.0, 10.0, 0.0),
-            v(0.0, 0.0, 3.0), v(20.0, 0.0, 3.0), v(20.0, 1.0, 3.0), v(0.0, 1.0, 3.0),
-        ];
-        let quads = [
-            [0u32, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
-            [3, 2, 1, 0], [4, 5, 6, 7],
-        ];
-        let mut tris = Vec::new();
-        for q in quads {
-            tris.push([q[0], q[1], q[2]]);
-            tris.push([q[0], q[2], q[3]]);
-        }
-        Mesh { vertices: verts, triangles: tris }
-    }
-
-    #[test]
-    fn arachne_inner_ring_covers_shallow_side() {
-        let mut s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Arachne, ..Settings::default() };
-        s.half_height_outer_walls = true;
-        let layers = generate(&m_wedge(), &s);
-        let mid = &layers[7];
-        for ph in [0.0, -0.5 * s.layer_height_mm] {
-            let outer_len: f64 = mid
-                .paths
-                .iter()
-                .filter(|p| p.kind == PathKind::ExternalPerimeter && (p.z_offset_mm - ph).abs() < 1e-9)
-                .flat_map(|p| p.points.windows(2))
-                .map(|w| pt_dist_mm(w[0], w[1]))
-                .sum();
-            let inner_len: f64 = mid
-                .paths
-                .iter()
-                .filter(|p| p.kind == PathKind::Perimeter && (p.z_offset_mm - ph).abs() < 1e-9)
-                .flat_map(|p| p.points.windows(2))
-                .map(|w| pt_dist_mm(w[0], w[1]))
-                .sum();
-            eprintln!("phase {ph}: outer {outer_len:.1} inner {inner_len:.1}");
-            assert!(
-                inner_len > 0.6 * outer_len,
-                "phase {ph}: inner ring covers only {inner_len:.1} of outer {outer_len:.1}"
-            );
-        }
-    }
-
-    fn m_wedge() -> Mesh {
-        wedge()
     }
 
     #[test]
@@ -2657,7 +2387,7 @@ mod tests {
         // Classic mode: this pins the exact offset constants (arachne's
         // grid-extracted rings match within a cell — covered in wall::tests).
         let m = Mesh::cube(20.0);
-        let s = Settings { skirt_loops: 0, wall_mode: config::WallMode::Classic, ..Settings::default() };
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
         let layers = generate(&m, &s);
         let mid = &layers[50];
         let span = |kind: PathKind| {

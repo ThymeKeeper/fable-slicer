@@ -84,9 +84,6 @@ struct Args {
     /// Support mode: none | grid | arc.
     #[arg(long)]
     support: Option<String>,
-    /// Wall generation: arachne (variable width, default) | distributed | classic.
-    #[arg(long)]
-    wall_mode: Option<String>,
     /// Spiral vase mode: one continuously rising wall, no infill above the bottom.
     #[arg(long)]
     vase: bool,
@@ -96,9 +93,6 @@ struct Args {
     /// Iron top surfaces with a low-flow smoothing pass.
     #[arg(long)]
     ironing: bool,
-    /// Disable gap fill (thin-sliver strokes between walls).
-    #[arg(long)]
-    no_gap_fill: bool,
     /// Shrink the first layer outline by this much (mm) to counter squish.
     #[arg(long)]
     elephant_foot: Option<f64>,
@@ -205,10 +199,6 @@ fn main() -> Result<()> {
         settings.solid_pattern = config::InfillPattern::parse(s)
             .ok_or_else(|| anyhow::anyhow!("unknown infill pattern '{s}' (use lines | grid | concentric)"))?;
     }
-    if let Some(s) = &args.wall_mode {
-        settings.wall_mode = config::WallMode::parse(s)
-            .ok_or_else(|| anyhow::anyhow!("unknown wall mode '{s}' (use arachne | distributed | classic)"))?;
-    }
     if let Some(s) = &args.support {
         settings.support_mode = config::SupportMode::parse(s)
             .ok_or_else(|| anyhow::anyhow!("unknown support mode '{s}' (use none | grid | arc)"))?;
@@ -250,9 +240,6 @@ fn main() -> Result<()> {
     }
     if args.ironing {
         settings.ironing = true;
-    }
-    if args.no_gap_fill {
-        settings.gap_fill = false;
     }
     if let Some(v) = args.elephant_foot {
         settings.elephant_foot_mm = v;
@@ -402,7 +389,6 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::TopSkin => "#ed618c",
             PathKind::BottomSkin => "#9e7333",
             PathKind::Infill => "#e08a2b",
-            PathKind::GapFill => "#d62728",
             PathKind::Ironing => "#bcbd22",
             PathKind::Support => "#8c6bb1",
             PathKind::Bridge => "#17becf",

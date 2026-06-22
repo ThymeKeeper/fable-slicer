@@ -279,20 +279,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            if let Some(ws) = &path.widths {
-                // Variable-width bead: per-segment E from the mean of the two
-                // endpoint widths (no arc fitting — E varies along the path).
-                let n_pts = path.points.len();
-                let segs = if path.closed { n_pts } else { n_pts - 1 };
-                for k in 0..segs {
-                    let a = path.points[k];
-                    let b = path.points[(k + 1) % n_pts];
-                    let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
-                    let c = config::bead_area_mm2(w, layer.height_mm * path.height_scale) / area
-                        * flow_factor(path, s);
-                    g.extrude(b.x_mm(), b.y_mm(), dist_mm(a, b) * c, feed);
-                }
-            } else if s.arc_fitting {
+            if s.arc_fitting {
                 emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
             } else {
                 let mut prev = start;
@@ -448,7 +435,6 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
         PathKind::Solid => s.solid_speed_mm_s,
         // Visible skins share the outer wall's pace: finish over time.
         PathKind::TopSkin | PathKind::BottomSkin => s.external_perimeter_speed_mm_s,
-        PathKind::GapFill => s.gap_fill_speed_mm_s,
         PathKind::Ironing => s.ironing_speed_mm_s,
         PathKind::Support => s.support_speed_mm_s,
         // Bridges print into air anchored on both ends.
@@ -574,7 +560,6 @@ pub fn kind_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "top surface",
         PathKind::BottomSkin => "bottom surface",
         PathKind::Infill => "infill",
-        PathKind::GapFill => "gap fill",
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
@@ -595,7 +580,6 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "Top surface",
         PathKind::BottomSkin => "Bottom surface",
         PathKind::Infill => "Sparse infill",
-        PathKind::GapFill => "Gap infill",
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
         // Arc overhangs report as Bridge: viewers colour-code known names.
@@ -1031,24 +1015,11 @@ pub fn format_duration(seconds: f64) -> String {
     }
 }
 
-/// Deposited bead volume (mm³) for one path — honors variable widths,
-/// per-path flow (brick, ironing), bridge flow, and the extrusion multiplier.
-/// Shared by the filament estimate and the heat stats so the preview maps
-/// can't disagree with the totals.
+/// Deposited bead volume (mm³) for one path — honors per-path flow (brick,
+/// ironing), bridge flow, and the extrusion multiplier. Shared by the
+/// filament estimate and the heat stats so the preview maps can't disagree
+/// with the totals.
 fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, s: &Settings) -> f64 {
-    if let Some(ws) = &path.widths {
-        let n_pts = path.points.len();
-        let segs = if path.closed { n_pts } else { n_pts.saturating_sub(1) };
-        let mut volume = 0.0;
-        for k in 0..segs {
-            let d = dist_mm(path.points[k], path.points[(k + 1) % n_pts]);
-            let w = 0.5 * (ws[k] + ws[(k + 1) % n_pts]);
-            volume += d
-                * config::bead_area_mm2(w, layer_height_mm * path.height_scale)
-                * flow_factor(path, s);
-        }
-        return volume;
-    }
     let mut len = 0.0;
     for w in path.points.windows(2) {
         len += dist_mm(w[0], w[1]);
