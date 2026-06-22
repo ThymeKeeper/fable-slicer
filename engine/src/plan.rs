@@ -464,14 +464,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         if !inner.is_empty() {
             // Arc-overhang mode: the flat unsupported part of this layer's interior
             // is filled with self-supporting arcs instead of normal fill.
-            // Without supports (None) the flat overhangs still need handling:
-            // spans anchored on both sides bridge with straight lines (like
-            // Orca's bridge detection); true cantilevers stay normal fill —
-            // nothing rescues those except supports or arc mode.
+            // No support mode = the user has accepted unsupported areas: leave
+            // overhangs to the normal fill (the bottom shell, ordered below for the
+            // best chance of printing) rather than overriding with auto-bridging.
+            // Only arc mode actively rescues overhangs — bridge anchored straight
+            // spans, else arc-fill.
             let mut supported_below = Polygons::new();
-            let overhang_region = if i > 0
-                && matches!(settings.support_mode, SupportMode::Arc | SupportMode::None)
-            {
+            let overhang_region = if i > 0 && settings.support_mode == SupportMode::Arc {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 supported_below = offset(&layers[i - 1].polygons, allowance);
@@ -659,6 +658,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                             PathKind::BottomSkin => settings.bottom_pattern,
                             _ => settings.solid_pattern,
                         };
+                        // An unsupported underside printed as bottom shell prints for
+                        // the best chance of landing on what's already down: line/grid
+                        // patterns go nearest-neighbour (each segment lands beside the
+                        // last) instead of a monotonic sweep; concentric is reordered
+                        // outer→in downstream. The bed face (i == 0) keeps its sweep.
+                        let monotone = if kind == PathKind::BottomSkin && i > 0 {
+                            false
+                        } else {
+                            monotone
+                        };
                         fill_region(
                             &fill, pattern, sp, pat_angle(pattern), lw, kind,
                             settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
@@ -734,6 +743,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 
     add_supports(&mut plans, &layers, settings);
     order_layers(&mut plans);
+    order_unsupported_rings_outer_in(&mut plans, &layers, settings);
     center_on_bed(&mut plans, mesh, settings);
     if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
         align_seams(&mut plans, settings.seam_mode);
@@ -1149,6 +1159,89 @@ fn order_layers(plans: &mut [LayerPlan]) {
         }
         paths.extend(iron); // already in boustrophedon order
         plan.paths = paths;
+    }
+}
+
+/// Concentric rings spanning an *enclosed* unsupported void must print supported-
+/// edge inward, so each ring lands on the previously-laid outer ring. Greedy travel
+/// ordering can lay them inner-first, which drops the first ring into the void.
+/// This covers the roof-as-walls case (overhang wall rings, no bottom shell) and a
+/// concentric bottom shell over air. A *cantilever* is the opposite case and is
+/// left alone: its outermost ring runs over its own free edge, so outer→in would
+/// lay that unsupported span first — there's nothing to print supported-edge-first
+/// from. The test is geometric: reorder a run only when its outermost (largest)
+/// ring sits fully on the layer below and its innermost is over air.
+fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
+    fn loop_area(p: &ToolPath) -> f64 {
+        let pts = &p.points;
+        let m = pts.len();
+        if m < 3 {
+            return 0.0;
+        }
+        (0..m)
+            .map(|j| {
+                let (a, b) = (pts[j], pts[(j + 1) % m]);
+                a.x_mm() * b.y_mm() - b.x_mm() * a.y_mm()
+            })
+            .sum::<f64>()
+            .abs()
+            * 0.5
+    }
+    // A ring sits fully on support when every segment midpoint is over the (grown)
+    // layer below.
+    fn supported(p: &ToolPath, below: &Polygons) -> bool {
+        let pts = &p.points;
+        let n = pts.len();
+        if n < 2 {
+            return true;
+        }
+        let segs = if p.closed { n } else { n - 1 };
+        (0..segs).all(|k| {
+            let (a, b) = (pts[k], pts[(k + 1) % n]);
+            in_polys(below, Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
+        })
+    }
+    let is_ring = |k: PathKind| {
+        matches!(
+            k,
+            PathKind::Perimeter
+                | PathKind::ExternalPerimeter
+                | PathKind::OverhangWall
+                | PathKind::BottomSkin
+        )
+    };
+    for plan in plans.iter_mut() {
+        if plan.index == 0 {
+            continue;
+        }
+        let allowance =
+            settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+        let below = offset(&layers[plan.index - 1].polygons, allowance);
+        let paths = &mut plan.paths;
+        let mut i = 0;
+        while i < paths.len() {
+            if !(paths[i].closed && is_ring(paths[i].kind)) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < paths.len() && paths[j].closed && is_ring(paths[j].kind) {
+                j += 1;
+            }
+            // Enclosed void only: largest ring fully on support, smallest over air.
+            // A cantilever fails the first test; a fully supported run the second.
+            let enclosed = {
+                let run = &paths[i..j];
+                let outer = run.iter().max_by(|a, b| loop_area(a).partial_cmp(&loop_area(b)).unwrap());
+                let inner = run.iter().min_by(|a, b| loop_area(a).partial_cmp(&loop_area(b)).unwrap());
+                outer.map_or(false, |p| supported(p, &below))
+                    && inner.map_or(false, |p| !supported(p, &below))
+            };
+            if enclosed {
+                paths[i..j].sort_by(|a, b| loop_area(b).partial_cmp(&loop_area(a)).unwrap());
+            }
+            i = j;
+        }
     }
 }
 
@@ -1950,34 +2043,94 @@ mod tests {
     }
 
     #[test]
-    fn anchored_spans_bridge_without_supports() {
+    fn arc_bridges_anchored_span_none_leaves_it_to_the_shell() {
         // A table: slab across two legs with a 4mm air gap between them.
-        // With support off, the gap's first layer must print as straight
-        // Bridge lines (it's anchored on both sides); the unsupported span
-        // must not silently print as ordinary fill.
         let mut tris = Vec::new();
         push_box(&mut tris, [0.0, 0.0, 0.0], [4.0, 10.0, 4.0]);
         push_box(&mut tris, [8.0, 0.0, 0.0], [12.0, 10.0, 4.0]);
         push_box(&mut tris, [0.0, 0.0, 4.0], [12.0, 10.0, 6.0]);
         let m = mesh::Mesh::from_triangle_soup(&tris);
-        let s = Settings { skirt_loops: 0, ..Settings::default() };
-        assert_eq!(s.support_mode, SupportMode::None);
-        let plans = generate(&m, &s);
-        let slab_first = plans.iter().find(|p| p.print_z_mm > 4.05).unwrap();
-        let bridges: Vec<&ToolPath> =
-            slab_first.paths.iter().filter(|p| p.kind == PathKind::Bridge).collect();
-        assert!(!bridges.is_empty(), "the anchored gap must bridge");
-        let (min_x, max_x) = bridges
+        // No support mode: the user has accepted the unsupported span, so it prints
+        // as ordinary bottom shell — never auto-bridged.
+        let none = generate(&m, &Settings { skirt_loops: 0, ..Settings::default() });
+        let slab = none.iter().find(|p| p.print_z_mm > 4.05).unwrap();
+        assert_eq!(count(slab, PathKind::Bridge), 0, "None must not auto-bridge");
+        assert!(count(slab, PathKind::BottomSkin) > 0, "the span prints as bottom shell");
+        // Arc mode actively rescues overhangs: the anchored gap bridges.
+        let arc = generate(
+            &m,
+            &Settings { skirt_loops: 0, support_mode: SupportMode::Arc, ..Settings::default() },
+        );
+        let slab_arc = arc.iter().find(|p| p.print_z_mm > 4.05).unwrap();
+        assert!(count(slab_arc, PathKind::Bridge) > 0, "arc mode bridges the anchored gap");
+    }
+
+    fn closed_wall_areas(plan: &LayerPlan) -> Vec<f64> {
+        plan.paths
             .iter()
-            .flat_map(|b| b.points.iter())
-            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.x_mm()), hi.max(p.x_mm())));
-        // The model is centered on the bed; the gap is the middle third of a
-        // 12mm-wide part. Bridge lines must stay near it (≤ a couple mm of
-        // anchor overlap past each side).
-        assert!(max_x - min_x < 8.0, "bridge lines span {:.1}mm — leaked beyond the gap", max_x - min_x);
-        // And the layer above is fully supported: no bridges.
-        let above = plans.iter().find(|p| p.print_z_mm > slab_first.print_z_mm).unwrap();
-        assert_eq!(count(above, PathKind::Bridge), 0, "second slab layer re-bridged");
+            .filter(|p| {
+                p.closed
+                    && matches!(
+                        p.kind,
+                        PathKind::Perimeter | PathKind::ExternalPerimeter | PathKind::OverhangWall
+                    )
+            })
+            .map(|p| {
+                let pts = &p.points;
+                let m = pts.len();
+                (0..m)
+                    .map(|j| {
+                        let (a, b) = (pts[j], pts[(j + 1) % m]);
+                        a.x_mm() * b.y_mm() - b.x_mm() * a.y_mm()
+                    })
+                    .sum::<f64>()
+                    .abs()
+                    * 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enclosed_void_walls_print_outer_in() {
+        // Four walls form a ring around a void; a cap slab tops it. With no bottom
+        // shell the cap's first layer over the void prints as concentric walls, and
+        // they must lay supported-edge inward (outer→in / area-descending).
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [2.0, 12.0, 8.0]);
+        push_box(&mut tris, [10.0, 0.0, 0.0], [12.0, 12.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 0.0], [12.0, 2.0, 8.0]);
+        push_box(&mut tris, [0.0, 10.0, 0.0], [12.0, 12.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 8.0], [12.0, 12.0, 10.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, wall_count: 20, top_layers: 0, bottom_layers: 0, ..Settings::default() };
+        let plans = generate(&m, &s);
+        let cap = plans.iter().find(|p| p.print_z_mm > 8.05).unwrap();
+        let areas = closed_wall_areas(cap);
+        assert!(areas.len() >= 3, "cap should have several rings, got {}", areas.len());
+        assert!(
+            areas.windows(2).all(|w| w[0] >= w[1] - 1.0),
+            "enclosed rings must print outer→in: {areas:?}"
+        );
+    }
+
+    #[test]
+    fn cantilever_walls_are_left_alone() {
+        // A shelf on a single-edge post: most of it overhangs air. outer→in would
+        // lay the unsupported outer span first, so the cantilever must NOT be
+        // reordered — its rings keep travel order (not forced area-descending).
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [2.0, 12.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 8.0], [12.0, 12.0, 10.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, wall_count: 20, top_layers: 0, bottom_layers: 0, ..Settings::default() };
+        let plans = generate(&m, &s);
+        let shelf = plans.iter().find(|p| p.print_z_mm > 8.05).unwrap();
+        let areas = closed_wall_areas(shelf);
+        assert!(areas.len() >= 3, "shelf should have rings, got {}", areas.len());
+        assert!(
+            !areas.windows(2).all(|w| w[0] >= w[1] - 1.0),
+            "cantilever must not be reordered outer→in: {areas:?}"
+        );
     }
 
     #[test]
