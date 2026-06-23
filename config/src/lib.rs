@@ -312,6 +312,11 @@ pub struct Settings {
     pub first_layer_accel_mm_s2: f64,
     /// Junction speed limit (mm/s) used for the time estimate.
     pub jerk_mm_s: f64,
+    /// Minimum cruise ratio (Klipper accel-to-decel smoothing): the fraction of
+    /// each move that must cruise rather than accelerate-then-decelerate. 0 = off
+    /// (fastest, spikier); higher = smoother/quieter, slower on short moves.
+    /// Emitted as `SET_VELOCITY_LIMIT ACCEL_TO_DECEL = accel × (1 − ratio)`.
+    pub min_cruise_ratio: f64,
 
     // --- process ---
     pub layer_height_mm: f64,
@@ -564,6 +569,7 @@ impl Default for Settings {
             outer_wall_accel_mm_s2: derived_outer_wall_accel_mm_s2(3000.0),
             first_layer_accel_mm_s2: derived_first_layer_accel_mm_s2(3000.0),
             jerk_mm_s: 10.0,
+            min_cruise_ratio: 0.5,
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             line_width_mm: 0.45,

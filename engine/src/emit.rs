@@ -121,6 +121,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let mut cur_accel = s.first_layer_accel_mm_s2;
     g.raw(&format!("M204 S{cur_accel:.0}"));
     g.raw(&format!("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={:.1}", s.jerk_mm_s));
+    if let Some(c) = atd_cmd(cur_accel, s) {
+        g.raw(&c);
+    }
     if s.pressure_advance > 0.0 {
         g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}", s.pressure_advance));
     }
@@ -192,6 +195,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 let accel = accel_for(path.kind, layer.index, s);
                 if (accel - cur_accel).abs() > 0.5 {
                     g.raw(&format!("M204 S{accel:.0}"));
+                    if let Some(c) = atd_cmd(accel, s) {
+                        g.raw(&c);
+                    }
                     cur_accel = accel;
                 }
                 emit_spiral_layer(&mut g, layer, path, coeff, feed, travel_f, retract_f, s);
@@ -217,6 +223,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let accel = accel_for(path.kind, layer.index, s);
             if (accel - cur_accel).abs() > 0.5 {
                 g.raw(&format!("M204 S{accel:.0}"));
+                if let Some(c) = atd_cmd(accel, s) {
+                    g.raw(&c);
+                }
                 cur_accel = accel;
             }
             // Bridges and overhanging walls want max cooling; everything else
@@ -607,6 +616,16 @@ fn accel_for(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
     }
 }
 
+/// `SET_VELOCITY_LIMIT ACCEL_TO_DECEL=…` for the accel-to-decel smoothing at this
+/// acceleration, or `None` when smoothing is off. Tracks the per-feature accel so
+/// the cruise ratio stays constant as the acceleration changes feature to feature.
+fn atd_cmd(accel: f64, s: &Settings) -> Option<String> {
+    (s.min_cruise_ratio > 1.0e-3).then(|| {
+        let atd = accel * (1.0 - s.min_cruise_ratio.clamp(0.0, 0.95));
+        format!("SET_VELOCITY_LIMIT ACCEL_TO_DECEL={atd:.0}")
+    })
+}
+
 fn dist_mm(a: Point, b: Point) -> f64 {
     let dx = a.x_mm() - b.x_mm();
     let dy = a.y_mm() - b.y_mm();
@@ -822,7 +841,7 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
                 }
                 prev = Some(pt);
             }
-            t += trapezoid_time(len, 0.0, 0.0, travel_v, accel);
+            t += trapezoid_time(len, 0.0, 0.0, travel_v, accel, s.min_cruise_ratio);
             if tr.retract {
                 t += retract_t;
                 // The wipe back over the previous path before travelling.
@@ -934,7 +953,7 @@ pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
 
 /// Time for an extrusion polyline, with junction-speed look-ahead. Both ends stop
 /// (a retraction brackets every path).
-fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64) -> f64 {
+fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64, min_cruise_ratio: f64) -> f64 {
     let n_pts = pts.len();
     let count = if closed { n_pts } else { n_pts.saturating_sub(1) };
     let mut dist: Vec<f64> = Vec::with_capacity(count);
@@ -978,18 +997,24 @@ fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64)
     let mut t = 0.0;
     for i in 0..n {
         let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
-        t += trapezoid_time(dist[i], entry[i], exit, v_nom, accel);
+        t += trapezoid_time(dist[i], entry[i], exit, v_nom, accel, min_cruise_ratio);
     }
     t
 }
 
 /// Time for one move of `dist` mm from `v_entry` to `v_exit`, cruising up to
 /// `v_cruise`, at acceleration `accel`.
-fn trapezoid_time(dist: f64, v_entry: f64, v_exit: f64, v_cruise: f64, accel: f64) -> f64 {
+fn trapezoid_time(dist: f64, v_entry: f64, v_exit: f64, v_cruise: f64, accel: f64, min_cruise_ratio: f64) -> f64 {
     if dist <= 0.0 {
         return 0.0;
     }
-    let vc = v_cruise.max(v_entry).max(v_exit);
+    // Accel-to-decel smoothing: cap the peak as if the spike above the endpoints
+    // climbed at accel·(1−ratio), so the move cruises for `ratio` of its length
+    // instead of sprinting to v_cruise and braking back down. ratio 0 ⇒ cap is the
+    // natural peak, i.e. no change.
+    let atd = accel * (1.0 - min_cruise_ratio.clamp(0.0, 0.95));
+    let cap = (atd * dist + 0.5 * (v_entry * v_entry + v_exit * v_exit)).max(0.0).sqrt();
+    let vc = v_cruise.min(cap).max(v_entry).max(v_exit);
     let d_acc = ((vc * vc - v_entry * v_entry) / (2.0 * accel)).max(0.0);
     let d_dec = ((vc * vc - v_exit * v_exit) / (2.0 * accel)).max(0.0);
     if d_acc + d_dec <= dist {
@@ -1045,7 +1070,7 @@ fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale
     }
     let accel = accel_for(path.kind, layer.index, s).max(1.0);
     let v = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0 * total_scale;
-    polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1))
+    polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1), s.min_cruise_ratio)
 }
 
 /// Estimate filament used: `(length_mm, grams)`. Honors per-path flow (brick,

@@ -2689,6 +2689,12 @@ impl eframe::App for App {
                         "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
                     hslider(ui, true, egui::Slider::new(&mut s.jerk_mm_s, 1.0..=50.0), "jerk mm/s",
                         "Klipper square-corner-velocity — how briskly direction changes are taken.");
+                    hslider(ui, true,
+                        egui::Slider::new(&mut s.min_cruise_ratio, 0.0..=0.95)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                            .custom_parser(|t| t.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
+                        "cruise smoothing",
+                        "Cruise smoothing (Klipper accel-to-decel): forces each move to spend at least this fraction cruising instead of sprinting up to speed and braking back down. 0% = fastest/sharpest; higher = smoother and quieter on short moves (infill, fine detail, arcs), a touch slower. Emitted as ACCEL_TO_DECEL = accel × (1 − this). Separate from jerk, which only sets cornering speed.");
                     // Hardware the printer either has or doesn't. Declared here
                     // rather than via a printer.cfg macro so a downloaded slicer
                     // is self-contained — no macros to install. Off by default:
