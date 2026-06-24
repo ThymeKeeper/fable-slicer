@@ -11,8 +11,10 @@
 
 mod arc;
 mod calibrate;
+mod coverage;
 mod emit;
 mod fill;
+pub mod medial;
 mod plan;
 mod slice;
 
@@ -23,5 +25,5 @@ pub use emit::{
     audit_smoothing, effective_heat_target, estimate_filament, estimate_seconds, format_duration,
     kind_label, per_layer_stats, to_gcode, LayerStats, SlowdownRange, SmoothingReport,
 };
-pub use plan::{generate, LayerPlan, PathKind, ToolPath, Travel};
+pub use plan::{debug_uncovered, generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};

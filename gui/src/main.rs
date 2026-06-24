@@ -805,6 +805,7 @@ struct App {
     show_walls: bool,
     show_solid: bool,
     show_infill: bool,
+    show_gap_fill: bool,
     show_skirt: bool,
     show_support: bool,
     show_travel: bool,
@@ -970,6 +971,7 @@ impl App {
             show_walls: true,
             show_solid: true,
             show_infill: true,
+            show_gap_fill: true,
             show_skirt: true,
             show_support: true,
             show_travel: false,
@@ -1036,6 +1038,9 @@ impl App {
         if self.show_support {
             m |= 1 << 6;
         }
+        if self.show_gap_fill {
+            m |= 1 << 7;
+        }
         if self.show_ironing {
             m |= 1 << 8;
         }
@@ -1092,6 +1097,7 @@ impl App {
             config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
         s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
         s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
+        s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
         s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
         if !self.pins.outer_wall_accel {
             s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
@@ -2304,6 +2310,7 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
                     ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
                     ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
+                    ui.checkbox(&mut self.show_gap_fill, "gap fill").on_hover_text("Show thin gap-fill strokes between walls.");
                     ui.checkbox(&mut self.show_ironing, "ironing").on_hover_text("Show the top-surface ironing pass.");
                     ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
                     ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
@@ -2490,6 +2497,8 @@ impl eframe::App for App {
                         "Number of solid layers on bottom surfaces.");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
+                        .on_hover_text("Fill gaps too thin for a wall or normal infill — between and inside walls — with single width-matched strokes traced down each gap's medial axis.");
                     ui.add_enabled(!vase && !s.brick_layers, egui::Checkbox::new(&mut s.half_height_outer_walls, "half-height outer wall"))
                         .on_hover_text("Print the outer wall as two half-height passes, each sliced at its own plane — halves the visible Z staircase on slopes while the interior keeps full layer height. Costs roughly the outer-wall print time again.")
                         .on_disabled_hover_text("Unavailable in spiral vase mode or with brick layers (their Z choreographies collide).");
@@ -3711,6 +3720,7 @@ const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 const CAT_SEAM: f32 = 5.0;
 const CAT_SUPPORT: f32 = 6.0;
+const CAT_GAPFILL: f32 = 7.0;
 const CAT_IRONING: f32 = 8.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
@@ -3772,17 +3782,28 @@ fn build_instances(
             };
             let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
             let n_pts = path.points.len();
+            // Per-vertex width for a tapering bead (gap fill); else the uniform w.
+            let vert_w = |i: usize| -> f32 {
+                match &path.widths {
+                    Some(ws) => {
+                        let wm = ws[i.min(ws.len() - 1)];
+                        (if path.flow >= 1.0 { wm * path.flow } else { wm }) as f32
+                    }
+                    None => w,
+                }
+            };
             for k in 0..n_pts - 1 {
-                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, w, bh, c, layer_id, cat);
+                let sw = (vert_w(k) + vert_w(k + 1)) * 0.5;
+                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, c, layer_id, cat);
             }
             if path.closed {
                 push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, c, layer_id, cat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
-            for p in path.points.iter() {
+            for (vi, p) in path.points.iter().enumerate() {
                 joints.push([
                     p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
-                    w, bh,
+                    vert_w(vi), bh,
                     c[0], c[1], c[2],
                     layer_id, cat,
                 ]);
@@ -3850,6 +3871,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
         Solid | TopSkin | BottomSkin => CAT_SOLID,
         Infill => CAT_INFILL,
+        GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
         Support | Bridge | InternalBridge | ArcOverhang => CAT_SUPPORT,
     }
@@ -3876,6 +3898,7 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
         TopSkin => col(0.0, 0.90, 0.68),       // the crown — the accent at its brightest
         BottomSkin => col(0.0, 0.70, 0.36),    // dark underside
         Infill => col(40.0, 0.45, 0.54),       // analogous step one way — recedes
+        GapFill => col(-40.0, 0.55, 0.50),     // analogous step the other way
         Ironing => col(0.0, 0.30, 0.78),       // pale sheen over the top skin
         Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
         Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air

@@ -41,6 +41,23 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mesh = mesh::Mesh::load_stl(&a.stl).map_err(|e| format!("load {}: {e}", a.stl.display()))?;
     let mut settings = config::Settings::default();
     settings.wall_count = a.walls;
+    // Debug env overrides so the offscreen render can reproduce GUI experiments.
+    if let Some(v) = std::env::var("INFILL_DENSITY").ok().and_then(|s| s.parse::<f64>().ok()) {
+        settings.infill_density = v;
+    }
+    if let Some(p) = std::env::var("INFILL_PATTERN").ok().and_then(|s| config::InfillPattern::parse(&s)) {
+        settings.sparse_pattern = p;
+        settings.solid_pattern = p;
+    }
+    if let Some(n) = std::env::var("TOP").ok().and_then(|s| s.parse().ok()) {
+        settings.top_layers = n;
+    }
+    if let Some(n) = std::env::var("BOTTOM").ok().and_then(|s| s.parse().ok()) {
+        settings.bottom_layers = n;
+    }
+    if std::env::var("NO_GAP").is_ok() {
+        settings.gap_fill = false;
+    }
     let layers = engine::generate(&mesh, &settings);
     if layers.is_empty() {
         return Err("slice produced no layers".into());

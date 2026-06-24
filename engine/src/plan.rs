@@ -46,6 +46,9 @@ pub enum PathKind {
     ArcOverhang,
     /// Sparse interior fill.
     Infill,
+    /// Single width-matched strokes filling gaps too thin for a wall or normal
+    /// infill (between/inside walls), traced down each gap's medial axis.
+    GapFill,
     /// Low-flow smoothing pass over exposed top surfaces.
     Ironing,
     /// Removable support structure under overhangs.
@@ -76,12 +79,68 @@ pub struct ToolPath {
     /// Bead height as a fraction of the layer height (half-height outer walls
     /// print two 0.5 passes per layer). 1.0 = the full layer.
     pub height_scale: f64,
+    /// Per-point extrusion width (mm), one per `points` entry, for a continuously
+    /// tapering bead (gap fill). `None` = uniform `width_mm`. When set, the g-code
+    /// varies E per segment and the preview renders a variable-width ribbon;
+    /// `width_mm` then carries the mean (used for feed/flow/estimates).
+    pub widths: Option<Vec<f64>>,
 }
 
 impl ToolPath {
     fn new(kind: PathKind, closed: bool, width_mm: f64, points: Vec<Point>) -> Self {
-        Self { kind, closed, width_mm, points, z_offset_mm: 0.0, flow: 1.0, group: None, height_scale: 1.0 }
+        Self {
+            kind,
+            closed,
+            width_mm,
+            points,
+            z_offset_mm: 0.0,
+            flow: 1.0,
+            group: None,
+            height_scale: 1.0,
+            widths: None,
+        }
     }
+}
+
+/// DEBUG: the uncovered area (mm²) left inside the layer outline after stamping
+/// every extrusion path at its true bead width — a raster "grid" measure of how
+/// completely a fill strategy covers the layer. Returns `(outline_area, uncovered)`.
+pub fn debug_uncovered(layer: &LayerPlan, lw: f64) -> (f64, f64) {
+    let beads: Vec<(Vec<Point>, Vec<f64>)> = layer
+        .paths
+        .iter()
+        .map(|p| {
+            let mut pts = p.points.clone();
+            let mut ws = p.widths.clone().unwrap_or_else(|| vec![p.width_mm; p.points.len()]);
+            if p.closed && pts.len() >= 2 {
+                pts.push(pts[0]);
+                ws.push(ws[0]);
+            }
+            (pts, ws)
+        })
+        .collect();
+    let unc = crate::coverage::uncovered(&layer.outline, &beads, lw, 0.0);
+    if std::env::var("GRID").is_ok() {
+        if let Some(bb) = layer.outline.bounds() {
+            let cols = 110usize;
+            let cell = (bb.max.x_mm() - bb.min.x_mm()) / cols as f64;
+            let rows = ((bb.max.y_mm() - bb.min.y_mm()) / cell).ceil() as usize;
+            let inside = |g: &Polygons, p: Point| g.contours.iter().filter(|c| c.contains(p)).count() % 2 == 1;
+            let mut s = String::with_capacity((cols + 1) * rows);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let p = Point::from_mm(
+                        bb.min.x_mm() + (c as f64 + 0.5) * cell,
+                        bb.max.y_mm() - (r as f64 + 0.5) * cell,
+                    );
+                    s.push(if !inside(&layer.outline, p) { ' ' } else if inside(&unc, p) { '#' } else { '.' });
+                }
+                s.push('\n');
+            }
+            eprint!("{s}");
+        }
+    }
+    (layer.outline.net_area_mm2().abs(), unc.net_area_mm2().abs())
 }
 
 /// The non-extruding move that reaches a path's start. Computed once (combing +
@@ -309,6 +368,24 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let core = difference(interior, &surf);
             let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
+            // Inner perimeters trace the SAME concentric primitive as the infill,
+            // so they fill the medial seams a raw per-ring offset of the outline
+            // leaves: inset one bead, morphologically OPEN (erode then dilate by
+            // half a bead) to delete the sub-bead medial slivers, then extend by the
+            // infill overlap. Stepping `inner_region` inward by `sp` (below) yields
+            // densely-nested rings that pack to the medial — measured ~0.6%
+            // uncovered vs ~5.7% for raw offsets, matching concentric infill. The
+            // outer wall is exempt: it hugs the exact outline (opening would round
+            // off surface detail and drop thin features).
+            let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
+            // Simplify away the arc over-sampling the open's round join leaves on
+            // every corner — otherwise each inner ring carries hundreds of stray
+            // points that bloat the g-code (arc fitting would absorb them, but it's
+            // off by default). The tolerance is tiny, so the fill is unchanged.
+            let inner_region = simplify(
+                &offset(&offset(&offset(&offset(interior, -lw), -lw * 0.5), lw * 0.5), ov),
+                lw * 0.1,
+            );
             let mut walls = Vec::new();
             for w in 0..settings.wall_count {
                 let inset = -(lw * 0.5 + w as f64 * sp);
@@ -335,15 +412,24 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     (0.0, 1.0)
                 };
                 // Outer wall (w == 0) hugs the true outline (or its halves);
-                // everything deeper offsets from the safe interior core.
-                let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
+                // inner walls trace the opened `inner_region` via the concentric
+                // primitive (ring `w` at `(w-1)*sp` into it), which fills the
+                // medial seams the raw per-ring offset leaves.
+                // Outer wall (w == 0) hugs the true outline (or its halves); inner
+                // walls step inward through the opened `inner_region` by `sp`.
+                let centers = if w == 0 {
+                    offset(&layer.polygons, inset)
+                } else {
+                    offset(&inner_region, -(lw * 0.5 + (w - 1) as f64 * sp))
+                };
                 let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
                             // Drop sub-bead micro-loops on INNER walls — the offset
                             // pinches these off at corners and junctions (a thin-wall
                             // cusp, a spanned-lintel corner). The outer wall is never
-                            // touched, so no visible detail is lost.
+                            // touched, so no visible detail is lost, and the raster
+                            // gap fill fills whatever area a dropped loop leaves.
                             if kind == PathKind::Perimeter {
                                 let m = c.points.len();
                                 let perim: f64 =
@@ -372,6 +458,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 flow,
                                 group: None,
                                 height_scale: hscale,
+                                widths: None,
                             });
                         }
                     }
@@ -460,6 +547,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         let inner = &inner_per_layer[i];
         let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
         let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
+        // The sparse-infill region, captured for the gap-fill pass below: its
+        // intended between-line gaps must be excluded from void detection.
+        let mut sparse_region = Polygons::new();
 
         if !inner.is_empty() {
             // Arc-overhang mode: the flat unsupported part of this layer's interior
@@ -524,6 +614,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let on_surf = intersection(&sparse, &surface_per_layer[i]);
                 (union(&solid, &on_surf), difference(&sparse, &on_surf))
             };
+            sparse_region = sparse.clone();
 
             // Close the wall↔skin seam. Inner walls offset from `core` starting at
             // w=1, so the innermost ring stops ~one bead-spacing short of the
@@ -682,6 +773,39 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
+            }
+        }
+
+        // Gap fill (raster oracle): stamp every dense bead actually laid onto a
+        // fine grid and trace the medial axis of whatever the part interior —
+        // minus the sparse-infill region (its between-line gaps are intentional) —
+        // is left uncovered. A raster sees the medial-seam voids that an offset
+        // coverage test merges across. Runs before ironing so a gap stroke prints
+        // with the structure, not over the finished surface.
+        if settings.gap_fill {
+            let dense = difference(&layers[i].polygons, &sparse_region);
+            if !dense.is_empty() {
+                let beads: Vec<(Vec<Point>, Vec<f64>)> = paths
+                    .iter()
+                    .filter(|p| p.kind != PathKind::Infill && p.points.len() >= 2)
+                    .map(|p| {
+                        let mut pts = p.points.clone();
+                        if p.closed {
+                            pts.push(pts[0]); // stamp the closing segment too
+                        }
+                        let ws = vec![p.width_mm; pts.len()];
+                        (pts, ws)
+                    })
+                    .collect();
+                let raw_voids = crate::coverage::uncovered(&dense, &beads, lw, lw * lw * 1.5);
+                // Light simplify (~one raster cell): knocks the single-cell stair
+                // jaggies off the marching-squares boundary without shrinking the
+                // void, so the medial stays DENSE (its width tracks the true
+                // channel; a heavier simplify makes it sparse and the clearance
+                // reads low at the few surviving vertices → a too-thin bead). Do
+                // NOT morphologically close (that truncates the tip).
+                let voids = simplify(&raw_voids, lw * 0.15);
+                emit_gap_fill(&voids, lw, sp, &mut paths);
             }
         }
 
@@ -1050,6 +1174,7 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 flow: path.flow,
                 group: path.group,
                 height_scale: path.height_scale,
+                widths: path.widths.clone(),
             });
         }
     }
@@ -1117,6 +1242,121 @@ fn point_in(polys: &Polygons, p: Point) -> bool {
 
 fn pt_dist_mm(a: Point, b: Point) -> f64 {
     (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm())
+}
+
+/// Classic gap fill: trace the medial axis of each sliver the walls + infill
+/// leave uncovered and lay it as single width-matched strokes.
+///
+/// `coverage` is the union of the actual wall-bead footprints (so a ring the
+/// offset abandoned on a thin flank shows up as missing coverage); `opened` is
+/// the infill region. The uncovered remainder is banded to widths a stroke can
+/// fill (≥ `0.2·lw`) but a full ring can't (≤ `2·sp`), mirroring PrusaSlicer's
+/// gap-region cleanup, then handed to the segment-Voronoi medial axis.
+fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
+    if raw.is_empty() {
+        return;
+    }
+    let min = 0.2 * lw;
+    let max = 2.0 * sp;
+    // Drop sub-min hair ribbons (open by min/2) and subtract the >max cores that
+    // should have taken a real ring (the open-by-max/2 part): the fillable band.
+    let opened_min = offset(&offset(&raw, -min * 0.5), min * 0.5);
+    let wide = offset(&offset(&raw, -max * 0.5), max * 0.5);
+    let gaps = difference(&opened_min, &wide);
+    if gaps.is_empty() {
+        return;
+    }
+    // Now that the dense walls fill the bulk, gap fill only sees the residual
+    // seam specks where rings don't quite meet — a short isolated bead per speck
+    // strings out into a dashed line that is mostly travel for negligible fill.
+    // Skip beads too short to be worth reaching (5·lw, above the medial's 2·max
+    // twig-cull; on Benchy these specks are all < 2.25mm with a clean gap to the
+    // next real fill at > 5mm).
+    for tp in crate::medial::medial_axis(&gaps, min, max) {
+        if tp.length_mm() < lw * 5.0 {
+            continue;
+        }
+        emit_tapered_bead(&tp, lw, out);
+    }
+}
+
+/// Emit a medial polyline as one continuously-tapered `GapFill` bead. The
+/// centerline is resampled to fine segments and carries a per-point width
+/// (`ToolPath.widths`), so the g-code varies E per segment — a smooth taper to
+/// the tip — and the preview renders a variable-width ribbon. Widths are floored
+/// at the minimum printable bead; `width_mm` carries the mean for feed/flow.
+fn emit_tapered_bead(tp: &crate::medial::ThickPolyline, lw: f64, out: &mut Vec<ToolPath>) {
+    const FLOOR: f64 = 0.1; // min printable bead width
+    // The medial centerline can be sparse — a wedge void traces as just two
+    // points (wide base, thin tip). Resample so the per-segment width actually
+    // varies along it instead of collapsing to one mean.
+    let (pts, ws) = resample_thick(&tp.points, &tp.widths, lw * 0.5);
+    if pts.len() < 2 {
+        return;
+    }
+    // The medial clearance to the raster void's jagged (~0.18mm) boundary
+    // oscillates, which reads as a lumpy bead pinching below the real channel
+    // width. Low-pass the width profile (~2mm window) so the bead fills the
+    // channel smoothly; the centerline itself is already smooth.
+    let ws = smooth_widths(&ws, lw * 0.5, 2.0);
+    let widths: Vec<f64> = ws.iter().map(|&w| w.max(FLOOR)).collect();
+    let mean = widths.iter().sum::<f64>() / widths.len() as f64;
+    let mut p = ToolPath::new(PathKind::GapFill, false, mean, pts);
+    p.widths = Some(widths);
+    out.push(p);
+}
+
+/// Moving-average the width profile over a ~`window_mm` window (samples spaced
+/// `step_mm`) to strip the high-frequency oscillation the raster void's jagged
+/// boundary injects into the medial clearance, while keeping the real taper.
+fn smooth_widths(ws: &[f64], step_mm: f64, window_mm: f64) -> Vec<f64> {
+    let r = ((window_mm / step_mm / 2.0).round() as usize).max(1);
+    if ws.len() <= 2 {
+        return ws.to_vec();
+    }
+    (0..ws.len())
+        .map(|i| {
+            let lo = i.saturating_sub(r);
+            let hi = (i + r + 1).min(ws.len());
+            ws[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+        })
+        .collect()
+}
+
+/// Resample a polyline + per-point widths at ~`step_mm` spacing, interpolating
+/// both position and width — turns a sparse medial centerline into enough points
+/// that its width taper survives the run-split.
+fn resample_thick(pts: &[Point], ws: &[f64], step_mm: f64) -> (Vec<Point>, Vec<f64>) {
+    let n = pts.len();
+    if n < 2 {
+        return (pts.to_vec(), ws.to_vec());
+    }
+    let step = (step_mm * geo2d::UNITS_PER_MM).max(1.0);
+    let mut op = vec![pts[0]];
+    let mut ow = vec![ws[0]];
+    let mut acc = 0.0; // distance walked since the last emitted point
+    for i in 0..n - 1 {
+        let (a, b) = (pts[i], pts[i + 1]);
+        let seg = ((b.x - a.x) as f64).hypot((b.y - a.y) as f64);
+        if seg < 1.0 {
+            continue;
+        }
+        let mut t0 = 0.0; // fraction of this segment already consumed
+        while acc + seg * (1.0 - t0) >= step {
+            let t = t0 + (step - acc) / seg;
+            op.push(Point::new(
+                a.x + ((b.x - a.x) as f64 * t).round() as i64,
+                a.y + ((b.y - a.y) as f64 * t).round() as i64,
+            ));
+            ow.push(ws[i] + (ws[i + 1] - ws[i]) * t);
+            t0 = t;
+            acc = 0.0;
+        }
+        acc += seg * (1.0 - t0);
+    }
+    op.push(pts[n - 1]);
+    ow.push(ws[n - 1]);
+    (op, ow)
 }
 
 /// Greedily order each layer's paths (nearest-neighbour) to cut travel, keeping
@@ -1218,27 +1458,56 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
             settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
         let below = offset(&layers[plan.index - 1].polygons, allowance);
         let paths = &mut plan.paths;
+        let part_of_run = |p: &ToolPath| is_ring(p.kind) || p.kind == PathKind::GapFill;
         let mut i = 0;
         while i < paths.len() {
-            if !(paths[i].closed && is_ring(paths[i].kind)) {
+            if !is_ring(paths[i].kind) {
                 i += 1;
                 continue;
             }
+            // A run is the maximal stretch of ring segments plus the gap-fill
+            // strokes travel-ordering tucks among them. Ring segments may be
+            // OPEN: a void cap's supported outer walls are split into open
+            // overhang arcs by slow_overhanging_walls, while the loops over the
+            // void stay closed — both must count, or the run looks all-unsupported
+            // and the cap keeps its (travel-order) inner→out sequence.
             let mut j = i;
-            while j < paths.len() && paths[j].closed && is_ring(paths[j].kind) {
+            while j < paths.len() && part_of_run(&paths[j]) {
                 j += 1;
             }
+            let area_at = |k: usize| loop_area(&paths[k]);
+            // Enclosed-void test over every ring segment (open arcs included); the
+            // reorder touches only the closed loops, leaving arcs + gap fill put.
+            let segs: Vec<usize> = (i..j).filter(|&k| is_ring(paths[k].kind)).collect();
+            let closed: Vec<usize> =
+                (i..j).filter(|&k| paths[k].closed && is_ring(paths[k].kind)).collect();
             // Enclosed void only: largest ring fully on support, smallest over air.
             // A cantilever fails the first test; a fully supported run the second.
-            let enclosed = {
-                let run = &paths[i..j];
-                let outer = run.iter().max_by(|a, b| loop_area(a).partial_cmp(&loop_area(b)).unwrap());
-                let inner = run.iter().min_by(|a, b| loop_area(a).partial_cmp(&loop_area(b)).unwrap());
-                outer.map_or(false, |p| supported(p, &below))
-                    && inner.map_or(false, |p| !supported(p, &below))
-            };
-            if enclosed {
-                paths[i..j].sort_by(|a, b| loop_area(b).partial_cmp(&loop_area(a)).unwrap());
+            if segs.len() >= 2 && closed.len() >= 2 {
+                let outer = *segs.iter().max_by(|&&a, &&b| area_at(a).partial_cmp(&area_at(b)).unwrap()).unwrap();
+                let inner = *segs.iter().min_by(|&&a, &&b| area_at(a).partial_cmp(&area_at(b)).unwrap()).unwrap();
+                let outer_supported = supported(&paths[outer], &below);
+                let inner_supported = supported(&paths[inner], &below);
+                // Reorder only the closed loops; open arcs + gap fill stay put.
+                let mut sorted: Vec<ToolPath> = closed.iter().map(|&k| paths[k].clone()).collect();
+                if outer_supported && !inner_supported {
+                    // Enclosed void: outer ring on solid, inner over air. Print
+                    // outer→in so each ring bridges off the one before it.
+                    sorted.sort_by(|a, b| loop_area(b).partial_cmp(&loop_area(a)).unwrap());
+                    for (&slot, r) in closed.iter().zip(sorted) {
+                        paths[slot] = r;
+                    }
+                } else if !outer_supported {
+                    // Cantilever/overhang: even the outer ring is over air (the
+                    // opened inner rings nest into clean concentric loops past the
+                    // support). Print inner→out so the big unsupported span is never
+                    // laid first — without this they default to travel order, which
+                    // walks the nested loops outer→in.
+                    sorted.sort_by(|a, b| loop_area(a).partial_cmp(&loop_area(b)).unwrap());
+                    for (&slot, r) in closed.iter().zip(sorted) {
+                        paths[slot] = r;
+                    }
+                }
             }
             i = j;
         }
@@ -2406,9 +2675,17 @@ mod tests {
             (19.0..20.5).contains(&span),
             "jittered wall span {span:.2} should stay near the nominal 19.55"
         );
-        // Inner wall unaffected.
+        // Fuzzy is outer-wall only: the inner wall is not jittered. (It is now
+        // rounded by the concentric primitive's morphological open, so it carries
+        // more than the bare 4 corner points — but far fewer than the fuzzed outer
+        // wall's dense resample, and with no random in/out jitter.)
         let inner = mid.paths.iter().find(|p| p.kind == PathKind::Perimeter).unwrap();
-        assert!(inner.points.len() < 20, "inner wall must stay smooth");
+        assert!(
+            inner.points.len() < ext.points.len() / 2,
+            "inner wall must not be fuzzed: {} pts vs outer {}",
+            inner.points.len(),
+            ext.points.len()
+        );
         // First layer unaffected (bed adhesion).
         let l0 = layers[0].paths.iter().find(|p| p.kind == PathKind::ExternalPerimeter).unwrap();
         assert!(l0.points.len() < 20, "first layer must not be fuzzed");
@@ -2595,7 +2872,7 @@ mod tests {
         // Classic mode: this pins the exact offset constants (arachne's
         // grid-extracted rings match within a cell — covered in wall::tests).
         let m = Mesh::cube(20.0);
-        let s = Settings { skirt_loops: 0, ..Settings::default() };
+        let s = Settings { skirt_loops: 0, wall_count: 4, ..Settings::default() };
         let layers = generate(&m, &s);
         let mid = &layers[50];
         let span = |kind: PathKind| {
@@ -2604,15 +2881,35 @@ mod tests {
             xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
         };
         // Outer wall centerline stays at lw/2 from the surface (dimensional
-        // accuracy); the inner wall sits one *stadium spacing* further in, so
-        // its span is smaller by 2·sp, not 2·lw.
+        // accuracy). Inner walls trace the infill's concentric primitive on the
+        // opened+overlap-extended region: the first inner wall bonds to the outer
+        // wall by the infill overlap `ov` (denser than a bare stadium step, which
+        // is what lets the rings pack to the medial), and deeper inner walls then
+        // step inward by one stadium spacing `sp`.
         let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        let ov = s.line_width_mm * s.infill_overlap.clamp(0.0, 0.5);
+        let mut inners: Vec<f64> = mid
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Perimeter)
+            .map(|p| {
+                let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
+                xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+            })
+            .collect();
+        inners.sort_by(|a, b| b.partial_cmp(a).unwrap());
         let outer = span(PathKind::ExternalPerimeter);
-        let inner = span(PathKind::Perimeter);
         assert!((outer - (20.0 - s.line_width_mm)).abs() < 0.02, "outer span {outer}");
         assert!(
-            (outer - inner - 2.0 * sp).abs() < 0.02,
-            "wall gap should be sp={sp:.3}: outer {outer:.3} inner {inner:.3}"
+            (outer - inners[0] - 2.0 * (s.line_width_mm - ov)).abs() < 0.05,
+            "first inner bonds by ov={ov:.3}: outer {outer:.3} inner {:.3}",
+            inners[0]
+        );
+        assert!(
+            (inners[0] - inners[1] - 2.0 * sp).abs() < 0.05,
+            "inner walls step by sp={sp:.3}: {:.3} {:.3}",
+            inners[0],
+            inners[1]
         );
     }
 

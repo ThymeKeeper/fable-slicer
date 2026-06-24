@@ -288,7 +288,21 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            if s.arc_fitting {
+            if let Some(ws) = &path.widths {
+                // Variable-width bead (gap fill): E per segment from the local
+                // width, so the bead tapers continuously. Arc fitting assumes a
+                // constant width, so it's skipped here.
+                let h = layer.height_mm * path.height_scale;
+                let ff = flow_factor(path, s);
+                let mut prev = start;
+                for k in 0..path.points.len() - 1 {
+                    let w = (ws[k] + ws[k + 1]) * 0.5;
+                    let c = config::bead_area_mm2(w, h) / area * ff;
+                    let p = path.points[k + 1];
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feed);
+                    prev = p;
+                }
+            } else if s.arc_fitting {
                 emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
             } else {
                 let mut prev = start;
@@ -442,6 +456,7 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
     match kind {
         PathKind::ExternalPerimeter => s.external_perimeter_speed_mm_s,
         PathKind::Solid => s.solid_speed_mm_s,
+        PathKind::GapFill => s.gap_fill_speed_mm_s,
         // Visible skins share the outer wall's pace: finish over time.
         PathKind::TopSkin | PathKind::BottomSkin => s.external_perimeter_speed_mm_s,
         PathKind::Ironing => s.ironing_speed_mm_s,
@@ -569,6 +584,7 @@ pub fn kind_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "top surface",
         PathKind::BottomSkin => "bottom surface",
         PathKind::Infill => "infill",
+        PathKind::GapFill => "gap fill",
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
@@ -589,6 +605,7 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "Top surface",
         PathKind::BottomSkin => "Bottom surface",
         PathKind::Infill => "Sparse infill",
+        PathKind::GapFill => "Gap infill",
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
         // Arc overhangs report as Bridge: viewers colour-code known names.

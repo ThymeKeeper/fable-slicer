@@ -389,6 +389,7 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::TopSkin => "#ed618c",
             PathKind::BottomSkin => "#9e7333",
             PathKind::Infill => "#e08a2b",
+            PathKind::GapFill => "#d65fb0",
             PathKind::Ironing => "#bcbd22",
             PathKind::Support => "#8c6bb1",
             PathKind::Bridge => "#17becf",

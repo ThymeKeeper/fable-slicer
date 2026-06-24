@@ -356,6 +356,12 @@ pub struct Settings {
     /// Print solid-fill lines in monotonic order (strict sweep across each
     /// region) so top surfaces get an even sheen without overlap ridges.
     pub monotonic_solid: bool,
+    /// Fill gaps too thin for normal infill (between/inside walls) with single
+    /// width-matched strokes. Off by default: the inner walls now trace the
+    /// concentric primitive on an opened region (they pack to the medial and fill
+    /// the seams themselves), so gap fill is only a marginal residual mop-up for
+    /// tight features — usually not worth the extra travel.
+    pub gap_fill: bool,
     /// Jitter external perimeters for a rough "fuzzy" surface texture.
     pub fuzzy_skin: bool,
     /// Total jitter band (mm) for fuzzy skin, centered on the wall line.
@@ -463,6 +469,8 @@ pub struct Settings {
     pub solid_speed_mm_s: f64,
     /// Speed (mm/s) for support structure.
     pub support_speed_mm_s: f64,
+    /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
+    pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for straight bridges (spans anchored on both sides).
     /// Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — each arc
     /// cantilevers off the previous ring, far more delicate than a bridge.
@@ -587,6 +595,7 @@ impl Default for Settings {
             solid_pattern: InfillPattern::default(),
             infill_overlap: 0.25,
             monotonic_solid: true,
+            gap_fill: false,
             fuzzy_skin: false,
             fuzzy_skin_thickness_mm: 0.3,
             fuzzy_skin_point_dist_mm: 0.8,
@@ -629,6 +638,7 @@ impl Default for Settings {
             external_perimeter_speed_mm_s: 25.0,
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
+            gap_fill_speed_mm_s: 20.0,
             bridge_speed_mm_s: 50.0,
             overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
             min_layer_time_s: 8.0,
@@ -721,6 +731,12 @@ pub fn derived_solid_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f6
 /// never past the flow cap.
 pub fn derived_support_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
     (print_speed_mm_s * 0.9).min(flow_cap_mm_s)
+}
+
+/// Auto gap-fill speed: 40% of print speed, capped — gap strokes live in tight
+/// corners where the head is always turning; never past the flow cap.
+pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
+    (print_speed_mm_s * 0.4).min(40.0).min(flow_cap_mm_s)
 }
 
 /// Auto overhang-wall speed: same as bridges — both lay beads onto air.

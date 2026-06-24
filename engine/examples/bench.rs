@@ -8,6 +8,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args.first().map(String::as_str).unwrap_or("fixtures/benchy.stl");
     let mut settings = config::Settings::default();
+    if std::env::var("NO_GAP").is_ok() {
+        settings.gap_fill = false;
+    }
     if args.iter().any(|a| a == "--support") {
         if let Some(i) = args.iter().position(|a| a == "--support") {
             settings.support_mode = config::SupportMode::parse(&args[i + 1]).expect("support mode");

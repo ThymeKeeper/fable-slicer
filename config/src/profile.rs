@@ -185,6 +185,8 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monotonic_solid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_fill: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_skin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_skin_thickness_mm: Option<f64>,
@@ -263,7 +265,7 @@ impl Tier for ProcessProfile {
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm,
-            infill_overlap, monotonic_solid,
+            infill_overlap, monotonic_solid, gap_fill,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
@@ -386,6 +388,7 @@ impl ProcessProfile {
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
             monotonic_solid: diff_field!(cur.monotonic_solid, base.monotonic_solid),
+            gap_fill: diff_field!(cur.gap_fill, base.gap_fill),
             fuzzy_skin: diff_field!(cur.fuzzy_skin, base.fuzzy_skin),
             fuzzy_skin_thickness_mm: diff_field!(cur.fuzzy_skin_thickness_mm, base.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: diff_field!(cur.fuzzy_skin_point_dist_mm, base.fuzzy_skin_point_dist_mm),
@@ -694,6 +697,7 @@ impl Profiles {
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
             infill_overlap: pc.infill_overlap.unwrap_or(d.infill_overlap),
             monotonic_solid: pc.monotonic_solid.unwrap_or(d.monotonic_solid),
+            gap_fill: pc.gap_fill.unwrap_or(d.gap_fill),
             fuzzy_skin: pc.fuzzy_skin.unwrap_or(d.fuzzy_skin),
             fuzzy_skin_thickness_mm: pc.fuzzy_skin_thickness_mm.unwrap_or(d.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: pc.fuzzy_skin_point_dist_mm.unwrap_or(d.fuzzy_skin_point_dist_mm),
@@ -740,6 +744,7 @@ impl Profiles {
             external_perimeter_speed_mm_s: crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap),
             solid_speed_mm_s: crate::derived_solid_speed_mm_s(print_v, flow_cap),
             support_speed_mm_s: crate::derived_support_speed_mm_s(print_v, flow_cap),
+            gap_fill_speed_mm_s: crate::derived_gap_fill_speed_mm_s(print_v, flow_cap),
             bridge_speed_mm_s: d.bridge_speed_mm_s,
             overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(d.bridge_speed_mm_s),
             min_layer_time_s: d.min_layer_time_s,
