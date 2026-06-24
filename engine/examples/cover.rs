@@ -26,31 +26,65 @@ fn main() {
     }
 
     let layers = engine::generate(&mesh, &s);
-    let l = &layers[li.min(layers.len()) - 1];
-    let (area, unc) = engine::debug_uncovered(l, s.line_width_mm);
-    // Over-extrusion: deposited bead volume vs the region volume. ~1.0 = balanced
-    // (stadium overlap fills the cusps); >1.0 = depositing into occupied space.
-    let h = l.height_mm;
-    let mut vol = 0.0;
-    for p in &l.paths {
-        let pts = &p.points;
-        if pts.len() < 2 {
-            continue;
+
+    // Over-extrusion: deposited bead volume vs the region volume. ~1.0 = balanced;
+    // >1.0 = depositing into occupied space.
+    let over_of = |l: &engine::LayerPlan| -> (f64, f64, f64) {
+        let (area, unc) = engine::debug_uncovered(l, s.line_width_mm);
+        let h = l.height_mm;
+        let mut vol = 0.0;
+        for p in &l.paths {
+            let pts = &p.points;
+            // Skirt/support sit outside the part outline (the `area`), so counting
+            // their volume against it would falsely read as over-extrusion.
+            if pts.len() < 2 || matches!(p.kind, engine::PathKind::Skirt | engine::PathKind::Support) {
+                continue;
+            }
+            let bh = h * p.height_scale;
+            let seg_flow = |k: usize| -> f64 { p.flows.as_ref().map_or(1.0, |f| f.get(k).copied().unwrap_or(1.0)) };
+            let seg_w = |k: usize| -> f64 { p.widths.as_ref().map_or(p.width_mm, |ws| (ws[k] + ws[k + 1]) * 0.5) };
+            for k in 0..pts.len() - 1 {
+                let len = (pts[k + 1].x_mm() - pts[k].x_mm()).hypot(pts[k + 1].y_mm() - pts[k].y_mm());
+                vol += config::bead_area_mm2(seg_w(k), bh) * len * seg_flow(k);
+            }
+            if p.closed {
+                let (a, b) = (pts[pts.len() - 1], pts[0]);
+                let len = (b.x_mm() - a.x_mm()).hypot(b.y_mm() - a.y_mm());
+                vol += config::bead_area_mm2(p.width_mm, bh) * len * seg_flow(pts.len() - 1);
+            }
         }
-        let bh = h * p.height_scale;
-        let seg_flow = |k: usize| -> f64 { p.flows.as_ref().map_or(1.0, |f| f.get(k).copied().unwrap_or(1.0)) };
-        let seg_w = |k: usize| -> f64 { p.widths.as_ref().map_or(p.width_mm, |ws| (ws[k] + ws[k + 1]) * 0.5) };
-        for k in 0..pts.len() - 1 {
-            let len = (pts[k + 1].x_mm() - pts[k].x_mm()).hypot(pts[k + 1].y_mm() - pts[k].y_mm());
-            vol += config::bead_area_mm2(seg_w(k), bh) * len * seg_flow(k);
+        (area, unc, vol / (area * h).max(1e-9))
+    };
+
+    if std::env::var("SCAN").is_ok() {
+        // Whole-model scan: report the worst over-extruders and any layer >+2%.
+        let mut worst = (0usize, 0.0f64);
+        let mut over_cnt = 0;
+        for (i, l) in layers.iter().enumerate() {
+            let (_, _, over) = over_of(l);
+            if over > worst.1 {
+                worst = (i + 1, over);
+            }
+            if over > 1.02 {
+                over_cnt += 1;
+                println!("  OVER L{:<3} deposited/region {over:.3} ({:+.0}%)", i + 1, (over - 1.0) * 100.0);
+            }
         }
-        if p.closed {
-            let (a, b) = (pts[pts.len() - 1], pts[0]);
-            let len = (b.x_mm() - a.x_mm()).hypot(b.y_mm() - a.y_mm());
-            vol += config::bead_area_mm2(p.width_mm, bh) * len * seg_flow(pts.len() - 1);
-        }
+        println!(
+            "scan {} layers (walls={}, dens={:.2}, gap={}): {over_cnt} layers over +2%; worst = L{} at {:.3} ({:+.0}%)",
+            layers.len(),
+            s.wall_count,
+            s.infill_density,
+            s.gap_fill,
+            worst.0,
+            worst.1,
+            (worst.1 - 1.0) * 100.0,
+        );
+        return;
     }
-    let over = vol / (area * h);
+
+    let l = &layers[li.min(layers.len()) - 1];
+    let (area, unc, over) = over_of(l);
     println!(
         "L{li}  walls={:<3} dens={:.2} gap={:<5}  outline {area:7.1} mm²  uncovered {unc:6.2} mm² ({:5.2}%)  deposited/region {over:.3} ({:+.0}%)  paths={}",
         s.wall_count,
