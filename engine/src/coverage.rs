@@ -56,45 +56,71 @@ pub(crate) fn uncovered(
 /// (`bead_spacing`), so a normally-spaced fill tiles at count 1 (flow 1) and only
 /// EXCESS overlap (the over-extrusion) is scaled down. One Vec per bead, 1:1 with
 /// its points.
-pub(crate) fn flow_factors(region: &Polygons, beads: &[(Vec<Point>, Vec<f64>)], lw: f64) -> Vec<Vec<f64>> {
+pub(crate) fn flow_factors(
+    region: &Polygons,
+    beads: &[(Vec<Point>, Vec<f64>)],
+    outer: &[bool],
+    lw: f64,
+) -> Vec<Vec<f64>> {
     let beads_ref: Vec<Bead> = beads.iter().map(|(p, w)| (p.as_slice(), w.as_slice())).collect();
     let Some(grid) = Grid::new(region, lw) else {
         return beads.iter().map(|(p, _)| vec![1.0; p.len()]).collect();
     };
     let n = grid.nx * grid.ny;
-    let mut count = vec![0u16; n];
-    let mut last = vec![usize::MAX; n];
+    let inside = grid.rasterize(region);
+    // Outer-wall tiles are LOCKED: those cells belong to the surface bead at full
+    // flow, and the inner beads don't claim them — so reducing overlap never thins
+    // the outer wall. (Edge cells beyond the tile, toward the surface, have no
+    // inner competitor and stay the outer's too.)
+    let mut locked = vec![false; n];
     for (bi, &(pts, widths)) in beads_ref.iter().enumerate() {
-        grid.stamp_count(&mut count, &mut last, bi, pts, widths);
+        if outer.get(bi).copied().unwrap_or(false) {
+            grid.stamp_lock(&mut locked, pts, widths);
+        }
     }
-    // Per-SEGMENT fair share (not per-point): sample 1/count over each segment's
-    // actual capsule footprint — localized, so curves/corners don't pull in
-    // off-segment cells the way a point-centered disk does. `flows[k]` is the flow
-    // for the segment starting at point k (the emitter indexes it that way).
-    beads_ref
-        .iter()
-        .map(|&(pts, widths)| {
-            let n = pts.len();
-            let mut f = vec![1.0; n];
-            for k in 0..n.saturating_sub(1) {
-                let ra = (0.5 * widths.get(k).copied().unwrap_or(lw)).max(grid.cell);
-                let rb = (0.5 * widths.get(k + 1).copied().unwrap_or(lw)).max(grid.cell);
-                f[k] = grid.capsule_mean_inv_count(
-                    &count,
-                    pts[k].x_mm(),
-                    pts[k].y_mm(),
-                    ra,
-                    pts[k + 1].x_mm(),
-                    pts[k + 1].y_mm(),
-                    rb,
-                );
-            }
-            if n >= 2 {
-                f[n - 1] = f[n - 2]; // last point: unused for open paths
-            }
-            f
-        })
-        .collect()
+    // Voronoi territory: assign each unlocked inside cell to its NEAREST inner
+    // bead segment. Each segment then owns a tile-tiling slice of the region, so
+    // every cell is filled by exactly one bead — no double-deposit, no new gap.
+    let mut best = vec![f64::INFINITY; n];
+    let mut owner = vec![u32::MAX; n];
+    let mut seg_ids: Vec<(usize, usize)> = Vec::new();
+    for (bi, &(pts, widths)) in beads_ref.iter().enumerate() {
+        if outer.get(bi).copied().unwrap_or(false) || pts.len() < 2 {
+            continue;
+        }
+        for si in 0..pts.len() - 1 {
+            let fid = seg_ids.len() as u32;
+            seg_ids.push((bi, si));
+            let reach = widths.get(si).copied().unwrap_or(lw).max(widths.get(si + 1).copied().unwrap_or(lw));
+            grid.claim_nearest(&inside, &locked, &mut best, &mut owner, fid, pts[si], pts[si + 1], reach);
+        }
+    }
+    let cell_area = grid.cell * grid.cell;
+    let mut terr = vec![0u32; seg_ids.len()];
+    for k in 0..n {
+        let o = owner[k];
+        if o != u32::MAX {
+            terr[o as usize] += 1;
+        }
+    }
+    // flow = owned area / nominal tile footprint (clamped ≤1: where the territory
+    // is wider than a tile the beads are simply sparse — deposit one bead's worth,
+    // the leftover is a genuine gap, not over-extrusion). `flows[k]` = segment k.
+    let mut out: Vec<Vec<f64>> = beads.iter().map(|(p, _)| vec![1.0; p.len()]).collect();
+    for (fid, &(bi, si)) in seg_ids.iter().enumerate() {
+        let (pts, widths) = &beads[bi];
+        let seg_len = (pts[si + 1].x_mm() - pts[si].x_mm()).hypot(pts[si + 1].y_mm() - pts[si].y_mm());
+        let tile = (widths[si] + widths[si + 1]) * 0.5;
+        let nominal = tile * seg_len;
+        out[bi][si] = if nominal > 1e-9 { (terr[fid] as f64 * cell_area / nominal).min(1.0) } else { 1.0 };
+    }
+    for (bi, f) in out.iter_mut().enumerate() {
+        if !outer.get(bi).copied().unwrap_or(false) && f.len() >= 2 {
+            let l = f.len();
+            f[l - 1] = f[l - 2]; // last point: unused for open paths
+        }
+    }
+    out
 }
 
 fn uncovered_inner(region: &Polygons, beads: &[Bead], lw: f64, min_area_mm2: f64) -> Polygons {
@@ -287,98 +313,75 @@ impl Grid {
         (ix0, iy0, ix1, iy1)
     }
 
-    /// Increment `count` once for every cell this bead's footprint covers (the
-    /// `last`/`bi` guard stops a bead's own overlapping segments double-counting
-    /// at shared vertices). Footprint = swept capsules of the per-vertex widths.
-    fn stamp_count(&self, count: &mut [u16], last: &mut [usize], bi: usize, pts: &[Point], widths: &[f64]) {
-        if pts.is_empty() {
-            return;
-        }
-        if pts.len() == 1 {
-            self.count_disk(count, last, bi, pts[0].x_mm(), pts[0].y_mm(), 0.5 * widths.first().copied().unwrap_or(0.0));
+    /// Mark `locked` true over a bead's tile footprint (swept capsules of the
+    /// per-vertex widths) — used to reserve the outer wall's tile so inner beads
+    /// never claim it.
+    fn stamp_lock(&self, locked: &mut [bool], pts: &[Point], widths: &[f64]) {
+        if pts.len() < 2 {
             return;
         }
         for (i, seg) in pts.windows(2).enumerate() {
             let ra = 0.5 * widths.get(i).copied().unwrap_or(0.0);
             let rb = 0.5 * widths.get(i + 1).copied().unwrap_or(ra * 2.0);
-            self.count_capsule(count, last, bi, seg[0].x_mm(), seg[0].y_mm(), ra, seg[1].x_mm(), seg[1].y_mm(), rb);
-        }
-    }
-
-    fn count_disk(&self, count: &mut [u16], last: &mut [usize], bi: usize, cx: f64, cy: f64, r: f64) {
-        if r <= 0.0 {
-            return;
-        }
-        let r2 = r * r;
-        let (ix0, iy0, ix1, iy1) = self.cell_box(cx - r, cy - r, cx + r, cy + r);
-        for iy in iy0..=iy1 {
-            for ix in ix0..=ix1 {
-                let (x, y) = self.center(ix, iy);
-                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2 {
-                    let k = self.idx(ix, iy);
-                    if last[k] != bi {
-                        count[k] = count[k].saturating_add(1);
-                        last[k] = bi;
+            let rmax = ra.max(rb);
+            if rmax <= 0.0 {
+                continue;
+            }
+            let (ax, ay, bx, by) = (seg[0].x_mm(), seg[0].y_mm(), seg[1].x_mm(), seg[1].y_mm());
+            let (ix0, iy0, ix1, iy1) =
+                self.cell_box(ax.min(bx) - rmax, ay.min(by) - rmax, ax.max(bx) + rmax, ay.max(by) + rmax);
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = dx * dx + dy * dy;
+            for iy in iy0..=iy1 {
+                for ix in ix0..=ix1 {
+                    let (x, y) = self.center(ix, iy);
+                    let t = if len2 <= 1e-18 { 0.0 } else { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) };
+                    let (px, py) = (ax + t * dx, ay + t * dy);
+                    let r = ra + t * (rb - ra);
+                    if (x - px) * (x - px) + (y - py) * (y - py) <= r * r {
+                        locked[self.idx(ix, iy)] = true;
                     }
                 }
             }
         }
     }
 
-    fn count_capsule(&self, count: &mut [u16], last: &mut [usize], bi: usize, ax: f64, ay: f64, ra: f64, bx: f64, by: f64, rb: f64) {
-        let rmax = ra.max(rb);
-        if rmax <= 0.0 {
-            return;
-        }
+    /// Voronoi claim: for every inside, unlocked cell within `reach` of segment
+    /// AB, if AB is the closest segment seen so far, record its `fid` as the
+    /// cell's owner. After all segments run, each cell belongs to its nearest bead.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_nearest(
+        &self,
+        inside: &[bool],
+        locked: &[bool],
+        best: &mut [f64],
+        owner: &mut [u32],
+        fid: u32,
+        a: Point,
+        b: Point,
+        reach: f64,
+    ) {
+        let (ax, ay, bx, by) = (a.x_mm(), a.y_mm(), b.x_mm(), b.y_mm());
         let (ix0, iy0, ix1, iy1) =
-            self.cell_box(ax.min(bx) - rmax, ay.min(by) - rmax, ax.max(bx) + rmax, ay.max(by) + rmax);
+            self.cell_box(ax.min(bx) - reach, ay.min(by) - reach, ax.max(bx) + reach, ay.max(by) + reach);
         let (dx, dy) = (bx - ax, by - ay);
         let len2 = dx * dx + dy * dy;
+        let reach2 = reach * reach;
         for iy in iy0..=iy1 {
             for ix in ix0..=ix1 {
+                let k = self.idx(ix, iy);
+                if !inside[k] || locked[k] {
+                    continue;
+                }
                 let (x, y) = self.center(ix, iy);
                 let t = if len2 <= 1e-18 { 0.0 } else { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) };
                 let (px, py) = (ax + t * dx, ay + t * dy);
-                let r = ra + t * (rb - ra);
-                if (x - px) * (x - px) + (y - py) * (y - py) <= r * r {
-                    let k = self.idx(ix, iy);
-                    if last[k] != bi {
-                        count[k] = count[k].saturating_add(1);
-                        last[k] = bi;
-                    }
+                let d2 = (x - px) * (x - px) + (y - py) * (y - py);
+                if d2 <= reach2 && d2 < best[k] {
+                    best[k] = d2;
+                    owner[k] = fid;
                 }
             }
-        }
-    }
-
-    /// Mean of `1/count` over a capsule (the segment's swept footprint) — the
-    /// segment's fair share of the material where `count` beads overlap.
-    fn capsule_mean_inv_count(&self, count: &[u16], ax: f64, ay: f64, ra: f64, bx: f64, by: f64, rb: f64) -> f64 {
-        let rmax = ra.max(rb);
-        let (ix0, iy0, ix1, iy1) =
-            self.cell_box(ax.min(bx) - rmax, ay.min(by) - rmax, ax.max(bx) + rmax, ay.max(by) + rmax);
-        let (dx, dy) = (bx - ax, by - ay);
-        let len2 = dx * dx + dy * dy;
-        let (mut sum, mut n) = (0.0f64, 0u32);
-        for iy in iy0..=iy1 {
-            for ix in ix0..=ix1 {
-                let (x, y) = self.center(ix, iy);
-                let t = if len2 <= 1e-18 { 0.0 } else { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) };
-                let (px, py) = (ax + t * dx, ay + t * dy);
-                let r = ra + t * (rb - ra);
-                if (x - px) * (x - px) + (y - py) * (y - py) <= r * r {
-                    let c = count[self.idx(ix, iy)];
-                    if c >= 1 {
-                        sum += 1.0 / c as f64;
-                        n += 1;
-                    }
-                }
-            }
-        }
-        if n == 0 {
-            1.0
-        } else {
-            sum / n as f64
         }
     }
 

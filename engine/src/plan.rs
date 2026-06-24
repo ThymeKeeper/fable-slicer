@@ -855,7 +855,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     (pts, tile)
                 })
                 .collect();
-            for (&k, mut f) in idxs.iter().zip(crate::coverage::flow_factors(&layers[i].polygons, &beads, lw)) {
+            // Outer walls keep full flow (their tiles are locked) so the surface
+            // is never thinned.
+            let outer: Vec<bool> = idxs.iter().map(|&k| paths[k].kind == PathKind::ExternalPerimeter).collect();
+            for (&k, mut f) in idxs.iter().zip(crate::coverage::flow_factors(&layers[i].polygons, &beads, &outer, lw)) {
                 if paths[k].closed {
                     f.pop(); // drop the appended closing-point duplicate
                 }
