@@ -84,6 +84,12 @@ pub struct ToolPath {
     /// varies E per segment and the preview renders a variable-width ribbon;
     /// `width_mm` then carries the mean (used for feed/flow/estimates).
     pub widths: Option<Vec<f64>>,
+    /// Per-point extrusion-flow multiplier (≤1), one per `points` entry, for
+    /// overlap compensation: where a bead is packed tighter than it tiles, its E
+    /// is scaled down so each spot gets one bead's worth of plastic (no depositing
+    /// into occupied space). `None` = full flow. The nozzle path/width is
+    /// unchanged — only E is reduced — so the preview still renders full width.
+    pub flows: Option<Vec<f64>>,
 }
 
 impl ToolPath {
@@ -98,6 +104,7 @@ impl ToolPath {
             group: None,
             height_scale: 1.0,
             widths: None,
+            flows: None,
         }
     }
 }
@@ -459,6 +466,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 group: None,
                                 height_scale: hscale,
                                 widths: None,
+                                flows: None,
                             });
                         }
                     }
@@ -806,6 +814,54 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // NOT morphologically close (that truncates the tip).
                 let voids = simplify(&raw_voids, lw * 0.15);
                 emit_gap_fill(&voids, lw, sp, &mut paths);
+            }
+        }
+
+        // Overlap flow compensation: dense concentric walls (and concentric
+        // infill) pack rings tighter than they tile at the converging medial,
+        // depositing into already-filled space (~+10-18% there). Rather than
+        // leave seams or repair with gap fill, scale each bead's E down where it
+        // overlaps: stamp every structural bead at its TILING width
+        // (`bead_spacing`, so normal stadium spacing reads as count 1) into a
+        // coverage-count grid, then give each point `1/count` of the material.
+        // The nozzle path/width is untouched — only E drops — so a spot covered
+        // by K beads still receives exactly one bead's worth.
+        {
+            let lh = layers[i].height_mm;
+            let idxs: Vec<usize> = paths
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p.points.len() >= 2
+                        && !matches!(p.kind, PathKind::Skirt | PathKind::Support | PathKind::Ironing)
+                })
+                .map(|(k, _)| k)
+                .collect();
+            let beads: Vec<(Vec<Point>, Vec<f64>)> = idxs
+                .iter()
+                .map(|&k| {
+                    let p = &paths[k];
+                    let mut pts = p.points.clone();
+                    let mut tile: Vec<f64> = (0..pts.len())
+                        .map(|j| {
+                            let w = p.widths.as_ref().map_or(p.width_mm, |ws| ws[j]);
+                            config::bead_spacing_mm(w, lh)
+                        })
+                        .collect();
+                    if p.closed {
+                        pts.push(pts[0]);
+                        tile.push(tile[0]);
+                    }
+                    (pts, tile)
+                })
+                .collect();
+            for (&k, mut f) in idxs.iter().zip(crate::coverage::flow_factors(&layers[i].polygons, &beads, lw)) {
+                if paths[k].closed {
+                    f.pop(); // drop the appended closing-point duplicate
+                }
+                if f.iter().any(|&x| x < 0.995) {
+                    paths[k].flows = Some(f);
+                }
             }
         }
 
@@ -1175,6 +1231,7 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 group: path.group,
                 height_scale: path.height_scale,
                 widths: path.widths.clone(),
+                flows: path.flows.clone(),
             });
         }
     }

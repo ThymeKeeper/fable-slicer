@@ -28,12 +28,36 @@ fn main() {
     let layers = engine::generate(&mesh, &s);
     let l = &layers[li.min(layers.len()) - 1];
     let (area, unc) = engine::debug_uncovered(l, s.line_width_mm);
+    // Over-extrusion: deposited bead volume vs the region volume. ~1.0 = balanced
+    // (stadium overlap fills the cusps); >1.0 = depositing into occupied space.
+    let h = l.height_mm;
+    let mut vol = 0.0;
+    for p in &l.paths {
+        let pts = &p.points;
+        if pts.len() < 2 {
+            continue;
+        }
+        let bh = h * p.height_scale;
+        let seg_flow = |k: usize| -> f64 { p.flows.as_ref().map_or(1.0, |f| f.get(k).copied().unwrap_or(1.0)) };
+        let seg_w = |k: usize| -> f64 { p.widths.as_ref().map_or(p.width_mm, |ws| (ws[k] + ws[k + 1]) * 0.5) };
+        for k in 0..pts.len() - 1 {
+            let len = (pts[k + 1].x_mm() - pts[k].x_mm()).hypot(pts[k + 1].y_mm() - pts[k].y_mm());
+            vol += config::bead_area_mm2(seg_w(k), bh) * len * seg_flow(k);
+        }
+        if p.closed {
+            let (a, b) = (pts[pts.len() - 1], pts[0]);
+            let len = (b.x_mm() - a.x_mm()).hypot(b.y_mm() - a.y_mm());
+            vol += config::bead_area_mm2(p.width_mm, bh) * len * seg_flow(pts.len() - 1);
+        }
+    }
+    let over = vol / (area * h);
     println!(
-        "L{li}  walls={:<3} dens={:.2} gap={:<5}  outline {area:7.1} mm²  uncovered {unc:6.2} mm²  ({:5.2}%)  paths={}",
+        "L{li}  walls={:<3} dens={:.2} gap={:<5}  outline {area:7.1} mm²  uncovered {unc:6.2} mm² ({:5.2}%)  deposited/region {over:.3} ({:+.0}%)  paths={}",
         s.wall_count,
         s.infill_density,
         s.gap_fill.to_string(),
         unc / area * 100.0,
+        (over - 1.0) * 100.0,
         l.paths.len(),
     );
 }

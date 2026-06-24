@@ -48,6 +48,55 @@ pub(crate) fn uncovered(
     uncovered_inner(region, &beads_ref, lw, min_area_mm2)
 }
 
+/// Per-point extrusion-flow multipliers (≤1) that compensate for beads packed
+/// tighter than they tile: rasterize a per-cell coverage COUNT, then each point's
+/// flow is the mean of `1/count` over its footprint — where K beads overlap a
+/// spot, each contributes 1/K so the spot gets exactly one bead's worth of
+/// plastic (order-independent). **`widths` must be the bead TILING width**
+/// (`bead_spacing`), so a normally-spaced fill tiles at count 1 (flow 1) and only
+/// EXCESS overlap (the over-extrusion) is scaled down. One Vec per bead, 1:1 with
+/// its points.
+pub(crate) fn flow_factors(region: &Polygons, beads: &[(Vec<Point>, Vec<f64>)], lw: f64) -> Vec<Vec<f64>> {
+    let beads_ref: Vec<Bead> = beads.iter().map(|(p, w)| (p.as_slice(), w.as_slice())).collect();
+    let Some(grid) = Grid::new(region, lw) else {
+        return beads.iter().map(|(p, _)| vec![1.0; p.len()]).collect();
+    };
+    let n = grid.nx * grid.ny;
+    let mut count = vec![0u16; n];
+    let mut last = vec![usize::MAX; n];
+    for (bi, &(pts, widths)) in beads_ref.iter().enumerate() {
+        grid.stamp_count(&mut count, &mut last, bi, pts, widths);
+    }
+    // Per-SEGMENT fair share (not per-point): sample 1/count over each segment's
+    // actual capsule footprint — localized, so curves/corners don't pull in
+    // off-segment cells the way a point-centered disk does. `flows[k]` is the flow
+    // for the segment starting at point k (the emitter indexes it that way).
+    beads_ref
+        .iter()
+        .map(|&(pts, widths)| {
+            let n = pts.len();
+            let mut f = vec![1.0; n];
+            for k in 0..n.saturating_sub(1) {
+                let ra = (0.5 * widths.get(k).copied().unwrap_or(lw)).max(grid.cell);
+                let rb = (0.5 * widths.get(k + 1).copied().unwrap_or(lw)).max(grid.cell);
+                f[k] = grid.capsule_mean_inv_count(
+                    &count,
+                    pts[k].x_mm(),
+                    pts[k].y_mm(),
+                    ra,
+                    pts[k + 1].x_mm(),
+                    pts[k + 1].y_mm(),
+                    rb,
+                );
+            }
+            if n >= 2 {
+                f[n - 1] = f[n - 2]; // last point: unused for open paths
+            }
+            f
+        })
+        .collect()
+}
+
 fn uncovered_inner(region: &Polygons, beads: &[Bead], lw: f64, min_area_mm2: f64) -> Polygons {
     let Some(grid) = Grid::new(region, lw) else {
         return Polygons::new();
@@ -236,6 +285,101 @@ impl Grid {
         let ix1 = (to_ix(hi_x).ceil().max(0.0) as usize).min(self.nx - 1);
         let iy1 = (to_iy(hi_y).ceil().max(0.0) as usize).min(self.ny - 1);
         (ix0, iy0, ix1, iy1)
+    }
+
+    /// Increment `count` once for every cell this bead's footprint covers (the
+    /// `last`/`bi` guard stops a bead's own overlapping segments double-counting
+    /// at shared vertices). Footprint = swept capsules of the per-vertex widths.
+    fn stamp_count(&self, count: &mut [u16], last: &mut [usize], bi: usize, pts: &[Point], widths: &[f64]) {
+        if pts.is_empty() {
+            return;
+        }
+        if pts.len() == 1 {
+            self.count_disk(count, last, bi, pts[0].x_mm(), pts[0].y_mm(), 0.5 * widths.first().copied().unwrap_or(0.0));
+            return;
+        }
+        for (i, seg) in pts.windows(2).enumerate() {
+            let ra = 0.5 * widths.get(i).copied().unwrap_or(0.0);
+            let rb = 0.5 * widths.get(i + 1).copied().unwrap_or(ra * 2.0);
+            self.count_capsule(count, last, bi, seg[0].x_mm(), seg[0].y_mm(), ra, seg[1].x_mm(), seg[1].y_mm(), rb);
+        }
+    }
+
+    fn count_disk(&self, count: &mut [u16], last: &mut [usize], bi: usize, cx: f64, cy: f64, r: f64) {
+        if r <= 0.0 {
+            return;
+        }
+        let r2 = r * r;
+        let (ix0, iy0, ix1, iy1) = self.cell_box(cx - r, cy - r, cx + r, cy + r);
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let (x, y) = self.center(ix, iy);
+                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2 {
+                    let k = self.idx(ix, iy);
+                    if last[k] != bi {
+                        count[k] = count[k].saturating_add(1);
+                        last[k] = bi;
+                    }
+                }
+            }
+        }
+    }
+
+    fn count_capsule(&self, count: &mut [u16], last: &mut [usize], bi: usize, ax: f64, ay: f64, ra: f64, bx: f64, by: f64, rb: f64) {
+        let rmax = ra.max(rb);
+        if rmax <= 0.0 {
+            return;
+        }
+        let (ix0, iy0, ix1, iy1) =
+            self.cell_box(ax.min(bx) - rmax, ay.min(by) - rmax, ax.max(bx) + rmax, ay.max(by) + rmax);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let (x, y) = self.center(ix, iy);
+                let t = if len2 <= 1e-18 { 0.0 } else { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) };
+                let (px, py) = (ax + t * dx, ay + t * dy);
+                let r = ra + t * (rb - ra);
+                if (x - px) * (x - px) + (y - py) * (y - py) <= r * r {
+                    let k = self.idx(ix, iy);
+                    if last[k] != bi {
+                        count[k] = count[k].saturating_add(1);
+                        last[k] = bi;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mean of `1/count` over a capsule (the segment's swept footprint) — the
+    /// segment's fair share of the material where `count` beads overlap.
+    fn capsule_mean_inv_count(&self, count: &[u16], ax: f64, ay: f64, ra: f64, bx: f64, by: f64, rb: f64) -> f64 {
+        let rmax = ra.max(rb);
+        let (ix0, iy0, ix1, iy1) =
+            self.cell_box(ax.min(bx) - rmax, ay.min(by) - rmax, ax.max(bx) + rmax, ay.max(by) + rmax);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let (mut sum, mut n) = (0.0f64, 0u32);
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let (x, y) = self.center(ix, iy);
+                let t = if len2 <= 1e-18 { 0.0 } else { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) };
+                let (px, py) = (ax + t * dx, ay + t * dy);
+                let r = ra + t * (rb - ra);
+                if (x - px) * (x - px) + (y - py) * (y - py) <= r * r {
+                    let c = count[self.idx(ix, iy)];
+                    if c >= 1 {
+                        sum += 1.0 / c as f64;
+                        n += 1;
+                    }
+                }
+            }
+        }
+        if n == 0 {
+            1.0
+        } else {
+            sum / n as f64
+        }
     }
 
     /// Flood-fill connected components of the `true` cells, drop the ones below
