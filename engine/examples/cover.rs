@@ -41,16 +41,15 @@ fn main() {
                 continue;
             }
             let bh = h * p.height_scale;
-            let seg_flow = |k: usize| -> f64 { p.flows.as_ref().map_or(1.0, |f| f.get(k).copied().unwrap_or(1.0)) };
             let seg_w = |k: usize| -> f64 { p.widths.as_ref().map_or(p.width_mm, |ws| (ws[k] + ws[k + 1]) * 0.5) };
             for k in 0..pts.len() - 1 {
                 let len = (pts[k + 1].x_mm() - pts[k].x_mm()).hypot(pts[k + 1].y_mm() - pts[k].y_mm());
-                vol += config::bead_area_mm2(seg_w(k), bh) * len * seg_flow(k);
+                vol += config::bead_area_mm2(seg_w(k), bh) * len;
             }
             if p.closed {
                 let (a, b) = (pts[pts.len() - 1], pts[0]);
                 let len = (b.x_mm() - a.x_mm()).hypot(b.y_mm() - a.y_mm());
-                vol += config::bead_area_mm2(p.width_mm, bh) * len * seg_flow(pts.len() - 1);
+                vol += config::bead_area_mm2(p.width_mm, bh) * len;
             }
         }
         (area, unc, vol / (area * h).max(1e-9))

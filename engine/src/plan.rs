@@ -84,12 +84,6 @@ pub struct ToolPath {
     /// varies E per segment and the preview renders a variable-width ribbon;
     /// `width_mm` then carries the mean (used for feed/flow/estimates).
     pub widths: Option<Vec<f64>>,
-    /// Per-point extrusion-flow multiplier (≤1), one per `points` entry, for
-    /// overlap compensation: where a bead is packed tighter than it tiles, its E
-    /// is scaled down so each spot gets one bead's worth of plastic (no depositing
-    /// into occupied space). `None` = full flow. The nozzle path/width is
-    /// unchanged — only E is reduced — so the preview still renders full width.
-    pub flows: Option<Vec<f64>>,
 }
 
 impl ToolPath {
@@ -104,7 +98,6 @@ impl ToolPath {
             group: None,
             height_scale: 1.0,
             widths: None,
-            flows: None,
         }
     }
 }
@@ -375,24 +368,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let core = difference(interior, &surf);
             let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
-            // Inner perimeters trace the SAME concentric primitive as the infill,
-            // so they fill the medial seams a raw per-ring offset of the outline
-            // leaves: inset one bead, morphologically OPEN (erode then dilate by
-            // half a bead) to delete the sub-bead medial slivers, then extend by the
-            // infill overlap. Stepping `inner_region` inward by `sp` (below) yields
-            // densely-nested rings that pack to the medial — measured ~0.6%
-            // uncovered vs ~5.7% for raw offsets, matching concentric infill. The
-            // outer wall is exempt: it hugs the exact outline (opening would round
-            // off surface detail and drop thin features).
-            let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
-            // Simplify away the arc over-sampling the open's round join leaves on
-            // every corner — otherwise each inner ring carries hundreds of stray
-            // points that bloat the g-code (arc fitting would absorb them, but it's
-            // off by default). The tolerance is tiny, so the fill is unchanged.
-            let inner_region = simplify(
-                &offset(&offset(&offset(&offset(interior, -lw), -lw * 0.5), lw * 0.5), ov),
-                lw * 0.1,
-            );
             let mut walls = Vec::new();
             for w in 0..settings.wall_count {
                 let inset = -(lw * 0.5 + w as f64 * sp);
@@ -419,16 +394,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     (0.0, 1.0)
                 };
                 // Outer wall (w == 0) hugs the true outline (or its halves);
-                // inner walls trace the opened `inner_region` via the concentric
-                // primitive (ring `w` at `(w-1)*sp` into it), which fills the
-                // medial seams the raw per-ring offset leaves.
-                // Outer wall (w == 0) hugs the true outline (or its halves); inner
-                // walls step inward through the opened `inner_region` by `sp`.
-                let centers = if w == 0 {
-                    offset(&layer.polygons, inset)
-                } else {
-                    offset(&inner_region, -(lw * 0.5 + (w - 1) as f64 * sp))
-                };
+                // everything deeper offsets from the safe interior core at stadium
+                // spacing. The medial seams these leave are closed by gap fill.
+                let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
                 let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
@@ -466,7 +434,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 group: None,
                                 height_scale: hscale,
                                 widths: None,
-                                flows: None,
                             });
                         }
                     }
@@ -814,57 +781,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // NOT morphologically close (that truncates the tip).
                 let voids = simplify(&raw_voids, lw * 0.15);
                 emit_gap_fill(&voids, lw, sp, &mut paths);
-            }
-        }
-
-        // Overlap flow compensation: dense concentric walls (and concentric
-        // infill) pack rings tighter than they tile at the converging medial,
-        // depositing into already-filled space (~+10-18% there). Rather than
-        // leave seams or repair with gap fill, scale each bead's E down where it
-        // overlaps: stamp every structural bead at its TILING width
-        // (`bead_spacing`, so normal stadium spacing reads as count 1) into a
-        // coverage-count grid, then give each point `1/count` of the material.
-        // The nozzle path/width is untouched — only E drops — so a spot covered
-        // by K beads still receives exactly one bead's worth.
-        {
-            let lh = layers[i].height_mm;
-            let idxs: Vec<usize> = paths
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    p.points.len() >= 2
-                        && !matches!(p.kind, PathKind::Skirt | PathKind::Support | PathKind::Ironing)
-                })
-                .map(|(k, _)| k)
-                .collect();
-            let beads: Vec<(Vec<Point>, Vec<f64>)> = idxs
-                .iter()
-                .map(|&k| {
-                    let p = &paths[k];
-                    let mut pts = p.points.clone();
-                    let mut tile: Vec<f64> = (0..pts.len())
-                        .map(|j| {
-                            let w = p.widths.as_ref().map_or(p.width_mm, |ws| ws[j]);
-                            config::bead_spacing_mm(w, lh)
-                        })
-                        .collect();
-                    if p.closed {
-                        pts.push(pts[0]);
-                        tile.push(tile[0]);
-                    }
-                    (pts, tile)
-                })
-                .collect();
-            // Outer walls keep full flow (their tiles are locked) so the surface
-            // is never thinned.
-            let outer: Vec<bool> = idxs.iter().map(|&k| paths[k].kind == PathKind::ExternalPerimeter).collect();
-            for (&k, mut f) in idxs.iter().zip(crate::coverage::flow_factors(&layers[i].polygons, &beads, &outer, lw)) {
-                if paths[k].closed {
-                    f.pop(); // drop the appended closing-point duplicate
-                }
-                if f.iter().any(|&x| x < 0.995) {
-                    paths[k].flows = Some(f);
-                }
             }
         }
 
@@ -1234,7 +1150,6 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 group: path.group,
                 height_scale: path.height_scale,
                 widths: path.widths.clone(),
-                flows: path.flows.clone(),
             });
         }
     }
@@ -2932,7 +2847,7 @@ mod tests {
         // Classic mode: this pins the exact offset constants (arachne's
         // grid-extracted rings match within a cell — covered in wall::tests).
         let m = Mesh::cube(20.0);
-        let s = Settings { skirt_loops: 0, wall_count: 4, ..Settings::default() };
+        let s = Settings { skirt_loops: 0, ..Settings::default() };
         let layers = generate(&m, &s);
         let mid = &layers[50];
         let span = |kind: PathKind| {
@@ -2941,35 +2856,15 @@ mod tests {
             xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
         };
         // Outer wall centerline stays at lw/2 from the surface (dimensional
-        // accuracy). Inner walls trace the infill's concentric primitive on the
-        // opened+overlap-extended region: the first inner wall bonds to the outer
-        // wall by the infill overlap `ov` (denser than a bare stadium step, which
-        // is what lets the rings pack to the medial), and deeper inner walls then
-        // step inward by one stadium spacing `sp`.
+        // accuracy); the inner wall sits one *stadium spacing* further in, so
+        // its span is smaller by 2·sp, not 2·lw.
         let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
-        let ov = s.line_width_mm * s.infill_overlap.clamp(0.0, 0.5);
-        let mut inners: Vec<f64> = mid
-            .paths
-            .iter()
-            .filter(|p| p.kind == PathKind::Perimeter)
-            .map(|p| {
-                let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
-                xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
-            })
-            .collect();
-        inners.sort_by(|a, b| b.partial_cmp(a).unwrap());
         let outer = span(PathKind::ExternalPerimeter);
+        let inner = span(PathKind::Perimeter);
         assert!((outer - (20.0 - s.line_width_mm)).abs() < 0.02, "outer span {outer}");
         assert!(
-            (outer - inners[0] - 2.0 * (s.line_width_mm - ov)).abs() < 0.05,
-            "first inner bonds by ov={ov:.3}: outer {outer:.3} inner {:.3}",
-            inners[0]
-        );
-        assert!(
-            (inners[0] - inners[1] - 2.0 * sp).abs() < 0.05,
-            "inner walls step by sp={sp:.3}: {:.3} {:.3}",
-            inners[0],
-            inners[1]
+            (outer - inner - 2.0 * sp).abs() < 0.02,
+            "wall gap should be sp={sp:.3}: outer {outer:.3} inner {inner:.3}"
         );
     }
 

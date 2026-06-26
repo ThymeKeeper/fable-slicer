@@ -288,14 +288,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            // Per-segment overlap-compensation flow multiplier (1.0 when absent).
             let n_pts = path.points.len();
-            let seg_flow = |k: usize| -> f64 {
-                match &path.flows {
-                    Some(fs) => fs.get(k).copied().unwrap_or(1.0),
-                    None => 1.0,
-                }
-            };
             if let Some(ws) = &path.widths {
                 // Variable-width bead (gap fill): E per segment from the local
                 // width, so the bead tapers continuously. Arc fitting assumes a
@@ -305,22 +298,22 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 let mut prev = start;
                 for k in 0..n_pts - 1 {
                     let w = (ws[k] + ws[k + 1]) * 0.5;
-                    let c = config::bead_area_mm2(w, h) / area * ff * seg_flow(k);
+                    let c = config::bead_area_mm2(w, h) / area * ff;
                     let p = path.points[k + 1];
                     g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feed);
                     prev = p;
                 }
-            } else if s.arc_fitting && path.flows.is_none() {
+            } else if s.arc_fitting {
                 emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
             } else {
                 let mut prev = start;
                 for k in 0..n_pts - 1 {
                     let p = path.points[k + 1];
-                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * coeff * seg_flow(k), feed);
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * coeff, feed);
                     prev = p;
                 }
                 if path.closed {
-                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff * seg_flow(n_pts - 1), feed);
+                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff, feed);
                 }
             }
             wipe_tail = compute_wipe_tail(path, s.wipe_mm);
