@@ -352,8 +352,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // becomes wall too, instead of a tiny solid pocket breaking the span.
                 // A large flat over-air face (a cabin roof) survives the erosion and
                 // stays surface, so it skins. The split is by width: a lintel erodes
-                // to nothing under a few mm, a roof slab doesn't.
-                let span = wd.min(settings.max_bridge_span_mm * 0.5).max(lw);
+                // to nothing under a few mm, a roof slab doesn't. This cap is a
+                // FIXED few-mm lintel width, NOT tied to max_bridge_span_mm: a wide
+                // ceiling must skin+bridge, even though a tall wall stack (large
+                // `wd`) could nominally "close" it with looping, sagging rings.
+                let span = wd.min(3.0).max(lw);
                 let mut keep = Polygons::new();
                 for isl in islands(&skinnable) {
                     if offset(&isl, -span).is_empty() && !intersection(&isl, &over_air).is_empty() {

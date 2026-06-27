@@ -6,10 +6,34 @@ fn main() {
     let mut s = config::Settings::default();
     s.bottom_layers = std::env::var("BOTTOM").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     s.top_layers = std::env::var("TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    if let Some(w) = std::env::var("WALLS").ok().and_then(|v| v.parse().ok()) { s.wall_count = w; }
+    if let Some(d) = std::env::var("DENSITY").ok().and_then(|v| v.parse().ok()) { s.infill_density = d; }
+    if let Some(h) = std::env::var("LH").ok().and_then(|v| v.parse().ok()) { s.layer_height_mm = h; }
+    if let Some(p) = std::env::var("PATTERN").ok().and_then(|v| config::InfillPattern::parse(&v)) {
+        s.bottom_pattern = p;
+        s.solid_pattern = p;
+    }
     if std::env::var("ARC").is_ok() {
         s.support_mode = config::SupportMode::Arc;
     }
     let layers = engine::generate(&mesh, &s);
+    if let Some(n) = std::env::var("DETAIL").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let l = &layers[n - 1];
+        println!("L{n} z={:.1} — paths by kind (count, total mm):", l.print_z_mm);
+        let mut kinds: std::collections::BTreeMap<String, (usize, f64)> = std::collections::BTreeMap::new();
+        for p in &l.paths {
+            let len: f64 = p.points.windows(2)
+                .map(|w| (w[1].x_mm() - w[0].x_mm()).hypot(w[1].y_mm() - w[0].y_mm()))
+                .sum();
+            let e = kinds.entry(format!("{:?}", p.kind)).or_default();
+            e.0 += 1;
+            e.1 += len;
+        }
+        for (k, (n, mm)) in &kinds {
+            println!("  {k:<18} {n:>4}  {mm:>7.1}mm");
+        }
+        return;
+    }
     let c = |l: &engine::LayerPlan, k: engine::PathKind| l.paths.iter().filter(|p| p.kind == k).count();
     let mut tot = 0;
     for (i, l) in layers.iter().enumerate() {
