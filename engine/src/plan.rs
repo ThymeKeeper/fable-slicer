@@ -567,8 +567,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     }
                     None => continue,
                 };
-                for (kind, seg) in segs {
+                for (kind, mut seg) in segs {
                     if seg.len() >= 2 {
+                        // A bridge strand clipped to the inner perimeter ends OVER the
+                        // hollow, anchored only on a floating ring. Walk each free end
+                        // outward (staying on this layer's solid) until it sits over
+                        // material the layer below supports — so it lands on something.
+                        if kind == PathKind::Bridge {
+                            anchor_bridge_ends(&mut seg, &supported_below, &layers[i].polygons, lw);
+                        }
                         paths.push(ToolPath::new(kind, false, lw, seg));
                     }
                 }
@@ -1153,6 +1160,54 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 height_scale: path.height_scale,
                 widths: path.widths.clone(),
             });
+        }
+    }
+    out
+}
+
+/// Extend a bridge strand's two free ends outward until each sits over material
+/// the layer below supports, so the strand lands on solid instead of floating on
+/// this layer's inner ring. Each end walks along the strand direction, staying on
+/// this layer's `solid`, until it enters `supported` (one extra step for overlap)
+/// or it would run off the layer.
+fn anchor_bridge_ends(seg: &mut [Point], supported: &Polygons, solid: &Polygons, lw: f64) {
+    let n = seg.len();
+    if n < 2 {
+        return;
+    }
+    seg[0] = walk_to_support(seg[0], seg[1], supported, solid, lw);
+    seg[n - 1] = walk_to_support(seg[n - 1], seg[n - 2], supported, solid, lw);
+}
+
+/// Walk `end` away from `inner` in `lw/2` steps (≤ a few mm) until it lands on
+/// `supported`, staying within `solid`; returns the furthest supported (or last
+/// in-solid) point reached.
+fn walk_to_support(end: Point, inner: Point, supported: &Polygons, solid: &Polygons, lw: f64) -> Point {
+    let (ex, ey) = (end.x_mm(), end.y_mm());
+    let (dx, dy) = (ex - inner.x_mm(), ey - inner.y_mm());
+    let len = dx.hypot(dy);
+    if len < 1.0e-6 {
+        return end;
+    }
+    let (ux, uy) = (dx / len, dy / len);
+    let step = lw * 0.5;
+    let steps = (6.0 / step).ceil() as usize; // cap the reach at ~6mm
+    let overlap = lw * 3.0; // once on supported, grip this far onto it
+    let mut out = end;
+    let mut entered: Option<f64> = None;
+    for k in 1..=steps {
+        let d = step * k as f64;
+        let p = Point::from_mm(ex + ux * d, ey + uy * d);
+        if !point_in(solid, p) {
+            break; // ran off this layer's solid
+        }
+        out = p;
+        if point_in(supported, p) {
+            match entered {
+                None => entered = Some(d),
+                Some(d0) if d - d0 >= overlap => break, // gripped enough onto it
+                _ => {}
+            }
         }
     }
     out
