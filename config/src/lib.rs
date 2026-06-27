@@ -412,8 +412,9 @@ pub struct Settings {
     pub support_z_gap_layers: usize,
     /// Dense interface layers at the support top (smoother overhang underside).
     pub support_interface_layers: usize,
-    /// In arc mode, a bridge (supported ≥2 sides) narrower than this (mm) is filled
-    /// with straight bridge lines across the gap; wider ones use arcs.
+    /// A bridge (supported on ≥2 sides) up to this span (mm) is filled with straight
+    /// anchored bridge lines across the gap, in any support mode. Wider gaps fall
+    /// back to arc-fill (arc mode) or the ordered bottom shell (no-support mode).
     pub max_bridge_span_mm: f64,
     /// Max arc-overhang radius (mm); a fan that reaches it re-seeds from its
     /// frontier so arcs stay anchored on recently-printed material (McCulloch).
@@ -617,7 +618,7 @@ impl Default for Settings {
             support_xy_clearance_mm: 0.4,
             support_z_gap_layers: 1,
             support_interface_layers: 2,
-            max_bridge_span_mm: 6.0,
+            max_bridge_span_mm: 18.0,
             max_arc_radius_mm: 40.0,
             arc_seam_overlap_mm: 0.1,
             retract_len_mm: 0.8,
@@ -646,7 +647,7 @@ impl Default for Settings {
             max_volumetric_speed_mm3_s: 15.0,
             max_flow_derate_per_c: 0.3,
             extrusion_multiplier: 1.0,
-            bridge_flow: 1.0,
+            bridge_flow: 0.9,
             pressure_advance: 0.0,
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,

@@ -527,15 +527,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         let mut sparse_region = Polygons::new();
 
         if !inner.is_empty() {
-            // Arc-overhang mode: the flat unsupported part of this layer's interior
-            // is filled with self-supporting arcs instead of normal fill.
-            // No support mode = the user has accepted unsupported areas: leave
-            // overhangs to the normal fill (the bottom shell, ordered below for the
-            // best chance of printing) rather than overriding with auto-bridging.
-            // Only arc mode actively rescues overhangs — bridge anchored straight
-            // spans, else arc-fill.
+            // Unsupported interior, computed in every mode. A span anchored on
+            // both ends (a ceiling enclosed by walls) is reliably bridgeable — it's
+            // correct bottom-surface printing, not a "rescue" — so it bridges
+            // regardless of support mode (below). What's mode-gated is the rescue of
+            // NON-anchored overhangs: arc mode arc-fills them, no-support mode leaves
+            // them to the ordered bottom shell.
             let mut supported_below = Polygons::new();
-            let overhang_region = if i > 0 && settings.support_mode == SupportMode::Arc {
+            let overhang_region = if i > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 supported_below = offset(&layers[i - 1].polygons, allowance);
@@ -2287,26 +2286,25 @@ mod tests {
     }
 
     #[test]
-    fn arc_bridges_anchored_span_none_leaves_it_to_the_shell() {
+    fn anchored_span_bridges_in_every_mode() {
         // A table: slab across two legs with a 4mm air gap between them.
         let mut tris = Vec::new();
         push_box(&mut tris, [0.0, 0.0, 0.0], [4.0, 10.0, 4.0]);
         push_box(&mut tris, [8.0, 0.0, 0.0], [12.0, 10.0, 4.0]);
         push_box(&mut tris, [0.0, 0.0, 4.0], [12.0, 10.0, 6.0]);
         let m = mesh::Mesh::from_triangle_soup(&tris);
-        // No support mode: the user has accepted the unsupported span, so it prints
-        // as ordinary bottom shell — never auto-bridged.
+        // A span anchored on both legs is reliably bridgeable — correct bottom-
+        // surface printing, not a rescue — so it bridges even with no support mode.
         let none = generate(&m, &Settings { skirt_loops: 0, ..Settings::default() });
         let slab = none.iter().find(|p| p.print_z_mm > 4.05).unwrap();
-        assert_eq!(count(slab, PathKind::Bridge), 0, "None must not auto-bridge");
-        assert!(count(slab, PathKind::BottomSkin) > 0, "the span prints as bottom shell");
-        // Arc mode actively rescues overhangs: the anchored gap bridges.
+        assert!(count(slab, PathKind::Bridge) > 0, "anchored span bridges without support mode");
+        // Arc mode bridges the anchored gap too (it never falls through to arc-fill).
         let arc = generate(
             &m,
             &Settings { skirt_loops: 0, support_mode: SupportMode::Arc, ..Settings::default() },
         );
         let slab_arc = arc.iter().find(|p| p.print_z_mm > 4.05).unwrap();
-        assert!(count(slab_arc, PathKind::Bridge) > 0, "arc mode bridges the anchored gap");
+        assert!(count(slab_arc, PathKind::Bridge) > 0, "arc mode bridges the anchored gap too");
     }
 
     fn closed_wall_areas(plan: &LayerPlan) -> Vec<f64> {
