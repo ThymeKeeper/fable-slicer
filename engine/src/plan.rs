@@ -368,6 +368,29 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 Polygons::new()
             };
             let surf = difference(&skinnable, &spannable_air);
+            // An ENCLOSED over-air ceiling (ringed by supported walls) counts as
+            // surface in full, so perimeters stay OFF the whole bridge region and the
+            // sheet spans the entire hollow — anchoring on the supported rim that
+            // rings it, not on floating inner rings grown into it. Gated to enclosed
+            // spans (a cantilever's over-air reaches the part's free edge, so dilating
+            // it leaves the slice — excluded) with bottom shells on.
+            let surf = if layer.index > 0 && settings.bottom_layers > 0 {
+                let allowance =
+                    settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+                let over_air =
+                    difference(&layer.polygons, &offset(&layers[layer.index - 1].polygons, allowance));
+                let mut enclosed = Polygons::new();
+                for isl in islands(&over_air) {
+                    if difference(&offset(&isl, lw), &layer.polygons).is_empty() {
+                        enclosed.contours.extend(isl.contours);
+                    }
+                }
+                // Dilate onto the supported rim so a perimeter-free anchor band rings
+                // the hollow — the sheet's ends land on bare solid, not on rings.
+                union(&surf, &offset(&enclosed, lw * 2.0))
+            } else {
+                surf
+            };
             let core = difference(interior, &surf);
             let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
