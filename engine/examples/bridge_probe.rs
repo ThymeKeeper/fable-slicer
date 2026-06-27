@@ -32,6 +32,15 @@ fn main() {
         for (k, (n, mm)) in &kinds {
             println!("  {k:<18} {n:>4}  {mm:>7.1}mm");
         }
+        let mut bl: Vec<f64> = l.paths.iter()
+            .filter(|p| p.kind == engine::PathKind::Bridge)
+            .map(|p| p.points.windows(2).map(|w| (w[1].x_mm()-w[0].x_mm()).hypot(w[1].y_mm()-w[0].y_mm())).sum())
+            .collect();
+        bl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if !bl.is_empty() {
+            let n = bl.len();
+            println!("  bridge strand lengths (mm): min {:.1}, median {:.1}, max {:.1}", bl[0], bl[n/2], bl[n-1]);
+        }
         return;
     }
     let c = |l: &engine::LayerPlan, k: engine::PathKind| l.paths.iter().filter(|p| p.kind == k).count();
