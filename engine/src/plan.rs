@@ -554,7 +554,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 supported_below = offset(&layers[i - 1].polygons, allowance);
                 let oh = difference(&layers[i].polygons, &supported_below);
                 let oh = offset(&offset(&oh, -lw), lw); // open: drop slivers
-                intersection(&oh, inner)
+                // The hollow + its landing band bridges as one sheet, so the ends sit
+                // on the band (solid the layer below holds up) — a real foothold —
+                // not over air. Inner walls beyond the band are untouched.
+                let ceiling =
+                    enclosed_ceiling_sheet(&layers[i].polygons, &layers[i - 1].polygons, lw, allowance);
+                union(&intersection(&oh, inner), &ceiling)
             } else {
                 Polygons::new()
             };
@@ -1169,41 +1174,29 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
     out
 }
 
-/// The interior (inside the outer wall) of islands that ring an ENCLOSED over-air
-/// hollow large enough to dominate the island. Such a ceiling prints as one bridge
-/// sheet anchored on the outer wall — no inner perimeters boxing it in — so this
-/// region is kept clear of inner walls (Pass 1) and bridged whole (Pass 2). `below`
-/// is the layer underneath; `allowance` is the overhang reach.
+/// For each ENCLOSED over-air hollow (a ceiling hollow ringed by supported walls),
+/// the hollow plus a thin landing band onto the supported rim. The bridge sheet
+/// spans this whole region, so its ends sit on the band — which is over solid the
+/// layer below holds up (a real foothold) — and the band is kept clear of inner
+/// perimeters (Pass 1) so nothing boxes the sheet in. Inner walls beyond the band
+/// are untouched. `below` is the layer underneath; `allowance` the overhang reach.
 fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance: f64) -> Polygons {
     let supported = offset(below, allowance);
     let over_air = difference(layer, &supported);
     if over_air.is_empty() {
         return Polygons::new();
     }
-    // Enclosed hollows only: dilating one stays inside the slice. A cantilever's
-    // over-air reaches the part's free edge, so dilating it leaves the slice.
-    let enclosed: Vec<Polygons> = islands(&over_air)
-        .into_iter()
-        .filter(|h| difference(&offset(h, lw), layer).is_empty())
-        .collect();
-    if enclosed.is_empty() {
-        return Polygons::new();
-    }
     let inside_outer = offset(layer, -lw);
-    let mut sheet = Polygons::new();
-    for isl in islands(&inside_outer) {
-        let isl_area = isl.net_area_mm2();
-        if isl_area <= 0.0 {
-            continue;
-        }
-        let hollow: f64 = enclosed.iter().map(|h| intersection(&isl, h).net_area_mm2()).sum();
-        // The hollow must dominate, so a small embedded pocket (e.g. a debossed
-        // logo on an otherwise solid face) doesn't turn the whole face into bridge.
-        if hollow >= 0.4 * isl_area {
-            sheet.contours.extend(isl.contours);
+    let mut band = Polygons::new();
+    for h in islands(&over_air) {
+        // Enclosed only: dilating the hollow stays inside the slice. A cantilever's
+        // over-air reaches the part's free edge, so dilating it leaves the slice.
+        if difference(&offset(&h, lw), layer).is_empty() {
+            // Hollow + ~2 line-widths onto the supported rim: the landing strip.
+            band = union(&band, &intersection(&offset(&h, lw * 2.0), &inside_outer));
         }
     }
-    sheet
+    band
 }
 
 /// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
