@@ -1192,7 +1192,7 @@ fn walk_to_support(end: Point, inner: Point, supported: &Polygons, solid: &Polyg
     let (ux, uy) = (dx / len, dy / len);
     let step = lw * 0.5;
     let steps = (6.0 / step).ceil() as usize; // cap the reach at ~6mm
-    let overlap = lw * 3.0; // once on supported, grip this far onto it
+    let overlap = lw * 0.5; // once on supported, grip a sliver onto it (anchor bond)
     let mut out = end;
     let mut entered: Option<f64> = None;
     for k in 1..=steps {
