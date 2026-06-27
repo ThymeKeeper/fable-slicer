@@ -2563,6 +2563,8 @@ impl eframe::App for App {
                         "Dense solid layers at the support top for a smoother overhang underside.");
                     hslider(ui, arc, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0), "bridge span mm",
                         "Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
+                    hslider(ui, !vase, egui::Slider::new(&mut s.bridge_foothold_mm, 0.0..=3.0), "bridge foothold mm",
+                        "How far an enclosed-ceiling bridge sheet lands onto the supported rim. Bigger = more solid under the sheet's ends, but inner perimeters start further from the hollow. 0 = no foothold band. Applies in every support mode.");
                     hslider(ui, arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0), "arc radius mm",
                         "Arc mode: max arc-overhang radius before a fan re-seeds.");
                     hslider(ui, arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6), "arc seam overlap mm",
@@ -2644,6 +2646,10 @@ impl eframe::App for App {
                         mf_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
                         "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_flow, 0.3..=2.0), "bridge flow",
+                        "Extrusion multiplier for bridge strands and arc overhangs. <1 thins them so they pull taut over air; >1 fattens them to grip when cooling is poor.");
+                    hslider(ui, true, egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0), "bridge speed mm/s",
+                        "Print speed for bridge strands. Slow lets each strand cool and set before the next is laid.");
                 });
                 tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
                     hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",

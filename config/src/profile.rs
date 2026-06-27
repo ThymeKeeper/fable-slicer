@@ -102,6 +102,12 @@ pub struct FilamentProfile {
     pub fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_fan_speed: Option<f64>,
+    /// Flow multiplier for bridge strands (and arc overhangs). Auto: 1.5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_flow: Option<f64>,
+    /// Print speed (mm/s) for bridge strands. Auto: 10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_flow_derate_per_c: Option<f64>,
     /// Allowable heat-load ceiling (mW/mm², per island) — a material range
@@ -176,6 +182,9 @@ pub struct ProcessProfile {
     pub support_interface_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bridge_span_mm: Option<f64>,
+    /// How far (mm) an enclosed-ceiling bridge lands onto the supported rim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_foothold_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arc_radius_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,7 +257,8 @@ impl Tier for FilamentProfile {
             nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             max_heat_mw_mm2, pressure_advance,
-            fan_speed, bridge_fan_speed, fan_off_layers, aux_fan_speed, exhaust_fan_speed,
+            fan_speed, bridge_fan_speed, bridge_flow, bridge_speed_mm_s,
+            fan_off_layers, aux_fan_speed, exhaust_fan_speed,
             chamber_temp_c)
     }
 }
@@ -264,7 +274,7 @@ impl Tier for ProcessProfile {
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
-            max_bridge_span_mm, max_arc_radius_mm, arc_seam_overlap_mm,
+            max_bridge_span_mm, bridge_foothold_mm, max_arc_radius_mm, arc_seam_overlap_mm,
             infill_overlap, monotonic_solid, gap_fill,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
@@ -340,6 +350,8 @@ impl FilamentProfile {
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
+            bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
+            bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
             aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
             exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
@@ -383,6 +395,7 @@ impl ProcessProfile {
             support_z_gap_layers: diff_field!(cur.support_z_gap_layers, base.support_z_gap_layers),
             support_interface_layers: diff_field!(cur.support_interface_layers, base.support_interface_layers),
             max_bridge_span_mm: diff_field!(cur.max_bridge_span_mm, base.max_bridge_span_mm),
+            bridge_foothold_mm: diff_field!(cur.bridge_foothold_mm, base.bridge_foothold_mm),
             max_arc_radius_mm: diff_field!(cur.max_arc_radius_mm, base.max_arc_radius_mm),
             arc_seam_overlap_mm: diff_field!(cur.arc_seam_overlap_mm, base.arc_seam_overlap_mm),
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
@@ -722,6 +735,7 @@ impl Profiles {
             support_z_gap_layers: pc.support_z_gap_layers.unwrap_or(d.support_z_gap_layers),
             support_interface_layers: pc.support_interface_layers.unwrap_or(d.support_interface_layers),
             max_bridge_span_mm: pc.max_bridge_span_mm.unwrap_or(d.max_bridge_span_mm),
+            bridge_foothold_mm: pc.bridge_foothold_mm.unwrap_or(d.bridge_foothold_mm),
             max_arc_radius_mm: pc.max_arc_radius_mm.unwrap_or(d.max_arc_radius_mm),
             arc_seam_overlap_mm: pc.arc_seam_overlap_mm.unwrap_or(d.arc_seam_overlap_mm),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
@@ -745,14 +759,16 @@ impl Profiles {
             solid_speed_mm_s: crate::derived_solid_speed_mm_s(print_v, flow_cap),
             support_speed_mm_s: crate::derived_support_speed_mm_s(print_v, flow_cap),
             gap_fill_speed_mm_s: crate::derived_gap_fill_speed_mm_s(print_v, flow_cap),
-            bridge_speed_mm_s: d.bridge_speed_mm_s,
-            overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(d.bridge_speed_mm_s),
+            bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
+            overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(
+                fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
+            ),
             min_layer_time_s: d.min_layer_time_s,
             min_print_speed_mm_s: d.min_print_speed_mm_s,
             max_volumetric_speed_mm3_s: max_flow,
             max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
-            bridge_flow: d.bridge_flow,
+            bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
             heat_control: pc.heat_control.unwrap_or(d.heat_control),
             // Material ranges live with the filament; the class supplies
             // them until calibration pins one.

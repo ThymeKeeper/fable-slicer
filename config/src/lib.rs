@@ -504,6 +504,11 @@ pub struct Settings {
     /// body to span and grip when cooling is poor (enclosed chamber) and a lean
     /// strand would curl into vines. 1.0 = nominal.
     pub bridge_flow: f64,
+    /// How far (mm) a bridge sheet over an enclosed ceiling lands onto the
+    /// supported rim — the perimeter-free foothold its ends rest on. Bigger =
+    /// more solid under the bridge ends (sturdier anchor) but the inner
+    /// perimeters start further from the hollow. 0 = no foothold band.
+    pub bridge_foothold_mm: f64,
     /// Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE after the start
     /// g-code when > 0. 0 leaves the printer's configured value untouched.
     pub pressure_advance: f64,
@@ -642,14 +647,15 @@ impl Default for Settings {
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
             gap_fill_speed_mm_s: 20.0,
-            bridge_speed_mm_s: 30.0,
+            bridge_speed_mm_s: 10.0,
             overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             max_volumetric_speed_mm3_s: 15.0,
             max_flow_derate_per_c: 0.3,
             extrusion_multiplier: 1.0,
-            bridge_flow: 1.1,
+            bridge_flow: 1.5,
+            bridge_foothold_mm: 0.9,
             pressure_advance: 0.0,
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,

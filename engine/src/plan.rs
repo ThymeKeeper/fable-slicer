@@ -375,9 +375,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let ceiling = if layer.index > 0 && settings.bottom_layers > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
-                // Carve reach: clears inner perimeters out of the hollow + a ~2-lw
-                // landing band, but keeps the rings beyond it.
-                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance, lw * 2.0)
+                // Carve reach: clears inner perimeters out of the hollow + the
+                // foothold band, but keeps the rings beyond it.
+                let foothold = settings.bridge_foothold_mm;
+                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance, foothold)
             } else {
                 Polygons::new()
             };
@@ -558,14 +559,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let oh = offset(&offset(&oh, -lw), lw); // open: drop slivers
                 // The hollow + its landing band bridges as one sheet, so the ends sit
                 // on solid the layer below holds up (a foothold), not over air. The
-                // bridge reaches one wall-spacing PAST the carve (lw*2) so the strands
-                // just kiss the innermost kept ring, which sits sp beyond the carve.
+                // bridge reaches one wall-spacing PAST the carve (the foothold band)
+                // so the strands just kiss the innermost kept ring, which sits sp
+                // beyond the carve.
                 let ceiling = enclosed_ceiling_sheet(
                     &layers[i].polygons,
                     &layers[i - 1].polygons,
                     lw,
                     allowance,
-                    lw * 2.0 + sp,
+                    settings.bridge_foothold_mm + sp,
                 );
                 union(&intersection(&oh, inner), &ceiling)
             } else {
