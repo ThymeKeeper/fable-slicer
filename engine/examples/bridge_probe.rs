@@ -17,6 +17,10 @@ fn main() {
         s.support_mode = config::SupportMode::Arc;
     }
     let layers = engine::generate(&mesh, &s);
+    if std::env::var("GCODE").is_ok() {
+        print!("{}", engine::to_gcode(&layers, &s));
+        return;
+    }
     if let Some(n) = std::env::var("DETAIL").ok().and_then(|v| v.parse::<usize>().ok()) {
         let l = &layers[n - 1];
         println!("L{n} z={:.1} — paths by kind (count, total mm):", l.print_z_mm);

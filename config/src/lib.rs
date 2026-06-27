@@ -499,8 +499,10 @@ pub struct Settings {
     pub max_flow_derate_per_c: f64,
     /// Global extrusion multiplier (filament-specific flow tuning). 1.0 = nominal.
     pub extrusion_multiplier: f64,
-    /// Flow multiplier for bridges and arc overhangs (slight under-extrusion can
-    /// tighten sagging strands). 1.0 = nominal.
+    /// Flow multiplier for bridges and arc overhangs. <1.0 tightens a strand that
+    /// cools and sets (round-bead, anti-sag); >1.0 gives a fatter strand with the
+    /// body to span and grip when cooling is poor (enclosed chamber) and a lean
+    /// strand would curl into vines. 1.0 = nominal.
     pub bridge_flow: f64,
     /// Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE after the start
     /// g-code when > 0. 0 leaves the printer's configured value untouched.
@@ -647,7 +649,7 @@ impl Default for Settings {
             max_volumetric_speed_mm3_s: 15.0,
             max_flow_derate_per_c: 0.3,
             extrusion_multiplier: 1.0,
-            bridge_flow: 0.8,
+            bridge_flow: 1.1,
             pressure_advance: 0.0,
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,
