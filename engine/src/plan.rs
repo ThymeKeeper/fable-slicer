@@ -368,30 +368,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 Polygons::new()
             };
             let surf = difference(&skinnable, &spannable_air);
-            // An ENCLOSED over-air ceiling (ringed by supported walls) counts as
-            // surface in full, so perimeters stay OFF the whole bridge region and the
-            // sheet spans the entire hollow — anchoring on the supported rim that
-            // rings it, not on floating inner rings grown into it. Gated to enclosed
-            // spans (a cantilever's over-air reaches the part's free edge, so dilating
-            // it leaves the slice — excluded) with bottom shells on.
-            let surf = if layer.index > 0 && settings.bottom_layers > 0 {
+            // An enclosed over-air ceiling (a hollow ringed by supported walls, the
+            // hollow dominating the island) prints as ONE bridge sheet anchored on
+            // the outer wall — no inner perimeters boxing it in. Carve its interior
+            // out of the wall region here; Pass 2 bridges it.
+            let ceiling = if layer.index > 0 && settings.bottom_layers > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
-                let over_air =
-                    difference(&layer.polygons, &offset(&layers[layer.index - 1].polygons, allowance));
-                let mut enclosed = Polygons::new();
-                for isl in islands(&over_air) {
-                    if difference(&offset(&isl, lw), &layer.polygons).is_empty() {
-                        enclosed.contours.extend(isl.contours);
-                    }
-                }
-                // Dilate onto the supported rim so a perimeter-free anchor band rings
-                // the hollow — the sheet's ends land on bare solid, not on rings.
-                union(&surf, &offset(&enclosed, lw * 2.0))
+                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance)
             } else {
-                surf
+                Polygons::new()
             };
-            let core = difference(interior, &surf);
+            let core = difference(&difference(interior, &surf), &ceiling);
             let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
             let interior: &Polygons = &core;
             let mut walls = Vec::new();
@@ -590,15 +578,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     }
                     None => continue,
                 };
-                for (kind, mut seg) in segs {
+                for (kind, seg) in segs {
                     if seg.len() >= 2 {
-                        // A bridge strand clipped to the inner perimeter ends OVER the
-                        // hollow, anchored only on a floating ring. Walk each free end
-                        // outward (staying on this layer's solid) until it sits over
-                        // material the layer below supports — so it lands on something.
-                        if kind == PathKind::Bridge {
-                            anchor_bridge_ends(&mut seg, &supported_below, &layers[i].polygons, lw);
-                        }
                         paths.push(ToolPath::new(kind, false, lw, seg));
                     }
                 }
@@ -1188,52 +1169,41 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
     out
 }
 
-/// Extend a bridge strand's two free ends outward until each sits over material
-/// the layer below supports, so the strand lands on solid instead of floating on
-/// this layer's inner ring. Each end walks along the strand direction, staying on
-/// this layer's `solid`, until it enters `supported` (one extra step for overlap)
-/// or it would run off the layer.
-fn anchor_bridge_ends(seg: &mut [Point], supported: &Polygons, solid: &Polygons, lw: f64) {
-    let n = seg.len();
-    if n < 2 {
-        return;
+/// The interior (inside the outer wall) of islands that ring an ENCLOSED over-air
+/// hollow large enough to dominate the island. Such a ceiling prints as one bridge
+/// sheet anchored on the outer wall — no inner perimeters boxing it in — so this
+/// region is kept clear of inner walls (Pass 1) and bridged whole (Pass 2). `below`
+/// is the layer underneath; `allowance` is the overhang reach.
+fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance: f64) -> Polygons {
+    let supported = offset(below, allowance);
+    let over_air = difference(layer, &supported);
+    if over_air.is_empty() {
+        return Polygons::new();
     }
-    seg[0] = walk_to_support(seg[0], seg[1], supported, solid, lw);
-    seg[n - 1] = walk_to_support(seg[n - 1], seg[n - 2], supported, solid, lw);
-}
-
-/// Walk `end` away from `inner` in `lw/2` steps (≤ a few mm) until it lands on
-/// `supported`, staying within `solid`; returns the furthest supported (or last
-/// in-solid) point reached.
-fn walk_to_support(end: Point, inner: Point, supported: &Polygons, solid: &Polygons, lw: f64) -> Point {
-    let (ex, ey) = (end.x_mm(), end.y_mm());
-    let (dx, dy) = (ex - inner.x_mm(), ey - inner.y_mm());
-    let len = dx.hypot(dy);
-    if len < 1.0e-6 {
-        return end;
+    // Enclosed hollows only: dilating one stays inside the slice. A cantilever's
+    // over-air reaches the part's free edge, so dilating it leaves the slice.
+    let enclosed: Vec<Polygons> = islands(&over_air)
+        .into_iter()
+        .filter(|h| difference(&offset(h, lw), layer).is_empty())
+        .collect();
+    if enclosed.is_empty() {
+        return Polygons::new();
     }
-    let (ux, uy) = (dx / len, dy / len);
-    let step = lw * 0.5;
-    let steps = (6.0 / step).ceil() as usize; // cap the reach at ~6mm
-    let overlap = lw * 0.5; // once on supported, grip a sliver onto it (anchor bond)
-    let mut out = end;
-    let mut entered: Option<f64> = None;
-    for k in 1..=steps {
-        let d = step * k as f64;
-        let p = Point::from_mm(ex + ux * d, ey + uy * d);
-        if !point_in(solid, p) {
-            break; // ran off this layer's solid
+    let inside_outer = offset(layer, -lw);
+    let mut sheet = Polygons::new();
+    for isl in islands(&inside_outer) {
+        let isl_area = isl.net_area_mm2();
+        if isl_area <= 0.0 {
+            continue;
         }
-        out = p;
-        if point_in(supported, p) {
-            match entered {
-                None => entered = Some(d),
-                Some(d0) if d - d0 >= overlap => break, // gripped enough onto it
-                _ => {}
-            }
+        let hollow: f64 = enclosed.iter().map(|h| intersection(&isl, h).net_area_mm2()).sum();
+        // The hollow must dominate, so a small embedded pocket (e.g. a debossed
+        // logo on an otherwise solid face) doesn't turn the whole face into bridge.
+        if hollow >= 0.4 * isl_area {
+            sheet.contours.extend(isl.contours);
         }
     }
-    out
+    sheet
 }
 
 /// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
