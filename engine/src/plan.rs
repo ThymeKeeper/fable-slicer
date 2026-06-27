@@ -375,7 +375,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let ceiling = if layer.index > 0 && settings.bottom_layers > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
-                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance)
+                // Carve reach: clears inner perimeters out of the hollow + a ~2-lw
+                // landing band, but keeps the rings beyond it.
+                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance, lw * 2.0)
             } else {
                 Polygons::new()
             };
@@ -555,10 +557,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let oh = difference(&layers[i].polygons, &supported_below);
                 let oh = offset(&offset(&oh, -lw), lw); // open: drop slivers
                 // The hollow + its landing band bridges as one sheet, so the ends sit
-                // on the band (solid the layer below holds up) — a real foothold —
-                // not over air. Inner walls beyond the band are untouched.
-                let ceiling =
-                    enclosed_ceiling_sheet(&layers[i].polygons, &layers[i - 1].polygons, lw, allowance);
+                // on solid the layer below holds up (a foothold), not over air. The
+                // bridge reaches one wall-spacing PAST the carve (lw*2) so the strands
+                // just kiss the innermost kept ring, which sits sp beyond the carve.
+                let ceiling = enclosed_ceiling_sheet(
+                    &layers[i].polygons,
+                    &layers[i - 1].polygons,
+                    lw,
+                    allowance,
+                    lw * 2.0 + sp,
+                );
                 union(&intersection(&oh, inner), &ceiling)
             } else {
                 Polygons::new()
@@ -1180,7 +1188,7 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
 /// layer below holds up (a real foothold) — and the band is kept clear of inner
 /// perimeters (Pass 1) so nothing boxes the sheet in. Inner walls beyond the band
 /// are untouched. `below` is the layer underneath; `allowance` the overhang reach.
-fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance: f64) -> Polygons {
+fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance: f64, reach: f64) -> Polygons {
     let supported = offset(below, allowance);
     let over_air = difference(layer, &supported);
     if over_air.is_empty() {
@@ -1192,8 +1200,7 @@ fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance
         // Enclosed only: dilating the hollow stays inside the slice. A cantilever's
         // over-air reaches the part's free edge, so dilating it leaves the slice.
         if difference(&offset(&h, lw), layer).is_empty() {
-            // Hollow + ~2 line-widths onto the supported rim: the landing strip.
-            band = union(&band, &intersection(&offset(&h, lw * 2.0), &inside_outer));
+            band = union(&band, &intersection(&offset(&h, reach), &inside_outer));
         }
     }
     band
