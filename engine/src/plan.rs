@@ -1365,11 +1365,26 @@ fn order_layers(plans: &mut [LayerPlan]) {
             if group.is_empty() {
                 continue;
             }
-            let ordered = order_paths(group, cur);
-            if let Some(last) = ordered.last() {
-                cur = path_end(last);
+            // Walls before fill: a bridge or solid must anchor on perimeters
+            // already laid THIS layer — a bridge strand whose ends sit on the inner
+            // rim (not the layer below) has nothing to grab if its perimeter prints
+            // afterwards, and flails. Order the wall block first, then the fill.
+            let (walls, fill): (Vec<_>, Vec<_>) = group.into_iter().partition(|p| {
+                matches!(
+                    p.kind,
+                    PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
+                )
+            });
+            for sub in [walls, fill] {
+                if sub.is_empty() {
+                    continue;
+                }
+                let ordered = order_paths(sub, cur);
+                if let Some(last) = ordered.last() {
+                    cur = path_end(last);
+                }
+                paths.extend(ordered);
             }
-            paths.extend(ordered);
         }
         if let Some(last) = iron.last() {
             cur = path_end(last);
