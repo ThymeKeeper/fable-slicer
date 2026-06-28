@@ -80,6 +80,10 @@ pub struct ToolPath {
     /// varies E per segment and the preview renders a variable-width ribbon;
     /// `width_mm` then carries the mean (used for feed/flow/estimates).
     pub widths: Option<Vec<f64>>,
+    /// How unsupported this path's bead is — 0 = fully on solid below, 1 = fully
+    /// over air — set on graduated overhang-wall runs. Drives a per-run speed lerp
+    /// from the wall speed down to the overhang floor. 0 for everything else.
+    pub overhang: f32,
 }
 
 impl ToolPath {
@@ -94,6 +98,7 @@ impl ToolPath {
             group: None,
             height_scale: 1.0,
             widths: None,
+            overhang: 0.0,
         }
     }
 }
@@ -447,6 +452,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 group: None,
                                 height_scale: hscale,
                                 widths: None,
+                                overhang: 0.0,
                             });
                         }
                     }
@@ -488,7 +494,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 if unsupported.is_empty() {
                     walls
                 } else {
-                    slow_overhanging_walls(walls, &unsupported, lw)
+                    slow_overhanging_walls(walls, &below, lw)
                 }
             } else {
                 walls
@@ -1074,8 +1080,24 @@ fn in_polys(polys: &Polygons, p: Point) -> bool {
 /// Loops are split into consecutive open pieces (no travel in between), with
 /// runs shorter than ~2 line widths merged into their neighbour so the speed
 /// doesn't chatter at classification borders.
-fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64) -> Vec<ToolPath> {
+fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Vec<ToolPath> {
     let min_run_mm = lw * 2.0;
+    // Outward bands by how far a segment sits OUTSIDE the support below: inside
+    // `below` (a supported or vertical wall) = 0; within half a line width out =
+    // mild; within a full width = steep; beyond = fully airborne. Two offsets.
+    let near = offset(below, lw * 0.5);
+    let far = offset(below, lw);
+    let degree_at = |p: Point| -> f32 {
+        if in_polys(below, p) {
+            0.0
+        } else if in_polys(&near, p) {
+            0.34
+        } else if in_polys(&far, p) {
+            0.67
+        } else {
+            1.0
+        }
+    };
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
         if !matches!(path.kind, PathKind::ExternalPerimeter | PathKind::Perimeter) || path.points.len() < 2 {
@@ -1084,45 +1106,45 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
         }
         let n = path.points.len();
         let segs = if path.closed { n } else { n - 1 };
-        let class: Vec<bool> = (0..segs)
+        let deg: Vec<f32> = (0..segs)
             .map(|k| {
                 let a = path.points[k];
                 let b = path.points[(k + 1) % n];
-                in_polys(unsupported, Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
+                degree_at(Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
             })
             .collect();
-        if class.iter().all(|&c| !c) {
-            out.push(path);
-            continue;
-        }
-        if class.iter().all(|&c| c) {
+        // All one band: keep the path whole (band 0 = as-is, else overhang).
+        let d0 = deg[0];
+        if deg.iter().all(|&d| d == d0) {
             let mut p = path;
-            p.kind = PathKind::OverhangWall;
+            if d0 > 0.0 {
+                p.kind = PathKind::OverhangWall;
+                p.overhang = d0;
+            }
             out.push(p);
             continue;
         }
-        // Mixed: gather maximal runs (cyclic for loops), starting at a border.
+        // Mixed: gather maximal same-band runs (cyclic for loops), at a border.
         let seg_len = |k: usize| pt_dist_mm(path.points[k], path.points[(k + 1) % n]);
         let start = if path.closed {
-            (0..segs).find(|&k| class[(k + segs - 1) % segs] != class[k]).unwrap_or(0)
+            (0..segs).find(|&k| deg[(k + segs - 1) % segs] != deg[k]).unwrap_or(0)
         } else {
             0
         };
-        let mut runs: Vec<(bool, Vec<usize>, f64)> = Vec::new();
+        let mut runs: Vec<(f32, Vec<usize>, f64)> = Vec::new();
         for i in 0..segs {
             let k = (start + i) % segs;
             let len = seg_len(k);
             match runs.last_mut() {
-                Some((c, idxs, l)) if *c == class[k] => {
+                Some((c, idxs, l)) if *c == deg[k] => {
                     idxs.push(k);
                     *l += len;
                 }
-                _ => runs.push((class[k], vec![k], len)),
+                _ => runs.push((deg[k], vec![k], len)),
             }
         }
-        // Dissolve sub-threshold runs into the previous one (the previous run
-        // is always sound: it either met the threshold or absorbed others).
-        let mut merged: Vec<(bool, Vec<usize>, f64)> = Vec::new();
+        // Dissolve sub-threshold runs into the previous (sound) one.
+        let mut merged: Vec<(f32, Vec<usize>, f64)> = Vec::new();
         for run in runs {
             match merged.last_mut() {
                 Some((c, idxs, l)) if *c == run.0 || run.2 < min_run_mm => {
@@ -1141,22 +1163,23 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
         }
         if merged.len() == 1 {
             let mut p = path;
-            if merged[0].0 {
+            if merged[0].0 > 0.0 {
                 p.kind = PathKind::OverhangWall;
+                p.overhang = merged[0].0;
             }
             out.push(p);
             continue;
         }
-        for (over, idxs, _) in merged {
+        for (deg_run, idxs, _) in merged {
             // Segment indices are consecutive (mod n): the piece's points run
             // from the first segment's start to the last segment's end.
             let first = idxs[0];
             let count = idxs.len();
             let mut points = Vec::with_capacity(count + 1);
             for j in 0..=count {
-                let idx = (first + j) % n;
-                points.push(path.points[idx]);
+                points.push(path.points[(first + j) % n]);
             }
+            let over = deg_run > 0.0;
             out.push(ToolPath {
                 kind: if over { PathKind::OverhangWall } else { path.kind },
                 closed: false,
@@ -1167,6 +1190,7 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, unsupported: &Polygons, lw: f64)
                 group: path.group,
                 height_scale: path.height_scale,
                 widths: path.widths.clone(),
+                overhang: if over { deg_run } else { 0.0 },
             });
         }
     }

@@ -450,7 +450,7 @@ fn substitute(template: &str, s: &Settings) -> String {
 }
 
 /// The configured speed (mm/s) for a feature, before any limits.
-fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
+fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Settings) -> f64 {
     if layer_index == 0 {
         return s.first_layer_speed_mm_s; // first layer is slow everywhere
     }
@@ -474,8 +474,14 @@ fn nominal_speed_mm_s(kind: PathKind, layer_index: usize, s: &Settings) -> f64 {
             let ratio = (s.max_bridge_span_mm / cell).max(1.0);
             (s.bridge_speed_mm_s * ratio).min(s.solid_speed_mm_s)
         }
-        // Wall stretches past the layer below: same physics as bridges.
-        PathKind::OverhangWall => s.overhang_speed_mm_s,
+        // Wall stretches past the layer below slow by how far they overhang:
+        // graduated from the outer-wall pace (a barely-unsupported bead) down to
+        // the overhang floor (bridge speed) when the bead is fully airborne.
+        PathKind::OverhangWall => {
+            let ceiling = s.external_perimeter_speed_mm_s;
+            let floor = s.overhang_speed_mm_s;
+            ceiling + (floor - ceiling) * overhang as f64
+        }
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
         PathKind::Skirt | PathKind::Perimeter | PathKind::Infill => s.print_speed_mm_s,
     }
@@ -529,7 +535,7 @@ fn feed_for(
     flow_cap_mm3_s: f64,
     s: &Settings,
 ) -> f64 {
-    let mut v = nominal_speed_mm_s(path.kind, layer_index, s);
+    let mut v = nominal_speed_mm_s(path.kind, path.overhang, layer_index, s);
     if flow_cap_mm3_s > 0.0 {
         let mm3_per_mm =
             config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s);
@@ -555,7 +561,7 @@ pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f
             if path.points.len() < 2 {
                 continue;
             }
-            let nominal = nominal_speed_mm_s(path.kind, layer.index, s);
+            let nominal = nominal_speed_mm_s(path.kind, path.overhang, layer.index, s);
             let clamped = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0;
             if clamped < nominal - 1.0e-6 {
                 worst
