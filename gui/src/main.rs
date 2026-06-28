@@ -2490,6 +2490,9 @@ impl eframe::App for App {
                     hslider_lockout(ui, !vase, egui::Slider::new(&mut s.wall_count, 0..=99), "walls",
                         "Number of perimeter loops (shell wall thickness). 0 = infill only, no perimeters.",
                         "Spiral vase forces a single wall.");
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.outer_wall_first, "outer wall first"))
+                        .on_hover_text("Print each island's outer wall before its inner walls — crisper overhang edges. Off (default): inner walls first, outer wall last, for the best flat-surface finish.")
+                        .on_disabled_hover_text("Spiral vase prints a single wall.");
                     hslider_lockout(ui, !vase, egui::Slider::new(&mut s.top_layers, 0..=10), "top layers",
                         "Number of solid layers on top surfaces.",
                         "Spiral vase prints no top shells.");

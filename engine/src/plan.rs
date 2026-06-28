@@ -858,7 +858,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
 
     add_supports(&mut plans, &layers, settings);
-    order_layers(&mut plans);
+    order_layers(&mut plans, settings.outer_wall_first);
     order_unsupported_rings_outer_in(&mut plans, &layers, settings);
     center_on_bed(&mut plans, mesh, settings);
     if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
@@ -1379,7 +1379,7 @@ fn resample_thick(pts: &[Point], ws: &[f64], step_mm: f64) -> (Vec<Point>, Vec<f
 /// skirt/brim first and ironing last (it must run over the finished surface).
 /// Open paths may be reversed to start at the nearer end; runs of `no_reorder`
 /// paths (monotonic fill) move as one block.
-fn order_layers(plans: &mut [LayerPlan]) {
+fn order_layers(plans: &mut [LayerPlan], outer_first: bool) {
     let mut cur = Point::new(0, 0);
     for plan in plans.iter_mut() {
         let all = std::mem::take(&mut plan.paths);
@@ -1414,15 +1414,18 @@ fn order_layers(plans: &mut [LayerPlan]) {
                     PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
                 )
             });
-            for sub in [walls, fill] {
-                if sub.is_empty() {
-                    continue;
-                }
-                let ordered = order_paths(sub, cur);
-                if let Some(last) = ordered.last() {
+            // Walls: explicit outer-vs-inner sequence per island. Fill: greedy travel.
+            let walls = order_walls(walls, cur, outer_first);
+            if let Some(last) = walls.last() {
+                cur = path_end(last);
+            }
+            paths.extend(walls);
+            if !fill.is_empty() {
+                let fill = order_paths(fill, cur);
+                if let Some(last) = fill.last() {
                     cur = path_end(last);
                 }
-                paths.extend(ordered);
+                paths.extend(fill);
             }
         }
         if let Some(last) = iron.last() {
@@ -1598,6 +1601,118 @@ fn order_paths(remaining: Vec<ToolPath>, start: Point) -> Vec<ToolPath> {
         out.extend(b);
     }
     out
+}
+
+/// Order a layer's wall paths so each material island's external perimeter prints
+/// contiguously with its own inner walls — outer wall LAST (default: it lands on
+/// solid inner backing, the crispest flat surface) or FIRST (`outer_first`: better
+/// overhang edges). Greedy travel still picks island order and the route within
+/// each sub-group; this only pins the outer-vs-inner sequence, which pure travel
+/// ordering otherwise leaves arbitrary (the cause of inconsistent surfaces).
+fn order_walls(walls: Vec<ToolPath>, start: Point, outer_first: bool) -> Vec<ToolPath> {
+    if walls.len() < 2 {
+        return walls;
+    }
+    // Cluster each wall with the largest-area external perimeter whose loop holds
+    // its centroid: an island's outer wall, its hole walls, and the inner walls
+    // between them share one cluster, so the outer wall lands with its OWN inners,
+    // not another island's. A wall under no external falls in its own bucket.
+    let ext: Vec<usize> = (0..walls.len())
+        .filter(|&i| walls[i].kind == PathKind::ExternalPerimeter)
+        .collect();
+    let ext_area: Vec<f64> = ext.iter().map(|&i| loop_area_mm2(&walls[i].points)).collect();
+    let keys: Vec<usize> = walls
+        .iter()
+        .map(|p| {
+            let c = loop_centroid(&p.points);
+            let mut key = usize::MAX;
+            let mut best = -1.0;
+            for (k, &ei) in ext.iter().enumerate() {
+                if ext_area[k] > best && loop_contains(&walls[ei].points, c) {
+                    best = ext_area[k];
+                    key = k;
+                }
+            }
+            key
+        })
+        .collect();
+    let mut by_cluster: std::collections::BTreeMap<usize, Vec<ToolPath>> = std::collections::BTreeMap::new();
+    for (w, k) in walls.into_iter().zip(keys) {
+        by_cluster.entry(k).or_default().push(w);
+    }
+    let mut clusters: Vec<Vec<ToolPath>> = by_cluster.into_values().collect();
+    // Visit clusters greedily by travel; emit each one's walls in the chosen order.
+    let mut cur = start;
+    let mut out = Vec::with_capacity(clusters.iter().map(Vec::len).sum());
+    while !clusters.is_empty() {
+        let pick = (0..clusters.len())
+            .min_by_key(|&i| {
+                clusters[i].iter().map(|p| dist2(cur, p.points[0])).min().unwrap_or(i128::MAX)
+            })
+            .unwrap();
+        let (exts, inners): (Vec<_>, Vec<_>) = clusters
+            .swap_remove(pick)
+            .into_iter()
+            .partition(|p| p.kind == PathKind::ExternalPerimeter);
+        let seq = if outer_first { [exts, inners] } else { [inners, exts] };
+        for sub in seq {
+            if sub.is_empty() {
+                continue;
+            }
+            let ordered = order_paths(sub, cur);
+            if let Some(last) = ordered.last() {
+                cur = path_end(last);
+            }
+            out.extend(ordered);
+        }
+    }
+    out
+}
+
+/// Vertex-average centroid of a loop — a representative interior point.
+fn loop_centroid(pts: &[Point]) -> Point {
+    if pts.is_empty() {
+        return Point::new(0, 0);
+    }
+    let (sx, sy) = pts.iter().fold((0.0, 0.0), |(ax, ay), p| (ax + p.x_mm(), ay + p.y_mm()));
+    let n = pts.len() as f64;
+    Point::from_mm(sx / n, sy / n)
+}
+
+/// Even-odd point-in-loop test, treating the polyline as closed.
+fn loop_contains(pts: &[Point], p: Point) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+    let (px, py) = (p.x_mm(), p.y_mm());
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (pts[i].x_mm(), pts[i].y_mm());
+        let (xj, yj) = (pts[j].x_mm(), pts[j].y_mm());
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Unsigned area (mm²) of a closed loop.
+fn loop_area_mm2(pts: &[Point]) -> f64 {
+    let m = pts.len();
+    if m < 3 {
+        return 0.0;
+    }
+    (0..m)
+        .map(|j| {
+            let (a, b) = (pts[j], pts[(j + 1) % m]);
+            a.x_mm() * b.y_mm() - b.x_mm() * a.y_mm()
+        })
+        .sum::<f64>()
+        .abs()
+        * 0.5
 }
 
 fn path_end(p: &ToolPath) -> Point {

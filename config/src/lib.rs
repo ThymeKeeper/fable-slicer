@@ -324,6 +324,10 @@ pub struct Settings {
     /// Max deviation (mm) a point may have from a fitted arc to be folded into it.
     pub arc_tolerance_mm: f64,
     pub wall_count: usize,
+    /// Print each island's outer wall FIRST (before its inner walls) for crisper
+    /// overhang edges, instead of last (inner walls first) — the default, which
+    /// backs the outer wall against solid for the best flat-surface finish.
+    pub outer_wall_first: bool,
     pub top_layers: usize,
     pub bottom_layers: usize,
     /// Print the outer wall as two half-height passes per layer, each sliced at
@@ -579,6 +583,7 @@ impl Default for Settings {
             arc_fitting: false,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
+            outer_wall_first: false,
             half_height_outer_walls: false,
             brick_layers: false,
             top_layers: 4,

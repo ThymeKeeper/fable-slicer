@@ -143,6 +143,8 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wall_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_wall_first: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bottom_layers: Option<usize>,
@@ -265,7 +267,7 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm,
-            arc_fitting, arc_tolerance_mm, wall_count, top_layers, bottom_layers,
+            arc_fitting, arc_tolerance_mm, wall_count, outer_wall_first, top_layers, bottom_layers,
             half_height_outer_walls, brick_layers,
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
@@ -371,6 +373,7 @@ impl ProcessProfile {
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
             arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
             wall_count: diff_field!(cur.wall_count, base.wall_count),
+            outer_wall_first: diff_field!(cur.outer_wall_first, base.outer_wall_first),
             top_layers: diff_field!(cur.top_layers, base.top_layers),
             bottom_layers: diff_field!(cur.bottom_layers, base.bottom_layers),
             half_height_outer_walls: diff_field!(cur.half_height_outer_walls, base.half_height_outer_walls),
@@ -687,6 +690,7 @@ impl Profiles {
             arc_fitting: pc.arc_fitting.unwrap_or(d.arc_fitting),
             arc_tolerance_mm: pc.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
+            outer_wall_first: pc.outer_wall_first.unwrap_or(d.outer_wall_first),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
             half_height_outer_walls: pc
