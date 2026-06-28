@@ -228,19 +228,21 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 }
                 cur_accel = accel;
             }
-            // Bridges and overhanging walls want max cooling; everything else
-            // the layer's normal duty.
-            let airborne = matches!(
-                path.kind,
-                PathKind::Bridge
-                    | PathKind::InternalBridge
-                    | PathKind::OverhangWall
-                    | PathKind::BottomSkin
-            );
-            let want_fan = if airborne && layer.index >= s.fan_off_layers {
-                fan_duty(s.bridge_fan_speed).max(normal_fan)
-            } else {
+            // Cooling by how unsupported the bead is: bridges and bottom skins are
+            // fully airborne (the bridge fan); an overhang wall graduates from the
+            // layer's normal duty up to the bridge fan as its bead goes from barely-
+            // to fully-unsupported; everything else stays at the normal duty.
+            let want_fan = if layer.index < s.fan_off_layers {
                 normal_fan
+            } else {
+                let frac = match path.kind {
+                    PathKind::Bridge | PathKind::InternalBridge | PathKind::BottomSkin => s.bridge_fan_speed,
+                    PathKind::OverhangWall => {
+                        s.fan_speed + (s.bridge_fan_speed - s.fan_speed) * path.overhang as f64
+                    }
+                    _ => s.fan_speed,
+                };
+                fan_duty(frac).max(normal_fan)
             };
             if want_fan != cur_fan {
                 g.fan(want_fan);

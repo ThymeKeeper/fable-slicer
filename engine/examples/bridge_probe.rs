@@ -11,6 +11,7 @@ fn main() {
     if let Some(h) = std::env::var("LH").ok().and_then(|v| v.parse().ok()) { s.layer_height_mm = h; }
     if let Some(f) = std::env::var("FOOTHOLD").ok().and_then(|v| v.parse().ok()) { s.bridge_foothold_mm = f; }
     if std::env::var("OUTER_FIRST").is_ok() { s.outer_wall_first = true; }
+    if let Some(f) = std::env::var("FAN").ok().and_then(|v| v.parse().ok()) { s.fan_speed = f; }
     if let Some(p) = std::env::var("PATTERN").ok().and_then(|v| config::InfillPattern::parse(&v)) {
         s.bottom_pattern = p;
         s.solid_pattern = p;
