@@ -58,6 +58,9 @@ pub fn run(a: &Args) -> Result<(), String> {
     if std::env::var("NO_GAP").is_ok() {
         settings.gap_fill = false;
     }
+    if std::env::var("SUPPORT").is_ok() {
+        settings.support_mode = config::SupportMode::Grid;
+    }
     let layers = engine::generate(&mesh, &settings);
     if layers.is_empty() {
         return Err("slice produced no layers".into());

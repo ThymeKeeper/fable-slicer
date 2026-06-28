@@ -541,6 +541,27 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         let inner = &inner_per_layer[i];
         let ov = lw * settings.infill_overlap.clamp(0.0, 0.5);
         let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
+        // Where the perimeters actually are: the layer minus the wall beads (each
+        // closed wall loop stamped as a dilate−erode annulus of its width). `inner`
+        // stops ~1 bead short of this — the void that rings inset surfaces — so the
+        // solid sheet gaps. `wall_gap` is exactly that ring; the solid fill grows into
+        // it below to reach the walls flush, without disturbing the region split.
+        // ftw: the true region inside the innermost wall — the layer minus the actual
+        // wall beads (each perimeter loop stamped as a dilate−erode annulus of its
+        // width). This is the target each skin line-end is walked out to, per bead, so
+        // it meets the real wall edge (built from the beads, not a layer-offset guess).
+        let ftw = {
+            let mut band = Polygons::new();
+            for wp in &paths {
+                if !wp.closed || wp.points.len() < 3 {
+                    continue;
+                }
+                let mut poly = Polygons::new();
+                poly.contours.push(geo2d::Contour::new(wp.points.clone()));
+                band = union(&band, &difference(&offset(&poly, lw * 0.5), &offset(&poly, -lw * 0.5)));
+            }
+            difference(&layers[i].polygons, &band)
+        };
         // The sparse-infill region, captured for the gap-fill pass below: its
         // intended between-line gaps must be excluded from void detection.
         let mut sparse_region = Polygons::new();
@@ -614,21 +635,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
             sparse_region = sparse.clone();
 
-            // Close the wall↔skin seam. Inner walls offset from `core` starting at
-            // w=1, so the innermost ring stops ~one bead-spacing short of the
-            // surface boundary (nothing hugs that inner edge the way the outer wall
-            // hugs the outline), and the skin insets from the same boundary — a
-            // ~1-line void rings every inset top surface. Grow the skin out into the
-            // wall band so its perimeter loop overlaps the innermost bead and bonds.
-            // Bounded to the band — never past the outer wall, never into sparse — so
-            // it stays a thin seam, not a flood of the whole band.
-            let solid = if settings.wall_count > 0 && !solid.is_empty() {
-                let reach = sp + lw * 0.5;
-                let band = difference(&offset(&layers[i].polygons, -lw), inner);
-                union(&solid, &intersection(&offset(&solid, reach), &band))
-            } else {
-                solid
-            };
+            // No seam-closing and no wall-edge clip on the skin. Its region is already
+            // `inner`, which is bounded by the innermost wall at each location (the
+            // inner walls where solid, the outer wall over a surface — surf_inside).
+            // The full half-bead fill inset below lands the bead on that boundary:
+            // kiss, no overlap. The old seam-closing grew buried Solid into the void
+            // hard against the wall — the darker fill that lapped the perimeters
+            // (images #22/#23); a leftover void is the gap-fill pass's job, not a
+            // reason to flood solid into the wall band.
 
             // Alternate fill direction per layer for cross-hatching; aligned-lines
             // infill instead keeps one orientation every layer, so its globally
@@ -636,21 +650,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let alt_angle = if i % 2 == 0 { 45.0 } else { 135.0 };
             let pat_angle = |pat: InfillPattern| {
                 if pat == InfillPattern::AlignedLines { 45.0 } else { alt_angle }
-            };
-
-            // Internal bridges: where this layer's solid sits on sparse infill
-            // (the first shell layer over the core), the beads span open cells
-            // — print them as bridges, oriented across the sparse lines below
-            // (span = one line spacing), before the rest of the solid fill.
-            let internal_bridge = if i > 0 && settings.infill_density > 0.0 && !solid.is_empty() {
-                let sparse_below =
-                    difference(&inner_per_layer[i - 1], &solid_all_per_layer[i - 1]);
-                let ib = intersection(&solid, &sparse_below);
-                // Open: a band thinner than a line is covered by the solid
-                // loop's bead anyway, and micro-islands aren't worth a pass.
-                offset(&offset(&ib, -lw * 0.5), lw * 0.5)
-            } else {
-                Polygons::new()
             };
 
             if !solid.is_empty() {
@@ -680,66 +679,55 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     (internal, PathKind::Solid, settings.monotonic_solid),
                     (skin_top, PathKind::TopSkin, true),
                 ];
-                // A perimeter loop following each region's boundary (so where
-                // it runs alongside the shell it becomes a clean concentric bead),
-                // then straight-fill only the interior left inside that loop. Thin
-                // solid bands are consumed entirely by the loop — no lone strands.
-                // The loop and the fill both push `ov` into their neighbor so
-                // solid surfaces bond to the walls.
-                for (region, kind, _) in &regions {
-                    // No perimeter loop on top/bottom surfaces — the fill pattern is
-                    // extended out to cover that area instead (a clean monolithic
-                    // skin, no concentric ring). Buried Solid keeps its loop.
-                    if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
-                        continue;
-                    }
-                    let region_loop = offset(region, -(lw * 0.5 - ov * 0.5));
-                    for c in region_loop.contours {
-                        if c.points.len() < 3 {
-                            continue;
-                        }
-                        // Offsetting a dumbbell-shaped region can pinch off
-                        // micro-rings the island rebalance couldn't see; a loop
-                        // shorter than ~4 beads is a dab, not a surface.
-                        let m = c.points.len();
-                        let perim: f64 =
-                            (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
-                        if perim < lw * 4.0 {
-                            continue;
-                        }
-                        let points = place_seam(c.points, settings.seam_mode, i);
-                        paths.push(ToolPath::new(*kind, true, lw, points));
-                    }
-                }
-                let solid_core = offset(&solid, -(0.5 * (lw + sp) - 0.5 * ov));
-                if !internal_bridge.is_empty() {
-                    // Bridge lines run perpendicular to the sparse lines below
-                    // (each free span = one line spacing) and extend half a
-                    // bead into the supported solid around them to anchor.
-                    let below_angle = if (i - 1) % 2 == 0 { 45.0 } else { 135.0 };
-                    let lines_region =
-                        intersection(&offset(&internal_bridge, lw * 0.5), &solid_core);
-                    for seg in infill_lines(&lines_region, below_angle + 90.0, sp, false, 0.5) {
-                        paths.push(ToolPath::new(PathKind::InternalBridge, false, lw, seg));
-                    }
-                }
+                // A wide solid region gets NO concentric perimeter loop: alongside a
+                // wall the loop just doubles the perimeter bead (walls + solid in the
+                // same band, the user's complaint). Its fill pattern extends out to
+                // where the loop would have sat and butts the wall directly — one bead,
+                // then the wall (the fill bead's half-width laps the wall to bond). A
+                // region too thin to line-fill (a narrow solid bar, < ~2 beads) is the
+                // exception: trace it as a single boundary loop, the only way to fill
+                // it — and such a sliver is bounded by its own walls, not doubling one.
                 for (region, kind, monotone) in regions {
                     if region.is_empty() {
                         continue;
                     }
-                    // Top/bottom surfaces have no perimeter loop, so extend the fill
-                    // out to where that loop would have sat (half a bead in) — the
-                    // pattern covers the whole face. Buried Solid insets past its loop.
-                    let fill_inset = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
-                        lw * 0.5 - ov * 0.5
+                    if offset(&region, -lw).is_empty() {
+                        let loop_region = offset(&region, -(lw * 0.5 - ov * 0.5));
+                        for c in loop_region.contours {
+                            if c.points.len() < 3 {
+                                continue;
+                            }
+                            let m = c.points.len();
+                            let perim: f64 =
+                                (0..m).map(|j| pt_dist_mm(c.points[j], c.points[(j + 1) % m])).sum();
+                            if perim >= lw * 4.0 {
+                                let points = place_seam(c.points, settings.seam_mode, i);
+                                paths.push(ToolPath::new(kind, true, lw, points));
+                            }
+                        }
+                        continue;
+                    }
+                    // Extend the solid sheet into the wall gap it borders so it reaches
+                    // the perimeters flush (`inner` stops a bead short, the void ring).
+                    // Grow ONLY into that ring — never into `inner` (the neighbouring
+                    // sparse/solid), so no overlap — and the thin-check above already
+                    // ran on the original region, so this never spawns a loop.
+                    // A surface skin is ringed by walls: grow it into the void it
+                    // borders, then clip to the SMOOTH wall kiss-line (half a bead
+                    // inside the wall edge). Clipping to that smooth line — not eroding
+                    // the jagged grown boundary — lands the sheet's bead flush on the
+                    // perimeters, no gap. Buried solid borders sparse, not walls, so it
+                    // keeps the plain half-bead inset for the kiss there.
+                    // The skin is generated short of the walls, so first bring it close:
+                    // grow it into the void it borders (never into buried infill). Then
+                    // the per-bead pass below walks each line-end the last fraction to
+                    // the wall. Buried solid borders sparse, not walls, so it keeps the
+                    // half-bead inset for a clean kiss there.
+                    let fill = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
+                        let void = difference(&ftw, inner);
+                        union(&region, &intersection(&offset(&region, lw * 1.5), &void))
                     } else {
-                        0.5 * (lw + sp) - 0.5 * ov
-                    };
-                    let core = offset(&region, -fill_inset);
-                    let fill = if internal_bridge.is_empty() {
-                        core
-                    } else {
-                        difference(&core, &internal_bridge)
+                        offset(&region, -lw * 0.5)
                     };
                     if !fill.is_empty() {
                         let pattern = match kind {
@@ -757,20 +745,39 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         } else {
                             monotone
                         };
+                        let n0 = paths.len();
                         fill_region(
                             &fill, pattern, sp, pat_angle(pattern), lw, kind,
                             settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
                         );
+                        // PER-BEAD reach: lengthen each line-end along its OWN direction
+                        // until it meets the wall edge (`ftw`) — the few tenths it needs.
+                        // Ends that border a wall extend; ends facing other infill don't
+                        // move. Applies to every solid kind, not just skins.
+                        extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
                     }
                 }
             }
             if settings.infill_density > 0.0 && !sparse.is_empty() {
                 let spacing = sp / settings.infill_density;
-                let sparse_fill = if ov > 0.0 { offset(&sparse, ov) } else { sparse.clone() };
+                // Grow for the interior bond, then clip to a half-bead inside `inner`
+                // (the infill region's own boundary = the innermost wall edge at each
+                // location) so sparse beads kiss the wall instead of poking across the
+                // inner-wall ring. Interior solid bonds, away from that edge, keep ov.
+                let grown = if ov > 0.0 { offset(&sparse, ov) } else { sparse.clone() };
+                let sparse_fill = if settings.wall_count > 0 {
+                    intersection(&grown, &offset(inner, -lw * 0.5))
+                } else {
+                    grown
+                };
+                let n0 = paths.len();
                 fill_region(
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
+                // Same per-bead reach: sparse lines that run into a wall anchor to it;
+                // those facing other infill don't move.
+                extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
             }
         }
 
@@ -1282,6 +1289,71 @@ fn point_in(polys: &Polygons, p: Point) -> bool {
 
 fn pt_dist_mm(a: Point, b: Point) -> f64 {
     (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm())
+}
+
+/// Lengthen a skin line-end along its OWN direction until it meets the wall edge
+/// (`inside_walls`), so its bead reaches the perimeter — per bead, the few tenths
+/// it needs, no region grow and no extra perimeter. `prev` is the point before the
+/// endpoint (sets the outward direction). If a full `max` step stays inside the
+/// walls, this end faces interior infill (a sparse boundary), so it isn't moved.
+/// Apply `extend_to_wall` to both ends of every open path in `paths` — the
+/// per-bead reach, shared by solid skins, buried solid, and sparse infill.
+fn extend_ends_to_wall(paths: &mut [ToolPath], max: f64, inside_walls: &Polygons) {
+    for p in paths.iter_mut() {
+        if p.closed || p.points.len() < 2 {
+            continue;
+        }
+        let n = p.points.len();
+        p.points[0] = extend_to_wall(p.points[0], p.points[1], max, inside_walls);
+        p.points[n - 1] = extend_to_wall(p.points[n - 1], p.points[n - 2], max, inside_walls);
+    }
+}
+
+fn extend_to_wall(p: Point, prev: Point, max: f64, inside_walls: &Polygons) -> Point {
+    let (px, py, qx, qy) = (p.x_mm(), p.y_mm(), prev.x_mm(), prev.y_mm());
+    let len = (px - qx).hypot(py - qy);
+    if len < 1.0e-6 {
+        return p;
+    }
+    let (dx, dy) = ((px - qx) / len, (py - qy) / len); // outward direction
+    // Only lengthen ends that are genuinely SET BACK inside the walls: if a hair
+    // outward already leaves the region, this end is already at/past the wall —
+    // leave it (extending ends already on the boundary was the overshoot bug).
+    if !point_in(inside_walls, Point::from_mm(px + dx * 0.02, py + dy * 0.02)) {
+        return p;
+    }
+    // The NEAREST boundary crossing along the ray. Taking the nearest (not a
+    // binary search, which goes non-monotonic and converges on the FAR boundary
+    // at a wall with infill on both sides — a cockpit — and punches through) stops
+    // the line at the near wall. Beyond `max` → interior end facing other infill.
+    let mut best = f64::INFINITY;
+    for c in &inside_walls.contours {
+        let m = c.points.len();
+        if m < 2 {
+            continue;
+        }
+        for j in 0..m {
+            let a = c.points[j];
+            let b = c.points[(j + 1) % m];
+            // Ray P+t·D (t>0) vs segment A+s·E (E = B−A, 0≤s≤1).
+            let (ex, ey) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+            let det = dy * ex - dx * ey;
+            if det.abs() < 1.0e-12 {
+                continue; // parallel
+            }
+            let (fx, fy) = (a.x_mm() - px, a.y_mm() - py);
+            let t = (fy * ex - fx * ey) / det;
+            let s = (dx * fy - dy * fx) / det;
+            if t > 1.0e-3 && (0.0..=1.0).contains(&s) && t < best {
+                best = t;
+            }
+        }
+    }
+    if best <= max {
+        Point::from_mm(px + dx * best, py + dy * best)
+    } else {
+        p // nearest wall beyond reach → interior end, leave it
+    }
 }
 
 /// Classic gap fill: trace the medial axis of each sliver the walls + infill
@@ -2565,38 +2637,22 @@ mod tests {
     }
 
     #[test]
-    fn first_solid_layer_over_sparse_bridges() {
-        // In a cube, the first top-shell layer sits on 15% sparse infill: its
-        // interior must print as InternalBridge spans (perpendicular to the
-        // sparse lines below), while the layers above it — supported by that
-        // now-solid layer — must not.
+    fn solid_over_sparse_is_not_internal_bridged() {
+        // Internal bridging was removed (it ate the visible top surface at low
+        // top-layer counts). A solid shell over 15% sparse infill now prints as
+        // ordinary solid / top skin, and no layer internal-bridges.
         let m = mesh::Mesh::cube(20.0);
         let s = Settings { skirt_loops: 0, ..Settings::default() };
         let plans = generate(&m, &s);
-        let n = plans.len();
-        let first_top = plans
-            .iter()
-            .position(|p| count(p, PathKind::InternalBridge) > 0)
-            .expect("some layer bridges over the sparse core");
-        assert_eq!(first_top, n - s.top_layers, "bridges start at the first top-shell layer");
-        for p in &plans[first_top + 1..] {
-            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} re-bridges", p.index);
+        for p in &plans {
+            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} internal-bridges", p.index);
         }
-        // The bottom shells sit on the bed / each other — never bridged.
-        for p in &plans[..first_top] {
-            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} bridges early", p.index);
-        }
-        // The bridged layer still has its solid loop and the bridges carry
-        // real length.
-        let ib_len: f64 = plans[first_top]
-            .paths
-            .iter()
-            .filter(|p| p.kind == PathKind::InternalBridge)
-            .flat_map(|p| p.points.windows(2))
-            .map(|w| pt_dist_mm(w[0], w[1]))
-            .sum();
-        assert!(ib_len > 50.0, "internal bridge length {ib_len:.0}mm");
-        assert!(count(&plans[first_top], PathKind::Solid) > 0, "anchor loop survives");
+        // The first top-shell layer over the sparse core still prints solid.
+        let first_top = plans.len() - s.top_layers;
+        assert!(
+            count(&plans[first_top], PathKind::Solid) + count(&plans[first_top], PathKind::TopSkin) > 0,
+            "first top-shell layer over sparse prints solid, not bridge"
+        );
     }
 
     #[test]
