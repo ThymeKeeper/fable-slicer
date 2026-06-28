@@ -186,10 +186,6 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_foothold_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_arc_radius_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arc_seam_overlap_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub infill_overlap: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monotonic_solid: Option<bool>,
@@ -274,7 +270,7 @@ impl Tier for ProcessProfile {
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
-            max_bridge_span_mm, bridge_foothold_mm, max_arc_radius_mm, arc_seam_overlap_mm,
+            max_bridge_span_mm, bridge_foothold_mm,
             infill_overlap, monotonic_solid, gap_fill,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
@@ -396,8 +392,6 @@ impl ProcessProfile {
             support_interface_layers: diff_field!(cur.support_interface_layers, base.support_interface_layers),
             max_bridge_span_mm: diff_field!(cur.max_bridge_span_mm, base.max_bridge_span_mm),
             bridge_foothold_mm: diff_field!(cur.bridge_foothold_mm, base.bridge_foothold_mm),
-            max_arc_radius_mm: diff_field!(cur.max_arc_radius_mm, base.max_arc_radius_mm),
-            arc_seam_overlap_mm: diff_field!(cur.arc_seam_overlap_mm, base.arc_seam_overlap_mm),
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
             monotonic_solid: diff_field!(cur.monotonic_solid, base.monotonic_solid),
@@ -736,8 +730,6 @@ impl Profiles {
             support_interface_layers: pc.support_interface_layers.unwrap_or(d.support_interface_layers),
             max_bridge_span_mm: pc.max_bridge_span_mm.unwrap_or(d.max_bridge_span_mm),
             bridge_foothold_mm: pc.bridge_foothold_mm.unwrap_or(d.bridge_foothold_mm),
-            max_arc_radius_mm: pc.max_arc_radius_mm.unwrap_or(d.max_arc_radius_mm),
-            arc_seam_overlap_mm: pc.arc_seam_overlap_mm.unwrap_or(d.arc_seam_overlap_mm),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),

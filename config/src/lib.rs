@@ -265,9 +265,6 @@ pub enum SupportMode {
     None,
     /// Normal support structure under overhangs (sparse fill, removable).
     Grid,
-    /// Support-free: fill flat overhangs with self-supporting concentric arcs
-    /// (the "arc overhang" technique); steeper overhangs still get grid support.
-    Arc,
 }
 
 impl SupportMode {
@@ -275,7 +272,6 @@ impl SupportMode {
         match s.to_ascii_lowercase().as_str() {
             "none" | "off" => Some(Self::None),
             "grid" | "normal" | "on" => Some(Self::Grid),
-            "arc" | "arcs" | "arc-overhang" => Some(Self::Arc),
             _ => None,
         }
     }
@@ -283,7 +279,6 @@ impl SupportMode {
         match self {
             Self::None => "none",
             Self::Grid => "grid",
-            Self::Arc => "arc",
         }
     }
 }
@@ -413,15 +408,9 @@ pub struct Settings {
     /// Dense interface layers at the support top (smoother overhang underside).
     pub support_interface_layers: usize,
     /// A bridge (supported on ≥2 sides) up to this span (mm) is filled with straight
-    /// anchored bridge lines across the gap, in any support mode. Wider gaps fall
-    /// back to arc-fill (arc mode) or the ordered bottom shell (no-support mode).
+    /// anchored bridge lines across the gap. Wider gaps fall back to the ordered
+    /// bottom shell.
     pub max_bridge_span_mm: f64,
-    /// Max arc-overhang radius (mm); a fan that reaches it re-seeds from its
-    /// frontier so arcs stay anchored on recently-printed material (McCulloch).
-    pub max_arc_radius_mm: f64,
-    /// How far (mm) arc-overhang fans overlap where they meet (a little helps them
-    /// mesh; too much over-extrudes the seam). Per fan, so the join is ~2× this.
-    pub arc_seam_overlap_mm: f64,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -473,8 +462,6 @@ pub struct Settings {
     /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
     pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for straight bridges (spans anchored on both sides).
-    /// Arc overhangs derive ~30% of this, clamped to 5–15 mm/s — each arc
-    /// cantilevers off the previous ring, far more delicate than a bridge.
     pub bridge_speed_mm_s: f64,
     /// Speed (mm/s) for wall stretches that overhang the layer below by more
     /// than half a bead — slow so the unsupported side cools in place.
@@ -626,8 +613,6 @@ impl Default for Settings {
             support_z_gap_layers: 1,
             support_interface_layers: 2,
             max_bridge_span_mm: 18.0,
-            max_arc_radius_mm: 40.0,
-            arc_seam_overlap_mm: 0.1,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,

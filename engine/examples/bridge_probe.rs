@@ -1,5 +1,5 @@
-//! Per-layer Bridge / ArcOverhang counts, with real bottom/top shells.
-//! Env: BOTTOM, TOP (shell layer counts), ARC (use arc support mode).
+//! Per-layer Bridge counts, with real bottom/top shells.
+//! Env: BOTTOM, TOP (shell layer counts), WALLS, FOOTHOLD, DETAIL=N, GCODE.
 fn main() {
     let stl = std::env::args().nth(1).unwrap_or_else(|| "fixtures/benchy.stl".into());
     let mesh = mesh::Mesh::load_stl(&stl).expect("load stl");
@@ -13,9 +13,6 @@ fn main() {
     if let Some(p) = std::env::var("PATTERN").ok().and_then(|v| config::InfillPattern::parse(&v)) {
         s.bottom_pattern = p;
         s.solid_pattern = p;
-    }
-    if std::env::var("ARC").is_ok() {
-        s.support_mode = config::SupportMode::Arc;
     }
     let layers = engine::generate(&mesh, &s);
     if std::env::var("GCODE").is_ok() {
@@ -51,10 +48,10 @@ fn main() {
     let c = |l: &engine::LayerPlan, k: engine::PathKind| l.paths.iter().filter(|p| p.kind == k).count();
     let mut tot = 0;
     for (i, l) in layers.iter().enumerate() {
-        let (b, a) = (c(l, engine::PathKind::Bridge), c(l, engine::PathKind::ArcOverhang));
+        let b = c(l, engine::PathKind::Bridge);
         tot += b;
-        if b > 0 || a > 0 {
-            println!("L{:<3} z={:5.1}  bridge={b}  arc={a}", i + 1, l.print_z_mm);
+        if b > 0 {
+            println!("L{:<3} z={:5.1}  bridge={b}", i + 1, l.print_z_mm);
         }
     }
     println!("total Bridge paths across model: {tot}");

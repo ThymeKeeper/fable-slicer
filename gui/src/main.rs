@@ -2550,7 +2550,6 @@ impl eframe::App for App {
                             .on_disabled_hover_text("Forced off in spiral vase mode.");
                     });
                     let has_support = s.support_mode != config::SupportMode::None && !vase;
-                    let arc = s.support_mode == config::SupportMode::Arc && !vase;
                     hslider(ui, has_support, egui::Slider::new(&mut s.support_overhang_angle_deg, 0.0..=80.0), "overhang °",
                         "Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
                     hslider(ui, has_support, egui::Slider::new(&mut s.support_density, 0.0..=1.0), "density",
@@ -2561,14 +2560,10 @@ impl eframe::App for App {
                         "Empty layers between a support top and the part it holds up.");
                     hslider(ui, has_support, egui::Slider::new(&mut s.support_interface_layers, 0..=5), "interface",
                         "Dense solid layers at the support top for a smoother overhang underside.");
-                    hslider(ui, arc, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0), "bridge span mm",
-                        "Arc mode: gaps narrower than this bridge with straight lines; wider use arcs.");
+                    hslider(ui, !vase, egui::Slider::new(&mut s.max_bridge_span_mm, 0.0..=30.0), "bridge span mm",
+                        "Widest gap (supported on \u{2265}2 sides) filled with straight anchored bridge lines; wider gaps fall back to the bottom shell.");
                     hslider(ui, !vase, egui::Slider::new(&mut s.bridge_foothold_mm, 0.0..=3.0), "bridge foothold mm",
                         "How far an enclosed-ceiling bridge sheet lands onto the supported rim. Bigger = more solid under the sheet's ends, but inner perimeters start further from the hollow. 0 = no foothold band. Applies in every support mode.");
-                    hslider(ui, arc, egui::Slider::new(&mut s.max_arc_radius_mm, 5.0..=100.0), "arc radius mm",
-                        "Arc mode: max arc-overhang radius before a fan re-seeds.");
-                    hslider(ui, arc, egui::Slider::new(&mut s.arc_seam_overlap_mm, 0.0..=0.6), "arc seam overlap mm",
-                        "Arc mode: how far fans overlap where they meet (per fan). A little helps them mesh; too much over-extrudes the seam. 0 = butt.");
                 });
                 tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
                     hslider(ui, true, egui::Slider::new(&mut s.skirt_loops, 0..=5), "skirt loops",
@@ -3709,7 +3704,6 @@ fn support_combo(ui: &mut egui::Ui, current: &mut config::SupportMode) -> egui::
         .show_ui(ui, |ui| {
             ui.selectable_value(current, None, "none");
             ui.selectable_value(current, Grid, "grid");
-            ui.selectable_value(current, Arc, "arc");
         })
         .response
 }
@@ -3879,7 +3873,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         Infill => CAT_INFILL,
         GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
-        Support | Bridge | InternalBridge | ArcOverhang => CAT_SUPPORT,
+        Support | Bridge | InternalBridge => CAT_SUPPORT,
     }
 }
 
@@ -3909,7 +3903,6 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
         Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
         Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air
         InternalBridge => col(180.0, 0.55, 0.40), // complement, deep — spans over infill
-        ArcOverhang => col(150.0, 0.50, 0.55), // just off the complement — arc fans
     }
 }
 

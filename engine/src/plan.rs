@@ -40,10 +40,6 @@ pub enum PathKind {
     /// The first solid layer over sparse infill: beads span the open cells
     /// below, so they print like (short, well-anchored) bridges.
     InternalBridge,
-    /// Self-supporting concentric arc fill over a flat overhang (arc-overhang
-    /// technique) — each arc cantilevers sideways off the previous ring, so
-    /// it runs far slower than a straight, both-ends-anchored bridge.
-    ArcOverhang,
     /// Sparse interior fill.
     Infill,
     /// Single width-matched strokes filling gaps too thin for a wall or normal
@@ -546,10 +542,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         if !inner.is_empty() {
             // Unsupported interior, computed in every mode. A span anchored on
             // both ends (a ceiling enclosed by walls) is reliably bridgeable — it's
-            // correct bottom-surface printing, not a "rescue" — so it bridges
-            // regardless of support mode (below). What's mode-gated is the rescue of
-            // NON-anchored overhangs: arc mode arc-fills them, no-support mode leaves
-            // them to the ordered bottom shell.
+            // correct bottom-surface printing, so it bridges in every support mode.
+            // A NON-anchored overhang (a cantilever past its free edge) can't bridge
+            // and falls through to the ordered bottom shell.
             let mut supported_below = Polygons::new();
             let overhang_region = if i > 0 {
                 let allowance =
@@ -575,9 +570,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             };
 
             // Decide per disjoint island: a gap supported on ≥2 sides bridges
-            // with straight lines; otherwise arc mode arc-fills, support-less
-            // mode leaves it to the normal fill flow. Only the islands that
-            // actually got covered are carved out of the solid/sparse split.
+            // with straight lines; an unanchored span is left to the normal fill
+            // flow. Only the islands that actually got covered are carved out of
+            // the solid/sparse split.
             let mut bridged = Polygons::new();
             for island in islands(&overhang_region) {
                 let segs = match try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm) {
@@ -585,12 +580,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         .into_iter()
                         .map(|seg| (PathKind::Bridge, seg))
                         .collect::<Vec<_>>(),
-                    None if settings.support_mode == SupportMode::Arc => {
-                        crate::arc::arc_fill(&island, &supported_below, lw, settings.max_arc_radius_mm, settings.arc_seam_overlap_mm)
-                            .into_iter()
-                            .map(|seg| (PathKind::ArcOverhang, seg))
-                            .collect()
-                    }
                     None => continue,
                 };
                 for (kind, seg) in segs {
@@ -897,7 +886,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// projected downward and the support area (minus the part + clearance) is filled
 /// with sparse lines as `PathKind::Support`.
 fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
-    // Arc mode fills overhangs on-layer (in pass 2); only Grid adds structure below.
+    // Only Grid mode adds support structure below; None leaves overhangs as-is.
     if settings.support_mode != SupportMode::Grid {
         return;
     }
@@ -2366,13 +2355,6 @@ mod tests {
         let none = generate(&m, &Settings { skirt_loops: 0, ..Settings::default() });
         let slab = none.iter().find(|p| p.print_z_mm > 4.05).unwrap();
         assert!(count(slab, PathKind::Bridge) > 0, "anchored span bridges without support mode");
-        // Arc mode bridges the anchored gap too (it never falls through to arc-fill).
-        let arc = generate(
-            &m,
-            &Settings { skirt_loops: 0, support_mode: SupportMode::Arc, ..Settings::default() },
-        );
-        let slab_arc = arc.iter().find(|p| p.print_z_mm > 4.05).unwrap();
-        assert!(count(slab_arc, PathKind::Bridge) > 0, "arc mode bridges the anchored gap too");
     }
 
     fn closed_wall_areas(plan: &LayerPlan) -> Vec<f64> {
