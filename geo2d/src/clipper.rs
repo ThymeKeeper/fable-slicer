@@ -63,6 +63,25 @@ pub fn offset(polys: &Polygons, delta_mm: f64) -> Polygons {
     from_paths(result)
 }
 
+/// Stroke an OPEN polyline into its bead footprint: the area within
+/// `half_width_mm` of the path, rounded caps and joins. Mirrors how a closed
+/// loop's bead is stamped (`offset(+r) − offset(−r)`), but for an open arc — e.g.
+/// a trimmed perimeter, which has no interior to subtract.
+pub fn stroke_open(points: &[Point], half_width_mm: f64) -> Polygons {
+    if points.len() < 2 || half_width_mm <= 0.0 {
+        return Polygons::new();
+    }
+    let path: Vec<CPoint<One>> =
+        points.iter().map(|p| CPoint::<One>::from_scaled(p.x, p.y)).collect();
+    let paths: Paths<One> = vec![path].into();
+    let delta = half_width_mm * UNITS_PER_MM;
+    // EndType::Round strokes an OPEN path (vs EndType::Polygon for closed loops).
+    let result = paths
+        .inflate(delta, JoinType::Round, EndType::Round, 2.0)
+        .simplify(0.001 * UNITS_PER_MM, false);
+    from_paths(result)
+}
+
 /// Reduce vertex count, collapsing detail finer than `epsilon_mm`.
 pub fn simplify(polys: &Polygons, epsilon_mm: f64) -> Polygons {
     let Some(paths) = to_paths(polys) else {

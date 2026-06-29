@@ -136,6 +136,9 @@ pub struct ProcessProfile {
     pub layer_height_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_layer_height_mm: Option<f64>,
+    /// Bead width. Unset = derived from the nozzle (× 1.125); set to override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_width_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_fitting: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,8 +151,6 @@ pub struct ProcessProfile {
     pub top_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bottom_layers: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub half_height_outer_walls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brick_layers: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,8 +192,6 @@ pub struct ProcessProfile {
     pub infill_overlap: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monotonic_solid: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap_fill: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_skin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,14 +265,14 @@ impl Tier for ProcessProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, layer_height_mm, first_layer_height_mm,
+        merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             arc_fitting, arc_tolerance_mm, wall_count, outer_wall_first, top_layers, bottom_layers,
-            half_height_outer_walls, brick_layers,
+            brick_layers,
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, bridge_foothold_mm,
-            infill_overlap, monotonic_solid, gap_fill,
+            infill_overlap, monotonic_solid,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
@@ -370,13 +369,13 @@ impl ProcessProfile {
             inherits: None,
             layer_height_mm: diff_field!(cur.layer_height_mm, base.layer_height_mm),
             first_layer_height_mm: diff_field!(cur.first_layer_height_mm, base.first_layer_height_mm),
+            line_width_mm: diff_field!(cur.line_width_mm, base.line_width_mm),
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
             arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
             wall_count: diff_field!(cur.wall_count, base.wall_count),
             outer_wall_first: diff_field!(cur.outer_wall_first, base.outer_wall_first),
             top_layers: diff_field!(cur.top_layers, base.top_layers),
             bottom_layers: diff_field!(cur.bottom_layers, base.bottom_layers),
-            half_height_outer_walls: diff_field!(cur.half_height_outer_walls, base.half_height_outer_walls),
             brick_layers: diff_field!(cur.brick_layers, base.brick_layers),
             infill_density: diff_field!(cur.infill_density, base.infill_density),
             sparse_infill: diff_field!(cur.sparse_pattern, base.sparse_pattern).map(|p| p.label().to_string()),
@@ -398,7 +397,6 @@ impl ProcessProfile {
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
             monotonic_solid: diff_field!(cur.monotonic_solid, base.monotonic_solid),
-            gap_fill: diff_field!(cur.gap_fill, base.gap_fill),
             fuzzy_skin: diff_field!(cur.fuzzy_skin, base.fuzzy_skin),
             fuzzy_skin_thickness_mm: diff_field!(cur.fuzzy_skin_thickness_mm, base.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: diff_field!(cur.fuzzy_skin_point_dist_mm, base.fuzzy_skin_point_dist_mm),
@@ -664,7 +662,7 @@ impl Profiles {
         let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
         // The flow triangle: speed × bead area (line width × layer height) must
         // fit the filament's melt ceiling, so derived speeds balance against it.
-        let line_w = crate::derived_line_width_mm(nozzle);
+        let line_w = pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle));
         let layer_h = pc.layer_height_mm.unwrap_or(d.layer_height_mm);
         let max_flow = fl.max_volumetric_speed_mm3_s.unwrap_or_else(|| material.max_flow_mm3_s());
         let flow_cap = crate::flow_speed_cap_mm_s(max_flow, line_w, layer_h);
@@ -693,9 +691,6 @@ impl Profiles {
             outer_wall_first: pc.outer_wall_first.unwrap_or(d.outer_wall_first),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
-            half_height_outer_walls: pc
-                .half_height_outer_walls
-                .unwrap_or(d.half_height_outer_walls),
             brick_layers: pc.brick_layers.unwrap_or(d.brick_layers),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
@@ -708,7 +703,6 @@ impl Profiles {
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
             infill_overlap: pc.infill_overlap.unwrap_or(d.infill_overlap),
             monotonic_solid: pc.monotonic_solid.unwrap_or(d.monotonic_solid),
-            gap_fill: pc.gap_fill.unwrap_or(d.gap_fill),
             fuzzy_skin: pc.fuzzy_skin.unwrap_or(d.fuzzy_skin),
             fuzzy_skin_thickness_mm: pc.fuzzy_skin_thickness_mm.unwrap_or(d.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: pc.fuzzy_skin_point_dist_mm.unwrap_or(d.fuzzy_skin_point_dist_mm),
@@ -754,7 +748,6 @@ impl Profiles {
             external_perimeter_speed_mm_s: crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap),
             solid_speed_mm_s: crate::derived_solid_speed_mm_s(print_v, flow_cap),
             support_speed_mm_s: crate::derived_support_speed_mm_s(print_v, flow_cap),
-            gap_fill_speed_mm_s: crate::derived_gap_fill_speed_mm_s(print_v, flow_cap),
             bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
             overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(
                 fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
@@ -1023,12 +1016,12 @@ mod tests {
     }
 
     #[test]
-    fn line_width_derives_from_nozzle_when_unset() {
+    fn line_width_auto_from_nozzle_or_overridden() {
         let dir = std::env::temp_dir().join(format!("slicer_profiles_auto_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut p = Profiles::builtin();
         p.load_user_profiles(Some(dir.clone())).unwrap();
-        // A 0.6 mm nozzle printer with no pinned line width -> auto 0.675.
+        // A 0.6 mm nozzle printer with no pinned line width -> auto 0.675 (× 1.125).
         let pr = PrinterProfile {
             inherits: Some("generic".into()),
             nozzle_diameter_mm: Some(0.6),
@@ -1037,9 +1030,16 @@ mod tests {
         p.save_user_printer("fat-nozzle", pr).unwrap();
         let s = p.resolve("fat-nozzle", "pla", "standard").unwrap();
         assert!((s.line_width_mm - 0.675).abs() < 1e-9, "auto lw {}", s.line_width_mm);
-        // Line width is pure stadium math now — every process derives it.
-        let s = p.resolve("fat-nozzle", "pla", "draft").unwrap();
-        assert!((s.line_width_mm - 0.675).abs() < 1e-9);
+
+        // A process that pins line width overrides the nozzle-derived value.
+        let proc = ProcessProfile {
+            inherits: Some("standard".into()),
+            line_width_mm: Some(0.5),
+            ..Default::default()
+        };
+        p.save_user_process("wide-bead", proc).unwrap();
+        let s = p.resolve("fat-nozzle", "pla", "wide-bead").unwrap();
+        assert!((s.line_width_mm - 0.5).abs() < 1e-9, "pinned lw {}", s.line_width_mm);
         let _ = fs::remove_dir_all(&dir);
     }
 

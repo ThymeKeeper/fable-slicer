@@ -84,8 +84,7 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
 /// plane, the (possibly vertex-nudged) z actually used and the stitched
 /// polygons. Triangles are bucketed by the band of planes their z-span
 /// crosses, so each plane only visits candidate triangles, and the planes are
-/// sliced in parallel. Shared by normal layer slicing and the extra
-/// quarter-height planes of half-height outer walls.
+/// sliced in parallel.
 pub(crate) fn slice_many(mesh: &Mesh, zs: &[f64]) -> Vec<(f64, Polygons)> {
     if zs.is_empty() || mesh.triangles.is_empty() {
         return zs.iter().map(|&z| (z, Polygons::new())).collect();

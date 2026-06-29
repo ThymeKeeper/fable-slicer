@@ -246,7 +246,7 @@ pub(crate) fn chain_segments(segs: Vec<((f64, f64), (f64, f64))>, tol: f64) -> V
 /// Clip polylines to a region (even-odd), splitting where they cross the
 /// boundary and keeping the inside parts. Crossing points are computed exactly
 /// against the region edges so infill reaches the boundary.
-fn clip_polylines(lines: Vec<Vec<(f64, f64)>>, region: &Polygons) -> Vec<Vec<Point>> {
+pub(crate) fn clip_polylines(lines: Vec<Vec<(f64, f64)>>, region: &Polygons) -> Vec<Vec<Point>> {
     // Collect the region's edges once.
     let mut edges: Vec<((f64, f64), (f64, f64))> = Vec::new();
     for c in &region.contours {

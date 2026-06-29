@@ -48,15 +48,14 @@ pub fn run(a: &Args) -> Result<(), String> {
     if let Some(p) = std::env::var("INFILL_PATTERN").ok().and_then(|s| config::InfillPattern::parse(&s)) {
         settings.sparse_pattern = p;
         settings.solid_pattern = p;
+        settings.top_pattern = p;
+        settings.bottom_pattern = p;
     }
     if let Some(n) = std::env::var("TOP").ok().and_then(|s| s.parse().ok()) {
         settings.top_layers = n;
     }
     if let Some(n) = std::env::var("BOTTOM").ok().and_then(|s| s.parse().ok()) {
         settings.bottom_layers = n;
-    }
-    if std::env::var("NO_GAP").is_ok() {
-        settings.gap_fill = false;
     }
     if std::env::var("SUPPORT").is_ok() {
         settings.support_mode = config::SupportMode::Grid;
@@ -96,14 +95,17 @@ pub fn run(a: &Args) -> Result<(), String> {
     let view = Mat4::look_at_rh(eye, center, Vec3::Z);
     let view_proj = proj * view;
 
-    // Show every fill category, hide travels (bit 4). CAT_MASK (decimal) overrides
-    // for diagnostics — e.g. CAT_MASK=2 = walls only (bit 1).
-    let mask = std::env::var("CAT_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0x1FFu32 & !(1 << 4));
+    // Show every fill category (bits 0-9), hide travels (bit 4). CAT_MASK (decimal)
+    // overrides for diagnostics — e.g. CAT_MASK=2 = walls only (bit 1).
+    let mask = std::env::var("CAT_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0x3FFu32 & !(1 << 4));
+    // DIM (0.0–1.0) fades layers below the current one — set DIM=0 to isolate just
+    // the top layer's beads (everything below renders black).
+    let dim = std::env::var("DIM").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
     let preview = crate::render::Preview {
         count,
         joint_count,
         current_layer: layer as f32,
-        dim: 1.0,
+        dim,
         mask,
     };
     scene.render_to(&device, &queue, view_proj, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);

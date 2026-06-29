@@ -330,11 +330,6 @@ pub struct Settings {
     pub outer_wall_first: bool,
     pub top_layers: usize,
     pub bottom_layers: usize,
-    /// Print the outer wall as two half-height passes per layer, each sliced at
-    /// its own plane — halves the visible Z staircase on sloped surfaces while
-    /// the interior keeps the full layer height. Mutually exclusive with brick
-    /// layering (their Z choreographies collide).
-    pub half_height_outer_walls: bool,
     /// Brick layering: stagger odd-indexed perimeters by half a layer height so
     /// adjacent wall rings interlock (the outer wall stays put). The lifted
     /// beads' extra flow is DERIVED — see [`brick_flow_factor`].
@@ -355,12 +350,6 @@ pub struct Settings {
     /// Print solid-fill lines in monotonic order (strict sweep across each
     /// region) so top surfaces get an even sheen without overlap ridges.
     pub monotonic_solid: bool,
-    /// Fill gaps too thin for normal infill (between/inside walls) with single
-    /// width-matched strokes. Off by default: the inner walls now trace the
-    /// concentric primitive on an opened region (they pack to the medial and fill
-    /// the seams themselves), so gap fill is only a marginal residual mop-up for
-    /// tight features — usually not worth the extra travel.
-    pub gap_fill: bool,
     /// Jitter external perimeters for a rough "fuzzy" surface texture.
     pub fuzzy_skin: bool,
     /// Total jitter band (mm) for fuzzy skin, centered on the wall line.
@@ -463,8 +452,6 @@ pub struct Settings {
     pub solid_speed_mm_s: f64,
     /// Speed (mm/s) for support structure.
     pub support_speed_mm_s: f64,
-    /// Speed (mm/s) for gap-fill strokes — slow, they sit in tight corners.
-    pub gap_fill_speed_mm_s: f64,
     /// Speed (mm/s) for straight bridges (spans anchored on both sides).
     pub bridge_speed_mm_s: f64,
     /// Speed (mm/s) for wall stretches that overhang the layer below by more
@@ -584,7 +571,6 @@ impl Default for Settings {
             arc_tolerance_mm: 0.05,
             wall_count: 2,
             outer_wall_first: false,
-            half_height_outer_walls: false,
             brick_layers: false,
             top_layers: 4,
             bottom_layers: 4,
@@ -595,7 +581,6 @@ impl Default for Settings {
             solid_pattern: InfillPattern::default(),
             infill_overlap: 0.25,
             monotonic_solid: true,
-            gap_fill: false,
             fuzzy_skin: false,
             fuzzy_skin_thickness_mm: 0.3,
             fuzzy_skin_point_dist_mm: 0.8,
@@ -636,7 +621,6 @@ impl Default for Settings {
             external_perimeter_speed_mm_s: 25.0,
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
-            gap_fill_speed_mm_s: 20.0,
             bridge_speed_mm_s: 10.0,
             overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
             min_layer_time_s: 8.0,
@@ -732,12 +716,6 @@ pub fn derived_support_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> 
     (print_speed_mm_s * 0.9).min(flow_cap_mm_s)
 }
 
-/// Auto gap-fill speed: 40% of print speed, capped — gap strokes live in tight
-/// corners where the head is always turning; never past the flow cap.
-pub fn derived_gap_fill_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> f64 {
-    (print_speed_mm_s * 0.4).min(40.0).min(flow_cap_mm_s)
-}
-
 /// Auto overhang-wall speed: same as bridges — both lay beads onto air.
 pub fn derived_overhang_speed_mm_s(bridge_speed_mm_s: f64) -> f64 {
     bridge_speed_mm_s
@@ -774,15 +752,14 @@ pub fn bead_spacing_mm(width_mm: f64, height_mm: f64) -> f64 {
     bead_area_mm2(width_mm, height_mm) / height_mm.max(1.0e-9)
 }
 
-/// Contour-cleanup threshold (mm) — derived from the bead, no knob. Points
-/// whose deviation falls under ~1/9 of the line width are below what the
-/// bead can physically render (nozzle pressure smooths them) and only carry
-/// mesh-facet noise into planning: over-dense walls, slow passes, bloated
-/// g-code. At the stock 0.45 bead this derives the proven 0.05 mm floor
-/// (measured on the Benchy, commit abb2511); finer nozzles tighten it,
-/// fatter nozzles relax it.
-pub fn contour_resolution_mm(line_width_mm: f64) -> f64 {
-    line_width_mm / 9.0
+/// Contour-cleanup threshold (mm), no knob. After slicing, contour points whose
+/// deviation falls under this are dropped — they're mesh-facet tessellation noise
+/// below the printer's mechanical step. 0.01 mm matches Orca/Prusa: it preserves
+/// genuine curve detail (arc fitting renders it as smooth G2/G3) rather than the
+/// bead-scale decimation we used to do. It's a path-representation precision, not a
+/// bead property, so it doesn't scale with line width.
+pub fn contour_resolution_mm() -> f64 {
+    0.01
 }
 
 /// Flow multiplier for a brick-lifted bead — derived from the stadium model,
@@ -820,12 +797,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contour_resolution_derives_from_the_bead() {
-        // The stock 0.45 bead reproduces the proven 0.05 mm noise floor
-        // exactly; finer beads tighten, fatter beads relax.
-        assert!((contour_resolution_mm(0.45) - 0.05).abs() < 1e-12);
-        assert!(contour_resolution_mm(0.25) < 0.05);
-        assert!(contour_resolution_mm(0.9) > 0.05);
+    fn contour_resolution_is_a_fine_fixed_floor() {
+        // A fixed 0.01 mm path-precision (Orca-style), not bead-derived: fine
+        // enough to keep curve detail for arc fitting, coarse enough to drop
+        // mesh-facet tessellation noise.
+        assert!((contour_resolution_mm() - 0.01).abs() < 1e-12);
     }
 
     #[test]

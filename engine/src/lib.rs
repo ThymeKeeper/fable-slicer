@@ -13,7 +13,6 @@ mod calibrate;
 mod coverage;
 mod emit;
 mod fill;
-pub mod medial;
 mod plan;
 mod slice;
 

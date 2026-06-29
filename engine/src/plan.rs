@@ -42,9 +42,6 @@ pub enum PathKind {
     InternalBridge,
     /// Sparse interior fill.
     Infill,
-    /// Single width-matched strokes filling gaps too thin for a wall or normal
-    /// infill (between/inside walls), traced down each gap's medial axis.
-    GapFill,
     /// Low-flow smoothing pass over exposed top surfaces.
     Ironing,
     /// Removable support structure under overhangs.
@@ -72,8 +69,8 @@ pub struct ToolPath {
     /// indivisible block in travel ordering (a strict sweep over one surface).
     /// Distinct groups (e.g. separate islands) are ordered independently.
     pub group: Option<u32>,
-    /// Bead height as a fraction of the layer height (half-height outer walls
-    /// print two 0.5 passes per layer). 1.0 = the full layer.
+    /// Bead height as a fraction of the layer height; 1.0 = the full layer.
+    /// Currently always 1.0 (nothing sub-divides a layer's beads).
     pub height_scale: f64,
     /// Per-point extrusion width (mm), one per `points` entry, for a continuously
     /// tapering bead (gap fill). `None` = uniform `width_mm`. When set, the g-code
@@ -188,6 +185,21 @@ pub struct LayerPlan {
     pub temp_command_c: Option<f64>,
 }
 
+/// At or below this sparse-infill density, the first buried solid layer over the
+/// infill spans mostly open air between the lines (≳85% unsupported), so it prints
+/// as an internal bridge — bridge flow, speed, and cooling — instead of plain solid.
+const INTERNAL_BRIDGE_MAX_DENSITY: f64 = 0.15;
+
+/// Sparse pockets smaller than this the rebalance promotes to solid (a bead-scale
+/// gap fills solid cleaner than sparse). Internal-bridge detection reuses it: such
+/// a pocket prints solid below, so the layer over it isn't a bridge over open air.
+const SOLID_BELOW_AREA_MM2: f64 = 10.0;
+
+/// Minimum unsupported run (mm) a bead must travel over open sparse before it's
+/// worth bridging. A shorter span the solid bead carries without sagging, so it
+/// stays solid — no point switching to bridge flow/speed for a sub-2 mm hop.
+const MIN_BRIDGE_SPAN_MM: f64 = 2.0;
+
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
@@ -201,14 +213,8 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         norm_settings.top_layers = 0;
         norm_settings.support_mode = SupportMode::None;
         norm_settings.brick_layers = false;
-        norm_settings.half_height_outer_walls = false; // the spiral *is* the outer wall
         norm_settings.ironing = false;
         norm_settings.fuzzy_skin = false;
-    }
-    if norm_settings.half_height_outer_walls && norm_settings.brick_layers {
-        // Mutually exclusive: their Z choreographies collide (the lower outer
-        // pass would graze the previous layer's lifted brick beads).
-        norm_settings.brick_layers = false;
     }
     let settings = &norm_settings;
 
@@ -219,12 +225,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             first_layer_height_mm: settings.first_layer_height_mm,
         },
     );
-    // Contour-resolution cleanup: drop sub-resolution mesh-facet noise so walls
-    // aren't over-dense (cleaner preview, faster planning, smaller g-code). The
-    // threshold is derived from the bead — see config::contour_resolution_mm.
-    // Then dimensional compensation: XY grow/shrink on every layer, and the
-    // first layer pulled in to counter squish (elephant foot).
-    let res = config::contour_resolution_mm(settings.line_width_mm);
+    // Contour-resolution cleanup: drop sub-resolution mesh-facet noise (0.01 mm,
+    // Orca-style — preserves curve detail for arc fitting). Then dimensional
+    // compensation: XY grow/shrink on every layer, and the first layer pulled in
+    // to counter squish (elephant foot).
+    let res = config::contour_resolution_mm();
     layers.par_iter_mut().for_each(|layer| {
         layer.polygons = simplify(&layer.polygons, res);
         if settings.xy_compensation_mm != 0.0 {
@@ -236,41 +241,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     });
     let lw = settings.line_width_mm;
     let n = layers.len();
-
-    // Half-height outer walls: slice two extra planes per layer (the quarter
-    // heights), so each half-pass follows its *own* contour — on slopes the two
-    // outlines differ, which is what halves the visible staircase. Layer 0
-    // stays one full-height pass (bed squish wants one fat bead).
-    let outer_halves: Vec<Option<(Polygons, Polygons)>> =
-        if settings.half_height_outer_walls && n > 1 {
-            let mut zs = Vec::with_capacity((n - 1) * 2);
-            for layer in layers.iter().skip(1) {
-                zs.push(layer.z_mm - 0.25 * layer.height_mm);
-                zs.push(layer.z_mm + 0.25 * layer.height_mm);
-            }
-            let sliced = crate::slice::slice_many(mesh, &zs);
-            let processed: Vec<Polygons> = sliced
-                .into_par_iter()
-                .map(|(_, mut p)| {
-                    p = simplify(&p, res);
-                    if settings.xy_compensation_mm != 0.0 {
-                        p = offset(&p, settings.xy_compensation_mm);
-                    }
-                    p
-                })
-                .collect();
-            let mut halves: Vec<Option<(Polygons, Polygons)>> = vec![None];
-            for (k, layer) in layers.iter().enumerate().skip(1) {
-                let pick = |q: Polygons| if q.is_empty() { layer.polygons.clone() } else { q };
-                halves.push(Some((
-                    pick(processed[(k - 1) * 2].clone()),
-                    pick(processed[(k - 1) * 2 + 1].clone()),
-                )));
-            }
-            halves
-        } else {
-            vec![None; n]
-        };
 
     // A region with nothing immediately above (or below) is a top (or bottom)
     // surface, and a surface overrides a wall — it must be skinned even when the
@@ -307,68 +277,11 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Pass 1: walls + the infill region (inside the innermost wall) per layer.
     let per_layer: Vec<(Vec<ToolPath>, Polygons)> = layers
         .par_iter()
-        .zip(outer_halves.par_iter())
-        .map(|(layer, halves)| {
+        .map(|layer| {
             // Adjacent beads are placed at the stadium spacing: rounded
             // shoulders overlap just enough to fill the cusps between beads.
             let sp = config::bead_spacing_mm(lw, layer.height_mm);
-            // With half-height outer walls, interior geometry must stay inside
-            // *both* half contours (on a shallow slope the layer-midpoint
-            // outline is wider than the upper pass — inner walls based on it
-            // would poke outside the outer wall). The intersection is the safe
-            // core; without halves it's just the layer outline.
-            let interior_owned = halves.as_ref().map(|(lo, up)| intersection(lo, up));
-            let interior: &Polygons = interior_owned.as_ref().unwrap_or(&layer.polygons);
-            // Carve the exposed surface out of the inner-wall region: the outer
-            // wall still hugs the full outline, but the inner walls — and the
-            // infill region derived from them — stop at the surface, leaving it
-            // for the skin. `surf_inside` is the slice the skin reclaims.
-            //
-            // ...but only the SKINNABLE part of the surface — what survives a
-            // one-line morphological open. A surface sliver too thin to hold real
-            // skin (a bow tip, a tapering edge) prints cleaner as walls running
-            // into it than as stubby solid dabs that the solid/sparse rebalance
-            // then demotes to sparse infill. So thinner surface stays in the wall
-            // region and the inner walls fill it right out to the tip.
-            let surf_owned = &surface_per_layer[layer.index];
-            let skinnable = offset(&offset(surf_owned, -lw * 2.0), lw * 2.0);
-            // Don't carve an over-air bottom surface the walls can close (a door
-            // lintel) out of the wall region — otherwise the inner walls loop back
-            // around the just-closed notch instead of crossing it. Keep the whole
-            // spannable over-air span in the wall region so the wall beads run
-            // straight across; a wider bridge the walls can't close stays carved.
-            let wd = match settings.wall_count {
-                0 => 0.0,
-                wc => lw + (wc - 1) as f64 * sp,
-            };
-            let spannable_air = if layer.index > 0 && wd > 0.0 {
-                let allowance = settings.layer_height_mm
-                    * settings.support_overhang_angle_deg.to_radians().tan();
-                let over_air =
-                    difference(&layer.polygons, &offset(&layers[layer.index - 1].polygons, allowance));
-                // Keep the WHOLE skinnable surface patch when it's a thin bridge the
-                // walls cross: it must be over air (a lintel, not a flat shelf) AND
-                // close under the span. Taking the whole patch — not just its steep
-                // over-air core — means the shallow allowance ring at the span ends
-                // becomes wall too, instead of a tiny solid pocket breaking the span.
-                // A large flat over-air face (a cabin roof) survives the erosion and
-                // stays surface, so it skins. The split is by width: a lintel erodes
-                // to nothing under a few mm, a roof slab doesn't. This cap is a
-                // FIXED few-mm lintel width, NOT tied to max_bridge_span_mm: a wide
-                // ceiling must skin+bridge, even though a tall wall stack (large
-                // `wd`) could nominally "close" it with looping, sagging rings.
-                let span = wd.min(3.0).max(lw);
-                let mut keep = Polygons::new();
-                for isl in islands(&skinnable) {
-                    if offset(&isl, -span).is_empty() && !intersection(&isl, &over_air).is_empty() {
-                        keep.contours.extend(isl.contours);
-                    }
-                }
-                keep
-            } else {
-                Polygons::new()
-            };
-            let surf = difference(&skinnable, &spannable_air);
+            let interior: &Polygons = &layer.polygons;
             // An enclosed over-air ceiling (a hollow ringed by supported walls, the
             // hollow dominating the island) prints as ONE bridge sheet anchored on
             // the outer wall — no inner perimeters boxing it in. Carve its interior
@@ -383,9 +296,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 Polygons::new()
             };
-            let core = difference(&difference(interior, &surf), &ceiling);
-            let surf_inside = intersection(&surf, &offset(&layer.polygons, -lw));
-            let interior: &Polygons = &core;
+            // Inner walls are the SAME interior offset as the outer wall, so they run
+            // PARALLEL to it — straight through the skin surface near the edge instead
+            // of detouring around it. The skin/solid then fills INSIDE the innermost
+            // wall (Pass 2), reclaiming the interior the old surface-carved inner walls
+            // used to wander through. Only the enclosed ceiling is carved out, so the
+            // walls don't box in its bridged hollow. (Top surfaces get their edge
+            // perimeters + skin inside, like every other slicer — no more wandering.)
+            let wall_region = difference(interior, &ceiling);
+            let interior: &Polygons = &wall_region;
             let mut walls = Vec::new();
             for w in 0..settings.wall_count {
                 let inset = -(lw * 0.5 + w as f64 * sp);
@@ -411,9 +330,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 } else {
                     (0.0, 1.0)
                 };
-                // Outer wall (w == 0) hugs the true outline (or its halves);
-                // everything deeper offsets from the safe interior core at stadium
-                // spacing. The medial seams these leave are closed by gap fill.
+                // Outer wall (w == 0) hugs the true outline;
+                // inner walls are the SAME interior offset, so they run parallel to
+                // the outer at stadium spacing all the way around — the surface is
+                // no longer carved out of this region, so they no longer detour.
                 let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
                 let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
@@ -457,19 +377,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         }
                     }
                 };
-                match halves {
-                    // Half-height walls: *every* wall prints as two passes, each
-                    // offset from its own sliced contour — the lower half drops
-                    // the nozzle by h/2 (ordered first), the upper finishes at
-                    // the layer plane. Inner walls follow the upper contour too,
-                    // so they never stand proud on shallow treads where the next
-                    // layer doesn't cover them.
-                    Some((lower, upper)) => {
-                        emit_loops(&offset(lower, inset), -0.5 * layer.height_mm, 0.5, &mut walls);
-                        emit_loops(&offset(upper, inset), 0.0, 0.5, &mut walls);
-                    }
-                    None => emit_loops(&centers, z_offset_mm, 1.0, &mut walls),
-                }
+                emit_loops(&centers, z_offset_mm, 1.0, &mut walls);
             }
 
             // Inset to the infill region (the inner edge of the last wall bead),
@@ -480,15 +388,15 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 0 => 0.0,
                 wc => lw + (wc - 1) as f64 * sp,
             };
+            // Inside the innermost wall — the skin/solid fills this whole region now
+            // (the surface is no longer carved out into a separate band), so the
+            // interior the wandering walls used to occupy is reclaimed as fill.
             let inset = offset(interior, -wall_depth);
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
-            // The surface rejoins the infill region so the skin claims it (the
-            // inner walls were kept clear of it above).
-            let opened = union(&opened, &surf_inside);
             // Wall stretches hanging past the layer below print slow with full
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
-            let walls = if layer.index > 0 && !settings.spiral_vase {
+            let mut walls = if layer.index > 0 && !settings.spiral_vase {
                 let below = offset(&layers[layer.index - 1].polygons, 0.05);
                 let unsupported = difference(&layer.polygons, &below);
                 if unsupported.is_empty() {
@@ -499,6 +407,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             } else {
                 walls
             };
+            // Thin-wall trim: where two inner walls double up (a neck too thin for
+            // the perimeters it nominally fits — e.g. a hole beside the outline),
+            // drop the doubled run so the nozzle doesn't retrace the same bead.
+            trim_thin_walls(&mut walls, lw, sp);
             (walls, opened)
         })
         .collect();
@@ -553,18 +465,26 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         let ftw = {
             let mut band = Polygons::new();
             for wp in &paths {
-                if !wp.closed || wp.points.len() < 3 {
+                if wp.points.len() < 2 {
                     continue;
                 }
-                let mut poly = Polygons::new();
-                poly.contours.push(geo2d::Contour::new(wp.points.clone()));
-                band = union(&band, &difference(&offset(&poly, lw * 0.5), &offset(&poly, -lw * 0.5)));
+                let bead = if wp.closed {
+                    if wp.points.len() < 3 {
+                        continue;
+                    }
+                    let mut poly = Polygons::new();
+                    poly.contours.push(geo2d::Contour::new(wp.points.clone()));
+                    difference(&offset(&poly, lw * 0.5), &offset(&poly, -lw * 0.5))
+                } else {
+                    // Open wall arc (a trimmed perimeter) — stamp its stroked bead
+                    // footprint, so the solid fill stops at it too. The closed-loop
+                    // stamp skips open paths, which let fill run over the arc.
+                    geo2d::stroke_open(&wp.points, lw * 0.5)
+                };
+                band = union(&band, &bead);
             }
             difference(&layers[i].polygons, &band)
         };
-        // The sparse-infill region, captured for the gap-fill pass below: its
-        // intended between-line gaps must be excluded from void detection.
-        let mut sparse_region = Polygons::new();
 
         if !inner.is_empty() {
             // Unsupported interior, computed in every mode. A span anchored on
@@ -633,7 +553,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 let on_surf = intersection(&sparse, &surface_per_layer[i]);
                 (union(&solid, &on_surf), difference(&sparse, &on_surf))
             };
-            sparse_region = sparse.clone();
 
             // No seam-closing and no wall-edge clip on the skin. Its region is already
             // `inner`, which is bounded by the innermost wall at each location (the
@@ -673,7 +592,58 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 } else {
                     buried.clone()
                 };
-                let internal = difference(&buried, &skin_top);
+                let mut internal = difference(&buried, &skin_top);
+                // Blanket surface→solid merge (opt-in via matching fill pattern):
+                // a top/bottom surface that borders buried solid and shares its
+                // pattern joins it as ONE region — the shared-angle lines run
+                // continuously and no thin surface sliver is left to trace as a
+                // lone wall-hugging loop (the deck in image #34). The merged area
+                // prints as Solid, so a demoted surface strip trades the slow
+                // visible-surface pace for continuous fill. A surface with no solid
+                // neighbour stays a surface (see `absorb_into_solid`).
+                let skin_top = if settings.top_pattern == settings.solid_pattern {
+                    absorb_into_solid(&skin_top, &mut internal, lw)
+                } else {
+                    skin_top
+                };
+                let skin_bottom = if settings.bottom_pattern == settings.solid_pattern {
+                    absorb_into_solid(&skin_bottom, &mut internal, lw)
+                } else {
+                    skin_bottom
+                };
+                // The stretch of solid/skin over low-density sparse spans mostly air
+                // between the infill lines below, so it prints as an internal bridge
+                // (bridge flow/speed — HIGH flow to make up the missing volume, not
+                // under-fill). Rather than carve a separate region (which gives a
+                // visible split — two concentric onions), keep ONE region and cut each
+                // BEAD at the support boundary below: the part over open sparse steps to
+                // bridge, the rest keeps its kind. Applies to the whole shell over
+                // sparse — buried solid and visible top skin alike.
+                let bridge = if i > 0
+                    && settings.infill_density > 0.0
+                    && settings.infill_density <= INTERNAL_BRIDGE_MAX_DENSITY
+                {
+                    // Where the layer below actually carries open sparse infill — not a
+                    // pocket the rebalance promoted to solid (those print solid below,
+                    // not air). `solid_all` is pre-rebalance, so filter the small
+                    // pockets out by the same area floor the promotion uses.
+                    let below = difference(&inner_per_layer[i - 1], &solid_all_per_layer[i - 1]);
+                    let mut sparse_below = Polygons::new();
+                    for isl in islands(&below) {
+                        if isl.net_area_mm2() >= SOLID_BELOW_AREA_MM2 {
+                            sparse_below.contours.extend(isl.contours);
+                        }
+                    }
+                    intersection(&union(&internal, &skin_top), &sparse_below)
+                } else {
+                    Polygons::new()
+                };
+                // Everything NOT over open sparse — the other side of each bead's cut.
+                let supported = if bridge.is_empty() {
+                    Polygons::new()
+                } else {
+                    difference(&layers[i].polygons, &bridge)
+                };
                 let regions = [
                     (skin_bottom, PathKind::BottomSkin, true),
                     (internal, PathKind::Solid, settings.monotonic_solid),
@@ -726,6 +696,13 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     let fill = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
                         let void = difference(&ftw, inner);
                         union(&region, &intersection(&offset(&region, lw * 1.5), &void))
+                    } else if settings.solid_pattern == InfillPattern::Concentric {
+                        // Concentric loops are closed, so the per-bead reach below (it
+                        // only walks open line-ends) can't pull them to the wall. Hand
+                        // it the full region — no half-bead pre-inset — so concentric's
+                        // own lw/2 inset lands the OUTER loop flush against the wall (and
+                        // the sparse boundary), instead of a whole bead short.
+                        region.clone()
                     } else {
                         offset(&region, -lw * 0.5)
                     };
@@ -755,6 +732,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         // Ends that border a wall extend; ends facing other infill don't
                         // move. Applies to every solid kind, not just skins.
                         extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
+                        // Cut each bead at the support boundary: the stretch over open
+                        // sparse becomes an internal bridge (bridge flow/speed), the rest
+                        // keeps its kind — one continuous fill that steps at the boundary,
+                        // not two regions. skin_bottom is over air (a bottom shell), not
+                        // sparse, so it's left out.
+                        if !bridge.is_empty() && matches!(kind, PathKind::Solid | PathKind::TopSkin) {
+                            split_bridge_beads(&mut paths, n0, &bridge, &supported);
+                        }
                     }
                 }
             }
@@ -781,38 +766,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             }
         }
 
-        // Gap fill (raster oracle): stamp every dense bead actually laid onto a
-        // fine grid and trace the medial axis of whatever the part interior —
-        // minus the sparse-infill region (its between-line gaps are intentional) —
-        // is left uncovered. A raster sees the medial-seam voids that an offset
-        // coverage test merges across. Runs before ironing so a gap stroke prints
-        // with the structure, not over the finished surface.
-        if settings.gap_fill {
-            let dense = difference(&layers[i].polygons, &sparse_region);
-            if !dense.is_empty() {
-                let beads: Vec<(Vec<Point>, Vec<f64>)> = paths
-                    .iter()
-                    .filter(|p| p.kind != PathKind::Infill && p.points.len() >= 2)
-                    .map(|p| {
-                        let mut pts = p.points.clone();
-                        if p.closed {
-                            pts.push(pts[0]); // stamp the closing segment too
-                        }
-                        let ws = vec![p.width_mm; pts.len()];
-                        (pts, ws)
-                    })
-                    .collect();
-                let raw_voids = crate::coverage::uncovered(&dense, &beads, lw, lw * lw * 1.5);
-                // Light simplify (~one raster cell): knocks the single-cell stair
-                // jaggies off the marching-squares boundary without shrinking the
-                // void, so the medial stays DENSE (its width tracks the true
-                // channel; a heavier simplify makes it sparse and the clearance
-                // reads low at the few surviving vertices → a too-thin bead). Do
-                // NOT morphologically close (that truncates the tip).
-                let voids = simplify(&raw_voids, lw * 0.15);
-                emit_gap_fill(&voids, lw, sp, &mut paths);
-            }
-        }
 
         // Ironing: a slow, near-zero-flow boustrophedon pass over surfaces with
         // open air above, melting ridges into a smooth plane. Kept in order and
@@ -1033,7 +986,6 @@ fn islands(polys: &Polygons) -> Vec<Polygons> {
 /// back to solid — unless it merged into a bigger printable pocket, where
 /// pouring it solid is the right outcome anyway.
 fn rebalance_solid_sparse(solid: Polygons, sparse: Polygons, lw: f64) -> (Polygons, Polygons) {
-    const SOLID_BELOW_AREA_MM2: f64 = 10.0;
     let junk =
         |island: &Polygons| island.net_area_mm2() < 4.0 * lw * lw || offset(island, -lw * 0.5).is_empty();
     let mut solid = solid;
@@ -1067,6 +1019,284 @@ fn rebalance_solid_sparse(solid: Polygons, sparse: Polygons, lw: f64) -> (Polygo
         }
     }
     (solid, sparse)
+}
+
+/// Blanket surface→solid merge. Each surface island that borders the buried
+/// `solid` is folded into it, so the two (same-pattern) regions fill as ONE
+/// continuous sweep — no thin surface strip left over to trace as a lone
+/// wall-hugging loop, and the shared-angle lines run straight across the seam.
+/// Islands with NO solid neighbour (the bed face, a topmost-layer roof, a lone
+/// cantilever) have nothing to merge into, so they're returned as the kept
+/// surface and keep their visible-surface treatment. The caller gates this on
+/// the surface and solid fill patterns actually matching.
+fn absorb_into_solid(skin: &Polygons, solid: &mut Polygons, lw: f64) -> Polygons {
+    let mut kept = Polygons::new();
+    for isl in islands(skin) {
+        // skin and solid partition the same blob, so a real neighbour shares an
+        // edge — a half-bead dilation of an adjacent island always laps `solid`.
+        if intersection(&offset(&isl, lw * 0.5), solid).is_empty() {
+            kept.contours.extend(isl.contours);
+        } else {
+            *solid = union(solid, &isl);
+        }
+    }
+    kept
+}
+
+/// Thin-wall trim: where two wall beads land much closer than the stadium spacing
+/// they double up — the nozzle retraces the same line, blobbing and over-extruding.
+/// This happens in a neck too thin for the perimeters it nominally fits (a hole
+/// beside the outline — the chimney next to the cabin edge). Keep the outer walls
+/// and the larger inner loops whole; trim the doubled run out of each smaller inner
+/// (`Perimeter`) wall, leaving the neck to a single bead. The threshold sits well
+/// below `sp`, so normal concentric spacing (≈ sp) is never touched.
+fn trim_thin_walls(walls: &mut Vec<ToolPath>, lw: f64, sp: f64) {
+    let thresh = sp * 0.6;
+    // Pull each surviving arc tip back ~one bead past the cut, so it ends clear of
+    // the wall it was doubling instead of at the threshold boundary (~35% overlap).
+    let margin = lw;
+    let trimmable = |k: PathKind| k == PathKind::Perimeter;
+    if !walls.iter().any(|w| trimmable(w.kind)) {
+        return;
+    }
+    // Non-trimmable walls (outer + overhang) and larger inner loops are processed
+    // first and kept whole; smaller inner loops are trimmed against all of them.
+    let mut order: Vec<usize> = (0..walls.len()).collect();
+    order.sort_by(|&a, &b| {
+        trimmable(walls[a].kind).cmp(&trimmable(walls[b].kind)).then(
+            wall_pts_len(&walls[b].points, walls[b].closed)
+                .partial_cmp(&wall_pts_len(&walls[a].points, walls[a].closed))
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    // Kept centerlines (closed loops carry their closing segment) to test against.
+    let mut kept: Vec<Vec<Point>> = Vec::new();
+    let mut out: Vec<(usize, Vec<ToolPath>)> = Vec::with_capacity(walls.len());
+    for &i in &order {
+        let w = &walls[i];
+        let arcs = if trimmable(w.kind) { trim_loop(&w.points, w.closed, &kept, thresh, margin) } else { None };
+        match arcs {
+            // Untouched (or not trimmable) → keep the original path, seam intact.
+            None => {
+                kept.push(seq(&w.points, w.closed));
+                out.push((i, vec![w.clone()]));
+            }
+            Some(arcs) => {
+                let mut tps = Vec::new();
+                for (pts, closed) in arcs {
+                    if wall_pts_len(&pts, closed) < lw * 2.0 {
+                        continue; // drop sub-bead fragments
+                    }
+                    kept.push(seq(&pts, closed));
+                    let mut tp = w.clone();
+                    tp.points = pts;
+                    tp.closed = closed;
+                    tps.push(tp);
+                }
+                out.push((i, tps));
+            }
+        }
+    }
+    out.sort_by_key(|(i, _)| *i);
+    *walls = out.into_iter().flat_map(|(_, v)| v).collect();
+}
+
+fn wall_pts_len(pts: &[Point], closed: bool) -> f64 {
+    let mut l: f64 = pts.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum();
+    if closed && pts.len() > 2 {
+        l += pt_dist_mm(*pts.last().unwrap(), pts[0]);
+    }
+    l
+}
+
+/// Point sequence for distance tests: append the closing point for closed loops so
+/// the closing segment counts too.
+fn seq(pts: &[Point], closed: bool) -> Vec<Point> {
+    let mut v = pts.to_vec();
+    if closed && pts.len() > 2 {
+        v.push(pts[0]);
+    }
+    v
+}
+
+/// Trim a wall loop where its bead doubles a kept wall. `None` = nothing trimmed
+/// (caller keeps the loop as-is, seam intact); `Some(arcs)` = the surviving open
+/// runs. A point is "doubled" when within `thresh` of any kept centerline; isolated
+/// single hits (numerical noise at the spacing limit) are ignored — only runs of
+/// ≥2 are cut. The cut region is then grown by `margin` of arc length at each end,
+/// so the surviving arc tips pull back from the wall they were doubling (less tip
+/// overlap) instead of stopping right at the threshold boundary.
+fn trim_loop(
+    pts: &[Point],
+    closed: bool,
+    kept: &[Vec<Point>],
+    thresh: f64,
+    margin: f64,
+) -> Option<Vec<(Vec<Point>, bool)>> {
+    let n = pts.len();
+    if n < 2 {
+        return None;
+    }
+    let blocked: Vec<bool> = pts.iter().map(|&p| min_dist_to_polylines(p, kept) < thresh).collect();
+    // Cut a point only if it AND a neighbour are blocked (drop isolated hits).
+    let cut0: Vec<bool> = (0..n)
+        .map(|k| {
+            if !blocked[k] {
+                return false;
+            }
+            let prev = if closed { blocked[(k + n - 1) % n] } else { k > 0 && blocked[k - 1] };
+            let next = if closed { blocked[(k + 1) % n] } else { k + 1 < n && blocked[k + 1] };
+            prev || next
+        })
+        .collect();
+    if !cut0.iter().any(|&c| c) {
+        return None;
+    }
+    if cut0.iter().all(|&c| c) {
+        return Some(Vec::new()); // entirely doubled — drop the loop
+    }
+    // Grow the cut by `margin` of arc length around each cut point.
+    let cut: Vec<bool> = if margin <= 0.0 {
+        cut0
+    } else {
+        let mut cum = vec![0.0_f64; n];
+        for k in 1..n {
+            cum[k] = cum[k - 1] + pt_dist_mm(pts[k - 1], pts[k]);
+        }
+        let total = cum[n - 1] + if closed { pt_dist_mm(pts[n - 1], pts[0]) } else { 0.0 };
+        let cut_idx: Vec<usize> = (0..n).filter(|&j| cut0[j]).collect();
+        (0..n)
+            .map(|k| {
+                cut0[k]
+                    || cut_idx.iter().any(|&j| {
+                        let d = (cum[k] - cum[j]).abs();
+                        let d = if closed { d.min(total - d) } else { d };
+                        d <= margin
+                    })
+            })
+            .collect()
+    };
+    if cut.iter().all(|&c| c) {
+        return Some(Vec::new());
+    }
+    // Maximal runs of kept (non-cut) points. For a closed loop, start at a cut
+    // point so no run wraps the seam.
+    let mut arcs: Vec<(Vec<Point>, bool)> = Vec::new();
+    let mut cur: Vec<Point> = Vec::new();
+    let push = |cur: &mut Vec<Point>, arcs: &mut Vec<(Vec<Point>, bool)>| {
+        if cur.len() >= 2 {
+            arcs.push((std::mem::take(cur), false));
+        } else {
+            cur.clear();
+        }
+    };
+    if closed {
+        let start = (0..n).find(|&k| cut[k]).unwrap();
+        for step in 1..=n {
+            let idx = (start + step) % n;
+            if cut[idx] {
+                push(&mut cur, &mut arcs);
+            } else {
+                cur.push(pts[idx]);
+            }
+        }
+    } else {
+        for k in 0..n {
+            if cut[k] {
+                push(&mut cur, &mut arcs);
+            } else {
+                cur.push(pts[k]);
+            }
+        }
+    }
+    push(&mut cur, &mut arcs);
+    Some(arcs)
+}
+
+fn min_dist_to_polylines(p: Point, polylines: &[Vec<Point>]) -> f64 {
+    let mut best = f64::INFINITY;
+    for pl in polylines {
+        for w in pl.windows(2) {
+            best = best.min(pt_seg_dist_mm(p, w[0], w[1]));
+        }
+    }
+    best
+}
+
+fn pt_seg_dist_mm(p: Point, a: Point, b: Point) -> f64 {
+    let (px, py, ax, ay, bx, by) = (p.x_mm(), p.y_mm(), a.x_mm(), a.y_mm(), b.x_mm(), b.y_mm());
+    let (dx, dy) = (bx - ax, by - ay);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 < 1.0e-12 { 0.0 } else { (((px - ax) * dx + (py - ay) * dy) / l2).clamp(0.0, 1.0) };
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy))
+}
+
+/// Single-region bridge split: cut each just-filled bead at the support boundary.
+/// The stretch over `bridge` (open sparse below) is re-tagged `InternalBridge`
+/// (bridge flow/speed); the stretch over `supported` keeps the bead's own kind.
+/// A bead wholly on one side stays one path (closed loops stay closed); a bead
+/// that crosses is split into collinear arcs that abut at the boundary — so the
+/// fill stays one continuous onion/line-set that just steps where support changes.
+fn split_bridge_beads(paths: &mut Vec<ToolPath>, start: usize, bridge: &Polygons, supported: &Polygons) {
+    let Some(bb) = bridge.bounds() else { return };
+    let (bx0, by0, bx1, by1) = (bb.min.x_mm(), bb.min.y_mm(), bb.max.x_mm(), bb.max.y_mm());
+    let beads: Vec<ToolPath> = paths.split_off(start);
+    for bead in beads {
+        if bead.points.len() < 2 {
+            paths.push(bead);
+            continue;
+        }
+        // AABB reject: a bead clear of the bridge's bounds can't cross it — skip the
+        // (expensive) clip and keep it whole.
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for p in &bead.points {
+            x0 = x0.min(p.x_mm());
+            y0 = y0.min(p.y_mm());
+            x1 = x1.max(p.x_mm());
+            y1 = y1.max(p.y_mm());
+        }
+        if x1 < bx0 || x0 > bx1 || y1 < by0 || y0 > by1 {
+            paths.push(bead);
+            continue;
+        }
+        let mut tup: Vec<(f64, f64)> = bead.points.iter().map(|p| (p.x_mm(), p.y_mm())).collect();
+        if bead.closed {
+            tup.push(tup[0]); // close the ring for clipping
+        }
+        let over_air = crate::fill::clip_polylines(vec![tup.clone()], bridge);
+        let span = |a: &[Point]| -> f64 { a.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum() };
+        // Gate: only bridge a run that's actually long enough to sag (≥ 2 mm). If no
+        // over-air arc qualifies, don't split at all — leave the bead whole solid.
+        if !over_air.iter().any(|a| span(a) >= MIN_BRIDGE_SPAN_MM) {
+            paths.push(bead);
+            continue;
+        }
+        let over_solid = crate::fill::clip_polylines(vec![tup], supported);
+        for (arcs, base_kind) in [(over_solid, bead.kind), (over_air, PathKind::InternalBridge)] {
+            for arc in arcs {
+                if arc.len() < 2 {
+                    continue;
+                }
+                // A short over-air arc (< 2 mm) the bead carries fine — keep it the
+                // bead's own kind rather than switching to bridge.
+                let kind = if base_kind == PathKind::InternalBridge && span(&arc) < MIN_BRIDGE_SPAN_MM {
+                    bead.kind
+                } else {
+                    base_kind
+                };
+                let closed = arc.len() >= 4 && pt_dist_mm(arc[0], *arc.last().unwrap()) < 1.0e-3;
+                let mut points = arc;
+                if closed {
+                    points.pop();
+                }
+                let mut tp = bead.clone();
+                tp.kind = kind;
+                tp.points = points;
+                tp.closed = closed;
+                paths.push(tp);
+            }
+        }
+    }
 }
 
 /// Even-odd containment over a polygon set (outers + holes).
@@ -1356,121 +1586,6 @@ fn extend_to_wall(p: Point, prev: Point, max: f64, inside_walls: &Polygons) -> P
     }
 }
 
-/// Classic gap fill: trace the medial axis of each sliver the walls + infill
-/// leave uncovered and lay it as single width-matched strokes.
-///
-/// `coverage` is the union of the actual wall-bead footprints (so a ring the
-/// offset abandoned on a thin flank shows up as missing coverage); `opened` is
-/// the infill region. The uncovered remainder is banded to widths a stroke can
-/// fill (≥ `0.2·lw`) but a full ring can't (≤ `2·sp`), mirroring PrusaSlicer's
-/// gap-region cleanup, then handed to the segment-Voronoi medial axis.
-fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
-    if raw.is_empty() {
-        return;
-    }
-    let min = 0.2 * lw;
-    let max = 2.0 * sp;
-    // Drop sub-min hair ribbons (open by min/2) and subtract the >max cores that
-    // should have taken a real ring (the open-by-max/2 part): the fillable band.
-    let opened_min = offset(&offset(&raw, -min * 0.5), min * 0.5);
-    let wide = offset(&offset(&raw, -max * 0.5), max * 0.5);
-    let gaps = difference(&opened_min, &wide);
-    if gaps.is_empty() {
-        return;
-    }
-    // Now that the dense walls fill the bulk, gap fill only sees the residual
-    // seam specks where rings don't quite meet — a short isolated bead per speck
-    // strings out into a dashed line that is mostly travel for negligible fill.
-    // Skip beads too short to be worth reaching (5·lw, above the medial's 2·max
-    // twig-cull; on Benchy these specks are all < 2.25mm with a clean gap to the
-    // next real fill at > 5mm).
-    for tp in crate::medial::medial_axis(&gaps, min, max) {
-        if tp.length_mm() < lw * 5.0 {
-            continue;
-        }
-        emit_tapered_bead(&tp, lw, out);
-    }
-}
-
-/// Emit a medial polyline as one continuously-tapered `GapFill` bead. The
-/// centerline is resampled to fine segments and carries a per-point width
-/// (`ToolPath.widths`), so the g-code varies E per segment — a smooth taper to
-/// the tip — and the preview renders a variable-width ribbon. Widths are floored
-/// at the minimum printable bead; `width_mm` carries the mean for feed/flow.
-fn emit_tapered_bead(tp: &crate::medial::ThickPolyline, lw: f64, out: &mut Vec<ToolPath>) {
-    const FLOOR: f64 = 0.1; // min printable bead width
-    // The medial centerline can be sparse — a wedge void traces as just two
-    // points (wide base, thin tip). Resample so the per-segment width actually
-    // varies along it instead of collapsing to one mean.
-    let (pts, ws) = resample_thick(&tp.points, &tp.widths, lw * 0.5);
-    if pts.len() < 2 {
-        return;
-    }
-    // The medial clearance to the raster void's jagged (~0.18mm) boundary
-    // oscillates, which reads as a lumpy bead pinching below the real channel
-    // width. Low-pass the width profile (~2mm window) so the bead fills the
-    // channel smoothly; the centerline itself is already smooth.
-    let ws = smooth_widths(&ws, lw * 0.5, 2.0);
-    let widths: Vec<f64> = ws.iter().map(|&w| w.max(FLOOR)).collect();
-    let mean = widths.iter().sum::<f64>() / widths.len() as f64;
-    let mut p = ToolPath::new(PathKind::GapFill, false, mean, pts);
-    p.widths = Some(widths);
-    out.push(p);
-}
-
-/// Moving-average the width profile over a ~`window_mm` window (samples spaced
-/// `step_mm`) to strip the high-frequency oscillation the raster void's jagged
-/// boundary injects into the medial clearance, while keeping the real taper.
-fn smooth_widths(ws: &[f64], step_mm: f64, window_mm: f64) -> Vec<f64> {
-    let r = ((window_mm / step_mm / 2.0).round() as usize).max(1);
-    if ws.len() <= 2 {
-        return ws.to_vec();
-    }
-    (0..ws.len())
-        .map(|i| {
-            let lo = i.saturating_sub(r);
-            let hi = (i + r + 1).min(ws.len());
-            ws[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
-        })
-        .collect()
-}
-
-/// Resample a polyline + per-point widths at ~`step_mm` spacing, interpolating
-/// both position and width — turns a sparse medial centerline into enough points
-/// that its width taper survives the run-split.
-fn resample_thick(pts: &[Point], ws: &[f64], step_mm: f64) -> (Vec<Point>, Vec<f64>) {
-    let n = pts.len();
-    if n < 2 {
-        return (pts.to_vec(), ws.to_vec());
-    }
-    let step = (step_mm * geo2d::UNITS_PER_MM).max(1.0);
-    let mut op = vec![pts[0]];
-    let mut ow = vec![ws[0]];
-    let mut acc = 0.0; // distance walked since the last emitted point
-    for i in 0..n - 1 {
-        let (a, b) = (pts[i], pts[i + 1]);
-        let seg = ((b.x - a.x) as f64).hypot((b.y - a.y) as f64);
-        if seg < 1.0 {
-            continue;
-        }
-        let mut t0 = 0.0; // fraction of this segment already consumed
-        while acc + seg * (1.0 - t0) >= step {
-            let t = t0 + (step - acc) / seg;
-            op.push(Point::new(
-                a.x + ((b.x - a.x) as f64 * t).round() as i64,
-                a.y + ((b.y - a.y) as f64 * t).round() as i64,
-            ));
-            ow.push(ws[i] + (ws[i + 1] - ws[i]) * t);
-            t0 = t;
-            acc = 0.0;
-        }
-        acc += seg * (1.0 - t0);
-    }
-    op.push(pts[n - 1]);
-    ow.push(ws[n - 1]);
-    (op, ow)
-}
-
 /// Greedily order each layer's paths (nearest-neighbour) to cut travel, keeping
 /// skirt/brim first and ironing last (it must run over the finished surface).
 /// Open paths may be reversed to start at the nearer end; runs of `no_reorder`
@@ -1486,9 +1601,9 @@ fn order_layers(plans: &mut [LayerPlan], outer_first: bool) {
         }
         let (iron, mut rest): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|p| p.kind == PathKind::Ironing);
-        // Print z-phases in ascending order — half-height lower outer walls
-        // (−h/2) first, then the layer plane, then brick-lifted (+h/2) — so the
-        // nozzle never descends into material already printed this layer.
+        // Print z-phases in ascending order — the layer plane first, then
+        // brick-lifted (+h/2) — so the nozzle never descends into material
+        // already printed this layer.
         let mut phases: Vec<f64> = rest.iter().map(|p| p.z_offset_mm).collect();
         phases.sort_by(|a, b| a.partial_cmp(b).unwrap());
         phases.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
@@ -1588,7 +1703,7 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
             settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
         let below = offset(&layers[plan.index - 1].polygons, allowance);
         let paths = &mut plan.paths;
-        let part_of_run = |p: &ToolPath| is_ring(p.kind) || p.kind == PathKind::GapFill;
+        let part_of_run = |p: &ToolPath| is_ring(p.kind);
         let mut i = 0;
         while i < paths.len() {
             if !is_ring(paths[i].kind) {
@@ -1948,12 +2063,12 @@ fn fill_region(
             out.push(p);
         }
     };
-    // Minuscule solid dashes are pure overhead: the solid boundary loop
-    // already covers the region's rim, so a sub-1.5-line-width row-end stub
-    // adds a travel (often a retraction) for material the loop deposited.
-    // Sparse and support lines keep the small default — their patterns rely
-    // on short links.
-    let min_len = if kind == PathKind::Solid { lw * 1.5 } else { 0.5 };
+    // No minimum row length on any fill: keep every span a bead would cover,
+    // including the short corner stubs. Solid and skins must be airtight (there's
+    // no boundary loop covering the rim any more, so a dropped stub is a real hole),
+    // and sparse wants full coverage too; `extend_ends_to_wall` then walks each stub
+    // out to the wall it faces.
+    let min_len = 0.0;
     // Scanline patterns sweep each island separately when monotonic.
     let scan = |sets: &[(f64, f64)], out: &mut Vec<ToolPath>| {
         if monotonic {
@@ -2637,22 +2752,35 @@ mod tests {
     }
 
     #[test]
-    fn solid_over_sparse_is_not_internal_bridged() {
-        // Internal bridging was removed (it ate the visible top surface at low
-        // top-layer counts). A solid shell over 15% sparse infill now prints as
-        // ordinary solid / top skin, and no layer internal-bridges.
+    fn solid_over_low_sparse_internal_bridges() {
+        // Any solid/shell layer over low-density (≤15%) sparse spans mostly air
+        // between the infill lines, so it prints as an internal bridge — buried OR
+        // visible top shell, wherever it's over open sparse.
         let m = mesh::Mesh::cube(20.0);
-        let s = Settings { skirt_loops: 0, ..Settings::default() };
-        let plans = generate(&m, &s);
+        let low = Settings { skirt_loops: 0, infill_density: 0.10, ..Settings::default() };
+        let plans = generate(&m, &low);
+        let bridges: usize = plans.iter().map(|p| count(p, PathKind::InternalBridge)).sum();
+        assert!(bridges > 0, "low-density solid-over-sparse must internal-bridge");
+        // The roof here sits over the solid top shell (not sparse), so it stays a
+        // normal top skin — only layers over OPEN sparse bridge.
+        let roof = plans.last().unwrap();
+        assert!(count(roof, PathKind::TopSkin) > 0, "roof over solid stays top skin");
+        assert_eq!(count(roof, PathKind::InternalBridge), 0, "roof isn't over sparse");
+
+        // With a single top layer, the VISIBLE top is the layer over sparse — it
+        // bridges too (bridge flow runs high to fill the missing volume; not spared).
+        let thin = Settings { skirt_loops: 0, infill_density: 0.10, top_layers: 1, ..Settings::default() };
+        let plans = generate(&m, &thin);
+        let roof = plans.last().unwrap();
+        assert!(count(roof, PathKind::InternalBridge) > 0, "single top layer over sparse bridges");
+
+        // Above the threshold the sparse is dense enough to support the layer:
+        // plain solid, no internal bridges.
+        let dense = Settings { skirt_loops: 0, infill_density: 0.30, ..Settings::default() };
+        let plans = generate(&m, &dense);
         for p in &plans {
-            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} internal-bridges", p.index);
+            assert_eq!(count(p, PathKind::InternalBridge), 0, "layer {} bridges at 30%", p.index);
         }
-        // The first top-shell layer over the sparse core still prints solid.
-        let first_top = plans.len() - s.top_layers;
-        assert!(
-            count(&plans[first_top], PathKind::Solid) + count(&plans[first_top], PathKind::TopSkin) > 0,
-            "first top-shell layer over sparse prints solid, not bridge"
-        );
     }
 
     #[test]
@@ -2938,120 +3066,7 @@ mod tests {
         assert!(area(&grown[10]) > area(&base[10]) + 5.0, "XY comp should grow the outline");
     }
 
-    /// A square frustum: `base`-wide at z=0 tapering to `top` at height `h`
-    /// (45-degree slopes when (base-top)/2 == h). Sloped walls make the
-    /// half-height outer passes follow visibly different contours.
-    fn frustum(base: f64, top: f64, h: f64) -> Mesh {
-        let (b, t) = (base / 2.0, top / 2.0);
-        let v = |x: f64, y: f64, z: f64| [x, y, z];
-        let verts = vec![
-            v(-b, -b, 0.0), v(b, -b, 0.0), v(b, b, 0.0), v(-b, b, 0.0), // 0-3 base
-            v(-t, -t, h), v(t, -t, h), v(t, t, h), v(-t, t, h),          // 4-7 top
-        ];
-        let quads = [
-            [0u32, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7], // sides
-            [3, 2, 1, 0], // bottom
-            [4, 5, 6, 7], // top
-        ];
-        let mut tris = Vec::new();
-        for q in quads {
-            tris.push([q[0], q[1], q[2]]);
-            tris.push([q[0], q[2], q[3]]);
-        }
-        Mesh { vertices: verts, triangles: tris }
-    }
 
-    #[test]
-    fn half_height_outer_walls_follow_their_own_contours() {
-        // 45-degree slopes: the outline shrinks 1:1 with z, so the lower pass
-        // (sampled h/4 below the layer midpoint) spans ~h/2 wider per axis than
-        // the upper pass (h/4 above) -> span difference of ~h.
-        let m = frustum(20.0, 10.0, 5.0);
-        let mut s = Settings { skirt_loops: 0, ..Settings::default() };
-        s.half_height_outer_walls = true;
-        let layers = generate(&m, &s);
-        let mid = &layers[10];
-        let h = s.layer_height_mm;
-
-        let outers: Vec<&ToolPath> = mid
-            .paths
-            .iter()
-            .filter(|p| p.kind == PathKind::ExternalPerimeter)
-            .collect();
-        assert_eq!(outers.len(), 2, "two half passes per layer");
-        let lower = outers.iter().find(|p| p.z_offset_mm < 0.0).expect("lower pass");
-        let upper = outers.iter().find(|p| p.z_offset_mm == 0.0).expect("upper pass");
-        assert!((lower.z_offset_mm + 0.5 * h).abs() < 1e-9);
-        assert!((lower.height_scale - 0.5).abs() < 1e-9);
-        assert!((upper.height_scale - 0.5).abs() < 1e-9);
-
-        let span = |p: &ToolPath| {
-            let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
-            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
-        };
-        let diff = span(lower) - span(upper);
-        assert!(
-            (diff - h).abs() < 0.06,
-            "45-degree slope: lower span should exceed upper by ~{h}, got {diff:.3}"
-        );
-
-        // The lower pass prints before everything else printable on the layer.
-        let first = mid.paths.iter().position(|p| p.points.len() >= 2).unwrap();
-        assert!(mid.paths[first].z_offset_mm < 0.0, "lower outer phase prints first");
-
-        // Layer 0 stays one full-height pass for bed squish.
-        let l0: Vec<&ToolPath> = layers[0]
-            .paths
-            .iter()
-            .filter(|p| p.kind == PathKind::ExternalPerimeter)
-            .collect();
-        assert_eq!(l0.len(), 1);
-        assert_eq!(l0[0].height_scale, 1.0);
-    }
-
-    #[test]
-    fn inner_walls_stay_inside_half_height_outer_on_shallow_slopes() {
-        // Shallow slope (rise 2 over run 5 per side): the layer-midpoint
-        // outline is wider than the upper half pass — interior geometry must
-        // derive from the intersection of the halves, or inner walls poke
-        // outside the outer wall (seen on the Benchy roof).
-        let m = frustum(20.0, 10.0, 2.0);
-        let mut s = Settings { skirt_loops: 0, ..Settings::default() };
-        s.half_height_outer_walls = true;
-        let layers = generate(&m, &s);
-        let span = |p: &ToolPath| {
-            let xs: Vec<f64> = p.points.iter().map(|pt| pt.x_mm()).collect();
-            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
-        };
-        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
-        for layer in layers.iter().skip(1) {
-            for phase in [0.0, -0.5 * s.layer_height_mm] {
-                let outer = layer
-                    .paths
-                    .iter()
-                    .filter(|p| p.kind == PathKind::ExternalPerimeter && (p.z_offset_mm - phase).abs() < 1e-9)
-                    .map(|p| span(p))
-                    .fold(f64::MIN, f64::max);
-                for p in layer
-                    .paths
-                    .iter()
-                    .filter(|p| p.kind == PathKind::Perimeter && (p.z_offset_mm - phase).abs() < 1e-9)
-                {
-                    assert!(
-                        (p.height_scale - 0.5).abs() < 1e-9,
-                        "inner walls are half-height under this feature"
-                    );
-                    assert!(
-                        span(p) <= outer - 1.5 * sp,
-                        "layer {} phase {phase}: inner span {:.3} escapes outer span {:.3}",
-                        layer.index,
-                        span(p),
-                        outer
-                    );
-                }
-            }
-        }
-    }
 
     #[test]
     fn tiny_sparse_pockets_become_solid() {
@@ -3067,23 +3082,6 @@ mod tests {
         assert!(count(mid, PathKind::Solid) > 0, "pocket promoted to solid");
     }
 
-    #[test]
-    fn half_outer_walls_exclude_brick() {
-        let m = Mesh::cube(20.0);
-        let mut s = Settings { skirt_loops: 0, wall_count: 4, ..Settings::default() };
-        s.half_height_outer_walls = true;
-        s.brick_layers = true; // collides - brick must yield
-        let layers = generate(&m, &s);
-        let mid = &layers[50];
-        assert!(
-            mid.paths.iter().all(|p| p.z_offset_mm <= 0.0),
-            "no brick-lifted (positive offset) paths when half-outer is on"
-        );
-        assert!(
-            mid.paths.iter().any(|p| p.z_offset_mm < 0.0 && p.height_scale == 0.5),
-            "half-height lower pass present"
-        );
-    }
 
     #[test]
     fn walls_are_placed_at_stadium_spacing() {

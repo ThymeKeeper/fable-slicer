@@ -236,7 +236,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 normal_fan
             } else {
                 let frac = match path.kind {
-                    PathKind::Bridge | PathKind::InternalBridge | PathKind::BottomSkin => s.bridge_fan_speed,
+                    // InternalBridge keeps the normal fan: it's cut per-bead into the
+                    // surrounding solid, so a separate fan duty would thrash on/off
+                    // along one onion. The user asked for bridge flow/speed, not fan.
+                    PathKind::Bridge | PathKind::BottomSkin => s.bridge_fan_speed,
                     PathKind::OverhangWall => {
                         s.fan_speed + (s.bridge_fan_speed - s.fan_speed) * path.overhang as f64
                     }
@@ -459,23 +462,15 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
     match kind {
         PathKind::ExternalPerimeter => s.external_perimeter_speed_mm_s,
         PathKind::Solid => s.solid_speed_mm_s,
-        PathKind::GapFill => s.gap_fill_speed_mm_s,
         // Visible skins share the outer wall's pace: finish over time.
         PathKind::TopSkin | PathKind::BottomSkin => s.external_perimeter_speed_mm_s,
         PathKind::Ironing => s.ironing_speed_mm_s,
         PathKind::Support => s.support_speed_mm_s,
         // Bridges print into air anchored on both ends.
         PathKind::Bridge => s.bridge_speed_mm_s,
-        // Internal bridges (solid over sparse) are anchored every infill cell:
-        // the free span is spacing/density, not a real bridge's max span. Sag
-        // scales with span, so scale the bridge speed by the span ratio —
-        // never slower than a bridge, never faster than solid fill.
-        PathKind::InternalBridge => {
-            let spacing = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
-            let cell = if s.infill_density > 0.0 { spacing / s.infill_density } else { f64::MAX };
-            let ratio = (s.max_bridge_span_mm / cell).max(1.0);
-            (s.bridge_speed_mm_s * ratio).min(s.solid_speed_mm_s)
-        }
+        // Internal bridge: the first buried solid layer over low-density sparse,
+        // spanning mostly air between the infill lines — print it at bridge speed.
+        PathKind::InternalBridge => s.bridge_speed_mm_s,
         // Wall stretches past the layer below slow by how far they overhang:
         // graduated from the outer-wall pace (a barely-unsupported bead) down to
         // the overhang floor (bridge speed) when the bead is fully airborne.
@@ -492,7 +487,13 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
 /// (brick, ironing), per-kind flow (bridges), and the global multiplier.
 fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
-    let kind_flow = if path.kind == PathKind::Bridge { s.bridge_flow } else { 1.0 };
+    // Bridges and internal bridges (solid over open sparse) both span air — the
+    // stretched strand wants the reduced bridge flow so it doesn't droop.
+    let kind_flow = if matches!(path.kind, PathKind::Bridge | PathKind::InternalBridge) {
+        s.bridge_flow
+    } else {
+        1.0
+    };
     path.flow * kind_flow * s.extrusion_multiplier
 }
 
@@ -588,7 +589,6 @@ pub fn kind_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "top surface",
         PathKind::BottomSkin => "bottom surface",
         PathKind::Infill => "infill",
-        PathKind::GapFill => "gap fill",
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
@@ -608,7 +608,6 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "Top surface",
         PathKind::BottomSkin => "Bottom surface",
         PathKind::Infill => "Sparse infill",
-        PathKind::GapFill => "Gap infill",
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
         PathKind::Bridge => "Bridge",
@@ -1899,6 +1898,7 @@ mod tests {
         let m = mesh::Mesh::cube(10.0);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0; // keep nominal feeds visible in the g-code
+        s.heat_control = false; // and don't let per-layer heat scaling adjust them
         let layers = generate(&m, &s);
         let n = layers.len();
         let count = |l: &LayerPlan, k: PathKind| l.paths.iter().filter(|p| p.kind == k).count();
@@ -1948,42 +1948,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn half_height_walls_stay_governed() {
-        // A pyramid slopes everywhere, so every half-height pass follows its
-        // own contour and deposits beyond the mid-layer outline. Heat control
-        // must still afford a sane smoothing gradient and govern the narrowing
-        // (hot) upper layers.
-        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
-        let b = 15.0_f64;
-        let apex = [0.0_f64, 0.0, 20.0];
-        let corners =
-            [[-b, -b, 0.0_f64], [b, -b, 0.0], [b, b, 0.0], [-b, b, 0.0]];
-        for i in 0..4 {
-            let (c0, c1) = (corners[i], corners[(i + 1) % 4]);
-            soup.push([c0, c1, apex]);
-        }
-        soup.push([corners[0], corners[2], corners[1]]);
-        soup.push([corners[0], corners[3], corners[2]]);
-        let m = mesh::Mesh::from_triangle_soup(&soup);
-        let mut s = Settings::default();
-        s.min_layer_time_s = 0.0;
-        s.heat_control = true;
-        s.smooth_extra_time_pct = 30.0;
-        s.half_height_outer_walls = true;
-        let layers = generate(&m, &s);
-        let r = audit_smoothing(&layers, &s).expect("on");
-        assert!(
-            r.pct_per_layer < 12.0,
-            "half-height must not starve smoothing: {:.2}%/layer",
-            r.pct_per_layer
-        );
-        // The narrowing (hot) upper layers are slowed.
-        assert!(
-            !audit_heat_control_speed(&layers, &s).is_empty(),
-            "the hot upper layers must be governed"
-        );
-    }
 
     #[test]
     fn heat_control_smooths_transitions_within_budget() {

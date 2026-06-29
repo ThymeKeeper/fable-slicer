@@ -26,7 +26,6 @@ fn single_wall(settings: &Settings) -> Settings {
     s.infill_density = 0.0;
     s.spiral_vase = false;
     s.brick_layers = false;
-    s.half_height_outer_walls = false;
     // The cal cube is a lone synthetic mesh at the origin (cube() spans 0..size).
     // The GUI runs with auto-center OFF (it places objects itself), so without
     // this the cube prints in the front-left corner and its skirt spills off the

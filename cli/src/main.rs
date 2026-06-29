@@ -115,10 +115,6 @@ struct Args {
     /// Brick layering: stagger odd perimeters by half a layer for wall interlocking.
     #[arg(long)]
     brick: bool,
-    /// Outer wall as two half-height passes (own slice planes) — halves the
-    /// visible Z staircase on slopes. Mutually exclusive with --brick.
-    #[arg(long)]
-    half_outer_walls: bool,
     /// Fit circular arcs to curved toolpaths and emit G2/G3 (needs firmware arc support).
     #[arg(long)]
     arc_fitting: bool,
@@ -225,9 +221,6 @@ fn main() -> Result<()> {
     }
     if args.brick {
         settings.brick_layers = true;
-    }
-    if args.half_outer_walls {
-        settings.half_height_outer_walls = true;
     }
     if args.arc_fitting {
         settings.arc_fitting = true;
@@ -389,12 +382,10 @@ fn render_layer_svg(layer: &LayerPlan, bounds: &Aabb) -> String {
             PathKind::TopSkin => "#ed618c",
             PathKind::BottomSkin => "#9e7333",
             PathKind::Infill => "#e08a2b",
-            PathKind::GapFill => "#d65fb0",
             PathKind::Ironing => "#bcbd22",
             PathKind::Support => "#8c6bb1",
             PathKind::Bridge => "#17becf",
             PathKind::InternalBridge => "#1f8bb8",
-            PathKind::ArcOverhang => "#40c78c",
         };
         let mut d = String::from("M");
         for (i, &p) in path.points.iter().enumerate() {

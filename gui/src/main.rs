@@ -156,6 +156,7 @@ enum ColorBy {
 /// "priority mode": auto until touched, visible either way).
 #[derive(Default, Clone, Copy)]
 struct Pins {
+    line_width: bool,
     outer_wall_accel: bool,
     first_layer_accel: bool,
     max_heat: bool,
@@ -804,8 +805,8 @@ struct App {
     preview_layer: usize,
     show_walls: bool,
     show_solid: bool,
+    show_surface: bool,
     show_infill: bool,
-    show_gap_fill: bool,
     show_skirt: bool,
     show_support: bool,
     show_travel: bool,
@@ -917,7 +918,8 @@ impl App {
             profiles.merged_printer(&printer),
             profiles.merged_filament(&filament),
         ) {
-            (Ok(_pc), Ok(pr), Ok(fl)) => Pins {
+            (Ok(pc), Ok(pr), Ok(fl)) => Pins {
+                line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
                 max_heat: fl.max_heat_mw_mm2.is_some(),
@@ -970,8 +972,8 @@ impl App {
             preview_layer: 1,
             show_walls: true,
             show_solid: true,
+            show_surface: true,
             show_infill: true,
-            show_gap_fill: true,
             show_skirt: true,
             show_support: true,
             show_travel: false,
@@ -1038,11 +1040,11 @@ impl App {
         if self.show_support {
             m |= 1 << 6;
         }
-        if self.show_gap_fill {
-            m |= 1 << 7;
-        }
         if self.show_ironing {
             m |= 1 << 8;
+        }
+        if self.show_surface {
+            m |= 1 << 9;
         }
         m
     }
@@ -1064,12 +1066,13 @@ impl App {
     /// Pin state comes from the selected profiles: a field the profile chain
     /// sets explicitly is pinned; one it leaves unset follows auto.
     fn refresh_pins(&mut self) {
-        if let (Ok(_pc), Ok(pr), Ok(fl)) = (
+        if let (Ok(pc), Ok(pr), Ok(fl)) = (
             self.profiles.merged_process(&self.process),
             self.profiles.merged_printer(&self.printer),
             self.profiles.merged_filament(&self.filament),
         ) {
             self.pins = Pins {
+                line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
                 max_heat: fl.max_heat_mw_mm2.is_some(),
@@ -1085,7 +1088,9 @@ impl App {
         // the operating temperature + the material's adhesion bump, nominal
         // speed from the machine rating × the finish↔speed dial, features from
         // the nominal under the melt ceiling.
-        s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
+        if !self.pins.line_width {
+            s.line_width_mm = config::derived_line_width_mm(s.nozzle_diameter_mm);
+        }
         s.first_layer_nozzle_temp_c =
             config::derived_first_layer_temp_c(s.nozzle_temp_c, s.material);
         if !self.pins.max_heat {
@@ -1097,7 +1102,6 @@ impl App {
             config::derived_external_perimeter_speed_mm_s(s.print_speed_mm_s, cap);
         s.solid_speed_mm_s = config::derived_solid_speed_mm_s(s.print_speed_mm_s, cap);
         s.support_speed_mm_s = config::derived_support_speed_mm_s(s.print_speed_mm_s, cap);
-        s.gap_fill_speed_mm_s = config::derived_gap_fill_speed_mm_s(s.print_speed_mm_s, cap);
         s.overhang_speed_mm_s = config::derived_overhang_speed_mm_s(s.bridge_speed_mm_s);
         if !self.pins.outer_wall_accel {
             s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
@@ -2308,9 +2312,9 @@ impl eframe::App for App {
                 // (vertical); here in the panel are just the feature toggles.
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.show_walls, "walls").on_hover_text("Show wall (perimeter) toolpaths.");
-                    ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show solid top/bottom fill.");
+                    ui.checkbox(&mut self.show_solid, "solid").on_hover_text("Show buried solid infill (solid layers covered above and below).");
+                    ui.checkbox(&mut self.show_surface, "surface").on_hover_text("Show top and bottom surface skins (the visible faces).");
                     ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
-                    ui.checkbox(&mut self.show_gap_fill, "gap fill").on_hover_text("Show thin gap-fill strokes between walls.");
                     ui.checkbox(&mut self.show_ironing, "ironing").on_hover_text("Show the top-surface ironing pass.");
                     ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
                     ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
@@ -2461,6 +2465,9 @@ impl eframe::App for App {
                         lh_hint);
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_height_mm, 0.1..=0.4), "first layer mm",
                         "Thickness of the first layer — often thicker for bed adhesion.");
+                    auto_slider(ui, &mut s.line_width_mm, 0.1..=1.5, "line width mm",
+                        &mut pins.line_width, config::derived_line_width_mm(s.nozzle_diameter_mm),
+                        "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
                     seam_combo(ui, &mut s.seam_mode)
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
                     ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")
@@ -2500,14 +2507,9 @@ impl eframe::App for App {
                         "Number of solid layers on bottom surfaces.");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.gap_fill, "gap fill"))
-                        .on_hover_text("Fill gaps too thin for a wall or normal infill — between and inside walls — with single width-matched strokes traced down each gap's medial axis.");
-                    ui.add_enabled(!vase && !s.brick_layers, egui::Checkbox::new(&mut s.half_height_outer_walls, "half-height outer wall"))
-                        .on_hover_text("Print the outer wall as two half-height passes, each sliced at its own plane — halves the visible Z staircase on slopes while the interior keeps full layer height. Costs roughly the outer-wall print time again.")
-                        .on_disabled_hover_text("Unavailable in spiral vase mode or with brick layers (their Z choreographies collide).");
-                    ui.add_enabled(!vase && !s.half_height_outer_walls, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
                         .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). The lifted beads' extra flow is derived from the bead geometry. Best with 3+ walls.")
-                        .on_disabled_hover_text("Unavailable in spiral vase mode or with half-height outer walls.");
+                        .on_disabled_hover_text("Unavailable in spiral vase mode.");
                 });
                 tier_section(ui, "Infill", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
@@ -3723,8 +3725,8 @@ const CAT_INFILL: f32 = 3.0;
 const CAT_TRAVEL: f32 = 4.0;
 const CAT_SEAM: f32 = 5.0;
 const CAT_SUPPORT: f32 = 6.0;
-const CAT_GAPFILL: f32 = 7.0;
 const CAT_IRONING: f32 = 8.0;
+const CAT_SURFACE: f32 = 9.0;
 
 /// Flatten sliced layers into bead instances (one per extrusion/travel segment)
 /// plus joint blobs (one per extrusion vertex, to round ends and fill corners),
@@ -3777,7 +3779,7 @@ fn build_instances(
             // fatter (flow > 1), so the staggered, over-packed walls are visible.
             // Trickle-flow paths (ironing) render as a thin film at the layer top
             // instead: full width, height scaled by flow.
-            let base_h = h * path.height_scale as f32; // half-height outer walls
+            let base_h = h * path.height_scale as f32; // height_scale is 1.0 today
             let (w, bh) = if path.flow >= 1.0 {
                 ((path.width_mm * path.flow) as f32, base_h)
             } else {
@@ -3872,9 +3874,9 @@ fn category_of(kind: engine::PathKind) -> f32 {
     match kind {
         Skirt => CAT_SKIRT,
         ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
-        Solid | TopSkin | BottomSkin => CAT_SOLID,
+        Solid => CAT_SOLID,
+        TopSkin | BottomSkin => CAT_SURFACE,
         Infill => CAT_INFILL,
-        GapFill => CAT_GAPFILL,
         Ironing => CAT_IRONING,
         Support | Bridge | InternalBridge => CAT_SUPPORT,
     }
@@ -3901,7 +3903,6 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
         TopSkin => col(0.0, 0.90, 0.68),       // the crown — the accent at its brightest
         BottomSkin => col(0.0, 0.70, 0.36),    // dark underside
         Infill => col(40.0, 0.45, 0.54),       // analogous step one way — recedes
-        GapFill => col(-40.0, 0.55, 0.50),     // analogous step the other way
         Ironing => col(0.0, 0.30, 0.78),       // pale sheen over the top skin
         Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
         Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air

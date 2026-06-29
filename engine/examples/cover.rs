@@ -21,9 +21,6 @@ fn main() {
         s.sparse_pattern = p;
         s.solid_pattern = p;
     }
-    if std::env::var("NO_GAP").is_ok() {
-        s.gap_fill = false;
-    }
 
     let layers = engine::generate(&mesh, &s);
 
@@ -70,11 +67,10 @@ fn main() {
             }
         }
         println!(
-            "scan {} layers (walls={}, dens={:.2}, gap={}): {over_cnt} layers over +2%; worst = L{} at {:.3} ({:+.0}%)",
+            "scan {} layers (walls={}, dens={:.2}): {over_cnt} layers over +2%; worst = L{} at {:.3} ({:+.0}%)",
             layers.len(),
             s.wall_count,
             s.infill_density,
-            s.gap_fill,
             worst.0,
             worst.1,
             (worst.1 - 1.0) * 100.0,
@@ -85,10 +81,9 @@ fn main() {
     let l = &layers[li.min(layers.len()) - 1];
     let (area, unc, over) = over_of(l);
     println!(
-        "L{li}  walls={:<3} dens={:.2} gap={:<5}  outline {area:7.1} mm²  uncovered {unc:6.2} mm² ({:5.2}%)  deposited/region {over:.3} ({:+.0}%)  paths={}",
+        "L{li}  walls={:<3} dens={:.2}  outline {area:7.1} mm²  uncovered {unc:6.2} mm² ({:5.2}%)  deposited/region {over:.3} ({:+.0}%)  paths={}",
         s.wall_count,
         s.infill_density,
-        s.gap_fill.to_string(),
         unc / area * 100.0,
         (over - 1.0) * 100.0,
         l.paths.len(),
