@@ -1509,6 +1509,9 @@ impl App {
         let Some(m) = self.combined_mesh() else {
             return;
         };
+        // A re-slice keeps the layer the user was viewing (clamped below); only the
+        // first slice of a fresh model jumps the slider to the top.
+        let resliced = self.sliced.is_some();
         let layers = generate(&m, &self.settings);
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
@@ -1531,7 +1534,11 @@ impl App {
         // switches beds afterward.
         self.sliced_origin_x = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
         self.set_preview_instances(rs);
-        self.preview_layer = n.max(1);
+        self.preview_layer = if resliced {
+            self.preview_layer.clamp(1, n.max(1))
+        } else {
+            n.max(1)
+        };
         self.view_preview = true;
     }
 
