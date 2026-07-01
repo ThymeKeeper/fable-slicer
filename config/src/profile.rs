@@ -474,8 +474,6 @@ impl Profiles {
         p.filaments.insert("abs".into(), parse("filament/abs", include_str!("../profiles/filament/abs.toml")));
         p.filaments.insert("polymaker-pc".into(), parse("filament/polymaker_pc", include_str!("../profiles/filament/polymaker_pc.toml")));
         p.processes.insert("standard".into(), parse("process/standard", include_str!("../profiles/process/standard.toml")));
-        p.processes.insert("fine".into(), parse("process/fine", include_str!("../profiles/process/fine.toml")));
-        p.processes.insert("draft".into(), parse("process/draft", include_str!("../profiles/process/draft.toml")));
         for name in p.printers.keys() {
             p.builtin.insert(("printer", name.clone()));
         }
@@ -1002,11 +1000,23 @@ mod tests {
 
     #[test]
     fn process_inheritance_overrides() {
-        let p = Profiles::builtin();
-        let s = p.resolve("generic", "pla", "fine").unwrap();
-        assert_eq!(s.layer_height_mm, 0.12); // fine overrides
-        assert_eq!(s.line_width_mm, 0.45); // inherited from standard
-        assert_eq!(s.top_layers, 6); // fine overrides
+        // A process inheriting from the built-in `standard`, overriding a couple of
+        // fields — exercises the process inherits chain (standard is the only
+        // built-in process now, so synthesize the child here).
+        let mut p = Profiles::builtin();
+        p.processes.insert(
+            "myfine".into(),
+            ProcessProfile {
+                inherits: Some("standard".into()),
+                layer_height_mm: Some(0.12),
+                top_layers: Some(6),
+                ..Default::default()
+            },
+        );
+        let s = p.resolve("generic", "pla", "myfine").unwrap();
+        assert_eq!(s.layer_height_mm, 0.12); // child overrides
+        assert_eq!(s.top_layers, 6); // child overrides
+        assert_eq!(s.line_width_mm, 0.45); // derived from the 0.4 nozzle, not set by either
     }
 
     #[test]
