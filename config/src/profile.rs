@@ -110,10 +110,6 @@ pub struct FilamentProfile {
     pub bridge_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_flow_derate_per_c: Option<f64>,
-    /// Allowable heat-load ceiling (mW/mm², per island) — a material range
-    /// bound heat control works within, not a tuning target. Auto: 15.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_heat_mw_mm2: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_off_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,10 +204,6 @@ pub struct ProcessProfile {
     /// the derived speeds between 60% and 100% of the machine's rating.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed_quality: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heat_control: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub smooth_extra_time_pct: Option<f64>,
 }
 
 /// One inheritable tier: knows its parent and how to layer over a base.
@@ -251,7 +243,7 @@ impl Tier for FilamentProfile {
         merge_fields!(self, base, material, filament_diameter_mm, density_g_cm3,
             nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
-            max_heat_mw_mm2, pressure_advance,
+            pressure_advance,
             fan_speed, bridge_fan_speed, bridge_flow, bridge_speed_mm_s,
             fan_off_layers, aux_fan_speed, exhaust_fan_speed,
             chamber_temp_c)
@@ -273,7 +265,7 @@ impl Tier for ProcessProfile {
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
-            speed_quality, heat_control, smooth_extra_time_pct)
+            speed_quality)
     }
 }
 
@@ -340,7 +332,6 @@ impl FilamentProfile {
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
             max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
-            max_heat_mw_mm2: diff_field!(cur.max_heat_mw_mm2, base.max_heat_mw_mm2),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
@@ -401,8 +392,6 @@ impl ProcessProfile {
             xy_compensation_mm: diff_field!(cur.xy_compensation_mm, base.xy_compensation_mm),
             spiral_vase: diff_field!(cur.spiral_vase, base.spiral_vase),
             speed_quality: diff_field!(cur.speed_quality, base.speed_quality),
-            heat_control: diff_field!(cur.heat_control, base.heat_control),
-            smooth_extra_time_pct: diff_field!(cur.smooth_extra_time_pct, base.smooth_extra_time_pct),
         }
     }
 
@@ -751,11 +740,6 @@ impl Profiles {
             max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
             extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
             bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
-            heat_control: pc.heat_control.unwrap_or(d.heat_control),
-            // Material ranges live with the filament; the class supplies
-            // them until calibration pins one.
-            max_heat_mw_mm2: fl.max_heat_mw_mm2.unwrap_or_else(|| material.max_heat_mw_mm2()),
-            smooth_extra_time_pct: pc.smooth_extra_time_pct.unwrap_or(d.smooth_extra_time_pct),
             pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
             fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
             bridge_fan_speed: fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1),
@@ -868,22 +852,17 @@ mod tests {
     }
 
     #[test]
-    fn heat_control_keys_route_to_their_tiers() {
-        // The switch + budget live on the process tier; the ranges are
-        // material properties on the filament tier (auto when unset).
+    fn removed_heat_keys_still_load() {
+        // Heat control was removed; old saved profiles may still carry its keys
+        // (heat_control / smooth_extra_time_pct on the process tier,
+        // max_heat_mw_mm2 on the filament tier). They must be silently ignored,
+        // not error the load — the rest of the profile still resolves.
         let pc: ProcessProfile =
-            toml::from_str("heat_control = true\nsmooth_extra_time_pct = 25.0\n").unwrap();
-        assert_eq!(pc.heat_control, Some(true));
-        assert_eq!(pc.smooth_extra_time_pct, Some(25.0));
+            toml::from_str("heat_control = true\nsmooth_extra_time_pct = 25.0\nwall_count = 3\n").unwrap();
+        assert_eq!(pc.wall_count, Some(3));
         let fl: FilamentProfile =
             toml::from_str("material = \"petg\"\nmax_heat_mw_mm2 = 12.5\n").unwrap();
-        assert_eq!(fl.max_heat_mw_mm2, Some(12.5));
         assert_eq!(fl.material.as_deref(), Some("petg"));
-        // An unset ceiling resolves to the material class's value.
-        let p = Profiles::builtin();
-        let s = p.resolve("voron24", "pla", "standard").unwrap();
-        assert_eq!(s.max_heat_mw_mm2, crate::Material::Pla.max_heat_mw_mm2());
-        assert!(s.heat_control, "heat control is on by default");
     }
 
     #[test]

@@ -58,25 +58,6 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             ));
         }
     }
-    if s.heat_control {
-        let cap = s.max_heat_mw_mm2;
-        match audit_smoothing(layers, s) {
-            Some(r) => g.comment(&format!(
-                "heat control: cap {cap:.1} mW/mm2, transitions <= {:.1}%/layer ({:.0}% time budget)",
-                r.pct_per_layer, s.smooth_extra_time_pct
-            )),
-            None => g.comment(&format!("heat control: cap {cap:.1} mW/mm2")),
-        }
-        for r in audit_heat_control_speed(layers, s) {
-            g.comment(&format!(
-                "heat control (speed): layers {}-{} slowed to {:.0}%{}",
-                r.first_layer,
-                r.last_layer,
-                r.worst_scale * 100.0,
-                if r.floor_hit { " (still hot at the cap)" } else { "" }
-            ));
-        }
-    }
     g.comment(&format!(
         "layer_h={} line_w={} walls={} top/bot={}/{} infill={} ({}) bed={}x{}",
         s.layer_height_mm,
@@ -1228,29 +1209,14 @@ pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
     (length_mm, grams)
 }
 
-/// Per-layer numbers behind the preview heat maps.
+/// Per-layer numbers behind the preview layer-time map.
 pub struct LayerStats {
     /// Seconds printing this layer (its Z move + extrusion + travels).
     pub secs: f64,
-    /// Thermal energy deposited (J): bead volume × density × cₚ × (nozzle − ambient).
-    pub joules: f64,
-    /// Solid footprint of the part at this Z (mm², net of holes) — the area
-    /// the heat must spread over and shed through. Falls back to the deposited
-    /// cross-section when a layer carries no outline.
-    pub footprint_mm2: f64,
 }
 
-/// Specific heat of FDM thermoplastics, J/(g·K): PLA ≈ 1.9, PETG ≈ 1.3,
-/// ABS ≈ 1.5. One mid value is fine while the heat map is relative; promote
-/// to a filament field if absolute joules ever matter.
-const CP_J_PER_G_K: f64 = 1.8;
-/// Temperature the deposited bead cools toward (°C).
-const AMBIENT_C: f64 = 25.0;
-
-/// Time, deposited heat, and footprint per layer. Time mirrors
-/// [`estimate_seconds`]'s per-layer terms and volume comes from the same bead
-/// math as [`estimate_filament`], so the preview maps track what the totals
-/// and M73 progress already report.
+/// Time per layer. Mirrors [`estimate_seconds`]'s per-layer terms, so the
+/// preview layer-time map tracks what the totals and M73 progress report.
 pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let mut prev_z = 0.0;
@@ -1259,256 +1225,9 @@ pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
         let mut secs = (layer.print_z_mm - prev_z).abs() / travel_v;
         prev_z = layer.print_z_mm;
         secs += layer_print_seconds(layer, s, layer.speed_scale);
-
-        let volume = layer_volume_mm3(layer, s);
-        let nozzle_c = layer_nozzle_c(layer, s);
-        let joules = volume * s.filament_density_g_cm3 * 1e-3 // g/cm³ → g/mm³
-            * CP_J_PER_G_K
-            * (nozzle_c as f64 - AMBIENT_C).max(0.0);
-
-        let outline_area = layer.outline.net_area_mm2().abs();
-        let footprint_mm2 = if outline_area > 1e-6 {
-            outline_area
-        } else {
-            volume / layer.height_mm.max(1e-6)
-        };
-        out.push(LayerStats { secs, joules, footprint_mm2 });
+        out.push(LayerStats { secs });
     }
     out
-}
-
-pub fn effective_heat_target(layers: &[LayerPlan], s: &Settings) -> f64 {
-    // Pinned at plan time: every pass and audit chases the same numbers.
-    if let Some(t) = layers.iter().find_map(|l| l.planned_heat_target) {
-        return t;
-    }
-    s.max_heat_mw_mm2 * 1e-3
-}
-
-/// One layer's deposited heat (J) and cooling footprint (mm²) for the
-/// per-layer heat-load metric. Footprint is the layer's outline area (net of
-/// holes), or the deposited cross-section when the layer carries no outline.
-fn layer_heat_numbers(layer: &LayerPlan, s: &Settings) -> (f64, f64) {
-    let volume = layer_volume_mm3(layer, s);
-    let joules = volume * s.filament_density_g_cm3 * 1e-3 * CP_J_PER_G_K
-        * (layer_nozzle_c(layer, s) - AMBIENT_C).max(0.0);
-    let outline = layer.outline.net_area_mm2().abs();
-    let footprint = if outline > 1e-6 { outline } else { volume / layer.height_mm.max(1e-6) };
-    (joules, footprint.max(1e-9))
-}
-
-/// Per-layer heat targets (W/mm²), pinned onto the plan before the speed lever
-/// runs. The filament's ceiling is always in force; smoothing then derives ONE
-/// gradient-limited curve under it — the gentlest layer-to-layer change whose
-/// cost fits the time budget (`smooth_extra_time_pct`), found by bisection.
-/// Anchors are each layer's load lifted toward a small warm headroom (free in
-/// print time) so cold dips don't drag their neighbors all the way down; the
-/// speed lever then slows each layer onto its target. Targets are ceilings — a
-/// layer whose natural load is already under its target just rides below it.
-pub fn plan_heat_targets(layers: &[LayerPlan], s: &Settings) -> Vec<f64> {
-    let cap = s.max_heat_mw_mm2 * 1e-3;
-    let n = layers.len();
-    if !s.heat_control || cap <= 0.0 || n < 3 {
-        return vec![cap.max(0.0); n];
-    }
-    let base = s.nozzle_temp_c as f64;
-    // Cold dips lift toward a small headroom above the operating temperature so
-    // smoothing doesn't drag hot layers all the way down — a gradient margin
-    // for the anchor envelope, not a real setpoint (there's no temperature
-    // lever now; the speed lever realizes the gentler gradient).
-    const WARM_HEADROOM_C: f64 = 15.0;
-    let warm_rail = base + WARM_HEADROOM_C;
-    let warm_gain = ((warm_rail - AMBIENT_C) / (base - AMBIENT_C).max(1.0)).max(1.0);
-    // Raw per-layer loads and times (the first layer is adhesion policy — it
-    // neither pulls neighbors down nor gets pulled). `h` is the layer's
-    // joules ÷ footprint; the layer time the speed pass produces for a target
-    // b is h/b, and the realized heat load lands at q = h/time.
-    let mut q = vec![0.0_f64; n];
-    let mut h = vec![0.0_f64; n];
-    let mut t = vec![0.05_f64; n];
-    for (i, layer) in layers.iter().enumerate().skip(1) {
-        t[i] = layer_print_seconds(layer, s, layer.speed_scale).max(0.05);
-        let (joules, footprint) = layer_heat_numbers(layer, s);
-        if joules > 0.0 {
-            h[i] = joules / footprint;
-            q[i] = h[i] / t[i];
-        }
-    }
-    // Anchor: the load each layer can reach without slowing — its own,
-    // warmed, capped. Layers with nothing measurable stay neutral at the
-    // cap (they must not crater the envelope).
-    let anchors: Vec<f64> = q
-        .iter()
-        .map(|&qi| if qi > 0.0 { (qi * warm_gain).min(cap).max(0.2e-3) } else { cap })
-        .collect();
-    // Candidate curve for a gradient g: the highest curve under the anchors
-    // whose adjacent ratio stays ≤ g (min-propagation both ways).
-    let envelope = |g: f64| -> Vec<f64> {
-        let mut b = anchors.clone();
-        b[0] = cap;
-        for i in 2..n {
-            b[i] = b[i].min(b[i - 1] * g);
-        }
-        for i in (1..n - 1).rev() {
-            b[i] = b[i].min(b[i + 1] * g);
-        }
-        b
-    };
-    // The speed pass slows layer i to h[i]/b[i], landing its heat load on
-    // b[i]; the cost of a curve is the extra seconds that buys over the raw
-    // layer times. The gradient-limited envelope keeps those times — and so
-    // the realized heat — ramping gently between neighbors.
-    let g_max = 1.5_f64;
-    let proj_times = |b: &[f64]| -> Vec<f64> {
-        (0..n).map(|i| if h[i] > 0.0 { t[i].max(h[i] / b[i]) } else { t[i] }).collect()
-    };
-    let cost = |b: &[f64]| -> f64 {
-        proj_times(b).iter().zip(t.iter()).skip(1).map(|(tt, t0)| (tt - t0).max(0.0)).sum()
-    };
-    // The bare ceiling costs the time to pull every hot layer down to its
-    // (warmed, capped) anchor; the extra-time budget buys smoothing beyond it.
-    let budget = t.iter().sum::<f64>() * s.smooth_extra_time_pct.max(0.0) / 100.0
-        + cost(&envelope(g_max));
-    // Bisect the gentlest affordable gradient (log space): ×1.001/layer is
-    // near-uniform, ×1.5/layer is effectively unsmoothed.
-    let (mut lo, mut hi) = (1.001_f64, g_max);
-    if cost(&envelope(lo)) <= budget {
-        hi = lo;
-    } else {
-        for _ in 0..32 {
-            let mid = (0.5 * (lo.ln() + hi.ln())).exp();
-            if cost(&envelope(mid)) <= budget {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-    }
-    envelope(hi)
-}
-
-/// What heat control's smoothing actually planned, read back from the
-/// pinned targets so the report can't drift from the plan.
-pub struct SmoothingReport {
-    /// Steepest planned layer-to-layer target change (% per layer).
-    pub pct_per_layer: f64,
-}
-
-/// None when heat control is off or the print is trivially short.
-pub fn audit_smoothing(layers: &[LayerPlan], s: &Settings) -> Option<SmoothingReport> {
-    if !s.heat_control || layers.len() < 3 {
-        return None;
-    }
-    let mut worst = 1.0_f64;
-    for w in layers.windows(2).skip(1) {
-        if let (Some(a), Some(b)) = (w[0].planned_heat_target, w[1].planned_heat_target) {
-            if a > 0.0 && b > 0.0 {
-                worst = worst.max((a / b).max(b / a));
-            }
-        }
-    }
-    Some(SmoothingReport { pct_per_layer: (worst - 1.0) * 100.0 })
-}
-
-/// Heat control's speed lever: for every layer whose heat load — deposited
-/// joules ÷ (layer seconds × footprint) — exceeds its pinned target, slow the
-/// whole layer until it fits. No path drops below `min_print_speed_mm_s`; a
-/// layer still hot at that floor is left there and surfaces via
-/// [`audit_heat_control_speed`]. Folded into `speed_scale` (with `heat_scale`
-/// recording heat control's share), so toggling off returns the user's speeds.
-pub fn apply_heat_control_speed(layers: &mut [LayerPlan], s: &Settings) {
-    if !s.heat_control || s.max_heat_mw_mm2 <= 0.0 || s.spiral_vase {
-        return;
-    }
-    let floor_v = s.min_print_speed_mm_s.max(1.0);
-    let cap = s.max_heat_mw_mm2 * 1e-3;
-    for layer in layers.iter_mut() {
-        let target = layer.planned_heat_target.unwrap_or(cap);
-        if target <= 0.0 || layer.paths.is_empty() {
-            continue;
-        }
-        let (joules, footprint) = layer_heat_numbers(layer, s);
-        if joules <= 0.0 {
-            continue;
-        }
-        let t0 = layer_print_seconds(layer, s, layer.speed_scale).max(1e-9);
-        if joules / (t0 * footprint) <= target * 1.001 {
-            continue; // already under the target
-        }
-        // The whole layer must take this long for its heat load to reach the
-        // target. Slowing grows the time ~linearly but not exactly (accel), so
-        // bisect the extra factor against the real trapezoid time.
-        let t_needed = joules / (target * footprint);
-        // The slowest path's current speed sets how far the layer can slow
-        // before a path would dip under the min print speed.
-        let v_min = layer
-            .paths
-            .iter()
-            .filter(|p| p.points.len() >= 2)
-            .map(|p| {
-                feed_for(p, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0
-                    * layer.speed_scale
-            })
-            .fold(f64::INFINITY, f64::min);
-        let f_floor =
-            if v_min.is_finite() && v_min > 0.0 { (floor_v / v_min).min(1.0) } else { 1.0 };
-        let (mut lo, mut hi) = (f_floor, 1.0_f64);
-        for _ in 0..24 {
-            let mid = 0.5 * (lo + hi);
-            if layer_print_seconds(layer, s, layer.speed_scale * mid) >= t_needed {
-                lo = mid; // slow enough — try faster
-            } else {
-                hi = mid;
-            }
-        }
-        if lo < 0.999 {
-            layer.heat_scale = lo;
-            layer.speed_scale *= lo;
-        }
-    }
-}
-
-/// One contiguous run of heat-slowed layers, for the reports.
-pub struct SlowdownRange {
-    pub first_layer: usize,
-    pub last_layer: usize,
-    /// The strongest slowdown in the range (0.38 = slowed to 38% speed).
-    pub worst_scale: f64,
-    /// A layer in the range is still over the target even at the speed floor —
-    /// it needs cooling hardware, not more slowing.
-    pub floor_hit: bool,
-}
-
-/// Where the speed lever intervened — read back from the plan (its `heat_scale`
-/// and realized heat load) so the report can't drift from the g-code.
-pub fn audit_heat_control_speed(layers: &[LayerPlan], s: &Settings) -> Vec<SlowdownRange> {
-    let cap = s.max_heat_mw_mm2 * 1e-3;
-    let mut rows: Vec<SlowdownRange> = Vec::new();
-    for layer in layers {
-        // The layer's realized heat load against its own pinned target — a
-        // layer still hot even when it couldn't be slowed gets flagged too.
-        let target = layer.planned_heat_target.unwrap_or(cap);
-        let (joules, footprint) = layer_heat_numbers(layer, s);
-        let t = layer_print_seconds(layer, s, layer.speed_scale);
-        let hot = joules > 0.0 && joules / (t.max(1e-9) * footprint) > target * 1.05;
-        if layer.heat_scale >= 0.999 && !hot {
-            continue;
-        }
-        match rows.last_mut() {
-            Some(r) if r.last_layer + 1 == layer.index => {
-                r.last_layer = layer.index;
-                r.worst_scale = r.worst_scale.min(layer.heat_scale);
-                r.floor_hit |= hot;
-            }
-            _ => rows.push(SlowdownRange {
-                first_layer: layer.index,
-                last_layer: layer.index,
-                worst_scale: layer.heat_scale,
-                floor_hit: hot,
-            }),
-        }
-    }
-    rows
 }
 
 const MIN_TRAVEL_MM: f64 = 0.8;
@@ -1735,10 +1454,9 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_arc, ARC_MIN_PTS, AMBIENT_C, CP_J_PER_G_K};
+    use super::{fit_arc, ARC_MIN_PTS};
     use crate::{
-        audit_heat_control_speed, audit_smoothing, estimate_filament, estimate_seconds, generate,
-        per_layer_stats, to_gcode, LayerPlan, PathKind,
+        estimate_seconds, generate, per_layer_stats, to_gcode, LayerPlan, PathKind,
     };
     use config::Settings;
 
@@ -1914,7 +1632,6 @@ mod tests {
     fn first_layer_temp_drops_after_first_layer() {
         let m = mesh::Mesh::cube(10.0);
         let mut s = Settings::default();
-        s.heat_control = false; // the bare one-shot drop, not the schedule
         s.first_layer_nozzle_temp_c = 230;
         s.nozzle_temp_c = 210;
         let g = to_gcode(&generate(&m, &s), &s);
@@ -1959,9 +1676,7 @@ mod tests {
     #[test]
     fn per_layer_stats_match_totals() {
         let m = mesh::Mesh::cube(20.0);
-        let mut s = Settings::default();
-        s.heat_control = false; // single shared temp — the energy check below
-        s.first_layer_nozzle_temp_c = s.nozzle_temp_c;
+        let s = Settings::default();
         let layers = generate(&m, &s);
         let stats = per_layer_stats(&layers, &s);
         assert_eq!(stats.len(), layers.len());
@@ -1969,54 +1684,6 @@ mod tests {
         let total: f64 = stats.iter().map(|st| st.secs).sum();
         let est = estimate_seconds(&layers, &s);
         assert!((total - est).abs() < est * 1e-9, "{total} vs {est}");
-        // Mid-layer footprint is the cube's 20×20 cross-section.
-        let mid = &stats[stats.len() / 2];
-        assert!((mid.footprint_mm2 - 400.0).abs() < 40.0, "got {}", mid.footprint_mm2);
-        // Energy tracks the filament estimate: grams × cₚ × ΔT — force one
-        // shared temp (the derived first layer runs hotter by default).
-        let (_mm, grams) = estimate_filament(&layers, &s);
-        let joules: f64 = stats.iter().map(|st| st.joules).sum();
-        let expect = grams * CP_J_PER_G_K * (s.nozzle_temp_c as f64 - AMBIENT_C);
-        assert!((joules - expect).abs() < expect * 1e-6, "{joules} vs {expect}");
-    }
-
-    #[test]
-    fn heat_control_speed_slows_hot_tower() {
-        // A 5×5×30 mm tower: small footprint, quick layers → hot. Governed, its
-        // layers must slow until the heat load fits (or the floor binds); off,
-        // the plan is untouched.
-        let c = mesh::Mesh::cube(5.0);
-        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
-        for i in 0..c.triangles.len() {
-            let t = c.triangle(i);
-            soup.push(t.map(|v| [v[0], v[1], v[2] * 6.0]));
-        }
-        let m = mesh::Mesh::from_triangle_soup(&soup);
-        let mut s = Settings::default();
-        s.min_layer_time_s = 0.0; // isolate heat control from the layer-time pacing
-        s.heat_control = false; // opt out (the default is on) for the baseline
-        let plain = generate(&m, &s);
-        assert!(plain.iter().all(|l| l.heat_scale >= 0.999), "off = untouched");
-
-        s.heat_control = true;
-        s.max_heat_mw_mm2 = 6.0;
-        let governed = generate(&m, &s);
-        let mid = governed.len() / 2;
-        assert!(governed[mid].heat_scale < 0.999, "tower layers slowed");
-        let rows = audit_heat_control_speed(&governed, &s);
-        assert!(!rows.is_empty(), "intervention reported");
-        // Post-slowdown heat sits at/under the target — or the row flags that
-        // the min-speed floor bound first (no dwell to finish the job).
-        let stats = per_layer_stats(&governed, &s);
-        let q = stats[mid].joules
-            / (stats[mid].secs.max(1e-9) * stats[mid].footprint_mm2.max(1e-9));
-        let floored = rows.iter().any(|r| r.floor_hit);
-        assert!(
-            q <= 6.0e-3 * 1.06 || floored,
-            "governed heat {q} over target without a floor flag"
-        );
-        // Slowing costs time, and the estimator reports it honestly.
-        assert!(estimate_seconds(&governed, &s) > estimate_seconds(&plain, &s));
     }
 
     #[test]
@@ -2026,7 +1693,6 @@ mod tests {
         let m = mesh::Mesh::cube(10.0);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0; // keep nominal feeds visible in the g-code
-        s.heat_control = false; // and don't let per-layer heat scaling adjust them
         let layers = generate(&m, &s);
         let n = layers.len();
         let count = |l: &LayerPlan, k: PathKind| l.paths.iter().filter(|p| p.kind == k).count();
@@ -2076,78 +1742,6 @@ mod tests {
         );
     }
 
-
-    #[test]
-    fn heat_control_smooths_transitions_within_budget() {
-        // Base + spire: the natural heat curve cliffs at the junction. Heat
-        // control must turn the cliff into a ramp no steeper than the gradient
-        // it reports — the speed lever pacing each layer onto the curve — and
-        // respect the time budget.
-        let base = mesh::Mesh::cube(20.0);
-        let spire = mesh::Mesh::cube(5.0);
-        let mut soup: Vec<[mesh::Vec3; 3]> = Vec::new();
-        for i in 0..base.triangles.len() {
-            soup.push(base.triangle(i));
-        }
-        for i in 0..spire.triangles.len() {
-            let t = spire.triangle(i);
-            soup.push(t.map(|v| [v[0] + 7.5, v[1] + 7.5, v[2] * 4.0 + 20.0]));
-        }
-        let m = mesh::Mesh::from_triangle_soup(&soup);
-        let mut s = Settings::default();
-        s.min_layer_time_s = 0.0;
-        s.heat_control = true;
-        s.smooth_extra_time_pct = 200.0; // a huge budget => a gentle gradient
-        let layers = generate(&m, &s);
-        let report = audit_smoothing(&layers, &s).expect("heat control is on");
-        assert!(
-            report.pct_per_layer < 10.0,
-            "a huge budget should buy a gentle gradient, got {:.2}%/layer",
-            report.pct_per_layer
-        );
-        let stats = per_layer_stats(&layers, &s);
-        let q: Vec<f64> = (0..layers.len())
-            .map(|i| stats[i].joules / (stats[i].secs.max(1e-9) * stats[i].footprint_mm2.max(1e-9)))
-            .collect();
-        // Realized heat follows the planned gradient where the speed lever can
-        // reach the target; layers that floor (too hot to slow enough, with no
-        // dwell to finish) fall outside the guarantee and are skipped.
-        let g = 1.0 + report.pct_per_layer / 100.0;
-        for i in 2..q.len() - 1 {
-            if q[i] <= 0.0 || q[i + 1] <= 0.0 {
-                continue;
-            }
-            let (t_i, t_j) = (
-                layers[i].planned_heat_target.unwrap_or(f64::INFINITY),
-                layers[i + 1].planned_heat_target.unwrap_or(f64::INFINITY),
-            );
-            if q[i] > t_i * 1.05 || q[i + 1] > t_j * 1.05 {
-                continue; // a floored layer — outside the smoothing guarantee
-            }
-            let ratio = (q[i + 1] / q[i]).max(q[i] / q[i + 1]);
-            assert!(
-                ratio <= g * 1.15,
-                "layers {i}->{}: heat jumped ×{ratio:.3} (limit ×{g:.3})",
-                i + 1
-            );
-        }
-        // A zero budget still caps and warms but must not slow below the
-        // ceiling's own cost: it plans (near-)raw speeds on the base.
-        let mut s0 = s.clone();
-        s0.smooth_extra_time_pct = 0.0;
-        let layers0 = generate(&m, &s0);
-        let r0 = audit_smoothing(&layers0, &s0).expect("on");
-        assert!(
-            r0.pct_per_layer >= report.pct_per_layer,
-            "no budget => no gentler gradient ({:.2} vs {:.2})",
-            r0.pct_per_layer,
-            report.pct_per_layer
-        );
-        assert!(
-            estimate_seconds(&layers0, &s0) <= estimate_seconds(&layers, &s) + 1.0,
-            "the zero-budget plan must not cost more time than the smoothed one"
-        );
-    }
 
     #[test]
     fn time_estimate_is_sane() {

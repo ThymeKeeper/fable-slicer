@@ -146,9 +146,6 @@ enum ColorBy {
     /// Per-layer print time: red = quick layers, little cooling before the
     /// nozzle returns.
     LayerTime,
-    /// Per-layer heat load: deposited energy ÷ (time × footprint). Red = lots
-    /// of hot plastic delivered quickly to a small area.
-    Heat,
 }
 
 /// Which derivable settings the user has pinned to manual values. Unpinned
@@ -159,7 +156,6 @@ struct Pins {
     line_width: bool,
     outer_wall_accel: bool,
     first_layer_accel: bool,
-    max_heat: bool,
 }
 
 /// A slider with an auto/pin badge: while unpinned it shows a weak "auto" tag
@@ -253,11 +249,6 @@ fn hslider_lockout(
     })
     .inner
 }
-
-/// Fixed bounds of the heat-load color scale (mW/mm², log) — constant so any
-/// two slices are visually comparable regardless of data or settings.
-const HEAT_SCALE_LO_MW: f64 = 1.0;
-const HEAT_SCALE_HI_MW: f64 = 40.0;
 
 /// The default accent (brass): ONE hue drives every 3D-view color — the
 /// model tint, the feature palette, and the heat ramps are all derived from
@@ -702,8 +693,6 @@ struct SliceSummary {
     secs: f64,
     filament_m: f64,
     grams: f64,
-    /// The filament's heat-load ceiling in force at slice time (mW/mm²).
-    heat_target_mw: f64,
 }
 
 /// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
@@ -918,11 +907,10 @@ impl App {
             profiles.merged_printer(&printer),
             profiles.merged_filament(&filament),
         ) {
-            (Ok(pc), Ok(pr), Ok(fl)) => Pins {
+            (Ok(pc), Ok(pr), Ok(_)) => Pins {
                 line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
-                max_heat: fl.max_heat_mw_mm2.is_some(),
             },
             _ => Pins::default(),
         };
@@ -1066,7 +1054,7 @@ impl App {
     /// Pin state comes from the selected profiles: a field the profile chain
     /// sets explicitly is pinned; one it leaves unset follows auto.
     fn refresh_pins(&mut self) {
-        if let (Ok(pc), Ok(pr), Ok(fl)) = (
+        if let (Ok(pc), Ok(pr), Ok(_)) = (
             self.profiles.merged_process(&self.process),
             self.profiles.merged_printer(&self.printer),
             self.profiles.merged_filament(&self.filament),
@@ -1075,7 +1063,6 @@ impl App {
                 line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
                 first_layer_accel: pr.first_layer_accel.is_some(),
-                max_heat: fl.max_heat_mw_mm2.is_some(),
             };
         }
     }
@@ -1093,9 +1080,6 @@ impl App {
         }
         s.first_layer_nozzle_temp_c =
             config::derived_first_layer_temp_c(s.nozzle_temp_c, s.material);
-        if !self.pins.max_heat {
-            s.max_heat_mw_mm2 = s.material.max_heat_mw_mm2();
-        }
         s.print_speed_mm_s = config::derived_print_speed_mm_s(s.machine_speed_mm_s, s.speed_quality);
         let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
         s.external_perimeter_speed_mm_s =
@@ -1108,15 +1092,6 @@ impl App {
         }
         if !self.pins.first_layer_accel {
             s.first_layer_accel_mm_s2 = config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2);
-        }
-    }
-
-    /// Strip unpinned auto fields from a process diff: auto values are derived,
-    /// not chosen, so they're never saved (and never count as dirty).
-    /// Strip unpinned auto fields from a filament diff.
-    fn mask_auto_filament(&self, fl: &mut FilamentProfile) {
-        if !self.pins.max_heat {
-            fl.max_heat_mw_mm2 = None;
         }
     }
 
@@ -1134,8 +1109,7 @@ impl App {
     fn tier_dirty_masked(&self) -> [bool; 3] {
         let mut pr = PrinterProfile::diff(&self.settings, &self.baseline);
         self.mask_auto_printer(&mut pr);
-        let mut fl = FilamentProfile::diff(&self.settings, &self.baseline);
-        self.mask_auto_filament(&mut fl);
+        let fl = FilamentProfile::diff(&self.settings, &self.baseline);
         let pc = ProcessProfile::diff(&self.settings, &self.baseline);
         [!pr.is_empty(), !fl.is_empty(), !pc.is_empty()]
     }
@@ -1172,7 +1146,6 @@ impl App {
             }
             TierKind::Filament => {
                 let mut diff = FilamentProfile::diff(&self.settings, &self.baseline);
-                self.mask_auto_filament(&mut diff);
                 if name == self.filament && self.profiles.is_user(kind, name) {
                     let existing = self.profiles.get_filament(name).cloned().unwrap_or_default();
                     let parent = existing.parent().map(str::to_string);
@@ -1523,7 +1496,6 @@ impl App {
             secs,
             filament_m: fil_mm / 1000.0,
             grams,
-            heat_target_mw: engine::effective_heat_target(&layers, &self.settings) * 1e3,
         });
         self.status.clear();
         self.slice_gen += 1;
@@ -1572,56 +1544,22 @@ impl App {
         }
         let layers = self.sliced.as_ref()?;
         let acc = accent_hsl(self.accent);
-        match self.color_by {
-            ColorBy::LayerTime => {
-                let logs: Vec<f64> = self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
-                let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
-                let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let span = (hi - lo).max(1e-12);
-                Some(
-                    layers
-                        .iter()
-                        .zip(&logs)
-                        .map(|(layer, &l)| {
-                            // Inverted: short layers = least cooling = the hot end.
-                            let u = 1.0 - ((l - lo) / span) as f32;
-                            vec![heat_ramp(u, acc); layer.paths.len()]
-                        })
-                        .collect(),
-                )
-            }
-            ColorBy::Heat => {
-                if self.layer_stats.len() != layers.len() {
-                    return None;
-                }
-                // FIXED absolute log scale: colors mean the same thing in
-                // every slice regardless of settings, so before/after slider
-                // comparisons are honest. (A relative or target-anchored ramp
-                // re-stretches with the data/settings — two screenshots of
-                // different configs become incomparable, which misled tuning.)
-                let lo = HEAT_SCALE_LO_MW.ln();
-                let span = HEAT_SCALE_HI_MW.ln() - lo;
-                Some(
-                    layers
-                        .iter()
-                        .enumerate()
-                        .map(|(li, layer)| {
-                            let q = (self.layer_heat(li) * 1e3).max(1e-6).ln();
-                            let c = heat_ramp((((q - lo) / span).clamp(0.0, 1.0)) as f32, acc);
-                            vec![c; layer.paths.len()]
-                        })
-                        .collect(),
-                )
-            }
-            ColorBy::Feature => unreachable!(),
-        }
-    }
-
-    /// Per-layer heat-load metric (W/mm²): the layer's deposited energy over
-    /// its print time and footprint — what the speed lever paces against.
-    fn layer_heat(&self, li: usize) -> f64 {
-        let st = &self.layer_stats[li];
-        st.joules / (st.secs.max(1e-9) * st.footprint_mm2.max(1e-9))
+        // Only LayerTime reaches here (Feature returned above).
+        let logs: Vec<f64> = self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
+        let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let span = (hi - lo).max(1e-12);
+        Some(
+            layers
+                .iter()
+                .zip(&logs)
+                .map(|(layer, &l)| {
+                    // Inverted: short layers = least cooling = the hot end.
+                    let u = 1.0 - ((l - lo) / span) as f32;
+                    vec![heat_ramp(u, acc); layer.paths.len()]
+                })
+                .collect(),
+        )
     }
 
     /// The one-line status plus the last slice's summary — the body of the
@@ -2325,86 +2263,36 @@ impl eframe::App for App {
                 });
                 ui.horizontal(|ui| {
                     ui.label("color").on_hover_text(
-                        "What the preview colors encode. Feature type is the classic view. The two heat \
-                         maps spot overheating: layer time shows where the nozzle returns quickly (little \
-                         cooling time), and heat load also weighs how much hot plastic is deposited and \
-                         how much footprint it has to cool through — both scored per layer. All \
-                         views reflect the last slice — re-slice after changing toggles.",
+                        "What the preview colors encode. Feature type is the classic view; layer time \
+                         shows where the nozzle returns quickly (little cooling time), scored per layer. \
+                         Both reflect the last slice — re-slice after changing toggles.",
                     );
                     let before = self.color_by;
                     egui::ComboBox::from_id_salt("preview_color_by")
                         .selected_text(match self.color_by {
                             ColorBy::Feature => "feature type",
                             ColorBy::LayerTime => "layer time",
-                            ColorBy::Heat => "heat load",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.color_by, ColorBy::Feature, "feature type");
                             ui.selectable_value(&mut self.color_by, ColorBy::LayerTime, "layer time");
-                            ui.selectable_value(&mut self.color_by, ColorBy::Heat, "heat load");
                         });
                     if self.color_by != before {
                         self.set_preview_instances(&rs);
                     }
                 });
-                if self.color_by != ColorBy::Feature && !self.layer_stats.is_empty() {
-                    let mut vals: Vec<f64> = Vec::new();
-                    match self.color_by {
-                        ColorBy::LayerTime => vals.extend(self.layer_stats.iter().map(|st| st.secs)),
-                        _ => {
-                            for li in 0..self.layer_stats.len() {
-                                let q = self.layer_heat(li);
-                                if q > 0.0 {
-                                    vals.push(q);
-                                }
-                            }
-                        }
-                    }
+                if self.color_by == ColorBy::LayerTime && !self.layer_stats.is_empty() {
+                    let vals: Vec<f64> = self.layer_stats.iter().map(|st| st.secs).collect();
                     let lo = vals.iter().cloned().fold(f64::INFINITY, f64::min);
                     let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    // Legend ends carry the real numbers: left = dark (cool/safe), right = bright (hot).
-                    let anchored = self.color_by == ColorBy::Heat
-                        && self.settings.heat_control
-                        && self.settings.max_heat_mw_mm2 > 0.0;
-                    let (left, right, expl) = match self.color_by {
-                        ColorBy::LayerTime => (
-                            format!("{hi:.1}s"),
-                            format!("{lo:.1}s"),
-                            "Per-layer print time, log scale. Brightest = the quickest layers: the plastic \
-                             below gets the least time to cool before the nozzle returns. The min-layer \
-                             slowdown under Feature speeds is the usual fix."
-                                .to_string(),
-                        ),
-                        _ => {
-                            let target_note = if anchored {
-                                let target_mw = self
-                                    .slice_summary
-                                    .as_ref()
-                                    .map(|s| s.heat_target_mw)
-                                    .unwrap_or(self.settings.max_heat_mw_mm2);
-                                format!(" The tick marks the ceiling ({target_mw:.1}).")
-                            } else {
-                                String::new()
-                            };
-                            (
-                                format!("{HEAT_SCALE_LO_MW:.0}"),
-                                format!("{HEAT_SCALE_HI_MW:.0} mW/mm²"),
-                                format!(
-                                    "Heat load: how fast hot plastic lands on a region, per mm² of \
-                                     it — the heat the new layer deposits there, divided by the \
-                                     layer's print time and the region's area. Too high and the \
-                                     plastic below can't cool before more heat arrives (sagging, \
-                                     gloss bands). Too low and the layers contract as they print, \
-                                     pulling the band inward — the dimple that appears where the \
-                                     cross-section suddenly grows and layers turn slow and cold — \
-                                     and fuse weakly. \
-                                     Fixed log scale, {HEAT_SCALE_LO_MW:.0}–{HEAT_SCALE_HI_MW:.0} mW/mm².{target_note}"
-                                ),
-                            )
-                        }
-                    };
+                    // Legend ends carry the real numbers: left = bright (quick), right = dark (slow).
+                    let left = format!("{hi:.1}s");
+                    let right = format!("{lo:.1}s");
+                    let expl = "Per-layer print time, log scale. Brightest = the quickest layers: the \
+                                plastic below gets the least time to cool before the nozzle returns. The \
+                                min-layer slowdown under Feature speeds is the usual fix.";
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(left).small()).on_hover_text(expl.as_str());
+                        ui.label(egui::RichText::new(left).small()).on_hover_text(expl);
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 10.0), egui::Sense::hover());
                         if ui.is_rect_visible(rect) {
                             let n = 24;
@@ -2423,28 +2311,8 @@ impl eframe::App for App {
                                     ),
                                 );
                             }
-                            if anchored {
-                                // The heat target at its true position on the fixed
-                                // scale — the computed level in even mode.
-                                let target_mw = self
-                                    .slice_summary
-                                    .as_ref()
-                                    .map(|s| s.heat_target_mw)
-                                    .unwrap_or(self.settings.max_heat_mw_mm2);
-                                let lo = HEAT_SCALE_LO_MW.ln();
-                                let fr = ((target_mw.max(1e-6).ln() - lo)
-                                    / (HEAT_SCALE_HI_MW.ln() - lo))
-                                    .clamp(0.0, 1.0) as f32;
-                                let x = rect.min.x + rect.width() * fr;
-                                // Cream core in an ink casing: visible on
-                                // both the dark and bright halves, whatever
-                                // hue the ramp runs in.
-                                let seg = [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)];
-                                ui.painter().line_segment(seg, egui::Stroke::new(3.5, palette::INK));
-                                ui.painter().line_segment(seg, egui::Stroke::new(1.5, palette::CREAM));
-                            }
                         }
-                        ui.label(egui::RichText::new(right).small()).on_hover_text(expl.as_str());
+                        ui.label(egui::RichText::new(right).small()).on_hover_text(expl);
                     });
                 }
             }
@@ -2527,24 +2395,6 @@ impl eframe::App for App {
                         .on_hover_text("Pattern for buried solid fill, between the sparse infill and the skins.");
                     hslider(ui, true, egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5), "wall overlap",
                         "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
-                });
-                tier_section(ui, "Heat control", TierKind::Process, false, |ui| {
-                    ui.checkbox(&mut s.heat_control, "heat control")
-                        .on_hover_text(
-                            "The automatic: keeps every layer's heat load inside the filament's \
-                             allowable ceiling and smooths layer-to-layer transitions — the \
-                             banding/shrinkage killer. One gradient-limited heat curve is derived \
-                             per print, the gentlest the time budget below affords, and the nozzle \
-                             holds its derived temperature throughout: each layer's speed is paced \
-                             onto the curve, never below the minimum print speed (a layer too hot \
-                             to slow that far is left there and reported). Off restores the derived \
-                             speeds exactly.",
-                        );
-                    hslider(ui, s.heat_control, egui::Slider::new(&mut s.smooth_extra_time_pct, 0.0..=50.0), "extra time %",
-                        "Heat control's budget: the most extra print time smoothing may spend, as a % of the un-smoothed estimate. The transition gradient is bisected to the gentlest that fits and reported after slicing; 0 still does everything free (warming cold dips, capping at the filament's ceiling).");
-                    ui.weak("speeds and temperatures are chosen by the system: the machine \
-                             rating under the filament's melt ceiling, then heat control \
-                             paces the speeds");
                 });
                 tier_section(ui, "Support", TierKind::Process, true, |ui| {
                     let vase = s.spiral_vase;

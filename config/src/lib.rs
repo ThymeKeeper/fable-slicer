@@ -140,16 +140,6 @@ impl Material {
             _ => 0.3,
         }
     }
-    /// Allowable heat-load ceiling (mW/mm², per layer) for heat control.
-    pub fn max_heat_mw_mm2(self) -> f64 {
-        match self {
-            Self::Pla => 15.0,
-            Self::Petg => 13.0,
-            Self::Abs => 20.0,
-            Self::Tpu => 10.0,
-            Self::Other => 15.0,
-        }
-    }
     /// Aux-fan and chamber-exhaust duties (machines that declare them).
     pub fn aux_exhaust(self) -> (f64, f64) {
         match self {
@@ -518,28 +508,6 @@ pub struct Settings {
     /// chamber sensor before printing. Auto: the material class's value
     /// (ABS/ASA soak at 50, everything else 0).
     pub chamber_temp_c: u32,
-    /// Heat control, the automatic: keep every layer's heat load inside the
-    /// filament's allowable ceiling and smooth layer-to-layer transitions —
-    /// the banding/shrinkage killer — spending at most
-    /// `smooth_extra_time_pct` extra print time. One gradient-limited target
-    /// curve is derived per print (the gentlest the budget affords; the
-    /// achieved %/layer is reported) and one lever serves it with no knobs:
-    /// each layer's speed is paced onto the curve, never below
-    /// `min_print_speed_mm_s` (a layer too hot to slow that far is left there
-    /// and reported). The nozzle holds its derived temperature throughout. ON
-    /// BY DEFAULT — it is part of the derived surface, not an opt-in extra; a
-    /// profile may still set `heat_control = false` to print raw derived speeds.
-    pub heat_control: bool,
-    /// The filament's allowable heat-load ceiling (mW/mm², per layer) — a
-    /// material range bound, not a tuning target. Auto: the material class's
-    /// value; a calibration entry pins it. Heat control's temperature
-    /// authority is the packaging range itself.
-    pub max_heat_mw_mm2: f64,
-    /// Heat control's time budget: extra print time it may spend, as a % of
-    /// the un-smoothed estimate. The transition-gradient limit is bisected
-    /// to the gentlest that fits; 0 still does everything that's free
-    /// (warming cold dips, capping at the ceiling).
-    pub smooth_extra_time_pct: f64,
 
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
@@ -635,11 +603,6 @@ impl Default for Settings {
             exhaust_fan_speed: 0.0,
             chamber_sensor: String::new(),
             chamber_temp_c: Material::Pla.chamber_temp_c(),
-            heat_control: true,
-            // Calibrated on the Benchy: lone towers / chimneys / arch pillars
-            // run 20+ mW/mm², cabin-class thin walls ~13, hulls < 10.
-            max_heat_mw_mm2: Material::Pla.max_heat_mw_mm2(),
-            smooth_extra_time_pct: 10.0,
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
         }

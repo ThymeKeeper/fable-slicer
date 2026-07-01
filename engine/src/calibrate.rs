@@ -34,10 +34,8 @@ fn single_wall(settings: &Settings) -> Settings {
     // min-layer-time (tuned for real prints) stretches each layer to ~8 s by
     // crawling the walls to a few mm/s — slow, and an unrepresentative speed to
     // measure at. A throwaway cal only needs the wall *width* (robust to a little
-    // droop), so use a small floor and print plainly — heat control's temp/speed
-    // schedule is moot for a part we're going to throw away.
+    // droop), so use a small floor.
     s.min_layer_time_s = 2.0;
-    s.heat_control = false;
     s
 }
 
@@ -102,7 +100,6 @@ mod tests {
         s.min_layer_time_s = 8.0;
         let cal = single_wall(&s);
         assert!(cal.min_layer_time_s <= 2.0, "cal relaxes the layer-time floor");
-        assert!(!cal.heat_control, "cal prints plainly, no schedule");
         let layers = generate(&mesh::Mesh::cube(FLOW_TEST_MM), &cal);
         let secs = crate::estimate_seconds(&layers, &cal);
         assert!(secs < 400.0, "cal prints in a few minutes, not the floor's ~13 (got {secs:.0}s)");

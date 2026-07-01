@@ -19,9 +19,8 @@ mod slice;
 pub use calibrate::{flow_from_wall, flow_test_gcode, FLOW_TEST_MM};
 
 pub use emit::{
-    audit_combing, audit_flow_clamps, audit_heat_control_speed,
-    audit_smoothing, effective_heat_target, estimate_filament, estimate_seconds, format_duration,
-    kind_label, per_layer_stats, to_gcode, LayerStats, SlowdownRange, SmoothingReport,
+    audit_combing, audit_flow_clamps, estimate_filament, estimate_seconds, format_duration,
+    kind_label, per_layer_stats, to_gcode, LayerStats,
 };
 pub use plan::{debug_uncovered, generate, LayerPlan, PathKind, ToolPath, Travel};
 pub use slice::{slice_mesh, Layer, SliceParams};
