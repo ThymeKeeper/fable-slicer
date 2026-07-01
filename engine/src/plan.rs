@@ -412,14 +412,9 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // the perimeters it nominally fits — e.g. a hole beside the outline),
             // drop the doubled run so the nozzle doesn't retrace the same bead.
             trim_thin_walls(&mut walls, lw, sp);
-            // Spiralize each fully-supported island's inner walls into one continuous
-            // inward stroke (one seam per island, no per-ring travel). Needs ≥2 inner
-            // rings to chain; runs after the overhang split so only supported closed
-            // Perimeter rings are consumed, leaving the overhang/enclosed-void ordering
-            // untouched. The visible outer wall stays its own aligned-seam loop.
-            if settings.wall_count >= 3 && !settings.spiral_vase {
-                walls = spiralize_inner_walls(walls, &layer.polygons, lw, sp, settings.seam_mode, layer.index);
-            }
+            // Inner walls stay CLOSED rings here — they are spiralized in Pass 2
+            // (spiralize_shells), together with the concentric fill they ring, so the
+            // wall stack and cavity fill become one continuous stroke.
             (walls, opened)
         })
         .collect();
@@ -913,6 +908,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             }
         }
 
+        // Capstone: spiralize each supported island's inner walls AND the concentric
+        // fill they ring as ONE nested family, so the nozzle sweeps from the outer
+        // wall straight through the cavity fill as a single continuous stroke — the
+        // wall part keeps Perimeter speed/flow, the fill part its own (a SegAttr per
+        // segment). Runs here, after fill exists, on the closed wall + fill rings.
+        if settings.wall_count >= 1 && !settings.spiral_vase {
+            paths = spiralize_shells(paths, &layers[i].polygons, lw, sp, settings.seam_mode, i);
+        }
 
         // Ironing: a slow, near-zero-flow boustrophedon pass over surfaces with
         // open air above, melting ridges into a smooth plane. Kept in order and
@@ -1825,21 +1828,22 @@ fn join_inside(a: Point, b: Point, inside: &Polygons, max_jump: f64) -> bool {
     pt_dist_mm(a, b) <= max_jump && seg_inside(a, b, inside)
 }
 
-/// Splice concentric offset `rings` into continuous inward-spiral strokes. Start at
-/// the outermost unused ring (seamed), trace it closed, then jog to the nearest
-/// unused ring whose entry vertex is within `max_cross` and reachable without
-/// leaving `region` — repeat, so a nested family prints as ONE stroke with a single
-/// seam and no per-ring travel/restart. A ring no short in-region crossover can reach
-/// (a separate pocket, or the far side of an annulus across its void) seeds a fresh
-/// stroke. Built outermost-first, so a stroke over an enclosed void still lands each
-/// ring on the one before it.
+/// Splice concentric offset `rings` — each tagged with its PathKind — into continuous
+/// inward-spiral strokes. Start at the outermost unused ring (seamed), trace it closed,
+/// then jog to the nearest unused ring whose entry projects within `max_cross` and
+/// reaches without leaving `region` — repeat, so a nested family (a wall stack, a
+/// concentric fill, or the walls PLUS the fill they ring) prints as ONE stroke with a
+/// single seam and no per-ring travel/restart. Returns each stroke's points plus a
+/// per-segment kind, so a wall→fill hand-off inside one stroke keeps each side's
+/// speed/flow. A ring no short in-region crossover can reach seeds a fresh stroke;
+/// built outermost-first, so an enclosed-void ring still lands on the one before it.
 fn spiralize_rings(
-    rings: Vec<Vec<Point>>,
+    rings: Vec<(Vec<Point>, PathKind)>,
     region: &Polygons,
     max_cross: f64,
     seam_mode: SeamMode,
     layer_index: usize,
-) -> Vec<Vec<Point>> {
+) -> Vec<(Vec<Point>, Vec<PathKind>)> {
     let n = rings.len();
     if n == 0 {
         return Vec::new();
@@ -1848,19 +1852,20 @@ fn spiralize_rings(
     let mut used = vec![false; n];
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
-        loop_area_mm2(&rings[b]).partial_cmp(&loop_area_mm2(&rings[a])).unwrap()
+        loop_area_mm2(&rings[b].0).partial_cmp(&loop_area_mm2(&rings[a].0)).unwrap()
     });
-    let mut strokes: Vec<Vec<Point>> = Vec::new();
+    let mut strokes: Vec<(Vec<Point>, Vec<PathKind>)> = Vec::new();
     for &seed in &order {
         if used[seed] {
             continue;
         }
         used[seed] = true;
         // Trace the seed ring closed, from a placed seam.
-        let mut chain = place_seam(rings[seed].clone(), seam_mode, layer_index);
+        let mut chain = place_seam(rings[seed].0.clone(), seam_mode, layer_index);
         if let Some(&first) = chain.first() {
             chain.push(first);
         }
+        let mut kinds: Vec<PathKind> = vec![rings[seed].1; chain.len().saturating_sub(1)];
         loop {
             let tail = *chain.last().unwrap();
             // Nearest reachable point on any unused ring — projected onto its EDGES, so
@@ -1872,7 +1877,7 @@ fn spiralize_rings(
                 if used[i] {
                     continue;
                 }
-                let r = &rings[i];
+                let r = &rings[i].0;
                 let m = r.len();
                 for k in 0..m {
                     let e = nearest_point_on_seg(tail, r[k], r[(k + 1) % m]);
@@ -1885,7 +1890,8 @@ fn spiralize_rings(
             match best {
                 Some((i, k, entry, dd)) if dd <= max_cross && seg_inside(tail, entry, &inflated) => {
                     used[i] = true;
-                    let r = &rings[i];
+                    let kind = rings[i].1;
+                    let r = &rings[i].0;
                     let m = r.len();
                     // Enter ring i on edge k→k+1 at `entry`, trace it around, close to it.
                     chain.push(entry);
@@ -1893,41 +1899,53 @@ fn spiralize_rings(
                         chain.push(r[(k + j) % m]);
                     }
                     chain.push(entry);
+                    kinds.extend(std::iter::repeat(kind).take(m + 2));
                 }
                 _ => break,
             }
         }
-        strokes.push(chain);
+        strokes.push((chain, kinds));
     }
     strokes
 }
 
-/// Splice each island's inner `Perimeter` wall rings into one continuous inward
-/// spiral (reusing [`spiralize_rings`]) so a multi-wall stack prints as one stroke
-/// with a single seam instead of a seam + travel per ring. The visible
-/// `ExternalPerimeter` is left as its own clean closed loop (its seam is aligned
-/// across layers and may be fuzzed), and an island carrying ANY `OverhangWall` is
-/// left entirely alone — its rings must stay closed for the overhang / enclosed-void
-/// ordering ([`order_unsupported_rings_outer_in`]) to lay them supported-edge inward.
-/// `region` (the layer cross-section) bounds every crossover, so a jog never leaves
-/// the material or hops a hole/gap to another island.
-fn spiralize_inner_walls(
-    walls: Vec<ToolPath>,
+/// Convert a spiralized (points, per-segment kinds) result into a ToolPath: a
+/// uniform-kind stroke stays plain (`segs` None), a mixed one (a wall→fill sweep)
+/// carries a `SegAttr` per segment so each stretch keeps its own speed/flow.
+fn spiral_to_toolpath(points: Vec<Point>, kinds: &[PathKind], lw: f64) -> ToolPath {
+    let base = kinds.first().copied().unwrap_or(PathKind::Perimeter);
+    let mut tp = ToolPath::new(base, false, lw, points);
+    if kinds.iter().any(|&k| k != base) {
+        tp.segs = Some(kinds.iter().map(|&k| SegAttr { kind: k, overhang: 0.0 }).collect());
+    }
+    tp
+}
+
+/// Spiralize each supported island's SHELLS — its inner `Perimeter` wall rings PLUS
+/// the concentric fill loops they ring — into one continuous inward stroke, so the
+/// nozzle sweeps from the outer wall straight through the cavity fill with a single
+/// seam and no travel at the hand-off (reusing [`spiralize_rings`], kind-tagged so the
+/// wall keeps `Perimeter` speed/flow and the fill its own via a `SegAttr` per segment).
+/// The visible `ExternalPerimeter` is left its own loop; monotonic line fill (group
+/// set) and bridged/overhang runs (open, or already segmented) never qualify; and an
+/// island carrying ANY overhang opts out wholesale so its rings stay closed for the
+/// enclosed-void / cantilever ordering ([`order_unsupported_rings_outer_in`]).
+fn spiralize_shells(
+    paths: Vec<ToolPath>,
     region: &Polygons,
     lw: f64,
     sp: f64,
     seam_mode: SeamMode,
     layer_index: usize,
 ) -> Vec<ToolPath> {
-    // The island each wall belongs to = the largest-area external perimeter whose
-    // loop holds its centroid (same keying as order_walls).
-    let ext_loops: Vec<(Vec<Point>, f64)> = walls
+    // Island key = the largest-area external perimeter whose loop holds the centroid.
+    let ext_loops: Vec<(Vec<Point>, f64)> = paths
         .iter()
         .filter(|p| p.kind == PathKind::ExternalPerimeter && p.closed && p.points.len() >= 3)
         .map(|p| (p.points.clone(), loop_area_mm2(&p.points)))
         .collect();
     if ext_loops.is_empty() {
-        return walls;
+        return paths;
     }
     let key_of = |pts: &[Point]| -> usize {
         let c = loop_centroid(pts);
@@ -1940,11 +1958,10 @@ fn spiralize_inner_walls(
         }
         key
     };
-    // Islands with any overhang opt out wholesale — a uniform OverhangWall loop or a
-    // wall carrying overhang SEGMENTS (segmented beads mark a mixed-support wall).
-    // Their rings must stay whole for the enclosed-void / cantilever ordering.
+    // Islands with any overhang opt out — a uniform OverhangWall loop or a wall
+    // carrying overhang SEGMENTS. Their rings must stay whole for the void ordering.
     let mut overhang_island = vec![false; ext_loops.len()];
-    for p in &walls {
+    for p in &paths {
         if p.kind == PathKind::OverhangWall || p.segs.is_some() {
             let k = key_of(&p.points);
             if k != usize::MAX {
@@ -1952,29 +1969,42 @@ fn spiralize_inner_walls(
             }
         }
     }
+    // A shell ring is a CLOSED inner Perimeter wall, or a CLOSED concentric fill loop
+    // (group-less, so monotonic line fill and bridged arcs are excluded).
+    let is_shell = |p: &ToolPath| {
+        p.closed
+            && p.points.len() >= 3
+            && p.segs.is_none()
+            && match p.kind {
+                PathKind::Perimeter => true,
+                PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin => p.group.is_none(),
+                _ => false,
+            }
+    };
     let mut passthrough: Vec<ToolPath> = Vec::new();
-    let mut by_island: std::collections::BTreeMap<usize, Vec<Vec<Point>>> =
+    let mut by_island: std::collections::BTreeMap<usize, Vec<(Vec<Point>, PathKind)>> =
         std::collections::BTreeMap::new();
-    for p in walls {
-        let inner_ring = p.kind == PathKind::Perimeter && p.closed && p.points.len() >= 3;
-        let key = if inner_ring { key_of(&p.points) } else { usize::MAX };
-        if inner_ring && key != usize::MAX && !overhang_island[key] {
-            by_island.entry(key).or_default().push(p.points);
-        } else {
-            passthrough.push(p);
+    for p in paths {
+        if is_shell(&p) {
+            let k = key_of(&p.points);
+            if k != usize::MAX && !overhang_island[k] {
+                by_island.entry(k).or_default().push((p.points, p.kind));
+                continue;
+            }
         }
+        passthrough.push(p);
     }
     let mut out = passthrough;
     for (_k, rings) in by_island {
-        // A lone inner ring stays a clean closed loop (nothing to chain into).
+        // A lone ring stays a clean closed loop (nothing to chain into).
         if rings.len() < 2 {
-            for r in rings {
-                out.push(ToolPath::new(PathKind::Perimeter, true, lw, r));
+            for (pts, kind) in rings {
+                out.push(ToolPath::new(kind, true, lw, pts));
             }
             continue;
         }
-        for stroke in spiralize_rings(rings, region, sp * 1.7, seam_mode, layer_index) {
-            out.push(ToolPath::new(PathKind::Perimeter, false, lw, stroke));
+        for (pts, kinds) in spiralize_rings(rings, region, sp * 1.7, seam_mode, layer_index) {
+            out.push(spiral_to_toolpath(pts, &kinds, lw));
         }
     }
     out
@@ -2548,8 +2578,10 @@ fn fill_region(
             out,
         ),
         InfillPattern::Concentric => {
-            // Concentric offset rings, outermost first.
-            let mut rings: Vec<Vec<Point>> = Vec::new();
+            // Concentric offset rings, emitted CLOSED. The Pass-2 spiralize_shells pass
+            // splices them (together with the inner walls they ring) into continuous
+            // inward-spiral strokes with a single seam — so the concentric fill flows
+            // as one path, joined to the wall stack, with no per-ring travel/restart.
             let mut d = lw * 0.5;
             loop {
                 let loops = offset(region, -d);
@@ -2558,21 +2590,11 @@ fn fill_region(
                 }
                 for c in loops.contours {
                     if c.points.len() >= 3 {
-                        rings.push(c.points);
+                        let points = place_seam(c.points, seam_mode, layer_index);
+                        out.push(ToolPath::new(kind, true, lw, points));
                     }
                 }
                 d += spacing;
-            }
-            // Splice the nested rings into continuous inward-spiral strokes: one
-            // seam per nested family instead of one per ring. The stroke traces each
-            // ring closed, then a short in-region crossover jogs to the nearest
-            // not-yet-used ring — so a whole concentric fill flows as one path with
-            // no per-ring travel or flow restart (the corner seams the plain rings
-            // left). The crossover cap (~1.7× spacing) reaches an adjacent ring but
-            // not across a void, so an annulus' two ring-families join at the band
-            // midline into one Fermat-like sweep, and separate pockets seed their own.
-            for stroke in spiralize_rings(rings, region, spacing * 1.7, seam_mode, layer_index) {
-                out.push(ToolPath::new(kind, false, lw, stroke));
             }
         }
         InfillPattern::Gyroid => {
@@ -3327,14 +3349,17 @@ mod tests {
                 Point::from_mm(-r, r),
             ]
         };
-        let rings: Vec<Vec<Point>> = (1..=5).map(|k| ring(k as f64)).collect();
+        let rings: Vec<(Vec<Point>, PathKind)> =
+            (1..=5).map(|k| (ring(k as f64), PathKind::Perimeter)).collect();
         let mut region = Polygons::new();
         region.push(Contour::new(ring(5.5))); // holds every crossover in-region
         let strokes = spiralize_rings(rings, &region, 2.0, SeamMode::Nearest, 0);
         // Adjacent rings are √2 mm apart (< 2 mm crossover cap), so all five chain
         // into ONE continuous spiral stroke — one seam, not five.
         assert_eq!(strokes.len(), 1, "nested rings should chain into one spiral");
-        assert!(strokes[0].len() >= 20, "the stroke should trace all five rings");
+        assert!(strokes[0].0.len() >= 20, "the stroke should trace all five rings");
+        // All rings share a kind, so the stroke is uniform (no per-segment override).
+        assert!(strokes[0].1.iter().all(|&k| k == PathKind::Perimeter));
     }
 
     #[test]
@@ -3575,7 +3600,13 @@ mod tests {
         let layers = generate(&m, &s);
         let mid = &layers[10];
         assert_eq!(count(mid, PathKind::Infill), 0, "no sparse fill in a tiny pocket");
-        assert!(count(mid, PathKind::Solid) > 0, "pocket promoted to solid");
+        // The pocket fills solid — as a Solid path, or (when spiralize_shells merges it
+        // into the inner-wall stroke) as Solid segments carried on that stroke.
+        let has_solid = mid.paths.iter().any(|p| {
+            p.kind == PathKind::Solid
+                || p.segs.as_ref().is_some_and(|sa| sa.iter().any(|a| a.kind == PathKind::Solid))
+        });
+        assert!(has_solid, "pocket promoted to solid");
     }
 
 
