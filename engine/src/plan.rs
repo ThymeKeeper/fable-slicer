@@ -493,7 +493,26 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             difference(&layers[i].polygons, &band)
         };
 
-        if !inner.is_empty() {
+        // Run the interior fill when there's material inside the innermost wall — OR
+        // when there's an enclosed ceiling to bridge. A thin roof closing over a
+        // cockpit can have its whole ceiling swallowed by a wide wall stack (4+ walls),
+        // leaving `inner` empty; without the ceiling clause Pass 2 is skipped and the
+        // ceiling prints as an unfilled hollow (then solid-over-air a layer up) instead
+        // of bridging. The ceiling is wall-count-independent (it's the mesh slice), so
+        // the enclosed-sheet probe is only paid when `inner` is empty (short-circuit).
+        if !inner.is_empty()
+            || (i > 0
+                && settings.bottom_layers > 0
+                && !enclosed_ceiling_sheet(
+                    &layers[i].polygons,
+                    &layers[i - 1].polygons,
+                    lw,
+                    settings.layer_height_mm
+                        * settings.support_overhang_angle_deg.to_radians().tan(),
+                    settings.bridge_foothold_mm + sp,
+                )
+                .is_empty())
+        {
             // Unsupported interior, computed in every mode. A span anchored on
             // both ends (a ceiling enclosed by walls) is reliably bridgeable — it's
             // correct bottom-surface printing, so it bridges in every support mode.
@@ -839,6 +858,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                             // (the supported crossing such a connector spans).
                             let connector_cap = lw * (2.0 * settings.wall_count as f64 + 4.0);
                             merge_bridge_connectors(&mut paths[n0..], connector_cap);
+                            // The split cut each connected bead at the support boundary,
+                            // so the over-air middles are now separate InternalBridge arcs.
+                            // Stitch them (and the surviving solid arcs) back into
+                            // continuous runs — a bridge surface should print without
+                            // stopping the flow at every line, same as solid.
+                            if settings.connect_infill {
+                                connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
+                            }
                         }
                     }
                 }
@@ -1682,64 +1709,54 @@ fn pt_dist_mm(a: Point, b: Point) -> f64 {
     (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm())
 }
 
-/// Stitch consecutive boustrophedon fill beads (`paths[start..]`) into continuous
-/// runs: where the turnaround from one bead's end to the next bead's start stays
-/// inside the walls and is short, EXTRUDE it rather than travel — one unbroken bead
-/// with no stop/start, so no pressure-advance restart, no ooze, and no seam at every
-/// line end. A join that would leave the region (across a hole, a concavity, or the
-/// gap to another island) is kept as a travel, so the new bead never crosses open
-/// space. Only same-kind, same-group OPEN beads merge, so bridges and separate
-/// islands keep their own flow and travel ordering.
+/// Stitch fill beads (`paths[start..]`) into continuous runs. Each bead is appended to
+/// whichever OPEN run it can continue with a short turnaround that stays inside the
+/// walls — not merely the previous bead. That distinction matters where a hole (or an
+/// L's inner corner) splits a scanline into two spans: the monotonic order interleaves
+/// the sides (left, right, left, right...), so appending to the nearest joinable run
+/// lets each side accrete into its OWN continuous run instead of breaking every
+/// cross-void turnaround into a separate line. Every join is still a short in-region
+/// turnaround (nothing crosses the void, so no scribble), and only same-kind,
+/// same-group open beads join, so bridges and separate islands keep their own flow.
 fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons, max_jump: f64) {
     if paths.len() < start + 2 {
         return;
     }
     // The bead ends sit ON the wall edge (extend_ends_to_wall stopped them there), so
     // test joins against the walls grown a hair — otherwise an on-edge sample reads as
-    // "outside" and every flat-wall turnaround is wrongly rejected. The grow stays
-    // under the scan spacing, so a real notch or gap still rejects.
+    // "outside" and every flat-wall turnaround is wrongly rejected.
     let inflated = offset(inside, 0.1);
-    let runs: Vec<ToolPath> = paths.split_off(start);
-    for p in runs {
-        // What to splice before p's points: empty for a straight turnaround, one
-        // boundary vertex for a routed one, or None to leave the travel and start a
-        // fresh run.
-        let splice: Option<Vec<Point>> = if !p.closed && p.points.len() >= 2 {
-            match paths.last() {
-                Some(prev)
-                    if !prev.closed
-                        && prev.kind == p.kind
-                        && prev.group == p.group
-                        && prev.points.len() >= 2 =>
-                {
-                    let a = *prev.points.last().unwrap();
-                    let b = p.points[0];
-                    if join_inside(a, b, &inflated, max_jump) {
-                        Some(Vec::new())
-                    } else {
-                        // Straight join blocked (too far, or it would cut across a
-                        // concavity). Leave the travel. Routing around the bend was tried
-                        // and removed: on an L the monotonic sweep alternates the two
-                        // arms, so consecutive beads are always opposite arms and the
-                        // detours pile on the inner corner and collide. The fix is bead
-                        // ORDER (fill each arm as its own sweep), not a longer join.
-                        None
-                    }
-                }
-                _ => None,
+    let beads: Vec<ToolPath> = paths.split_off(start);
+    let mut runs: Vec<ToolPath> = Vec::new();
+    for bead in beads {
+        if bead.closed || bead.points.len() < 2 {
+            runs.push(bead);
+            continue;
+        }
+        let (head, tail) = (bead.points[0], *bead.points.last().unwrap());
+        // Nearest open run this bead can continue — in either orientation, since a
+        // boustrophedon reversal or a hole-split span may present its far end first.
+        let mut best: Option<(usize, bool, f64)> = None;
+        for (i, r) in runs.iter().enumerate() {
+            if r.closed || r.kind != bead.kind || r.group != bead.group || r.points.len() < 2 {
+                continue;
             }
-        } else {
-            None
-        };
-        match splice {
-            Some(way) => {
-                let prev = paths.last_mut().unwrap();
-                prev.points.extend(way);
-                prev.points.extend(p.points);
+            let end = *r.points.last().unwrap();
+            let (fwd, rev) = (pt_dist_mm(end, head), pt_dist_mm(end, tail));
+            let (d, flip) = if fwd <= rev { (fwd, false) } else { (rev, true) };
+            if best.map_or(true, |(_, _, bd)| d < bd)
+                && join_inside(end, if flip { tail } else { head }, &inflated, max_jump)
+            {
+                best = Some((i, flip, d));
             }
-            None => paths.push(p),
+        }
+        match best {
+            Some((i, true, _)) => runs[i].points.extend(bead.points.iter().rev().copied()),
+            Some((i, false, _)) => runs[i].points.extend(bead.points),
+            None => runs.push(bead),
         }
     }
+    paths.extend(runs);
 }
 
 /// Every sample along a→b stays inside `inside` — so the stitched bead never crosses
