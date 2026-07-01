@@ -119,6 +119,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     // by Klipper and Marlin; SQUARE_CORNER_VELOCITY is Klipper's "jerk" equivalent.
     // Acceleration then follows the feature being printed (M204 per change).
     let mut cur_accel = s.first_layer_accel_mm_s2;
+    // Pressure advance in force (eased on unsupported beads, see `pa_for`); starts
+    // at the profile value the startup `SET_PRESSURE_ADVANCE` below establishes.
+    let mut cur_pa = s.pressure_advance;
     g.raw(&format!("M204 S{cur_accel:.0}"));
     g.raw(&format!("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={:.1}", s.jerk_mm_s));
     if let Some(c) = atd_cmd(cur_accel, s) {
@@ -227,6 +230,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     g.raw(&c);
                 }
                 cur_accel = accel;
+            }
+            // Pressure advance, eased on unsupported beads (see `pa_for`). Emitted
+            // right after the accel block so its Klipper planner flush rides with the
+            // M204's rather than stalling separately. Self-restores: the next
+            // supported feature reads back the profile value.
+            if s.pressure_advance > 0.0 {
+                let pa = pa_for(path, s);
+                if (pa - cur_pa).abs() > 1.0e-4 {
+                    g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
+                    cur_pa = pa;
+                }
             }
             // Cooling by how unsupported the bead is: bridges and bottom skins are
             // fully airborne (the bridge fan); an overhang wall graduates from the
@@ -642,6 +656,35 @@ fn atd_cmd(accel: f64, s: &Settings) -> Option<String> {
         let atd = accel * (1.0 - s.min_cruise_ratio.clamp(0.0, 0.95));
         format!("SET_VELOCITY_LIMIT ACCEL_TO_DECEL={atd:.0}")
     })
+}
+
+/// The fraction of profile pressure advance a fully-airborne bead keeps. A
+/// bridge or a wall hanging fully past its support carries little nozzle
+/// pressure, so full PA over-corrects at the bead ends; halving it softens the
+/// flow blip where a fast supported wall steps down to a slow overhang/bridge.
+const OVERHANG_PA_FLOOR: f64 = 0.5;
+
+/// Pressure advance (mm of filament per mm/s of flow) for a feature: the profile
+/// value for supported moves, eased toward [`OVERHANG_PA_FLOOR`]×profile as a
+/// bead loses support — overhang walls graduate with how far they hang, true
+/// bridges take the floor. This is what blunts the line at a closing arch, where
+/// the wall slows hard in one stretch and full PA prints the speed step as a
+/// ridge. Returns 0 when PA is disabled.
+///
+/// InternalBridge is deliberately left at the base value: it is cut per-bead into
+/// the surrounding solid, so easing its PA would toggle the setting on and off
+/// along a single onion (a planner flush each time) — the same thrash the fan
+/// code sidesteps for it. Its droop is already handled by the reduced bridge flow.
+fn pa_for(path: &ToolPath, s: &Settings) -> f64 {
+    let base = s.pressure_advance;
+    if base <= 0.0 {
+        return 0.0;
+    }
+    match path.kind {
+        PathKind::Bridge => base * OVERHANG_PA_FLOOR,
+        PathKind::OverhangWall => base * (1.0 - (1.0 - OVERHANG_PA_FLOOR) * path.overhang as f64),
+        _ => base,
+    }
 }
 
 fn dist_mm(a: Point, b: Point) -> f64 {
