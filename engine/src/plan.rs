@@ -393,6 +393,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // the perimeters it nominally fits — e.g. a hole beside the outline),
             // drop the doubled run so the nozzle doesn't retrace the same bead.
             trim_thin_walls(&mut walls, lw, sp);
+            // Spiralize each fully-supported island's inner walls into one continuous
+            // inward stroke (one seam per island, no per-ring travel). Needs ≥2 inner
+            // rings to chain; runs after the overhang split so only supported closed
+            // Perimeter rings are consumed, leaving the overhang/enclosed-void ordering
+            // untouched. The visible outer wall stays its own aligned-seam loop.
+            if settings.wall_count >= 3 && !settings.spiral_vase {
+                walls = spiralize_inner_walls(walls, &layer.polygons, lw, sp, settings.seam_mode, layer.index);
+            }
             (walls, opened)
         })
         .collect();
@@ -1366,6 +1374,18 @@ fn pt_seg_dist_mm(p: Point, a: Point, b: Point) -> f64 {
     (px - (ax + t * dx)).hypot(py - (ay + t * dy))
 }
 
+/// The point on segment a→b nearest `p` (the projection, clamped to the segment).
+fn nearest_point_on_seg(p: Point, a: Point, b: Point) -> Point {
+    let (ax, ay, bx, by) = (a.x_mm(), a.y_mm(), b.x_mm(), b.y_mm());
+    let (dx, dy) = (bx - ax, by - ay);
+    let l2 = dx * dx + dy * dy;
+    if l2 < 1.0e-12 {
+        return a;
+    }
+    let t = (((p.x_mm() - ax) * dx + (p.y_mm() - ay) * dy) / l2).clamp(0.0, 1.0);
+    Point::from_mm(ax + dx * t, ay + dy * t)
+}
+
 /// Single-region bridge split: cut each just-filled bead at the support boundary.
 /// The stretch over `bridge` (open sparse below) is re-tagged `InternalBridge`
 /// (bridge flow/speed); the stretch over `supported` keeps the bead's own kind.
@@ -1826,45 +1846,119 @@ fn spiralize_rings(
         }
         loop {
             let tail = *chain.last().unwrap();
-            // Nearest unused ring, entered at its vertex closest to the tail, reachable
-            // by a crossover that stays in-region and within reach.
-            let mut best: Option<(usize, usize, f64)> = None;
+            // Nearest reachable point on any unused ring — projected onto its EDGES, so
+            // a long straight edge with sparse vertices still connects at its closest
+            // point rather than a distant corner (the difference between a wall stack
+            // chaining into one stroke and fragmenting into per-ring stubs).
+            let mut best: Option<(usize, usize, Point, f64)> = None;
             for i in 0..n {
                 if used[i] {
                     continue;
                 }
                 let r = &rings[i];
-                let (mut bvi, mut bvd) = (0usize, f64::INFINITY);
-                for (k, p) in r.iter().enumerate() {
-                    let dd = pt_dist_mm(tail, *p);
-                    if dd < bvd {
-                        bvd = dd;
-                        bvi = k;
+                let m = r.len();
+                for k in 0..m {
+                    let e = nearest_point_on_seg(tail, r[k], r[(k + 1) % m]);
+                    let dd = pt_dist_mm(tail, e);
+                    if dd < best.map_or(f64::INFINITY, |(_, _, _, bd)| bd) {
+                        best = Some((i, k, e, dd));
                     }
-                }
-                if bvd <= max_cross
-                    && best.map_or(true, |(_, _, cd)| bvd < cd)
-                    && seg_inside(tail, r[bvi], &inflated)
-                {
-                    best = Some((i, bvi, bvd));
                 }
             }
             match best {
-                Some((i, vi, _)) => {
+                Some((i, k, entry, dd)) if dd <= max_cross && seg_inside(tail, entry, &inflated) => {
                     used[i] = true;
                     let r = &rings[i];
                     let m = r.len();
-                    // Trace ring i closed, entering at its nearest vertex.
-                    for k in 0..=m {
-                        chain.push(r[(vi + k) % m]);
+                    // Enter ring i on edge k→k+1 at `entry`, trace it around, close to it.
+                    chain.push(entry);
+                    for j in 1..=m {
+                        chain.push(r[(k + j) % m]);
                     }
+                    chain.push(entry);
                 }
-                None => break,
+                _ => break,
             }
         }
         strokes.push(chain);
     }
     strokes
+}
+
+/// Splice each island's inner `Perimeter` wall rings into one continuous inward
+/// spiral (reusing [`spiralize_rings`]) so a multi-wall stack prints as one stroke
+/// with a single seam instead of a seam + travel per ring. The visible
+/// `ExternalPerimeter` is left as its own clean closed loop (its seam is aligned
+/// across layers and may be fuzzed), and an island carrying ANY `OverhangWall` is
+/// left entirely alone — its rings must stay closed for the overhang / enclosed-void
+/// ordering ([`order_unsupported_rings_outer_in`]) to lay them supported-edge inward.
+/// `region` (the layer cross-section) bounds every crossover, so a jog never leaves
+/// the material or hops a hole/gap to another island.
+fn spiralize_inner_walls(
+    walls: Vec<ToolPath>,
+    region: &Polygons,
+    lw: f64,
+    sp: f64,
+    seam_mode: SeamMode,
+    layer_index: usize,
+) -> Vec<ToolPath> {
+    // The island each wall belongs to = the largest-area external perimeter whose
+    // loop holds its centroid (same keying as order_walls).
+    let ext_loops: Vec<(Vec<Point>, f64)> = walls
+        .iter()
+        .filter(|p| p.kind == PathKind::ExternalPerimeter && p.closed && p.points.len() >= 3)
+        .map(|p| (p.points.clone(), loop_area_mm2(&p.points)))
+        .collect();
+    if ext_loops.is_empty() {
+        return walls;
+    }
+    let key_of = |pts: &[Point]| -> usize {
+        let c = loop_centroid(pts);
+        let (mut key, mut best) = (usize::MAX, -1.0);
+        for (k, (ep, ea)) in ext_loops.iter().enumerate() {
+            if *ea > best && loop_contains(ep, c) {
+                best = *ea;
+                key = k;
+            }
+        }
+        key
+    };
+    // Islands with an overhang wall opt out wholesale.
+    let mut overhang_island = vec![false; ext_loops.len()];
+    for p in &walls {
+        if p.kind == PathKind::OverhangWall {
+            let k = key_of(&p.points);
+            if k != usize::MAX {
+                overhang_island[k] = true;
+            }
+        }
+    }
+    let mut passthrough: Vec<ToolPath> = Vec::new();
+    let mut by_island: std::collections::BTreeMap<usize, Vec<Vec<Point>>> =
+        std::collections::BTreeMap::new();
+    for p in walls {
+        let inner_ring = p.kind == PathKind::Perimeter && p.closed && p.points.len() >= 3;
+        let key = if inner_ring { key_of(&p.points) } else { usize::MAX };
+        if inner_ring && key != usize::MAX && !overhang_island[key] {
+            by_island.entry(key).or_default().push(p.points);
+        } else {
+            passthrough.push(p);
+        }
+    }
+    let mut out = passthrough;
+    for (_k, rings) in by_island {
+        // A lone inner ring stays a clean closed loop (nothing to chain into).
+        if rings.len() < 2 {
+            for r in rings {
+                out.push(ToolPath::new(PathKind::Perimeter, true, lw, r));
+            }
+            continue;
+        }
+        for stroke in spiralize_rings(rings, region, sp * 1.7, seam_mode, layer_index) {
+            out.push(ToolPath::new(PathKind::Perimeter, false, lw, stroke));
+        }
+    }
+    out
 }
 
 /// Lengthen a skin line-end along its OWN direction until it meets the wall edge
