@@ -3796,20 +3796,35 @@ fn build_instances(
                     None => w,
                 }
             };
+            // Per-segment colour + category: a segmented bead (an overhang wall kept
+            // whole) shows each stretch in its own feature colour. Heat-map modes stay
+            // per-path (path_colors set).
+            let seg_cc = |k: usize| -> ([f32; 3], f32) {
+                match &path.segs {
+                    Some(sa) if path_colors.is_none() && !sa.is_empty() => {
+                        let sk = sa[k.min(sa.len() - 1)].kind;
+                        (color_for(sk, accent), category_of(sk))
+                    }
+                    _ => (c, cat),
+                }
+            };
             for k in 0..n_pts - 1 {
                 let sw = (vert_w(k) + vert_w(k + 1)) * 0.5;
-                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, c, layer_id, cat);
+                let (sc, scat) = seg_cc(k);
+                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat);
             }
             if path.closed {
-                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, c, layer_id, cat);
+                let (sc, scat) = seg_cc(n_pts - 1);
+                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
             for (vi, p) in path.points.iter().enumerate() {
+                let (sc, scat) = seg_cc(vi);
                 joints.push([
                     p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
                     vert_w(vi), bh,
-                    c[0], c[1], c[2],
-                    layer_id, cat,
+                    sc[0], sc[1], sc[2],
+                    layer_id, scat,
                 ]);
             }
             // Highlight the external-perimeter seam (loop start) with a larger

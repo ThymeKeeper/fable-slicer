@@ -50,6 +50,16 @@ pub enum PathKind {
     Bridge,
 }
 
+/// Per-segment print attributes for a bead whose speed/flow/cooling varies along
+/// its length. One entry per segment (segment `k` = `points[k]`→`points[k+1]`, the
+/// last wrapping for a closed loop). Lets a continuous bead carry an overhang or
+/// bridge stretch WITHOUT being cut into separate paths — see [`ToolPath::segs`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SegAttr {
+    pub kind: PathKind,
+    pub overhang: f32,
+}
+
 /// A single continuous extrusion path.
 #[derive(Clone, Debug)]
 pub struct ToolPath {
@@ -76,6 +86,13 @@ pub struct ToolPath {
     /// over air — set on graduated overhang-wall runs. Drives a per-run speed lerp
     /// from the wall speed down to the overhang floor. 0 for everything else.
     pub overhang: f32,
+    /// Per-SEGMENT attribute override (kind + overhang), `None` = the whole path
+    /// uses `kind`/`overhang`. When set, the emitter sub-blocks the bead into runs
+    /// of equal attribute and varies speed/flow/cooling ALONG it — so an overhang
+    /// wall that slows only over its air span, or a fill run that bridges only its
+    /// unsupported middle, stays one continuous bead (one seam, unbroken flow)
+    /// instead of being cut into separate paths.
+    pub segs: Option<Vec<SegAttr>>,
 }
 
 impl ToolPath {
@@ -90,6 +107,7 @@ impl ToolPath {
             height_scale: 1.0,
             widths: None,
             overhang: 0.0,
+            segs: None,
         }
     }
 }
@@ -355,6 +373,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 height_scale: 1.0,
                                 widths: None,
                                 overhang: 0.0,
+                                segs: None,
                             });
                         }
                     }
@@ -1615,28 +1634,26 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
             out.push(p);
             continue;
         }
-        for (deg_run, idxs, _) in merged {
-            // Segment indices are consecutive (mod n): the piece's points run
-            // from the first segment's start to the last segment's end.
-            let first = idxs[0];
-            let count = idxs.len();
-            let mut points = Vec::with_capacity(count + 1);
-            for j in 0..=count {
-                points.push(path.points[(first + j) % n]);
+        // Mixed support: keep ONE bead and ANNOTATE each segment — an over-air run
+        // becomes OverhangWall at its graduated degree, a supported run keeps the
+        // wall kind. The emitter grades speed / pressure-advance / fan along the loop
+        // (see ToolPath::segs), so it prints as one continuous bead with a single seam
+        // instead of a pile of split arcs — cohesion without losing the per-stretch
+        // overhang treatment.
+        let mut attrs = vec![SegAttr { kind: path.kind, overhang: 0.0 }; segs];
+        for (deg_run, idxs, _) in &merged {
+            let a = if *deg_run > 0.0 {
+                SegAttr { kind: PathKind::OverhangWall, overhang: *deg_run }
+            } else {
+                SegAttr { kind: path.kind, overhang: 0.0 }
+            };
+            for &k in idxs {
+                attrs[k] = a;
             }
-            let over = deg_run > 0.0;
-            out.push(ToolPath {
-                kind: if over { PathKind::OverhangWall } else { path.kind },
-                closed: false,
-                width_mm: path.width_mm,
-                points,
-                flow: path.flow,
-                group: path.group,
-                height_scale: path.height_scale,
-                widths: path.widths.clone(),
-                overhang: if over { deg_run } else { 0.0 },
-            });
         }
+        let mut p = path;
+        p.segs = Some(attrs);
+        out.push(p);
     }
     out
 }
@@ -1923,10 +1940,12 @@ fn spiralize_inner_walls(
         }
         key
     };
-    // Islands with an overhang wall opt out wholesale.
+    // Islands with any overhang opt out wholesale — a uniform OverhangWall loop or a
+    // wall carrying overhang SEGMENTS (segmented beads mark a mixed-support wall).
+    // Their rings must stay whole for the enclosed-void / cantilever ordering.
     let mut overhang_island = vec![false; ext_loops.len()];
     for p in &walls {
-        if p.kind == PathKind::OverhangWall {
+        if p.kind == PathKind::OverhangWall || p.segs.is_some() {
             let k = key_of(&p.points);
             if k != usize::MAX {
                 overhang_island[k] = true;
@@ -2098,8 +2117,13 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
             .abs()
             * 0.5
     }
-    // A ring sits fully on support when every segment midpoint is over the (grown)
-    // layer below.
+    // A ring counts as "supported" when the MAJORITY of its segment midpoints sit
+    // over the (grown) layer below. Majority, not all: an overhang wall is now kept
+    // whole (mixed-support beads carry per-segment overhang annotations rather than
+    // being split into arcs), so a void cap's outer ring dips a segment or two into
+    // the void yet is still predominantly anchored — while a cantilever's outer ring
+    // is predominantly over air. That split is exactly the enclosed-void vs
+    // cantilever distinction the reorder below needs.
     fn supported(p: &ToolPath, below: &Polygons) -> bool {
         let pts = &p.points;
         let n = pts.len();
@@ -2107,10 +2131,13 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
             return true;
         }
         let segs = if p.closed { n } else { n - 1 };
-        (0..segs).all(|k| {
-            let (a, b) = (pts[k], pts[(k + 1) % n]);
-            in_polys(below, Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
-        })
+        let sup = (0..segs)
+            .filter(|&k| {
+                let (a, b) = (pts[k], pts[(k + 1) % n]);
+                in_polys(below, Point::new((a.x + b.x) / 2, (a.y + b.y) / 2))
+            })
+            .count();
+        sup * 2 > segs
     }
     let is_ring = |k: PathKind| {
         matches!(
@@ -2136,12 +2163,11 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
                 i += 1;
                 continue;
             }
-            // A run is the maximal stretch of ring segments plus the gap-fill
-            // strokes travel-ordering tucks among them. Ring segments may be
-            // OPEN: a void cap's supported outer walls are split into open
-            // overhang arcs by slow_overhanging_walls, while the loops over the
-            // void stay closed — both must count, or the run looks all-unsupported
-            // and the cap keeps its (travel-order) inner→out sequence.
+            // A run is the maximal stretch of ring paths plus the strokes travel
+            // ordering tucks among them. Overhang walls are kept whole now (mixed
+            // support = per-segment annotation, not split arcs), so a void cap's
+            // rings are all closed; `supported` uses a majority test so a ring that
+            // dips a little into the void still reads anchored.
             let mut j = i;
             while j < paths.len() && part_of_run(&paths[j]) {
                 j += 1;
@@ -3044,23 +3070,44 @@ mod tests {
 
         // The slab's first layer is the one printed at z just above 2mm.
         let first_slab = plans.iter().find(|p| p.print_z_mm > 2.0).unwrap();
-        let over: Vec<&ToolPath> =
-            first_slab.paths.iter().filter(|p| p.kind == PathKind::OverhangWall).collect();
-        assert!(!over.is_empty(), "cantilever walls must be marked overhanging");
-        // Overhanging stretches live in the cantilever (y > 20, with margin
-        // for the bead inset); supported walls remain.
-        for p in &over {
-            for pt in &p.points {
-                assert!(pt.y_mm() > 19.0, "overhang piece at supported y={:.1}", pt.y_mm());
+        // Overhang is now marked per-SEGMENT on the wall bead (kept whole, not cut):
+        // a mixed wall stays ExternalPerimeter/Perimeter and carries OverhangWall
+        // segments; a wholly-airborne loop is a uniform OverhangWall. Gather every
+        // over-air segment and check it lives in the cantilever (y > 19).
+        let mut over_segs = 0usize;
+        for p in &first_slab.paths {
+            let n = p.points.len();
+            if n < 2 {
+                continue;
+            }
+            let nseg = if p.closed { n } else { n - 1 };
+            for k in 0..nseg {
+                let seg_kind = match &p.segs {
+                    Some(sa) => sa[k.min(sa.len() - 1)].kind,
+                    None => p.kind,
+                };
+                if seg_kind == PathKind::OverhangWall {
+                    over_segs += 1;
+                    let (a, b) = (p.points[k], p.points[(k + 1) % n]);
+                    let my = (a.y_mm() + b.y_mm()) / 2.0;
+                    assert!(my > 19.0, "overhang segment at supported y={my:.1}");
+                }
             }
         }
+        assert!(over_segs > 0, "cantilever walls must carry overhang segments");
+        // Supported walls keep their kind, and the mixed wall stays one closed bead.
         assert!(
             first_slab.paths.iter().any(|p| matches!(p.kind, PathKind::ExternalPerimeter | PathKind::Perimeter)),
             "supported walls keep their kind"
         );
-        // The layer above the cantilever's first is fully supported again.
+        // The layer above the cantilever's first is fully supported again: no
+        // OverhangWall paths and no overhang segments.
         let next = plans.iter().find(|p| p.print_z_mm > first_slab.print_z_mm).unwrap();
         assert_eq!(count(next, PathKind::OverhangWall), 0, "supported layer must not slow");
+        assert!(
+            next.paths.iter().all(|p| p.segs.is_none()),
+            "a fully-supported layer has no overhang segments"
+        );
     }
 
     #[test]

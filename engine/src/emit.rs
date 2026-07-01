@@ -211,55 +211,30 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             if path.points.len() < 2 {
                 continue;
             }
-            // Feature annotation + acceleration, on change. The accel is set
-            // before the lead-in travel so the whole block moves as one.
-            let t = type_label(path.kind);
-            if cur_type != Some(t) {
-                g.raw(&format!(";TYPE:{t}"));
-                cur_type = Some(t);
-            }
-            let accel = accel_for(path.kind, layer.index, s);
-            if (accel - cur_accel).abs() > 0.5 {
-                g.raw(&format!("M204 S{accel:.0}"));
-                if let Some(c) = atd_cmd(accel, s) {
-                    g.raw(&c);
-                }
-                cur_accel = accel;
-            }
-            // Pressure advance, eased on unsupported beads (see `pa_for`). Emitted
-            // right after the accel block so its Klipper planner flush rides with the
-            // M204's rather than stalling separately. Self-restores: the next
-            // supported feature reads back the profile value.
-            if s.pressure_advance > 0.0 {
-                let pa = pa_for(path, s);
-                if (pa - cur_pa).abs() > 1.0e-4 {
-                    g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
-                    cur_pa = pa;
-                }
-            }
-            // Cooling by how unsupported the bead is: bridges and bottom skins are
-            // fully airborne (the bridge fan); an overhang wall graduates from the
-            // layer's normal duty up to the bridge fan as its bead goes from barely-
-            // to fully-unsupported; everything else stays at the normal duty.
-            let want_fan = if layer.index < s.fan_off_layers {
-                normal_fan
-            } else {
-                let frac = match path.kind {
-                    // InternalBridge keeps the normal fan: it's cut per-bead into the
-                    // surrounding solid, so a separate fan duty would thrash on/off
-                    // along one onion. The user asked for bridge flow/speed, not fan.
-                    PathKind::Bridge | PathKind::BottomSkin => s.bridge_fan_speed,
-                    PathKind::OverhangWall => {
-                        s.fan_speed + (s.bridge_fan_speed - s.fan_speed) * path.overhang as f64
+            let n_pts = path.points.len();
+            let n_segs = if path.closed { n_pts } else { n_pts - 1 };
+            // Per-segment attribute lookup: the override when present (an overhang or
+            // bridge stretch inside a continuous bead), else the whole-path kind.
+            let seg = |k: usize| -> (PathKind, f32) {
+                match &path.segs {
+                    Some(sa) if !sa.is_empty() => {
+                        let a = sa[k.min(sa.len() - 1)];
+                        (a.kind, a.overhang)
                     }
-                    _ => s.fan_speed,
-                };
-                fan_duty(frac).max(normal_fan)
+                    _ => (path.kind, path.overhang),
+                }
             };
-            if want_fan != cur_fan {
-                g.fan(want_fan);
-                cur_fan = want_fan;
-            }
+            // Feature label, acceleration + ATD, pressure advance, and fan for the
+            // FIRST segment — set before the lead-in travel so the whole block moves as
+            // one (a segmented bead re-tunes these at each run boundary below, with no
+            // travel between runs). Cooling grades by how unsupported the bead is:
+            // bridges/bottom skins take the bridge fan, an overhang wall grades toward
+            // it, everything else the normal duty. PA eases the same way (see `pa_for`).
+            let (fk, fo) = seg(0);
+            set_seg_attrs(
+                &mut g, fk, fo, layer, normal_fan, s, &mut cur_type, &mut cur_accel, &mut cur_pa,
+                &mut cur_fan,
+            );
 
             let z = layer.print_z_mm;
             let feed =
@@ -300,7 +275,6 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 g.unretract(s.retract_len_mm, retract_f);
             }
 
-            let n_pts = path.points.len();
             if let Some(ws) = &path.widths {
                 // Variable-width bead (gap fill): E per segment from the local
                 // width, so the bead tapers continuously. Arc fitting assumes a
@@ -313,6 +287,35 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     let c = config::bead_area_mm2(w, h) / area * ff;
                     let p = path.points[k + 1];
                     g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feed);
+                    prev = p;
+                }
+            } else if path.segs.is_some() {
+                // Per-segment attributes: sub-block the bead into runs of equal
+                // (kind, overhang), retuning feed/flow — and via set_seg_attrs the
+                // accel/PA/fan — at each run boundary, but never lifting the nozzle.
+                // No arc fitting (feed varies within the path). The first run's
+                // attributes were already set before the lead-in travel above.
+                let flow_cap = layer_flow_cap_mm3_s(layer, s);
+                let bead = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale);
+                let mut run = seg(0);
+                let mut rfeed = feed_for_seg(run.0, run.1, path, layer.index, layer.height_mm, flow_cap, s)
+                    * layer.speed_scale;
+                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, s);
+                let mut prev = start;
+                for k in 0..n_segs {
+                    let a = seg(k);
+                    if a != run {
+                        set_seg_attrs(
+                            &mut g, a.0, a.1, layer, normal_fan, s, &mut cur_type, &mut cur_accel,
+                            &mut cur_pa, &mut cur_fan,
+                        );
+                        rfeed = feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, s)
+                            * layer.speed_scale;
+                        rcoeff = bead / area * flow_factor_kind(a.0, path.flow, s);
+                        run = a;
+                    }
+                    let p = path.points[(k + 1) % n_pts];
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * rcoeff, rfeed);
                     prev = p;
                 }
             } else if s.arc_fitting {
@@ -495,14 +498,20 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
 /// (ironing), per-kind flow (bridges), and the global multiplier.
 fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
+    flow_factor_kind(path.kind, path.flow, s)
+}
+
+/// [`flow_factor`] for one segment kind (so a bridge stretch inside an otherwise
+/// solid bead still gets bridge flow). `path_flow` is the bead's own multiplier.
+fn flow_factor_kind(kind: PathKind, path_flow: f64, s: &Settings) -> f64 {
     // Bridges and internal bridges (solid over open sparse) both span air — the
     // stretched strand wants the reduced bridge flow so it doesn't droop.
-    let kind_flow = if matches!(path.kind, PathKind::Bridge | PathKind::InternalBridge) {
+    let kind_flow = if matches!(kind, PathKind::Bridge | PathKind::InternalBridge) {
         s.bridge_flow
     } else {
         1.0
     };
-    path.flow * kind_flow * s.extrusion_multiplier
+    path_flow * kind_flow * s.extrusion_multiplier
 }
 
 /// The nozzle temperature for a layer: a per-layer planned override when the
@@ -546,10 +555,26 @@ fn feed_for(
     flow_cap_mm3_s: f64,
     s: &Settings,
 ) -> f64 {
-    let mut v = nominal_speed_mm_s(path.kind, path.overhang, layer_index, s);
+    feed_for_seg(path.kind, path.overhang, path, layer_index, layer_height_mm, flow_cap_mm3_s, s)
+}
+
+/// [`feed_for`] for one segment's `(kind, overhang)`, keeping the bead's own width /
+/// height / flow — so a bridge or overhang stretch inside a continuous bead gets its
+/// own speed and flow-clamp without the bead being split.
+#[allow(clippy::too_many_arguments)]
+fn feed_for_seg(
+    kind: PathKind,
+    overhang: f32,
+    path: &ToolPath,
+    layer_index: usize,
+    layer_height_mm: f64,
+    flow_cap_mm3_s: f64,
+    s: &Settings,
+) -> f64 {
+    let mut v = nominal_speed_mm_s(kind, overhang, layer_index, s);
     if flow_cap_mm3_s > 0.0 {
-        let mm3_per_mm =
-            config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s);
+        let mm3_per_mm = config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale)
+            * flow_factor_kind(kind, path.flow, s);
         if mm3_per_mm > 1.0e-9 {
             v = v.min(flow_cap_mm3_s / mm3_per_mm);
         }
@@ -669,15 +694,73 @@ const OVERHANG_PA_FLOOR: f64 = 0.5;
 /// the surrounding solid, so easing its PA would toggle the setting on and off
 /// along a single onion (a planner flush each time) — the same thrash the fan
 /// code sidesteps for it. Its droop is already handled by the reduced bridge flow.
-fn pa_for(path: &ToolPath, s: &Settings) -> f64 {
+/// Pressure advance (mm of filament per mm/s of flow) for one segment's
+/// `(kind, overhang)`.
+fn pa_for_kind(kind: PathKind, overhang: f32, s: &Settings) -> f64 {
     let base = s.pressure_advance;
     if base <= 0.0 {
         return 0.0;
     }
-    match path.kind {
+    match kind {
         PathKind::Bridge => base * OVERHANG_PA_FLOOR,
-        PathKind::OverhangWall => base * (1.0 - (1.0 - OVERHANG_PA_FLOOR) * path.overhang as f64),
+        PathKind::OverhangWall => base * (1.0 - (1.0 - OVERHANG_PA_FLOOR) * overhang as f64),
         _ => base,
+    }
+}
+
+/// Emit the state changes (feature label, acceleration + accel-to-decel, pressure
+/// advance, fan) for a run of `(kind, overhang)`, each only when it actually changes
+/// from the tracked current value. Shared by a path's first segment (set before the
+/// lead-in travel) and every attribute-run boundary inside a segmented bead — so a
+/// continuous loop retunes its speed/cooling mid-path without lifting the nozzle.
+#[allow(clippy::too_many_arguments)]
+fn set_seg_attrs(
+    g: &mut GcodeBuilder,
+    kind: PathKind,
+    overhang: f32,
+    layer: &LayerPlan,
+    normal_fan: u32,
+    s: &Settings,
+    cur_type: &mut Option<&'static str>,
+    cur_accel: &mut f64,
+    cur_pa: &mut f64,
+    cur_fan: &mut u32,
+) {
+    let t = type_label(kind);
+    if *cur_type != Some(t) {
+        g.raw(&format!(";TYPE:{t}"));
+        *cur_type = Some(t);
+    }
+    let accel = accel_for(kind, layer.index, s);
+    if (accel - *cur_accel).abs() > 0.5 {
+        g.raw(&format!("M204 S{accel:.0}"));
+        if let Some(c) = atd_cmd(accel, s) {
+            g.raw(&c);
+        }
+        *cur_accel = accel;
+    }
+    if s.pressure_advance > 0.0 {
+        let pa = pa_for_kind(kind, overhang, s);
+        if (pa - *cur_pa).abs() > 1.0e-4 {
+            g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
+            *cur_pa = pa;
+        }
+    }
+    let want_fan = if layer.index < s.fan_off_layers {
+        normal_fan
+    } else {
+        let frac = match kind {
+            PathKind::Bridge | PathKind::BottomSkin => s.bridge_fan_speed,
+            PathKind::OverhangWall => {
+                s.fan_speed + (s.bridge_fan_speed - s.fan_speed) * overhang as f64
+            }
+            _ => s.fan_speed,
+        };
+        ((frac.clamp(0.0, 1.0) * 255.0).round() as u32).max(normal_fan)
+    };
+    if want_fan != *cur_fan {
+        g.fan(want_fan);
+        *cur_fan = want_fan;
     }
 }
 
@@ -996,11 +1079,14 @@ pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
 
 /// Time for an extrusion polyline, with junction-speed look-ahead. Both ends stop
 /// (a retraction brackets every path).
-fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64, min_cruise_ratio: f64) -> f64 {
+fn polyline_time(pts: &[Point], closed: bool, v_seg: &[f64], accel: f64, jerk: f64, min_cruise_ratio: f64) -> f64 {
     let n_pts = pts.len();
     let count = if closed { n_pts } else { n_pts.saturating_sub(1) };
     let mut dist: Vec<f64> = Vec::with_capacity(count);
     let mut dir: Vec<(f64, f64)> = Vec::with_capacity(count);
+    // Per-segment nominal (cruise) speed — one entry per surviving segment, so a
+    // bead that slows over an overhang or bridge stretch is timed at the right pace.
+    let mut vseg: Vec<f64> = Vec::with_capacity(count);
     for k in 0..count {
         let p0 = pts[k];
         let p1 = pts[(k + 1) % n_pts];
@@ -1011,6 +1097,7 @@ fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64,
         }
         dist.push(d);
         dir.push((dx / d, dy / d));
+        vseg.push(v_seg[k.min(v_seg.len().saturating_sub(1))]);
     }
     let n = dist.len();
     if n == 0 {
@@ -1019,13 +1106,13 @@ fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64,
 
     // Entry speed at each segment: start with the junction limit (full stop at
     // the first), where a sharper corner allows a lower speed.
-    let mut entry = vec![v_nom; n];
+    let mut entry = vseg.clone();
     entry[0] = 0.0;
     for i in 1..n {
         let cos = (dir[i - 1].0 * dir[i].0 + dir[i - 1].1 * dir[i].1).clamp(-1.0, 1.0);
         let sin_half = ((1.0 - cos) * 0.5).max(0.0).sqrt();
-        let vj = if sin_half < 1.0e-6 { v_nom } else { jerk / (2.0 * sin_half) };
-        entry[i] = vj.min(v_nom);
+        let vj = if sin_half < 1.0e-6 { vseg[i] } else { jerk / (2.0 * sin_half) };
+        entry[i] = vj.min(vseg[i]);
     }
     // Reverse: cap so we can decelerate to the next entry over the move.
     for i in (0..n).rev() {
@@ -1040,7 +1127,7 @@ fn polyline_time(pts: &[Point], closed: bool, v_nom: f64, accel: f64, jerk: f64,
     let mut t = 0.0;
     for i in 0..n {
         let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
-        t += trapezoid_time(dist[i], entry[i], exit, v_nom, accel, min_cruise_ratio);
+        t += trapezoid_time(dist[i], entry[i], exit, vseg[i], accel, min_cruise_ratio);
     }
     t
 }
@@ -1112,8 +1199,24 @@ fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale
         return 0.0;
     }
     let accel = accel_for(path.kind, layer.index, s).max(1.0);
-    let v = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0 * total_scale;
-    polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1), s.min_cruise_ratio)
+    let cap = layer_flow_cap_mm3_s(layer, s);
+    // Per-segment cruise speed: an overhang / bridge stretch inside the bead is timed
+    // at its own (slower) pace, else the whole bead runs at the path speed.
+    let n_pts = path.points.len();
+    let count = if path.closed { n_pts } else { n_pts - 1 };
+    let v_seg: Vec<f64> = (0..count)
+        .map(|k| {
+            let (kind, oh) = match &path.segs {
+                Some(sa) if !sa.is_empty() => {
+                    let a = sa[k.min(sa.len() - 1)];
+                    (a.kind, a.overhang)
+                }
+                _ => (path.kind, path.overhang),
+            };
+            feed_for_seg(kind, oh, path, layer.index, layer.height_mm, cap, s) / 60.0 * total_scale
+        })
+        .collect();
+    polyline_time(&path.points, path.closed, &v_seg, accel, s.jerk_mm_s.max(0.1), s.min_cruise_ratio)
 }
 
 /// Estimate filament used: `(length_mm, grams)`. Honors per-path flow
