@@ -785,8 +785,18 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         PathKind::BottomSkin => settings.bottom_pattern,
                         _ => settings.solid_pattern,
                     };
-                    let pattern =
-                        if is_annular(&region) { InfillPattern::Concentric } else { base_pattern };
+                    // Concentric only for a genuinely NARROW ring-band, where a scanline
+                    // would be short stubs dead-ending at both the wall and the hole. A
+                    // WIDE flat solid/surface that merely has a hole or two (the Benchy
+                    // deck) line-fills cleanly, so it keeps the configured pattern —
+                    // concentric there reads as busy loops the user never selected, and
+                    // (is_annular being all-or-nothing over islands) flips with wall count.
+                    // Narrow = the region vanishes when eroded ~a ring-band's half-width.
+                    let pattern = if is_annular(&region) && is_narrow_band(&region, lw) {
+                        InfillPattern::Concentric
+                    } else {
+                        base_pattern
+                    };
                     // Prep the fill for the chosen pattern. A skin is generated short of the
                     // walls: grow it into the void ring it borders (never into buried
                     // infill) so the outer bead — concentric's outer loop, or the per-bead
@@ -1102,6 +1112,15 @@ fn is_annular(region: &Polygons) -> bool {
         && isls
             .iter()
             .all(|isl| isl.contours.iter().any(|c| c.points.len() >= 3 && !c.is_ccw()))
+}
+
+/// A region is a NARROW ring-band (worth filling concentric) when it vanishes once
+/// eroded by a ring-band's half-width (`NARROW_FILL_BEADS`) — i.e. it's thin enough
+/// everywhere that a scanline across it would be short stubs dead-ending at the wall
+/// and the hole. A WIDE flat solid that merely has a hole or two (a deck) survives
+/// the erosion, so it keeps its configured line/grid fill instead of busy loops.
+fn is_narrow_band(region: &Polygons, lw: f64) -> bool {
+    offset(region, -lw * NARROW_FILL_BEADS).is_empty()
 }
 
 /// Rebalance the solid/sparse split at the island level, in both directions:
@@ -3354,6 +3373,33 @@ mod tests {
         let mut mixed = washer.clone();
         mixed.contours.extend(rect(20.0, 0.0, 24.0, 4.0).contours);
         assert!(!is_annular(&mixed));
+    }
+
+    #[test]
+    fn wide_holed_plate_keeps_line_fill_thin_ring_goes_concentric() {
+        // Concentric fill is gated on BOTH annular AND narrow. A wide plate with a
+        // small hole (the Benchy deck) is annular but not a ring-band, so it keeps its
+        // configured line fill — the bug where 2 vs 4 walls flipped it to concentric.
+        let lw = 0.45;
+        let hole = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            // CW winding => a hole.
+            Contour::new(vec![
+                Point::from_mm(x0, y0),
+                Point::from_mm(x0, y1),
+                Point::from_mm(x1, y1),
+                Point::from_mm(x1, y0),
+            ])
+        };
+        // Wide washer: 8 mm band around a small hole — annular but NOT narrow.
+        let mut wide = rect(0.0, 0.0, 20.0, 20.0);
+        wide.push(hole(8.0, 8.0, 12.0, 12.0));
+        assert!(is_annular(&wide));
+        assert!(!is_narrow_band(&wide, lw), "a wide holed plate is not a ring-band");
+        // Thin ring: 2 mm band — a genuine cavity ring, worth concentric.
+        let mut thin = rect(0.0, 0.0, 10.0, 10.0);
+        thin.push(hole(2.0, 2.0, 8.0, 8.0));
+        assert!(is_annular(&thin));
+        assert!(is_narrow_band(&thin, lw), "a thin annular band IS a ring-band");
     }
 
     #[test]
