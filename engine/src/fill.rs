@@ -22,6 +22,7 @@ pub fn infill_lines(
     spacing_mm: f64,
     boustrophedon: bool,
     min_len_mm: f64,
+    anchor: bool,
 ) -> Vec<Vec<Point>> {
     let theta = angle_deg.to_radians();
     let (ct, st) = (theta.cos(), theta.sin());
@@ -49,14 +50,41 @@ pub fn infill_lines(
         return Vec::new();
     }
 
+    // Scan-line positions (perpendicular offsets, rotated frame).
+    let ys: Vec<f64> = if anchor {
+        // REGION-anchored: distribute lines so the outermost ones hug the
+        // region's perpendicular extremes — i.e. the walls running parallel to
+        // the lines — with near-uniform spacing. The per-bead end-reach can only
+        // stretch a line along its OWN direction, so it can't close the gap to a
+        // wall a line runs parallel to; anchoring the grid to the region does.
+        // Used for solid/skin fill (which needs no cross-layer stacking). `ceil`
+        // keeps the adjusted spacing ≤ requested, so solid never opens a gap. A
+        // hair of inset (`delta`) lifts the extreme scans off the boundary edge.
+        let delta = (spacing_mm * 0.03).clamp(2.0e-3, 0.03);
+        let (lo, hi) = (ymin + delta, ymax - delta);
+        if hi <= lo {
+            vec![(ymin + ymax) * 0.5]
+        } else {
+            let g = ((hi - lo) / spacing_mm).ceil().max(1.0);
+            let s_adj = (hi - lo) / g;
+            (0..=(g as usize)).map(|k| lo + k as f64 * s_adj).collect()
+        }
+    } else {
+        // GLOBAL grid (multiples of `spacing_mm`) rather than the region's own
+        // edge, so the same angle on different layers lands at the same
+        // coordinates. Sparse infill and grid support then stack into continuous
+        // walls instead of drifting as the region changes shape.
+        let mut y = ((ymin - spacing_mm * 0.5) / spacing_mm).ceil() * spacing_mm + spacing_mm * 0.5;
+        let mut v = Vec::new();
+        while y < ymax {
+            v.push(y);
+            y += spacing_mm;
+        }
+        v
+    };
+
     let mut out = Vec::new();
-    let mut row = 0usize;
-    // Anchor scan lines to a GLOBAL grid (multiples of `spacing_mm`) rather than
-    // the region's own lower edge, so the same angle on different layers lands
-    // at the same coordinates. Sparse infill and grid support then stack into
-    // continuous walls instead of drifting as the region changes shape.
-    let mut y = ((ymin - spacing_mm * 0.5) / spacing_mm).ceil() * spacing_mm + spacing_mm * 0.5;
-    while y < ymax {
+    for (row, &y) in ys.iter().enumerate() {
         let mut xs: Vec<f64> = Vec::new();
         for &(ax, ay, bx, by) in &edges {
             // half-open test so each vertex counts once
@@ -81,8 +109,6 @@ pub fn infill_lines(
             }
             k += 2;
         }
-        y += spacing_mm;
-        row += 1;
     }
     out
 }
@@ -408,7 +434,7 @@ mod tests {
     #[test]
     fn boustrophedon_alternates() {
         let region = rect(0.0, 0.0, 10.0, 10.0);
-        let lines = infill_lines(&region, 0.0, 1.0, true, 0.5);
+        let lines = infill_lines(&region, 0.0, 1.0, true, 0.5, false);
         assert!(lines.len() >= 8);
         // Consecutive rows start at opposite x ends.
         let x0 = lines[0][0].x_mm();
@@ -426,8 +452,8 @@ mod tests {
             Point::from_mm(10.0, 0.0),
             Point::from_mm(0.0, 10.0),
         ]));
-        let strict = infill_lines(&tri, 0.0, 1.0, false, 2.0);
-        let loose = infill_lines(&tri, 0.0, 1.0, false, 0.5);
+        let strict = infill_lines(&tri, 0.0, 1.0, false, 2.0, false);
+        let loose = infill_lines(&tri, 0.0, 1.0, false, 0.5, false);
         assert!(strict.len() < loose.len(), "threshold should drop apex rows");
         for l in &strict {
             let len: f64 = l
@@ -438,4 +464,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn anchored_lines_hug_region_edges() {
+        // A 10mm square, horizontal lines at spacing 1.0. Anchored: the outermost
+        // lines sit against the top/bottom edges (the walls parallel to the lines).
+        // Global grid: they sit half a spacing in. This is the parallel-wall gap
+        // the per-bead end-reach can't close.
+        let region = rect(0.0, 0.0, 10.0, 10.0);
+        let edge_y = |lines: &[Vec<Point>]| {
+            let ys: Vec<f64> = lines.iter().flat_map(|l| l.iter().map(|p| p.y_mm())).collect();
+            let lo = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (lo, hi)
+        };
+        let (lo_a, hi_a) = edge_y(&infill_lines(&region, 0.0, 1.0, false, 0.5, true));
+        assert!(lo_a < 0.1 && hi_a > 9.9, "anchored lines must hug both edges: {lo_a:.2}..{hi_a:.2}");
+        let (lo_g, hi_g) = edge_y(&infill_lines(&region, 0.0, 1.0, false, 0.5, false));
+        assert!(lo_g > 0.4 && hi_g < 9.6, "global grid sits inset: {lo_g:.2}..{hi_g:.2}");
+    }
 }

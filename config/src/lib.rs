@@ -350,6 +350,11 @@ pub struct Settings {
     /// Print solid-fill lines in monotonic order (strict sweep across each
     /// region) so top surfaces get an even sheen without overlap ridges.
     pub monotonic_solid: bool,
+    /// Stitch solid/skin infill into continuous runs: where a boustrophedon
+    /// turnaround stays inside the walls, extrude it instead of travelling, so the
+    /// flow never stops mid-surface (no pressure-advance restart, ooze, or seam).
+    /// Adds a little material at the turnarounds; sparse is never connected.
+    pub connect_infill: bool,
     /// Jitter external perimeters for a rough "fuzzy" surface texture.
     pub fuzzy_skin: bool,
     /// Total jitter band (mm) for fuzzy skin, centered on the wall line.
@@ -581,6 +586,7 @@ impl Default for Settings {
             solid_pattern: InfillPattern::default(),
             infill_overlap: 0.25,
             monotonic_solid: true,
+            connect_infill: false,
             fuzzy_skin: false,
             fuzzy_skin_thickness_mm: 0.3,
             fuzzy_skin_point_dist_mm: 0.8,

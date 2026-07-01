@@ -200,6 +200,13 @@ const SOLID_BELOW_AREA_MM2: f64 = 10.0;
 /// stays solid — no point switching to bridge flow/speed for a sub-2 mm hop.
 const MIN_BRIDGE_SPAN_MM: f64 = 2.0;
 
+/// Solid/skin regions narrower than this many line widths are filled with
+/// concentric wall loops instead of a line/crosshatch pattern — a door or window
+/// lintel, a thin solid bar. Concentric beads run the length of the section and
+/// tie into the bounding walls; a crosshatch there is short disjoint stubs. Wider
+/// regions keep line fill (a loop alongside a wall would just double it).
+const NARROW_FILL_BEADS: f64 = 4.0;
+
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
@@ -516,11 +523,51 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 Polygons::new()
             };
 
+            // Narrow lintels — a door/window top closing as a thin bar — should span as
+            // ONE continuous concentric run, not fragment into a solid onion + a
+            // try_bridge nub + another onion. Pull the thin connected strips out of
+            // (solid ∪ over-air material) here, fill them concentric now (whole loops,
+            // walls), and hold them OUT of both the bridge pass and the solid/sparse
+            // split below so neither re-fills them.
+            //
+            // Thinness is judged on the MERGED candidate, not per island. A lone thin
+            // bar or shell band stays; but where two thin rings nest closely — a cabin
+            // roof closing in concentric steps — their union is a THICK band that would
+            // spiral into a concentric onion (the roof bug, which only bit at narrower
+            // beads, where each rim slipped under the threshold). Eroding the union by the
+            // narrow distance and dilating back (a morphological open) leaves exactly that
+            // thick core; subtract it so the core falls back to line fill and only the
+            // genuinely thin runs concentric.
+            let solid_all = &solid_all_per_layer[i];
+            let thin_d = lw * NARROW_FILL_BEADS * 0.5;
+            let mut cand = Polygons::new();
+            for isl in islands(&union(solid_all, &overhang_region)) {
+                if offset(&isl, -thin_d).is_empty() {
+                    cand = union(&cand, &isl);
+                }
+            }
+            let narrow_lintel = difference(&cand, &offset(&offset(&cand, -thin_d), thin_d));
+            if !narrow_lintel.is_empty() {
+                let n0 = paths.len();
+                fill_region(
+                    &narrow_lintel, InfillPattern::Concentric, sp, 0.0, lw, PathKind::Solid,
+                    settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
+                );
+                // Keep loops whole (these are meant to span their void as continuous
+                // beads); drop only microscopic loops (a sub-bead pocket is a dot).
+                let tail: Vec<ToolPath> = paths.split_off(n0);
+                paths.extend(
+                    tail.into_iter().filter(|p| wall_pts_len(&p.points, p.closed) >= lw * 4.0),
+                );
+            }
+            let overhang_region = difference(&overhang_region, &narrow_lintel);
+
             // Decide per disjoint island: a gap supported on ≥2 sides bridges
             // with straight lines; an unanchored span is left to the normal fill
             // flow. Only the islands that actually got covered are carved out of
             // the solid/sparse split.
             let mut bridged = Polygons::new();
+            let bridge_start = paths.len();
             for island in islands(&overhang_region) {
                 let segs = match try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm) {
                     Some(segs) => segs
@@ -536,10 +583,19 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 }
                 bridged.contours.extend(island.contours);
             }
+            // A fully-bridged region (a cabin roof) is all one kind, so its boustrophedon
+            // beads stitch into continuous runs exactly like solid — and a bridge wants
+            // unbroken flow most of all, since a stop on an unsupported span sags. Same
+            // safety: only a turnaround that stays inside the walls connects.
+            if settings.connect_infill {
+                connect_fill_runs(&mut paths, bridge_start, &ftw, lw * 3.0);
+            }
 
-            let solid_all = &solid_all_per_layer[i];
-            let solid = difference(solid_all, &bridged);
-            let sparse = difference(&difference(inner, solid_all), &bridged);
+            // `solid_all` was bound above (for the lintel pull). Exclude the lintels
+            // from both fills so they aren't traced twice.
+            let solid = difference(&difference(solid_all, &bridged), &narrow_lintel);
+            let sparse =
+                difference(&difference(&difference(inner, solid_all), &bridged), &narrow_lintel);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
             // Sparse infill never belongs on an exposed surface the model is
             // skinning — it leaves holes in what must be a closed skin. Fold any
@@ -634,7 +690,20 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                             sparse_below.contours.extend(isl.contours);
                         }
                     }
-                    intersection(&union(&internal, &skin_top), &sparse_below)
+                    let skinnable = union(&internal, &skin_top);
+                    let mut b = intersection(&skinnable, &sparse_below);
+                    // A shell island that's MOSTLY over open air — a big bridge with only
+                    // a thin supported rim — bridges WHOLE: fold the rim into the bridge so
+                    // the surface prints as one uniform bridge, not a bridge field with a
+                    // solid edge band. A region carrying real supported area stays split.
+                    for isl in islands(&skinnable) {
+                        let air = intersection(&isl, &sparse_below).net_area_mm2();
+                        let held = difference(&isl, &sparse_below).net_area_mm2();
+                        if air > 3.0 * held {
+                            b = union(&b, &isl);
+                        }
+                    }
+                    b
                 } else {
                     Polygons::new()
                 };
@@ -661,6 +730,10 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     if region.is_empty() {
                         continue;
                     }
+                    // A sliver too thin to line-fill (a residual bar the lintel pull
+                    // above didn't claim — a mixed wide+narrow island) traces as a single
+                    // boundary loop, the only way to fill it; sub-bead nubs are dropped
+                    // (their own walls cover them).
                     if offset(&region, -lw).is_empty() {
                         let loop_region = offset(&region, -(lw * 0.5 - ov * 0.5));
                         for c in loop_region.contours {
@@ -737,8 +810,35 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         // keeps its kind — one continuous fill that steps at the boundary,
                         // not two regions. skin_bottom is over air (a bottom shell), not
                         // sparse, so it's left out.
+                        // Connect-when-safe, BEFORE the bridge split: stitch the
+                        // boustrophedon beads of a solid/skin surface into continuous
+                        // runs so the flow never stops at a line end — only where the
+                        // turnaround stays inside the walls (a hole or concavity keeps
+                        // its travel). Doing it first matters: a bead that merely crosses
+                        // an unsupported gap stays one continuous run, and the split below
+                        // then clips the over-air span out of that run — the supported
+                        // arcs keep the turnarounds joining consecutive passes, instead of
+                        // the split fragmenting the surface before connect ever sees it.
+                        // Sparse is left untouched (its ends aren't visible and connecting
+                        // would add material and defeat the sparseness).
+                        if settings.connect_infill
+                            && matches!(
+                                kind,
+                                PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin
+                            )
+                        {
+                            connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
+                        }
                         if !bridge.is_empty() && matches!(kind, PathKind::Solid | PathKind::TopSkin) {
                             split_bridge_beads(&mut paths, n0, &bridge, &supported);
+                            // A short solid arc threaded between two bridge spans is a
+                            // turn-around landing on the wall ring, not a real solid
+                            // patch — reclassify it to bridge so a mostly-unsupported
+                            // surface prints as one uniform bridge, not a bridge field
+                            // with a solid edge band. The cap scales with the wall ring
+                            // (the supported crossing such a connector spans).
+                            let connector_cap = lw * (2.0 * settings.wall_count as f64 + 4.0);
+                            merge_bridge_connectors(&mut paths[n0..], connector_cap);
                         }
                     }
                 }
@@ -760,9 +860,14 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
-                // Same per-bead reach: sparse lines that run into a wall anchor to it;
-                // those facing other infill don't move.
-                extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
+                // Same per-bead reach: a sparse line that runs into a WALL anchors to it;
+                // one facing other infill doesn't move. Target the non-solid part of the
+                // inside-walls region (ftw minus everything solid-filled) so an end facing
+                // a solid band stops AT that band — not dragged through it to the wall,
+                // which over-printed sparse across the solid (a line crossing the onion).
+                let sparse_anchor =
+                    difference(&difference(&difference(&ftw, &solid), &narrow_lintel), &bridged);
+                extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &sparse_anchor);
             }
         }
 
@@ -778,7 +883,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // Island by island, so the pass finishes one surface before
                 // gliding to the next (ironing skips travel ordering entirely).
                 for island in islands(&iron) {
-                    for seg in crate::fill::infill_lines(&island, 45.0, spacing, true, 0.5) {
+                    for seg in crate::fill::infill_lines(&island, 45.0, spacing, true, 0.5, false) {
                         let mut p = ToolPath::new(PathKind::Ironing, false, spacing, seg);
                         p.flow = settings.ironing_flow.clamp(0.0, 1.0);
                         paths.push(p);
@@ -1237,6 +1342,37 @@ fn pt_seg_dist_mm(p: Point, a: Point, b: Point) -> f64 {
 /// A bead wholly on one side stays one path (closed loops stay closed); a bead
 /// that crosses is split into collinear arcs that abut at the boundary — so the
 /// fill stays one continuous onion/line-set that just steps where support changes.
+/// After the bridge split, a SHORT solid arc that meets a bridge arc at EITHER end is
+/// a turn-around or anchor threading off a bridge span — a landing on the wall ring,
+/// not a genuine solid patch. On a mostly-unsupported surface those leave a solid band
+/// (or corner stubs) at the edges; reclassify them to bridge so the span prints as one
+/// uniform bridge (the bead still lands on the wall ring, where bridge flow bonds
+/// fine). A real solid region's interior arcs touch no bridge at all, or run wider
+/// than `cap`, so they're left alone.
+fn merge_bridge_connectors(paths: &mut [ToolPath], cap: f64) {
+    let mut ends: Vec<Point> = Vec::new();
+    for tp in paths.iter() {
+        if tp.kind == PathKind::InternalBridge && tp.points.len() >= 2 {
+            ends.push(tp.points[0]);
+            ends.push(*tp.points.last().unwrap());
+        }
+    }
+    if ends.is_empty() {
+        return;
+    }
+    let at_bridge = |p: Point| ends.iter().any(|&q| pt_dist_mm(p, q) < 0.05);
+    for tp in paths.iter_mut() {
+        if matches!(tp.kind, PathKind::Solid | PathKind::BottomSkin | PathKind::TopSkin)
+            && !tp.closed
+            && tp.points.len() >= 2
+            && tp.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum::<f64>() <= cap
+            && (at_bridge(tp.points[0]) || at_bridge(*tp.points.last().unwrap()))
+        {
+            tp.kind = PathKind::InternalBridge;
+        }
+    }
+}
+
 fn split_bridge_beads(paths: &mut Vec<ToolPath>, start: usize, bridge: &Polygons, supported: &Polygons) {
     let Some(bb) = bridge.bounds() else { return };
     let (bx0, by0, bx1, by1) = (bb.min.x_mm(), bb.min.y_mm(), bb.max.x_mm(), bb.max.y_mm());
@@ -1272,6 +1408,17 @@ fn split_bridge_beads(paths: &mut Vec<ToolPath>, start: usize, bridge: &Polygons
             continue;
         }
         let over_solid = crate::fill::clip_polylines(vec![tup], supported);
+        // Inverse gate: if the supported section is itself short (< 2 mm), the bead
+        // is mostly air — a sub-2 mm anchor can't hold a bridge, and a tiny solid
+        // nub between bridge runs is pointless fragmentation. Treat the WHOLE bead
+        // as unsupported (one InternalBridge bead, no split).
+        let solid_total: f64 = over_solid.iter().map(|a| span(a)).sum();
+        if solid_total < MIN_BRIDGE_SPAN_MM {
+            let mut tp = bead;
+            tp.kind = PathKind::InternalBridge;
+            paths.push(tp);
+            continue;
+        }
         for (arcs, base_kind) in [(over_solid, bead.kind), (over_air, PathKind::InternalBridge)] {
             for arc in arcs {
                 if arc.len() < 2 {
@@ -1319,21 +1466,32 @@ fn in_polys(polys: &Polygons, p: Point) -> bool {
 /// doesn't chatter at classification borders.
 fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Vec<ToolPath> {
     let min_run_mm = lw * 2.0;
-    // Outward bands by how far a segment sits OUTSIDE the support below: inside
-    // `below` (a supported or vertical wall) = 0; within half a line width out =
-    // mild; within a full width = steep; beyond = fully airborne. Two offsets.
-    let near = offset(below, lw * 0.5);
-    let far = offset(below, lw);
+    // How far past the support below each bead sits, as a 0→1 overhang degree:
+    // 0 on solid, rising to 1 a full line width out (fully airborne). Measured as
+    // the real distance to the support boundary and quantized to 0.1, so the
+    // graduated speed eases in ten small steps instead of the old three hard
+    // bands. Each hard band was a speed jump that — at constant pressure advance —
+    // printed a visible flow line, worst where a closing arch slows hardest. Any
+    // bead past the edge gets at least 0.1 so it's still flagged overhanging.
+    // Distance is computed only for the few beads actually outside support;
+    // supported beads short-circuit to 0 (the common case, and cheaper than the
+    // two polygon offsets this replaces).
     let degree_at = |p: Point| -> f32 {
         if in_polys(below, p) {
-            0.0
-        } else if in_polys(&near, p) {
-            0.34
-        } else if in_polys(&far, p) {
-            0.67
-        } else {
-            1.0
+            return 0.0;
         }
+        let mut best = f64::INFINITY;
+        for c in &below.contours {
+            let m = c.points.len();
+            if m < 2 {
+                continue;
+            }
+            for j in 0..m {
+                best = best.min(pt_seg_dist_mm(p, c.points[j], c.points[(j + 1) % m]));
+            }
+        }
+        let frac = (best / lw).clamp(0.0, 1.0);
+        ((frac * 10.0).round().max(1.0) / 10.0) as f32
     };
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
@@ -1470,7 +1628,7 @@ fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -
     let mut best: Option<(f64, f64)> = None; // (max line length, angle)
     for k in 0..12 {
         let angle = k as f64 * 15.0;
-        let segs = infill_lines(region, angle, lw, false, 0.5);
+        let segs = infill_lines(region, angle, lw, false, 0.5, false);
         let (mut total, mut anchored, mut max_len) = (0usize, 0usize, 0.0f64);
         for seg in &segs {
             if seg.len() < 2 {
@@ -1490,7 +1648,10 @@ fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -
         }
     }
     let (_, angle) = best?;
-    Some(infill_lines(region, angle, lw, false, 0.5))
+    // Boustrophedon order (alternating direction) so consecutive bridge lines meet at
+    // the same end — short turnarounds that `connect_fill_runs` can stitch into one
+    // continuous bridge, instead of every line being a span apart.
+    Some(infill_lines(region, angle, lw, true, 0.5, false))
 }
 
 /// A bridge line is anchored if both ends, extended outward by a line width, land
@@ -1519,6 +1680,93 @@ fn point_in(polys: &Polygons, p: Point) -> bool {
 
 fn pt_dist_mm(a: Point, b: Point) -> f64 {
     (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm())
+}
+
+/// Stitch consecutive boustrophedon fill beads (`paths[start..]`) into continuous
+/// runs: where the turnaround from one bead's end to the next bead's start stays
+/// inside the walls and is short, EXTRUDE it rather than travel — one unbroken bead
+/// with no stop/start, so no pressure-advance restart, no ooze, and no seam at every
+/// line end. A join that would leave the region (across a hole, a concavity, or the
+/// gap to another island) is kept as a travel, so the new bead never crosses open
+/// space. Only same-kind, same-group OPEN beads merge, so bridges and separate
+/// islands keep their own flow and travel ordering.
+fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons, max_jump: f64) {
+    if paths.len() < start + 2 {
+        return;
+    }
+    // The bead ends sit ON the wall edge (extend_ends_to_wall stopped them there), so
+    // test joins against the walls grown a hair — otherwise an on-edge sample reads as
+    // "outside" and every flat-wall turnaround is wrongly rejected. The grow stays
+    // under the scan spacing, so a real notch or gap still rejects.
+    let inflated = offset(inside, 0.1);
+    let runs: Vec<ToolPath> = paths.split_off(start);
+    for p in runs {
+        // What to splice before p's points: empty for a straight turnaround, one
+        // boundary vertex for a routed one, or None to leave the travel and start a
+        // fresh run.
+        let splice: Option<Vec<Point>> = if !p.closed && p.points.len() >= 2 {
+            match paths.last() {
+                Some(prev)
+                    if !prev.closed
+                        && prev.kind == p.kind
+                        && prev.group == p.group
+                        && prev.points.len() >= 2 =>
+                {
+                    let a = *prev.points.last().unwrap();
+                    let b = p.points[0];
+                    if join_inside(a, b, &inflated, max_jump) {
+                        Some(Vec::new())
+                    } else {
+                        // Straight join blocked (too far, or it would cut across a
+                        // concavity). Leave the travel. Routing around the bend was tried
+                        // and removed: on an L the monotonic sweep alternates the two
+                        // arms, so consecutive beads are always opposite arms and the
+                        // detours pile on the inner corner and collide. The fix is bead
+                        // ORDER (fill each arm as its own sweep), not a longer join.
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match splice {
+            Some(way) => {
+                let prev = paths.last_mut().unwrap();
+                prev.points.extend(way);
+                prev.points.extend(p.points);
+            }
+            None => paths.push(p),
+        }
+    }
+}
+
+/// Every sample along a→b stays inside `inside` — so the stitched bead never crosses
+/// the boundary into open space or another pocket.
+fn seg_inside(a: Point, b: Point, inside: &Polygons) -> bool {
+    let d = pt_dist_mm(a, b);
+    if d <= 1.0e-6 {
+        return true;
+    }
+    let steps = (d / 0.2).ceil() as usize;
+    for k in 0..=steps {
+        let t = k as f64 / steps as f64;
+        let s = Point::from_mm(
+            a.x_mm() + (b.x_mm() - a.x_mm()) * t,
+            a.y_mm() + (b.y_mm() - a.y_mm()) * t,
+        );
+        if !point_in(inside, s) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A turnaround a→b is a safe straight join when it's short (≤ `max_jump`) and stays
+/// inside the region the whole way.
+fn join_inside(a: Point, b: Point, inside: &Polygons, max_jump: f64) -> bool {
+    pt_dist_mm(a, b) <= max_jump && seg_inside(a, b, inside)
 }
 
 /// Lengthen a skin line-end along its OWN direction until it meets the wall edge
@@ -2069,18 +2317,22 @@ fn fill_region(
     // and sparse wants full coverage too; `extend_ends_to_wall` then walks each stub
     // out to the wall it faces.
     let min_len = 0.0;
+    // Anchor the line grid to the region (outermost lines hug the parallel walls)
+    // for solid/skin, which gains nothing from cross-layer stacking. Sparse keeps
+    // the global grid so its lines stack into continuous interior walls.
+    let anchor = kind != PathKind::Infill;
     // Scanline patterns sweep each island separately when monotonic.
     let scan = |sets: &[(f64, f64)], out: &mut Vec<ToolPath>| {
         if monotonic {
             for (gi, island) in islands(region).iter().enumerate() {
                 for (si, &(a, sp)) in sets.iter().enumerate() {
                     let group = Some((gi * sets.len() + si) as u32);
-                    push_lines(infill_lines(island, a, sp, true, min_len), group, out);
+                    push_lines(infill_lines(island, a, sp, true, min_len, anchor), group, out);
                 }
             }
         } else {
             for &(a, sp) in sets {
-                push_lines(infill_lines(region, a, sp, false, min_len), None, out);
+                push_lines(infill_lines(region, a, sp, false, min_len, anchor), None, out);
             }
         }
     };
