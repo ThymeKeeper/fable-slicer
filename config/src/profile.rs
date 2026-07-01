@@ -191,8 +191,6 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monotonic_solid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connect_infill: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_skin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_skin_thickness_mm: Option<f64>,
@@ -271,7 +269,7 @@ impl Tier for ProcessProfile {
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
             max_bridge_span_mm, bridge_foothold_mm,
-            infill_overlap, monotonic_solid, connect_infill,
+            infill_overlap, monotonic_solid,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
             elephant_foot_mm, xy_compensation_mm, spiral_vase,
@@ -395,7 +393,6 @@ impl ProcessProfile {
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
             monotonic_solid: diff_field!(cur.monotonic_solid, base.monotonic_solid),
-            connect_infill: diff_field!(cur.connect_infill, base.connect_infill),
             fuzzy_skin: diff_field!(cur.fuzzy_skin, base.fuzzy_skin),
             fuzzy_skin_thickness_mm: diff_field!(cur.fuzzy_skin_thickness_mm, base.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: diff_field!(cur.fuzzy_skin_point_dist_mm, base.fuzzy_skin_point_dist_mm),
@@ -699,7 +696,6 @@ impl Profiles {
             solid_pattern: pc.solid_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.solid_pattern),
             infill_overlap: pc.infill_overlap.unwrap_or(d.infill_overlap),
             monotonic_solid: pc.monotonic_solid.unwrap_or(d.monotonic_solid),
-            connect_infill: pc.connect_infill.unwrap_or(d.connect_infill),
             fuzzy_skin: pc.fuzzy_skin.unwrap_or(d.fuzzy_skin),
             fuzzy_skin_thickness_mm: pc.fuzzy_skin_thickness_mm.unwrap_or(d.fuzzy_skin_thickness_mm),
             fuzzy_skin_point_dist_mm: pc.fuzzy_skin_point_dist_mm.unwrap_or(d.fuzzy_skin_point_dist_mm),

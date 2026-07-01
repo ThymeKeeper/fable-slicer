@@ -2527,8 +2527,6 @@ impl eframe::App for App {
                         .on_hover_text("Pattern for buried solid fill, between the sparse infill and the skins.");
                     hslider(ui, true, egui::Slider::new(&mut s.infill_overlap, 0.0..=0.5), "wall overlap",
                         "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
-                    ui.checkbox(&mut s.connect_infill, "connect solid/skin")
-                        .on_hover_text("Stitch solid and top/bottom-skin lines into continuous runs where the turnaround stays inside the walls — the flow never stops mid-surface (no ooze, pressure-advance restart, or seam). Adds a little material at the turnarounds; sparse infill is untouched.");
                 });
                 tier_section(ui, "Heat control", TierKind::Process, false, |ui| {
                     ui.checkbox(&mut s.heat_control, "heat control")

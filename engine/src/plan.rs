@@ -603,9 +603,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // beads stitch into continuous runs exactly like solid — and a bridge wants
             // unbroken flow most of all, since a stop on an unsupported span sags. Same
             // safety: only a turnaround that stays inside the walls connects.
-            if settings.connect_infill {
-                connect_fill_runs(&mut paths, bridge_start, &ftw, lw * 3.0);
-            }
+            connect_fill_runs(&mut paths, bridge_start, &ftw, lw * 3.0);
 
             // `solid_all` was bound above (for the lintel pull). Exclude the lintels
             // from both fills so they aren't traced twice.
@@ -850,12 +848,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                         // the split fragmenting the surface before connect ever sees it.
                         // Sparse is left untouched (its ends aren't visible and connecting
                         // would add material and defeat the sparseness).
-                        if settings.connect_infill
-                            && matches!(
-                                kind,
-                                PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin
-                            )
-                        {
+                        if matches!(kind, PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin) {
                             connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
                         }
                         if !bridge.is_empty() && matches!(kind, PathKind::Solid | PathKind::TopSkin) {
@@ -873,9 +866,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                             // Stitch them (and the surviving solid arcs) back into
                             // continuous runs — a bridge surface should print without
                             // stopping the flow at every line, same as solid.
-                            if settings.connect_infill {
-                                connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
-                            }
+                            connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
                         }
                     }
                 }
@@ -3641,21 +3632,27 @@ mod tests {
         let m = Mesh::cube(20.0);
         let s = Settings { skirt_loops: 0, ..Settings::default() };
         let layers = generate(&m, &s);
-        let solids: Vec<&ToolPath> = layers[1]
+        // Solid fill is always stitched into continuous runs now, so recover the
+        // scanlines by projecting every solid point onto the fill-perpendicular axis
+        // and clustering into distinct levels — consecutive scanlines sit one sp apart.
+        let angle = 135.0_f64.to_radians();
+        let proj = |pt: Point| -pt.x_mm() * angle.sin() + pt.y_mm() * angle.cos();
+        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        let mut levels: Vec<f64> = layers[1]
             .paths
             .iter()
             .filter(|p| p.kind == PathKind::Solid && !p.closed)
+            .flat_map(|p| p.points.iter().map(|&pt| proj(pt)))
             .collect();
-        assert!(solids.len() > 10);
-        // Project line midpoints onto the scanline axis; consecutive monotonic
-        // lines must sit one stadium spacing apart.
-        let angle = 135.0_f64.to_radians();
-        let proj = |p: &ToolPath| {
-            let m = p.points[0];
-            -m.x_mm() * angle.sin() + m.y_mm() * angle.cos()
-        };
-        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
-        let mut gaps: Vec<f64> = solids.windows(2).map(|w| (proj(w[1]) - proj(w[0])).abs()).collect();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut distinct: Vec<f64> = Vec::new();
+        for v in levels {
+            if distinct.last().map_or(true, |&last| (v - last).abs() > sp * 0.5) {
+                distinct.push(v);
+            }
+        }
+        assert!(distinct.len() > 10, "expected many scanlines, got {}", distinct.len());
+        let mut gaps: Vec<f64> = distinct.windows(2).map(|w| w[1] - w[0]).collect();
         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = gaps[gaps.len() / 2];
         assert!(
@@ -3669,24 +3666,33 @@ mod tests {
         let m = Mesh::cube(20.0);
         let s = Settings { skirt_loops: 0, ..Settings::default() }; // monotonic_solid: true
         let layers = generate(&m, &s);
-        // Bottom shell: collect open solid lines in print order; their scanline
-        // positions (projection onto the perpendicular of the fill direction)
-        // must sweep one way only.
+        // Bottom shell: the monotonic solid is stitched into continuous run(s) now.
+        // Within each run the scanline position (projection onto the fill-perpendicular)
+        // must sweep one way only — the connect turnarounds keep the sweep, not scramble it.
         let solids: Vec<&ToolPath> = layers[1]
             .paths
             .iter()
             .filter(|p| p.kind == PathKind::Solid && !p.closed)
             .collect();
-        assert!(solids.len() > 10, "expected many solid lines, got {}", solids.len());
+        assert!(!solids.is_empty(), "expected solid fill");
         let angle = 135.0_f64.to_radians(); // layer 1 fills at 135°
-        let proj = |p: &ToolPath| {
-            let m = p.points[0];
-            -m.x_mm() * angle.sin() + m.y_mm() * angle.cos()
-        };
-        let ps: Vec<f64> = solids.iter().map(|p| proj(p)).collect();
-        let increasing = ps.windows(2).filter(|w| w[1] > w[0]).count();
-        let monotone = increasing == ps.len() - 1 || increasing == 0;
-        assert!(monotone, "solid lines should sweep monotonically; got {increasing}/{} increasing", ps.len() - 1);
+        let proj = |pt: Point| -pt.x_mm() * angle.sin() + pt.y_mm() * angle.cos();
+        let mut total_levels = 0usize;
+        for run in &solids {
+            // Distinct scanline levels in traversal order along the run.
+            let mut levels: Vec<f64> = Vec::new();
+            for &pt in &run.points {
+                let v = proj(pt);
+                if levels.last().map_or(true, |&last| (v - last).abs() > 0.05) {
+                    levels.push(v);
+                }
+            }
+            total_levels += levels.len();
+            let inc = levels.windows(2).filter(|w| w[1] > w[0]).count();
+            let monotone = levels.len() < 2 || inc == levels.len() - 1 || inc == 0;
+            assert!(monotone, "a solid run must sweep monotonically; {inc}/{} increasing", levels.len() - 1);
+        }
+        assert!(total_levels > 10, "expected many scanlines across the solid, got {total_levels}");
     }
 
     #[test]
