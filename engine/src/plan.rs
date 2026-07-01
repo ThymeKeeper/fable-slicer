@@ -1788,6 +1788,85 @@ fn join_inside(a: Point, b: Point, inside: &Polygons, max_jump: f64) -> bool {
     pt_dist_mm(a, b) <= max_jump && seg_inside(a, b, inside)
 }
 
+/// Splice concentric offset `rings` into continuous inward-spiral strokes. Start at
+/// the outermost unused ring (seamed), trace it closed, then jog to the nearest
+/// unused ring whose entry vertex is within `max_cross` and reachable without
+/// leaving `region` — repeat, so a nested family prints as ONE stroke with a single
+/// seam and no per-ring travel/restart. A ring no short in-region crossover can reach
+/// (a separate pocket, or the far side of an annulus across its void) seeds a fresh
+/// stroke. Built outermost-first, so a stroke over an enclosed void still lands each
+/// ring on the one before it.
+fn spiralize_rings(
+    rings: Vec<Vec<Point>>,
+    region: &Polygons,
+    max_cross: f64,
+    seam_mode: SeamMode,
+    layer_index: usize,
+) -> Vec<Vec<Point>> {
+    let n = rings.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let inflated = offset(region, 0.1);
+    let mut used = vec![false; n];
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        loop_area_mm2(&rings[b]).partial_cmp(&loop_area_mm2(&rings[a])).unwrap()
+    });
+    let mut strokes: Vec<Vec<Point>> = Vec::new();
+    for &seed in &order {
+        if used[seed] {
+            continue;
+        }
+        used[seed] = true;
+        // Trace the seed ring closed, from a placed seam.
+        let mut chain = place_seam(rings[seed].clone(), seam_mode, layer_index);
+        if let Some(&first) = chain.first() {
+            chain.push(first);
+        }
+        loop {
+            let tail = *chain.last().unwrap();
+            // Nearest unused ring, entered at its vertex closest to the tail, reachable
+            // by a crossover that stays in-region and within reach.
+            let mut best: Option<(usize, usize, f64)> = None;
+            for i in 0..n {
+                if used[i] {
+                    continue;
+                }
+                let r = &rings[i];
+                let (mut bvi, mut bvd) = (0usize, f64::INFINITY);
+                for (k, p) in r.iter().enumerate() {
+                    let dd = pt_dist_mm(tail, *p);
+                    if dd < bvd {
+                        bvd = dd;
+                        bvi = k;
+                    }
+                }
+                if bvd <= max_cross
+                    && best.map_or(true, |(_, _, cd)| bvd < cd)
+                    && seg_inside(tail, r[bvi], &inflated)
+                {
+                    best = Some((i, bvi, bvd));
+                }
+            }
+            match best {
+                Some((i, vi, _)) => {
+                    used[i] = true;
+                    let r = &rings[i];
+                    let m = r.len();
+                    // Trace ring i closed, entering at its nearest vertex.
+                    for k in 0..=m {
+                        chain.push(r[(vi + k) % m]);
+                    }
+                }
+                None => break,
+            }
+        }
+        strokes.push(chain);
+    }
+    strokes
+}
+
 /// Lengthen a skin line-end along its OWN direction until it meets the wall edge
 /// (`inside_walls`), so its bead reaches the perimeter — per bead, the few tenths
 /// it needs, no region grow and no extra perimeter. `prev` is the point before the
@@ -2349,6 +2428,8 @@ fn fill_region(
             out,
         ),
         InfillPattern::Concentric => {
+            // Concentric offset rings, outermost first.
+            let mut rings: Vec<Vec<Point>> = Vec::new();
             let mut d = lw * 0.5;
             loop {
                 let loops = offset(region, -d);
@@ -2357,11 +2438,21 @@ fn fill_region(
                 }
                 for c in loops.contours {
                     if c.points.len() >= 3 {
-                        let points = place_seam(c.points, seam_mode, layer_index);
-                        out.push(ToolPath::new(kind, true, lw, points));
+                        rings.push(c.points);
                     }
                 }
                 d += spacing;
+            }
+            // Splice the nested rings into continuous inward-spiral strokes: one
+            // seam per nested family instead of one per ring. The stroke traces each
+            // ring closed, then a short in-region crossover jogs to the nearest
+            // not-yet-used ring — so a whole concentric fill flows as one path with
+            // no per-ring travel or flow restart (the corner seams the plain rings
+            // left). The crossover cap (~1.7× spacing) reaches an adjacent ring but
+            // not across a void, so an annulus' two ring-families join at the band
+            // midline into one Fermat-like sweep, and separate pockets seed their own.
+            for stroke in spiralize_rings(rings, region, spacing * 1.7, seam_mode, layer_index) {
+                out.push(ToolPath::new(kind, false, lw, stroke));
             }
         }
         InfillPattern::Gyroid => {
@@ -3082,6 +3173,27 @@ mod tests {
             Point::from_mm(x0, y1),
         ]));
         p
+    }
+
+    #[test]
+    fn spiralize_chains_nested_rings_into_one_stroke() {
+        // Five nested square rings 1 mm apart — concentric fill of a square.
+        let ring = |r: f64| {
+            vec![
+                Point::from_mm(-r, -r),
+                Point::from_mm(r, -r),
+                Point::from_mm(r, r),
+                Point::from_mm(-r, r),
+            ]
+        };
+        let rings: Vec<Vec<Point>> = (1..=5).map(|k| ring(k as f64)).collect();
+        let mut region = Polygons::new();
+        region.push(Contour::new(ring(5.5))); // holds every crossover in-region
+        let strokes = spiralize_rings(rings, &region, 2.0, SeamMode::Nearest, 0);
+        // Adjacent rings are √2 mm apart (< 2 mm crossover cap), so all five chain
+        // into ONE continuous spiral stroke — one seam, not five.
+        assert_eq!(strokes.len(), 1, "nested rings should chain into one spiral");
+        assert!(strokes[0].len() >= 20, "the stroke should trace all five rings");
     }
 
     #[test]
