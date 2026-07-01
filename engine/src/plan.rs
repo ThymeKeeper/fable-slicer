@@ -785,25 +785,38 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                     // the per-bead pass below walks each line-end the last fraction to
                     // the wall. Buried solid borders sparse, not walls, so it keeps the
                     // half-bead inset for a clean kiss there.
+                    // Effective fill pattern. A solid/skin region that RINGS a cavity
+                    // (every island has a hole) fills Concentric — loops parallel to the
+                    // walls it wraps, reading as a continuation of the wall sweep — instead
+                    // of scanlines that dead-end at the wall (the teal cavity fill in the
+                    // preview becoming rings). A simply-connected region keeps its
+                    // configured pattern (a concentric loop there just doubles the
+                    // perimeter — the anti-doubling policy above). Skins ring holes readily
+                    // (a top surface around a window), so this catches them too.
+                    let base_pattern = match kind {
+                        PathKind::TopSkin => settings.top_pattern,
+                        PathKind::BottomSkin => settings.bottom_pattern,
+                        _ => settings.solid_pattern,
+                    };
+                    let pattern =
+                        if is_annular(&region) { InfillPattern::Concentric } else { base_pattern };
+                    // Prep the fill for the chosen pattern. A skin is generated short of the
+                    // walls: grow it into the void ring it borders (never into buried
+                    // infill) so the outer bead — concentric's outer loop, or the per-bead
+                    // reach below on open line-ends — lands flush on the perimeters.
+                    // Concentric loops are closed (the reach can't pull them), so hand the
+                    // full region: concentric's own lw/2 inset lands the outer loop flush on
+                    // the wall and the sparse boundary. Buried line-fill solid keeps the
+                    // plain half-bead inset for a clean kiss against the sparse it borders.
                     let fill = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
                         let void = difference(&ftw, inner);
                         union(&region, &intersection(&offset(&region, lw * 1.5), &void))
-                    } else if settings.solid_pattern == InfillPattern::Concentric {
-                        // Concentric loops are closed, so the per-bead reach below (it
-                        // only walks open line-ends) can't pull them to the wall. Hand
-                        // it the full region — no half-bead pre-inset — so concentric's
-                        // own lw/2 inset lands the OUTER loop flush against the wall (and
-                        // the sparse boundary), instead of a whole bead short.
+                    } else if pattern == InfillPattern::Concentric {
                         region.clone()
                     } else {
                         offset(&region, -lw * 0.5)
                     };
                     if !fill.is_empty() {
-                        let pattern = match kind {
-                            PathKind::TopSkin => settings.top_pattern,
-                            PathKind::BottomSkin => settings.bottom_pattern,
-                            _ => settings.solid_pattern,
-                        };
                         // An unsupported underside printed as bottom shell prints for
                         // the best chance of landing on what's already down: line/grid
                         // patterns go nearest-neighbour (each segment lands beside the
@@ -1100,6 +1113,21 @@ fn islands(polys: &Polygons) -> Vec<Polygons> {
             isl
         })
         .collect()
+}
+
+/// A region "rings a cavity": every island has a hole (a CW inner contour).
+/// Such a region fills cleanest with Concentric loops that parallel the walls
+/// wrapping it — a continuation of the wall sweep — rather than scanlines that
+/// dead-end at the wall. A simply-connected island is NOT annular: a concentric
+/// loop there would just double its perimeter, so a region with any such island
+/// keeps line fill (the deliberate anti-doubling policy). Conservative by design
+/// — "for rings only" — so a wide solid is never handed a wall-doubling loop.
+fn is_annular(region: &Polygons) -> bool {
+    let isls = islands(region);
+    !isls.is_empty()
+        && isls
+            .iter()
+            .all(|isl| isl.contours.iter().any(|c| c.points.len() >= 3 && !c.is_ccw()))
 }
 
 /// Rebalance the solid/sparse split at the island level, in both directions:
@@ -3094,6 +3122,31 @@ mod tests {
             Point::from_mm(x0, y1),
         ]));
         p
+    }
+
+    #[test]
+    fn is_annular_fires_only_on_ringed_regions() {
+        // A plain filled square is NOT annular: a concentric loop there would
+        // just double the perimeter, so it keeps line fill.
+        assert!(!is_annular(&rect(0.0, 0.0, 10.0, 10.0)));
+        // A washer — outer square with a centered CW hole — rings a cavity.
+        let mut washer = rect(0.0, 0.0, 10.0, 10.0);
+        washer.push(Contour::new(vec![
+            Point::from_mm(3.0, 3.0),
+            Point::from_mm(3.0, 7.0),
+            Point::from_mm(7.0, 7.0),
+            Point::from_mm(7.0, 3.0),
+        ])); // CW winding => a hole
+        assert!(is_annular(&washer));
+        // Two separate filled squares — two islands, neither ringed — stay line fill.
+        let mut two = rect(0.0, 0.0, 4.0, 4.0);
+        two.contours.extend(rect(8.0, 0.0, 12.0, 4.0).contours);
+        assert!(!is_annular(&two));
+        // Mixed: a washer beside a plain square. Conservative "every island rings"
+        // rule => not annular, so the plain square is never given a doubling loop.
+        let mut mixed = washer.clone();
+        mixed.contours.extend(rect(20.0, 0.0, 24.0, 4.0).contours);
+        assert!(!is_annular(&mixed));
     }
 
     #[test]
