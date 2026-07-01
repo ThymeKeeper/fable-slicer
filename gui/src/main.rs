@@ -2340,10 +2340,6 @@ impl eframe::App for App {
                         "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
                     seam_combo(ui, &mut s.seam_mode)
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
-                    ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")
-                        .on_hover_text("Emit curved toolpaths as G2/G3 arcs — smaller g-code, smoother motion. Needs firmware arc support (Klipper [gcode_arcs]).");
-                    hslider(ui, s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2), "arc tol mm",
-                        "Max deviation a point may have from a fitted arc to be folded into it.");
                     hslider(ui, true, egui::Slider::new(&mut s.elephant_foot_mm, 0.0..=0.5), "elephant foot mm",
                         "Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
                     hslider(ui, true, egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5), "XY comp mm",
@@ -2559,6 +2555,10 @@ impl eframe::App for App {
                             .custom_parser(|t| t.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
                         "cruise smoothing",
                         "Cruise smoothing (Klipper accel-to-decel): forces each move to spend at least this fraction cruising instead of sprinting up to speed and braking back down. 0% = fastest/sharpest; higher = smoother and quieter on short moves (infill, fine detail, arcs), a touch slower. Emitted as ACCEL_TO_DECEL = accel × (1 − this). Separate from jerk, which only sets cornering speed.");
+                    ui.checkbox(&mut s.arc_fitting, "arc fitting (G2/G3)")
+                        .on_hover_text("Emit curved toolpaths as G2/G3 arcs — smaller g-code, smoother motion. A firmware capability: needs arc support enabled (Klipper [gcode_arcs]; Marlin ARC_SUPPORT). Turn off for firmware that doesn't recognize G2/G3.");
+                    hslider(ui, s.arc_fitting, egui::Slider::new(&mut s.arc_tolerance_mm, 0.005..=0.2), "arc tol mm",
+                        "Max deviation a point may have from a fitted arc to be folded into it.");
                     // Hardware the printer either has or doesn't. Declared here
                     // rather than via a printer.cfg macro so a downloaded slicer
                     // is self-contained — no macros to install. Off by default:

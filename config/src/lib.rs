@@ -531,7 +531,7 @@ impl Default for Settings {
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             line_width_mm: 0.45,
-            arc_fitting: false,
+            arc_fitting: true,
             arc_tolerance_mm: 0.05,
             wall_count: 2,
             outer_wall_first: false,

@@ -47,6 +47,12 @@ pub struct PrinterProfile {
     pub jerk: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_cruise_ratio: Option<f64>,
+    /// Emit curves as G2/G3 arcs — a firmware capability (needs Klipper
+    /// `[gcode_arcs]`, Marlin `ARC_SUPPORT`, etc.), so it lives on the printer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arc_fitting: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arc_tolerance_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retract_len_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,10 +141,6 @@ pub struct ProcessProfile {
     /// Bead width. Unset = derived from the nozzle (× 1.125); set to override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_width_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arc_fitting: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arc_tolerance_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wall_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,7 +231,7 @@ impl Tier for PrinterProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
-            outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio,
+            outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             aux_fan, exhaust_fan, chamber_sensor, start_gcode, end_gcode)
     }
@@ -256,7 +258,7 @@ impl Tier for ProcessProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
-            arc_fitting, arc_tolerance_mm, wall_count, outer_wall_first, top_layers, bottom_layers,
+            wall_count, outer_wall_first, top_layers, bottom_layers,
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
@@ -299,6 +301,8 @@ impl PrinterProfile {
             first_layer_accel: diff_field!(cur.first_layer_accel_mm_s2, base.first_layer_accel_mm_s2),
             jerk: diff_field!(cur.jerk_mm_s, base.jerk_mm_s),
             min_cruise_ratio: diff_field!(cur.min_cruise_ratio, base.min_cruise_ratio),
+            arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
+            arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
             retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
             retract_speed_mm_s: diff_field!(cur.retract_speed_mm_s, base.retract_speed_mm_s),
             z_hop_mm: diff_field!(cur.z_hop_mm, base.z_hop_mm),
@@ -358,8 +362,6 @@ impl ProcessProfile {
             layer_height_mm: diff_field!(cur.layer_height_mm, base.layer_height_mm),
             first_layer_height_mm: diff_field!(cur.first_layer_height_mm, base.first_layer_height_mm),
             line_width_mm: diff_field!(cur.line_width_mm, base.line_width_mm),
-            arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
-            arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
             wall_count: diff_field!(cur.wall_count, base.wall_count),
             outer_wall_first: diff_field!(cur.outer_wall_first, base.outer_wall_first),
             top_layers: diff_field!(cur.top_layers, base.top_layers),
@@ -668,8 +670,8 @@ impl Profiles {
             layer_height_mm: layer_h,
             first_layer_height_mm: pc.first_layer_height_mm.unwrap_or(d.first_layer_height_mm),
             line_width_mm: line_w,
-            arc_fitting: pc.arc_fitting.unwrap_or(d.arc_fitting),
-            arc_tolerance_mm: pc.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
+            arc_fitting: pr.arc_fitting.unwrap_or(d.arc_fitting),
+            arc_tolerance_mm: pr.arc_tolerance_mm.unwrap_or(d.arc_tolerance_mm),
             wall_count: pc.wall_count.unwrap_or(d.wall_count),
             outer_wall_first: pc.outer_wall_first.unwrap_or(d.outer_wall_first),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
