@@ -23,13 +23,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let area = s.filament_area_mm2();
     let travel_f = s.travel_speed_mm_s * 60.0;
     let retract_f = s.retract_speed_mm_s * 60.0;
-    // Hopped travels lift by this much. With brick layering, force at least enough
-    // to clear a lifted bead (top = layer Z + layer height) even if z-hop is off.
-    let hop_mm = if s.brick_layers {
-        s.z_hop_mm.max(s.layer_height_mm + 0.25)
-    } else {
-        s.z_hop_mm
-    };
+    // Hopped travels lift by this much.
+    let hop_mm = s.z_hop_mm;
 
     // Cumulative time after each layer — drives M73 progress/remaining.
     let mut cum_secs: Vec<f64> = Vec::with_capacity(layers.len());
@@ -266,8 +261,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 cur_fan = want_fan;
             }
 
-            // Brick-layered perimeters print half a layer up and over-extrude a touch.
-            let z = layer.print_z_mm + path.z_offset_mm;
+            let z = layer.print_z_mm;
             let feed =
                 feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
                     * layer.speed_scale;
@@ -499,7 +493,7 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
 }
 
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
-/// (brick, ironing), per-kind flow (bridges), and the global multiplier.
+/// (ironing), per-kind flow (bridges), and the global multiplier.
 fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
     // Bridges and internal bridges (solid over open sparse) both span air — the
     // stretched strand wants the reduced bridge flow so it doesn't droop.
@@ -930,16 +924,14 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
 /// layer's travels (including its comb graph, the expensive part) are planned in
 /// parallel.
 pub(crate) fn plan_travels(plans: &mut [LayerPlan], s: &Settings) {
-    // Entry state per layer: nozzle position + z-phase after the previous layer.
-    let mut entries: Vec<(Option<Point>, f64)> = Vec::with_capacity(plans.len());
+    // Entry state per layer: nozzle position after the previous layer.
+    let mut entries: Vec<Option<Point>> = Vec::with_capacity(plans.len());
     let mut last_pos: Option<Point> = None;
-    let mut last_z_off = 0.0_f64;
     for plan in plans.iter() {
-        entries.push((last_pos, last_z_off));
+        entries.push(last_pos);
         for path in &plan.paths {
             if path.points.len() >= 2 {
                 last_pos = Some(path_end(path));
-                last_z_off = path.z_offset_mm;
             }
         }
     }
@@ -947,13 +939,12 @@ pub(crate) fn plan_travels(plans: &mut [LayerPlan], s: &Settings) {
     plans
         .par_iter_mut()
         .zip(entries)
-        .for_each(|(plan, (entry_pos, entry_z_off))| plan_layer_travels(plan, entry_pos, entry_z_off, s));
+        .for_each(|(plan, entry_pos)| plan_layer_travels(plan, entry_pos, s));
 }
 
-/// Plan one layer's travels, starting from the given entry position/z-phase.
-fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, entry_z_off: f64, s: &Settings) {
+/// Plan one layer's travels, starting from the given entry position.
+fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, s: &Settings) {
     let mut last_pos = entry_pos;
-    let mut last_z_off = entry_z_off;
     let mut travels: Vec<Travel> = Vec::with_capacity(plan.paths.len());
     let mut comb: Option<CombGraph> = None;
     for path in &plan.paths {
@@ -962,36 +953,27 @@ fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, entry_z_of
             continue;
         }
         let start = path.points[0];
-        // Brick layering: a travel into or out of a lifted perimeter must hop
-        // clear so the nozzle never drags through a bead at the other Z phase.
-        let phase_travel =
-            s.brick_layers && last_pos.is_some() && (path.z_offset_mm != 0.0 || last_z_off != 0.0);
-        let travel = if phase_travel {
-            Travel { points: vec![start], retract: s.retract_len_mm > 0.0, hop: true }
-        } else {
-            match last_pos {
-                None => Travel { points: vec![start], retract: false, hop: false },
-                Some(prev) => {
-                    let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
-                        && travel_crosses(&plan.outline, prev, start);
-                    if !crosses {
-                        Travel { points: vec![start], retract: false, hop: false }
-                    } else {
-                        let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
-                        match graph.route(&plan.outline, prev, start) {
-                            Some(route) => Travel { points: route, retract: false, hop: false },
-                            None => Travel {
-                                points: vec![start],
-                                retract: s.retract_len_mm > 0.0,
-                                hop: s.z_hop_mm > 0.0,
-                            },
-                        }
+        let travel = match last_pos {
+            None => Travel { points: vec![start], retract: false, hop: false },
+            Some(prev) => {
+                let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
+                    && travel_crosses(&plan.outline, prev, start);
+                if !crosses {
+                    Travel { points: vec![start], retract: false, hop: false }
+                } else {
+                    let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
+                    match graph.route(&plan.outline, prev, start) {
+                        Some(route) => Travel { points: route, retract: false, hop: false },
+                        None => Travel {
+                            points: vec![start],
+                            retract: s.retract_len_mm > 0.0,
+                            hop: s.z_hop_mm > 0.0,
+                        },
                     }
                 }
             }
         };
         last_pos = Some(path_end(path));
-        last_z_off = path.z_offset_mm;
         travels.push(travel);
     }
     plan.travels = travels;
@@ -1101,8 +1083,8 @@ pub fn format_duration(seconds: f64) -> String {
     }
 }
 
-/// Deposited bead volume (mm³) for one path — honors per-path flow (brick,
-/// ironing), bridge flow, and the extrusion multiplier. Shared by the
+/// Deposited bead volume (mm³) for one path — honors per-path flow (ironing),
+/// bridge flow, and the extrusion multiplier. Shared by the
 /// filament estimate and the heat stats so the preview maps can't disagree
 /// with the totals.
 fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, s: &Settings) -> f64 {
@@ -1134,8 +1116,8 @@ fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale
     polyline_time(&path.points, path.closed, v, accel, s.jerk_mm_s.max(0.1), s.min_cruise_ratio)
 }
 
-/// Estimate filament used: `(length_mm, grams)`. Honors per-path flow (brick,
-/// ironing), bridge flow, and the global extrusion multiplier.
+/// Estimate filament used: `(length_mm, grams)`. Honors per-path flow
+/// (ironing), bridge flow, and the global extrusion multiplier.
 pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
     let volume: f64 = layers.iter().map(|l| layer_volume_mm3(l, s)).sum();
     let length_mm = volume / s.filament_area_mm2();

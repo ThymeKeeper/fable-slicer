@@ -330,10 +330,6 @@ pub struct Settings {
     pub outer_wall_first: bool,
     pub top_layers: usize,
     pub bottom_layers: usize,
-    /// Brick layering: stagger odd-indexed perimeters by half a layer height so
-    /// adjacent wall rings interlock (the outer wall stays put). The lifted
-    /// beads' extra flow is DERIVED — see [`brick_flow_factor`].
-    pub brick_layers: bool,
     /// Sparse infill density, 0.0..=1.0 (0 disables sparse infill).
     pub infill_density: f64,
     /// Pattern for sparse (interior) infill.
@@ -576,7 +572,6 @@ impl Default for Settings {
             arc_tolerance_mm: 0.05,
             wall_count: 2,
             outer_wall_first: false,
-            brick_layers: false,
             top_layers: 4,
             bottom_layers: 4,
             infill_density: 0.15,
@@ -768,36 +763,6 @@ pub fn contour_resolution_mm() -> f64 {
     0.01
 }
 
-/// Flow multiplier for a brick-lifted bead — derived from the stadium model,
-/// no knob. Aligned columns are spaced ([`bead_spacing_mm`]) so the lens
-/// overlap of facing cap circles exactly feeds the cusps and the wall tiles
-/// watertight. Lifting a column half a layer splits its flank contact: the
-/// bead now meets two neighbours diagonally, and the two diagonal lenses
-/// (cap-centre distance √(d² + (h/2)²), d = πh/4 the facing distance at
-/// design spacing) sum to less than the aligned lens — that shortfall, on
-/// both flanks, is real unfilled void the lifted bead must carry as extra
-/// material. At 0.45 × 0.2 this derives 1.057 — right where hand-tuning had
-/// settled (1.05).
-pub fn brick_flow_factor(line_width_mm: f64, layer_height_mm: f64) -> f64 {
-    let (w, h) = (line_width_mm, layer_height_mm);
-    if w <= 0.0 || h <= 0.0 {
-        return 1.0;
-    }
-    let r = h / 2.0;
-    // Overlap area of two radius-r circles with centres `c` apart.
-    let lens = |c: f64| -> f64 {
-        if c >= 2.0 * r {
-            return 0.0;
-        }
-        2.0 * r * r * (c / (2.0 * r)).acos() - (c / 2.0) * (4.0 * r * r - c * c).sqrt()
-    };
-    let d = std::f64::consts::FRAC_PI_4 * h;
-    let aligned = lens(d);
-    let staggered = 2.0 * lens((d * d + r * r).sqrt());
-    let deficit_both_flanks = 2.0 * (aligned - staggered).max(0.0);
-    1.0 + deficit_both_flanks / bead_area_mm2(w, h).max(1.0e-9)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,21 +773,6 @@ mod tests {
         // enough to keep curve detail for arc fitting, coarse enough to drop
         // mesh-facet tessellation noise.
         assert!((contour_resolution_mm() - 0.01).abs() < 1e-12);
-    }
-
-    #[test]
-    fn brick_flow_derives_from_the_bead_geometry() {
-        // 0.45 × 0.2: the diagonal-lens shortfall derives ≈ 1.057 — right on
-        // top of the value hand-tuning had settled at (1.05).
-        let f = brick_flow_factor(0.45, 0.2);
-        assert!((f - 1.057).abs() < 0.005, "derived {f}");
-        // Taller beads have rounder flanks and lose more diagonal contact —
-        // the factor must grow with height and shrink with width.
-        assert!(brick_flow_factor(0.45, 0.28) > f);
-        assert!(brick_flow_factor(0.6, 0.2) < f);
-        // Degenerate inputs stay sane.
-        assert_eq!(brick_flow_factor(0.0, 0.2), 1.0);
-        assert!(brick_flow_factor(0.2, 0.2) >= 1.0);
     }
 
     #[test]

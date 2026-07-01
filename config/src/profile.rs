@@ -152,8 +152,6 @@ pub struct ProcessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bottom_layers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub brick_layers: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub infill_density: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_infill: Option<String>,
@@ -269,7 +267,6 @@ impl Tier for ProcessProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, layer_height_mm, first_layer_height_mm, line_width_mm,
             arc_fitting, arc_tolerance_mm, wall_count, outer_wall_first, top_layers, bottom_layers,
-            brick_layers,
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
@@ -378,7 +375,6 @@ impl ProcessProfile {
             outer_wall_first: diff_field!(cur.outer_wall_first, base.outer_wall_first),
             top_layers: diff_field!(cur.top_layers, base.top_layers),
             bottom_layers: diff_field!(cur.bottom_layers, base.bottom_layers),
-            brick_layers: diff_field!(cur.brick_layers, base.brick_layers),
             infill_density: diff_field!(cur.infill_density, base.infill_density),
             sparse_infill: diff_field!(cur.sparse_pattern, base.sparse_pattern).map(|p| p.label().to_string()),
             top_infill: diff_field!(cur.top_pattern, base.top_pattern).map(|p| p.label().to_string()),
@@ -692,7 +688,6 @@ impl Profiles {
             outer_wall_first: pc.outer_wall_first.unwrap_or(d.outer_wall_first),
             top_layers: pc.top_layers.unwrap_or(d.top_layers),
             bottom_layers: pc.bottom_layers.unwrap_or(d.bottom_layers),
-            brick_layers: pc.brick_layers.unwrap_or(d.brick_layers),
             infill_density: pc.infill_density.unwrap_or(d.infill_density),
             sparse_pattern: pc.sparse_infill.as_deref().and_then(InfillPattern::parse).unwrap_or(d.sparse_pattern),
             top_pattern: pc.top_infill.as_deref().and_then(InfillPattern::parse)

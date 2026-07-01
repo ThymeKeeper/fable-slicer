@@ -1546,12 +1546,7 @@ impl App {
     /// per the active mode. Called after slicing and when the mode changes.
     fn set_preview_instances(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         let Some(layers) = self.sliced.as_ref() else { return };
-        // Match the emitter's brick-aware hop height so preview travels line up.
-        let hop = if self.settings.brick_layers {
-            self.settings.z_hop_mm.max(self.settings.layer_height_mm + 0.25)
-        } else {
-            self.settings.z_hop_mm
-        };
+        let hop = self.settings.z_hop_mm;
         let layer_colors = self.layer_color_table();
         let (verts, ends, joints, joint_ends) = build_instances(
             layers,
@@ -2514,9 +2509,6 @@ impl eframe::App for App {
                         "Number of solid layers on bottom surfaces.");
                     ui.checkbox(&mut s.monotonic_solid, "monotonic top/bottom")
                         .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.brick_layers, "brick layers"))
-                        .on_hover_text("Stagger odd perimeters by half a layer height so wall rings interlock like bricks (the outer wall stays put). The lifted beads' extra flow is derived from the bead geometry. Best with 3+ walls.")
-                        .on_disabled_hover_text("Unavailable in spiral vase mode.");
                 });
                 tier_section(ui, "Infill", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
@@ -3784,17 +3776,15 @@ fn build_instances(
             // Heat-map modes override the feature palette per path (per layer).
             let c = path_colors.map_or_else(|| color_for(path.kind, accent), |t| t[li][pi]);
             let cat = category_of(path.kind);
-            // Brick-layered perimeters render half a layer up (z_offset) and a touch
-            // fatter (flow > 1), so the staggered, over-packed walls are visible.
-            // Trickle-flow paths (ironing) render as a thin film at the layer top
-            // instead: full width, height scaled by flow.
+            // Trickle-flow paths (ironing) render as a thin film at the layer top:
+            // full width, height scaled by flow.
             let base_h = h * path.height_scale as f32; // height_scale is 1.0 today
             let (w, bh) = if path.flow >= 1.0 {
                 ((path.width_mm * path.flow) as f32, base_h)
             } else {
                 (path.width_mm as f32, (base_h * path.flow as f32).max(0.04))
             };
-            let zc = z_top - bh * 0.5 + path.z_offset_mm as f32;
+            let zc = z_top - bh * 0.5;
             let n_pts = path.points.len();
             // Per-vertex width for a tapering bead (gap fill); else the uniform w.
             let vert_w = |i: usize| -> f32 {

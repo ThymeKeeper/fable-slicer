@@ -58,12 +58,7 @@ pub struct ToolPath {
     pub closed: bool,
     pub width_mm: f64,
     pub points: Vec<Point>,
-    /// Z shift added to the layer Z for this path (brick layering staggers odd
-    /// perimeters by half a layer). 0 for everything else.
-    pub z_offset_mm: f64,
-    /// Extrusion-flow multiplier for this path (brick layering bumps the lifted
-    /// perimeters to fill the diagonal gaps between staggered beads; ironing
-    /// trickles). 1.0 = normal.
+    /// Extrusion-flow multiplier for this path (ironing trickles). 1.0 = normal.
     pub flow: f64,
     /// Monotonic-block id: consecutive paths sharing a `Some` group move as one
     /// indivisible block in travel ordering (a strict sweep over one surface).
@@ -90,7 +85,6 @@ impl ToolPath {
             closed,
             width_mm,
             points,
-            z_offset_mm: 0.0,
             flow: 1.0,
             group: None,
             height_scale: 1.0,
@@ -219,7 +213,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         norm_settings.infill_density = 0.0;
         norm_settings.top_layers = 0;
         norm_settings.support_mode = SupportMode::None;
-        norm_settings.brick_layers = false;
         norm_settings.ironing = false;
         norm_settings.fuzzy_skin = false;
     }
@@ -320,29 +313,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 } else {
                     PathKind::Perimeter
                 };
-                // Brick layering: lift odd-indexed perimeters by half a layer (outer
-                // wall = index 0 stays put), so adjacent rings interlock like masonry;
-                // a flow bump fills the diagonal gaps between the staggered beads. Skip
-                // the first and last layers (base transition + top clamp).
-                let brick =
-                    settings.brick_layers && w % 2 == 1 && layer.index > 0 && layer.index + 1 < n;
-                let (z_offset_mm, flow) = if brick {
-                    // The lifted bead's extra material is derived from the
-                    // stadium model — what its halved flank contact leaves
-                    // unfilled (see config::brick_flow_factor).
-                    (
-                        0.5 * settings.layer_height_mm,
-                        config::brick_flow_factor(lw, settings.layer_height_mm),
-                    )
-                } else {
-                    (0.0, 1.0)
-                };
                 // Outer wall (w == 0) hugs the true outline;
                 // inner walls are the SAME interior offset, so they run parallel to
                 // the outer at stadium spacing all the way around — the surface is
                 // no longer carved out of this region, so they no longer detour.
                 let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
-                let emit_loops = |src: &Polygons, z_off: f64, hscale: f64, walls: &mut Vec<ToolPath>| {
+                let emit_loops = |src: &Polygons, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
                             // Drop sub-bead micro-loops on INNER walls — the offset
@@ -374,17 +350,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 closed: true,
                                 width_mm: lw,
                                 points,
-                                z_offset_mm: z_off,
-                                flow,
+                                flow: 1.0,
                                 group: None,
-                                height_scale: hscale,
+                                height_scale: 1.0,
                                 widths: None,
                                 overhang: 0.0,
                             });
                         }
                     }
                 };
-                emit_loops(&centers, z_offset_mm, 1.0, &mut walls);
+                emit_loops(&centers, &mut walls);
             }
 
             // Inset to the infill region (the inner edge of the last wall bead),
@@ -1635,7 +1610,6 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
                 closed: false,
                 width_mm: path.width_mm,
                 points,
-                z_offset_mm: path.z_offset_mm,
                 flow: path.flow,
                 group: path.group,
                 height_scale: path.height_scale,
@@ -1892,45 +1866,31 @@ fn order_layers(plans: &mut [LayerPlan], outer_first: bool) {
         if let Some(last) = prime.last() {
             cur = path_end(last);
         }
-        let (iron, mut rest): (Vec<_>, Vec<_>) =
+        let (iron, rest): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|p| p.kind == PathKind::Ironing);
-        // Print z-phases in ascending order — the layer plane first, then
-        // brick-lifted (+h/2) — so the nozzle never descends into material
-        // already printed this layer.
-        let mut phases: Vec<f64> = rest.iter().map(|p| p.z_offset_mm).collect();
-        phases.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        phases.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
         let mut paths = prime;
-        for ph in phases {
-            let (group, remaining): (Vec<_>, Vec<_>) =
-                rest.into_iter().partition(|p| (p.z_offset_mm - ph).abs() < 1.0e-9);
-            rest = remaining;
-            if group.is_empty() {
-                continue;
-            }
-            // Walls before fill: a bridge or solid must anchor on perimeters
-            // already laid THIS layer — a bridge strand whose ends sit on the inner
-            // rim (not the layer below) has nothing to grab if its perimeter prints
-            // afterwards, and flails. Order the wall block first, then the fill.
-            let (walls, fill): (Vec<_>, Vec<_>) = group.into_iter().partition(|p| {
-                matches!(
-                    p.kind,
-                    PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
-                )
-            });
-            // Walls: explicit outer-vs-inner sequence per island. Fill: greedy travel.
-            let walls = order_walls(walls, cur, outer_first);
-            if let Some(last) = walls.last() {
+        // Walls before fill: a bridge or solid must anchor on perimeters
+        // already laid THIS layer — a bridge strand whose ends sit on the inner
+        // rim (not the layer below) has nothing to grab if its perimeter prints
+        // afterwards, and flails. Order the wall block first, then the fill.
+        let (walls, fill): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| {
+            matches!(
+                p.kind,
+                PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
+            )
+        });
+        // Walls: explicit outer-vs-inner sequence per island. Fill: greedy travel.
+        let walls = order_walls(walls, cur, outer_first);
+        if let Some(last) = walls.last() {
+            cur = path_end(last);
+        }
+        paths.extend(walls);
+        if !fill.is_empty() {
+            let fill = order_paths(fill, cur);
+            if let Some(last) = fill.last() {
                 cur = path_end(last);
             }
-            paths.extend(walls);
-            if !fill.is_empty() {
-                let fill = order_paths(fill, cur);
-                if let Some(last) = fill.last() {
-                    cur = path_end(last);
-                }
-                paths.extend(fill);
-            }
+            paths.extend(fill);
         }
         if let Some(last) = iron.last() {
             cur = path_end(last);
@@ -3224,45 +3184,6 @@ mod tests {
             .unwrap();
         let area = Contour::new(ext.points.clone()).area_mm2();
         assert!(area > 360.0 && area < 400.0, "outer wall area {area}");
-    }
-
-    #[test]
-    fn brick_layers_lift_odd_perimeters() {
-        let m = Mesh::cube(20.0);
-        let mut s = Settings::default();
-        s.brick_layers = true;
-        s.wall_count = 3;
-        let layers = generate(&m, &s);
-        let mid = &layers[50]; // interior layer (not first/last)
-        // The external perimeter (index 0) stays on the layer plane.
-        let ext = mid.paths.iter().find(|p| p.kind == PathKind::ExternalPerimeter).unwrap();
-        assert_eq!(ext.z_offset_mm, 0.0);
-        assert_eq!(ext.flow, 1.0);
-        // An odd inner perimeter is lifted half a layer and over-extruded.
-        let lifted = mid.paths.iter().any(|p| {
-            p.kind == PathKind::Perimeter
-                && (p.z_offset_mm - 0.5 * s.layer_height_mm).abs() < 1e-9
-                && p.flow > 1.0
-        });
-        assert!(lifted, "an odd inner perimeter should be brick-lifted");
-        // First layer is a base transition — nothing lifted.
-        assert!(layers[0].paths.iter().all(|p| p.z_offset_mm == 0.0), "base layer is flat");
-    }
-
-    #[test]
-    fn brick_orders_low_phase_first_and_hops() {
-        let m = Mesh::cube(20.0);
-        let mut s = Settings::default();
-        s.brick_layers = true;
-        s.wall_count = 4;
-        let layers = generate(&m, &s);
-        let mid = &layers[50];
-        let first_high = mid.paths.iter().position(|p| p.z_offset_mm > 0.0).expect("lifted perimeters");
-        // Low (on-plane) phase entirely precedes the contiguous high (lifted) phase.
-        assert!(mid.paths[..first_high].iter().all(|p| p.z_offset_mm == 0.0), "low phase first");
-        assert!(mid.paths[first_high..].iter().all(|p| p.z_offset_mm > 0.0), "high phase contiguous");
-        // The travel reaching the first lifted perimeter hops clear of the low beads.
-        assert!(mid.travels[first_high].hop, "phase-boundary travel hops");
     }
 
     #[test]
