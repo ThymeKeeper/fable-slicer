@@ -81,7 +81,7 @@ struct Args {
     /// Buried solid infill pattern: lines | aligned | grid | triangles | concentric | gyroid.
     #[arg(long)]
     solid_infill: Option<String>,
-    /// Support mode: none | grid | arc.
+    /// Support mode: none | grid.
     #[arg(long)]
     support: Option<String>,
     /// Spiral vase mode: one continuously rising wall, no infill above the bottom.
@@ -194,7 +194,7 @@ fn main() -> Result<()> {
     }
     if let Some(s) = &args.support {
         settings.support_mode = config::SupportMode::parse(s)
-            .ok_or_else(|| anyhow::anyhow!("unknown support mode '{s}' (use none | grid | arc)"))?;
+            .ok_or_else(|| anyhow::anyhow!("unknown support mode '{s}' (use none | grid)"))?;
     }
     if let Some(v) = args.nozzle_temp {
         settings.nozzle_temp_c = v;

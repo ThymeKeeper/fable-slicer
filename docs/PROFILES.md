@@ -24,8 +24,9 @@ never fight: both apply in full. The deliberate exceptions:
   process was written for an Ender). The GUI therefore routes edits of these
   to the printer tier when saving.
 - **Derived per-feature speeds**: if a process profile doesn't pin
-  `external_perimeter`/`solid`/`support`/`gap_fill` speed, they're computed
-  from the winning print speed (50% / 80% / 90% / 40 %≤40) at resolve time.
+  `external_perimeter`/`solid`/`support` speed, they're computed from the
+  winning print speed (50% / 80% / 90%, each capped at the filament's max
+  volumetric flow) at resolve time.
 
 So the full resolution order for any one field is:
 
@@ -44,16 +45,17 @@ fall through. Chains can be any depth; cycles are an error.
 
 ## Built-in vs. user profiles
 
-- **Built-ins** (`generic`/`voron24`/`sovol-zero`, `pla`/`petg`,
-  `draft`/`standard`/`fine`) are embedded in the binary and **read-only** —
+- **Built-ins** (printers `generic`/`voron24`/`sovol-zero`; filaments
+  `pla`/`petg`/`pla-hf`/`asa`/`abs`/`polymaker-pc`; process `standard`) are
+  embedded in the binary and **read-only** —
   they can't be overwritten, deleted, or shadowed from the user directory.
   A user-dir file named like a built-in is skipped with a warning; base
   yours on it with `inherits` instead.
 - **User profiles** live in the platform config dir and are auto-loaded by
   both the GUI and the CLI:
-  - Linux: `~/.config/slicer/profiles/{printer,filament,process}/*.toml`
-  - macOS: `~/Library/Application Support/slicer/profiles/…`
-  - Windows: `%APPDATA%\slicer\profiles\…`
+  - Linux: `~/.config/fable-slicer/profiles/{printer,filament,process}/*.toml`
+  - macOS: `~/Library/Application Support/fable-slicer/profiles/…`
+  - Windows: `%APPDATA%\fable-slicer\profiles\…`
 
   Saved files are **minimal diffs**: only the fields you changed, plus
   `inherits = "<what you based it on>"`. Fix the parent and every child
@@ -77,14 +79,14 @@ Example: select `petg` + `standard`, raise nozzle temp to 245 and walls to 4,
 then save the filament tier as `my-petg` and the process tier as `strong`:
 
 ```toml
-# ~/.config/slicer/profiles/filament/my-petg.toml
+# ~/.config/fable-slicer/profiles/filament/my-petg.toml
 inherits = "petg"
 nozzle_temp_c = 245
 
-# ~/.config/slicer/profiles/process/strong.toml
+# ~/.config/fable-slicer/profiles/process/strong.toml
 inherits = "standard"
 wall_count = 4
 ```
 
-`slicer-cli model.stl --filament my-petg --process strong` now uses both —
+`fable-slicer-cli model.stl --filament my-petg --process strong` now uses both —
 and a future tweak to the built-in `petg` (or `standard`) flows through.

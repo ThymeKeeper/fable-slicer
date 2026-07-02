@@ -11,4 +11,3 @@ mesh = { workspace = true }
 config = { workspace = true }
 gcode = { workspace = true }
 rayon = { workspace = true }
-boostvoronoi = { workspace = true }

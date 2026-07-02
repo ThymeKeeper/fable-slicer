@@ -7,7 +7,7 @@ How the slicer is put together and why. Progress and milestones live in
 
 A **headless engine library + thin front-ends**, the same separation CuraEngine
 has from Cura. The `engine` crate knows nothing about UIs or files beyond
-producing geometry/g-code; the `cli` (and later `gui`) are consumers. This keeps
+producing geometry/g-code; the `cli` and `gui` are consumers. This keeps
 the core testable and is what structurally keeps us independent of a monolith.
 
 ```
@@ -16,7 +16,7 @@ the core testable and is what structurally keeps us independent of a monolith.
               └────┬────┘
                    ▼
               ┌─────────┐     ┌────────┐
-              │ engine  │◀────│ geo2d  │ integer polygons, (M1) Clipper2
+              │ engine  │◀────│ geo2d  │ integer polygons, Clipper2
               └────┬────┘     └────────┘
                    │  layers → walls → infill → surfaces → supports → toolpaths
                    ▼
@@ -24,25 +24,26 @@ the core testable and is what structurally keeps us independent of a monolith.
               │  gcode  │◀────│ config │ printer/filament/process profiles
               └────┬────┘     └────────┘
                    ▼
-            .gcode / SVG  ◀── cli (binary: `slicer`),  later: gui (egui/wgpu)
+            .gcode / SVG  ◀── cli (`fable-slicer-cli`) · gui (`fable-slicer`, egui/wgpu)
 ```
 
-## The pipeline (target end state)
+## The pipeline
 
 1. **Load & repair** — STL/3MF → indexed mesh; tolerate imperfect input.
 2. **Slice** — intersect each z-plane with the mesh → closed layer polygons.
 3. **2D ops** — boolean + offset on polygons (Clipper2).
-4. **Walls** — concentric inward offsets; later Arachne variable width.
+4. **Walls** — concentric inward offsets.
 5. **Infill** — clip a pattern to the wall interior; solid vs. sparse regions.
 6. **Surfaces** — top/bottom detection, bridging, ironing.
-7. **Supports** — overhang detection; grid then tree supports.
+7. **Supports** — overhang detection; grid supports.
 8. **Toolpaths** — order regions (travel minimization), seams, combing.
 9. **Extrusion + motion** — geometry → E values, speeds, cooling.
 10. **G-code** — emit moves, retraction, fan, arc fitting; simulate for time.
 11. **Preview** — feature-colored path rendering (GUI).
 
-Implemented today: all eleven steps in v1 form (Arachne walls, tree supports,
-and mesh repair remain; see PLAN.md). Steps 2, 4–8 run layer-parallel on rayon.
+All eleven steps are implemented. Supports are grid-based (no tree supports),
+and robust mesh repair for messy input is still the main gap (see PLAN.md).
+Steps 2, 4–8 run layer-parallel on rayon.
 
 ## Coordinate system
 
