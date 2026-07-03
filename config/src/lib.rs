@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 mod profile;
 pub use profile::{tier_dirty, FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Tier, TierKind};
 mod state;
-pub use state::{config_dir, AppState, BlendState};
+pub use state::{config_dir, AppState, BlendState, Loadout};
 
 /// Default start g-code. `{placeholders}` are substituted by the emitter; used
 /// when a printer profile sets no `start_gcode`. The order mirrors the presoak

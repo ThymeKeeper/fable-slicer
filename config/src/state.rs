@@ -6,6 +6,7 @@
 //! the app.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Fable Slicer's per-user dotfile folder (`~/.config/fable-slicer` on
@@ -51,6 +52,28 @@ pub struct BlendState {
     pub tools: Vec<u32>,
 }
 
+/// What one machine currently holds: the filament loaded in each tool slot,
+/// the spool colors over those slots, the blend palette mixed from them, and
+/// the process last used on it. All of it describes a physical setup —
+/// machines don't share spools — and blends reference slots by index, so the
+/// whole bundle only means anything relative to one machine. Keyed by
+/// printer profile name in [`AppState::loadouts`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Loadout {
+    /// Filament profile name per tool slot; slot 0 is the filament tier.
+    pub tools: Vec<String>,
+    /// Loaded-spool color per slot ("#RRGGBB", "" = none): an override of the
+    /// slot filament's profile color, describing the spool physically loaded.
+    /// Aligned with `tools` — a slot whose filament changes drops its
+    /// override.
+    pub tool_colors: Vec<String>,
+    /// The blend palette — pseudo colors dithered from the tool slots.
+    pub blends: Vec<BlendState>,
+    /// The process last used on this machine ("" = never recorded).
+    pub process: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppState {
@@ -62,6 +85,10 @@ pub struct AppState {
     /// Filament profile name per tool slot on a toolchanger. `filament`
     /// stays the tool-0 legacy mirror: an old state without `tools` reads as
     /// one slot (see [`Self::tool_filaments`]); saves write both.
+    ///
+    /// `tools`, `tool_colors`, `blends`, and `process` are the ACTIVE
+    /// printer's loadout mirrored flat — the legacy read path and what old
+    /// versions understand. The per-machine truth lives in [`Self::loadouts`].
     pub tools: Vec<String>,
     /// Loaded-spool color per slot ("#RRGGBB", "" = none): an override of the
     /// slot filament's profile color, describing the spool physically loaded.
@@ -70,6 +97,12 @@ pub struct AppState {
     pub tool_colors: Vec<String>,
     /// The blend palette — pseudo colors dithered from the tool slots.
     pub blends: Vec<BlendState>,
+    /// Each machine's own loadout, keyed by printer profile name: switching
+    /// printers swaps loadouts instead of dragging one machine's spools onto
+    /// another. Loading folds legacy flat fields in as the then-active
+    /// printer's entry (see [`Self::adopt_flat_loadout`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub loadouts: BTreeMap<String, Loadout>,
     /// Where the STL import dialog last picked a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_model_dir: Option<PathBuf>,
@@ -94,10 +127,31 @@ impl AppState {
     }
 
     fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut s: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        s.adopt_flat_loadout();
+        s
+    }
+
+    /// Fold the flat loadout fields into the per-printer map when it lacks
+    /// an entry for the saved printer — a legacy state's flat fields describe
+    /// the machine that was active when it was written. States saved by this
+    /// version already carry the entry (the flat fields are its mirror), so
+    /// this only fires on old files.
+    fn adopt_flat_loadout(&mut self) {
+        if !self.printer.is_empty() && !self.loadouts.contains_key(&self.printer) {
+            self.loadouts.insert(
+                self.printer.clone(),
+                Loadout {
+                    tools: self.tool_filaments(),
+                    tool_colors: self.tool_colors.clone(),
+                    blends: self.blends.clone(),
+                    process: self.process.clone(),
+                },
+            );
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -137,10 +191,7 @@ mod tests {
     fn state_roundtrips() {
         let dir = std::env::temp_dir().join(format!("slicer-state-{}", std::process::id()));
         let path = dir.join("state.toml");
-        let s = AppState {
-            printer: "sovol-zero-custom".into(),
-            filament: "pla".into(),
-            process: "sovol-zero-custom".into(),
+        let sovol = Loadout {
             tools: vec!["pla".into(), "petg".into(), "asa".into()],
             tool_colors: vec!["#F2F2F2".into(), String::new(), "#1A1A1A".into()],
             blends: vec![BlendState {
@@ -148,12 +199,85 @@ mod tests {
                 weights: vec![(0, 3.0), (2, 1.0)],
                 tools: vec![0, 2],
             }],
+            process: "sovol-zero-custom".into(),
+        };
+        let voron = Loadout {
+            tools: vec!["asa".into(); 5],
+            tool_colors: vec!["#0000FF".into()],
+            blends: Vec::new(),
+            process: "standard".into(),
+        };
+        let s = AppState {
+            printer: "sovol-zero-custom".into(),
+            filament: "pla".into(),
+            process: "sovol-zero-custom".into(),
+            tools: sovol.tools.clone(),
+            tool_colors: sovol.tool_colors.clone(),
+            blends: sovol.blends.clone(),
+            loadouts: [
+                ("sovol-zero-custom".to_string(), sovol),
+                ("voron 2.4 (garage)".to_string(), voron),
+            ]
+            .into_iter()
+            .collect(),
             last_model_dir: Some("/tmp/models".into()),
             last_export_dir: None,
             accent: Some("#D8A852".into()),
         };
         s.save_to(&path).unwrap();
         assert_eq!(AppState::load_from(&path), s);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_flat_fields_seed_the_active_printers_loadout() {
+        let dir = std::env::temp_dir().join(format!("slicer-state-legacy-{}", std::process::id()));
+        let path = dir.join("state.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pre-loadout file: flat fields only. Loading folds them into the
+        // then-active printer's map entry.
+        std::fs::write(
+            &path,
+            r##"
+printer = "voron24"
+filament = "pla"
+process = "standard"
+tools = ["pla", "petg"]
+tool_colors = ["#FFFFFF", ""]
+[[blends]]
+name = "grey"
+weights = [[0, 1.0], [1, 1.0]]
+"##,
+        )
+        .unwrap();
+        let s = AppState::load_from(&path);
+        let lo = s.loadouts.get("voron24").expect("legacy flat fields must seed a loadout");
+        assert_eq!(lo.tools, vec!["pla".to_string(), "petg".to_string()]);
+        assert_eq!(lo.tool_colors, vec!["#FFFFFF".to_string(), String::new()]);
+        assert_eq!(lo.blends.len(), 1);
+        assert_eq!(lo.process, "standard");
+        // A file that already carries a loadout for the printer is left
+        // alone — the map entry wins over the flat mirror.
+        std::fs::write(
+            &path,
+            r#"
+printer = "voron24"
+process = "standard"
+tools = ["pla"]
+[loadouts.voron24]
+tools = ["asa"]
+process = "draft"
+"#,
+        )
+        .unwrap();
+        let s = AppState::load_from(&path);
+        assert_eq!(s.loadouts["voron24"].tools, vec!["asa".to_string()]);
+        assert_eq!(s.loadouts["voron24"].process, "draft");
+        // A never-saved state (no printer) seeds nothing.
+        let fresh = AppState::default();
+        let mut fresh2 = fresh.clone();
+        fresh2.adopt_flat_loadout();
+        assert_eq!(fresh, fresh2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

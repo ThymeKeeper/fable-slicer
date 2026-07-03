@@ -1018,6 +1018,11 @@ struct App {
     /// time — the 320 px panel can't afford stacked editors).
     blend_edit: Option<usize>,
     process: String,
+    /// Every OTHER machine's loadout (spools, colors, blends, process),
+    /// keyed by printer profile name — the active printer's lives in the
+    /// fields above and is stashed here on switch (see
+    /// `switch_printer_loadout`). Machines don't share spools.
+    loadouts: std::collections::BTreeMap<String, config::Loadout>,
     /// Program state as last written to the dotfile folder — compared each
     /// frame, so every path that changes a selection persists it.
     saved_state: config::AppState,
@@ -1198,14 +1203,30 @@ impl App {
                 default.to_string()
             }
         };
+        let picked_printer = pick(&state.printer, profiles.printer_names(), "voron24");
+        // The machine's own loadout: spools, colors, blends, and the process
+        // last used on it. The flat fields only mirror the machine active at
+        // save time, which a deleted-profile fallback may no longer match.
+        let loadout = state.loadouts.get(&picked_printer).cloned().unwrap_or_else(|| {
+            config::Loadout {
+                tools: state.tool_filaments(),
+                tool_colors: state.tool_colors.clone(),
+                blends: state.blends.clone(),
+                process: state.process.clone(),
+            }
+        });
         let (mut printer, mut filament, mut process) = (
-            pick(&state.printer, profiles.printer_names(), "voron24"),
-            pick(&state.filament, profiles.filament_names(), "pla"),
-            pick(&state.process, profiles.process_names(), "standard"),
+            picked_printer,
+            pick(
+                loadout.tools.first().map_or(state.filament.as_str(), String::as_str),
+                profiles.filament_names(),
+                "pla",
+            ),
+            pick(&loadout.process, profiles.process_names(), "standard"),
         );
         // Tool slots restore per-slot (a vanished profile falls back alone).
-        let mut tools: Vec<String> = state
-            .tool_filaments()
+        let mut tools: Vec<String> = loadout
+            .tools
             .iter()
             .map(|t| pick(t, profiles.filament_names(), "pla"))
             .collect();
@@ -1252,7 +1273,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                state
+                loadout
                     .tool_colors
                     .get(i)
                     .and_then(|h| config::parse_hex_color(h))
@@ -1266,9 +1287,10 @@ impl App {
             tools,
             tool_colors,
             tool_hex: Vec::new(),
-            blends: state.blends.clone(),
+            blends: loadout.blends.clone(),
             blend_edit: None,
             process,
+            loadouts: state.loadouts.clone(),
             // Seed with the file's content as-loaded: if the fallbacks above
             // corrected anything, the first persist pass rewrites the file.
             last_model_dir: state.last_model_dir.clone(),
@@ -1415,6 +1437,56 @@ impl App {
             self.refit_camera = true;
         }
         self.refresh_pins();
+    }
+
+    /// Machines don't share spools: leaving a printer stashes its loadout
+    /// (per-slot filaments, spool colors, blend palette, process) under the
+    /// outgoing name and arriving at one restores its own. A printer seen
+    /// for the first time inherits the outgoing loadout as its seed — also
+    /// the pre-loadout behavior. Call with the OUTGOING printer's name after
+    /// `self.printer` has moved, before `reresolve`.
+    fn switch_printer_loadout(&mut self, old: &str) {
+        if old == self.printer {
+            return;
+        }
+        self.loadouts.insert(old.to_string(), self.current_loadout());
+        if let Some(lo) = self.loadouts.get(&self.printer).cloned() {
+            self.apply_loadout(&lo);
+        }
+    }
+
+    /// Bring a stored loadout onto the live fields: slots (a vanished
+    /// filament profile falls back to the tier selection), spool colors,
+    /// blends, and — where it still resolves — the machine's process.
+    /// `reresolve` afterwards syncs the slot count and the tool table.
+    fn apply_loadout(&mut self, lo: &config::Loadout) {
+        if !lo.tools.is_empty() {
+            self.tools = lo
+                .tools
+                .iter()
+                .map(|t| {
+                    if self.profiles.filament_names().contains(&t.as_str()) {
+                        t.clone()
+                    } else {
+                        self.filament.clone()
+                    }
+                })
+                .collect();
+            self.filament = self.tools[0].clone();
+        }
+        self.tool_colors = (0..self.tools.len())
+            .map(|i| {
+                lo.tool_colors
+                    .get(i)
+                    .and_then(|h| config::parse_hex_color(h))
+                    .map(|c| (self.tools[i].clone(), c))
+            })
+            .collect();
+        self.blends = lo.blends.clone();
+        self.blend_edit = None;
+        if !lo.process.is_empty() && self.profiles.process_names().contains(&lo.process.as_str()) {
+            self.process = lo.process.clone();
+        }
     }
 
     /// Keep the slot list in step with the machine: `count` entries, slot 0
@@ -1650,6 +1722,15 @@ impl App {
                 TierKind::Process => "standard".to_string(),
             };
             self.refresh_baseline();
+            if kind == TierKind::Printer {
+                // The machine is gone, its loadout with it; the fallback
+                // printer brings in its own.
+                self.loadouts.remove(name);
+                if let Some(lo) = self.loadouts.get(&self.printer).cloned() {
+                    self.apply_loadout(&lo);
+                }
+                self.reresolve();
+            }
         } else if kind == TierKind::Filament {
             // A non-selected filament may still be loaded in a tool slot —
             // those fall back to the tier selection.
@@ -2359,16 +2440,13 @@ impl App {
         };
     }
 
-    /// Write the program state to the dotfile folder when it changed —
-    /// convenience memory only, so a failed save never blocks anything.
-    fn persist_state(&mut self) {
-        let cur = config::AppState {
-            printer: self.printer.clone(),
-            filament: self.filament.clone(),
-            process: self.process.clone(),
+    /// The active machine's loadout as the live fields describe it: which
+    /// filament each slot holds, the spool-color overrides (a color entry
+    /// only survives while it still names its slot's loaded filament), the
+    /// blend palette, and the process in use.
+    fn current_loadout(&self) -> config::Loadout {
+        config::Loadout {
             tools: self.tools.clone(),
-            // A slot's color entry only survives while the override still
-            // names its loaded filament; anything else writes empty.
             tool_colors: (0..self.tools.len())
                 .map(|i| {
                     let slot = if i == 0 { &self.filament } else { &self.tools[i] };
@@ -2379,6 +2457,26 @@ impl App {
                 })
                 .collect(),
             blends: self.blends.clone(),
+            process: self.process.clone(),
+        }
+    }
+
+    /// Write the program state to the dotfile folder when it changed —
+    /// convenience memory only, so a failed save never blocks anything.
+    /// The flat fields stay the active machine's mirror (the legacy read
+    /// path); the per-printer truth is the loadout map.
+    fn persist_state(&mut self) {
+        let lo = self.current_loadout();
+        let mut loadouts = self.loadouts.clone();
+        loadouts.insert(self.printer.clone(), lo.clone());
+        let cur = config::AppState {
+            printer: self.printer.clone(),
+            filament: self.filament.clone(),
+            process: lo.process,
+            tools: lo.tools,
+            tool_colors: lo.tool_colors,
+            blends: lo.blends,
+            loadouts,
             last_model_dir: self.last_model_dir.clone(),
             last_export_dir: self.last_export_dir.clone(),
             accent: Some(accent_to_hex(self.accent)),
@@ -3488,9 +3586,11 @@ impl eframe::App for App {
                 } else {
                     // A new printer means a new plate — re-pivot even when its
                     // dimensions happen to match (the bed-size check at the
-                    // top of `ui` only catches actual changes).
+                    // top of `ui` only catches actual changes) — and its own
+                    // loadout: spools stay with their machine.
                     if self.printer != prev_sel.0 {
                         self.recenter_camera = true;
+                        self.switch_printer_loadout(&prev_sel.0);
                     }
                     self.reresolve();
                 }
@@ -4774,9 +4874,11 @@ impl eframe::App for App {
                 if p != self.printer {
                     self.recenter_camera = true;
                 }
+                let old = self.printer.clone();
                 self.printer = p;
                 self.filament = f;
                 self.process = pr;
+                self.switch_printer_loadout(&old);
                 self.reresolve();
             }
             if !open {
