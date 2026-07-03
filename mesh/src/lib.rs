@@ -5,7 +5,7 @@
 //! slicer only needs the triangle list and the z-range.
 
 mod threemf;
-pub use threemf::{load_3mf, load_3mf_reader, ThreeMfItem};
+pub use threemf::{load_3mf, load_3mf_reader, ThreeMfItem, ThreeMfPart};
 
 use std::collections::HashMap;
 use std::fs;

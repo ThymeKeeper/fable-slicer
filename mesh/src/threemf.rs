@@ -1,9 +1,11 @@
 //! 3MF import: the core spec's meshes, build items, transforms, and
 //! components, plus the production extension's cross-part references
-//! (`p:path` — how Orca/Bambu project files split objects into parts).
-//! Geometry only: embedded slicer settings, materials/colors, and the other
-//! extensions are deliberately ignored — profiles are this slicer's own
-//! three-tier system, not something to import from a foreign project file.
+//! (`p:path` — how Orca/Bambu project files split objects into parts), plus
+//! the human part names and extruder hints those slicers stash in
+//! `Metadata/model_settings.config`. Geometry and those hints only: embedded
+//! slicer settings, materials/colors, and the other extensions are
+//! deliberately ignored — profiles are this slicer's own three-tier system,
+//! not something to import from a foreign project file.
 //!
 //! Tolerant by design (the "load & repair" philosophy): unknown elements are
 //! skipped, out-of-range triangle indices and degenerate triangles are
@@ -16,11 +18,32 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
+/// One leaf mesh of a build item: its name (may be empty), the extruder hint
+/// from `Metadata/model_settings.config` when the file carries one (1-based,
+/// as Bambu/Orca write it), and its mesh with every transform baked, in
+/// millimeters.
+pub struct ThreeMfPart {
+    pub name: String,
+    pub extruder: Option<u32>,
+    pub mesh: Mesh,
+}
+
 /// One printable object from the 3MF build: its name (may be empty) and its
-/// mesh with every transform baked, in millimeters.
+/// leaf parts, each with every transform baked, in millimeters.
 pub struct ThreeMfItem {
     pub name: String,
-    pub mesh: Mesh,
+    pub parts: Vec<ThreeMfPart>,
+}
+
+impl ThreeMfItem {
+    /// All parts appended into one mesh — the single-material view.
+    pub fn merged(&self) -> Mesh {
+        let mut m = Mesh::default();
+        for p in &self.parts {
+            m.append(&p.mesh);
+        }
+        m
+    }
 }
 
 pub fn load_3mf<P: AsRef<Path>>(path: P) -> Result<Vec<ThreeMfItem>, String> {
@@ -52,6 +75,8 @@ pub fn load_3mf_reader<R: Read + Seek>(reader: R) -> Result<Vec<ThreeMfItem>, St
         }
     }
 
+    let config = read_model_settings(&mut zip);
+
     let root_part = &parts[&root];
     let mut out = Vec::new();
     // The build's items are the plate; a (spec-violating) file without a
@@ -63,12 +88,26 @@ pub fn load_3mf_reader<R: Read + Seek>(reader: R) -> Result<Vec<ThreeMfItem>, St
     };
     for (id, path, t) in items {
         let part_path = path.unwrap_or_else(|| root.clone());
-        let mut mesh = Mesh::default();
-        let mut name = String::new();
-        flatten(&parts, &part_path, id, t, &mut mesh, &mut name, 0)?;
-        if !mesh.triangles.is_empty() {
-            out.push(ThreeMfItem { name, mesh });
+        let mut item = ThreeMfItem { name: String::new(), parts: Vec::new() };
+        flatten(&parts, &part_path, id, t, "", &mut item, 0)?;
+        if item.parts.is_empty() {
+            continue;
         }
+        // model_settings hints fill what the core XML left anonymous; config
+        // parts pair with leaf parts by document order (Bambu writes one
+        // <part> per component), a count mismatch leaves the tail untouched.
+        if let Some(cfg) = config.get(&id) {
+            if item.name.is_empty() {
+                item.name.clone_from(&cfg.name);
+            }
+            for (lp, cp) in item.parts.iter_mut().zip(&cfg.parts) {
+                if lp.name.is_empty() {
+                    lp.name.clone_from(&cp.name);
+                }
+                lp.extruder = cp.extruder.or(cfg.extruder);
+            }
+        }
+        out.push(item);
     }
     Ok(out)
 }
@@ -384,14 +423,126 @@ fn parse_model_xml(text: &str) -> Result<Part, String> {
     Ok(Part { objects, build })
 }
 
-/// Recursively bake `(part_path, id)` under transform `t` into `mesh`.
+#[derive(Default)]
+struct ConfigPart {
+    name: String,
+    extruder: Option<u32>,
+}
+
+/// Per-object hints from `Metadata/model_settings.config`: name, 1-based
+/// extruder (the default for parts without their own), and one entry per
+/// `<part>` in document order.
+#[derive(Default)]
+struct ConfigObject {
+    name: String,
+    extruder: Option<u32>,
+    parts: Vec<ConfigPart>,
+}
+
+/// Read `Metadata/model_settings.config` (Bambu/Orca keep part names and
+/// extruder assignments there, keyed by build object id — not in the core
+/// XML). Tolerant by design: a missing entry or malformed XML yields
+/// whatever parsed, never an error.
+fn read_model_settings<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> HashMap<u64, ConfigObject> {
+    let mut out = HashMap::new();
+    let mut text = String::new();
+    match zip.by_name("Metadata/model_settings.config") {
+        Ok(mut f) => {
+            if f.read_to_string(&mut text).is_err() {
+                return out;
+            }
+        }
+        Err(_) => return out,
+    }
+    let mut reader = Reader::from_str(&text);
+    let mut buf = Vec::new();
+    let mut cur: Option<(u64, ConfigObject)> = None;
+    let mut cur_part: Option<ConfigPart> = None;
+    loop {
+        let Ok(ev) = reader.read_event_into(&mut buf) else {
+            break; // malformed from here on: keep what parsed
+        };
+        match &ev {
+            Event::Start(e) | Event::Empty(e) => {
+                let self_closing = matches!(&ev, Event::Empty(_));
+                let attr = |key: &[u8]| -> Option<String> {
+                    e.attributes().flatten().find_map(|a| {
+                        (local_name(a.key.as_ref()) == key)
+                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                    })
+                };
+                match local_name(e.name().as_ref()) {
+                    b"object" => {
+                        cur_part = None;
+                        if let Some(id) = attr(b"id").and_then(|s| s.parse().ok()) {
+                            if self_closing {
+                                out.insert(id, ConfigObject::default());
+                            } else {
+                                cur = Some((id, ConfigObject::default()));
+                            }
+                        }
+                    }
+                    b"part" if cur.is_some() => {
+                        // A bare <part/> still occupies its document-order slot.
+                        if self_closing {
+                            if let Some((_, o)) = cur.as_mut() {
+                                o.parts.push(ConfigPart::default());
+                            }
+                        } else {
+                            cur_part = Some(ConfigPart::default());
+                        }
+                    }
+                    b"metadata" => {
+                        let target = if let Some(p) = cur_part.as_mut() {
+                            Some((&mut p.name, &mut p.extruder))
+                        } else {
+                            cur.as_mut().map(|(_, o)| (&mut o.name, &mut o.extruder))
+                        };
+                        if let (Some((name, extruder)), Some(key)) = (target, attr(b"key")) {
+                            let value = attr(b"value").unwrap_or_default();
+                            match key.as_str() {
+                                "name" => *name = value,
+                                "extruder" => *extruder = value.trim().parse().ok(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(e) => match local_name(e.name().as_ref()) {
+                b"part" => {
+                    if let (Some(p), Some((_, o))) = (cur_part.take(), cur.as_mut()) {
+                        o.parts.push(p);
+                    }
+                }
+                b"object" => {
+                    cur_part = None;
+                    if let Some((id, o)) = cur.take() {
+                        out.insert(id, o);
+                    }
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// Recursively bake `(part_path, id)` under transform `t`, emitting one
+/// part into `item` per leaf mesh object (empty meshes dropped). `ancestor`
+/// is the nearest named object above on this path — the name fallback for
+/// anonymous leaves; the item keeps the first non-empty name found top-down.
 fn flatten(
     parts: &HashMap<String, Part>,
     part_path: &str,
     id: u64,
     t: Affine,
-    mesh: &mut Mesh,
-    name: &mut String,
+    ancestor: &str,
+    item: &mut ThreeMfItem,
     depth: usize,
 ) -> Result<(), String> {
     if depth > 32 {
@@ -403,20 +554,24 @@ fn flatten(
     let Some(obj) = part.objects.get(&id) else {
         return Ok(()); // dangling reference: tolerate
     };
-    if name.is_empty() {
-        name.clone_from(&obj.name);
+    if item.name.is_empty() {
+        item.name.clone_from(&obj.name);
     }
+    let named = if obj.name.is_empty() { ancestor } else { &obj.name };
     match &obj.kind {
         ObjKind::Mesh { vertices, triangles } => {
-            let base = mesh.vertices.len() as u32;
-            mesh.vertices.extend(vertices.iter().map(|&v| t.apply(v)));
-            mesh.triangles
-                .extend(triangles.iter().map(|tri| [tri[0] + base, tri[1] + base, tri[2] + base]));
+            if !triangles.is_empty() {
+                let mesh = Mesh {
+                    vertices: vertices.iter().map(|&v| t.apply(v)).collect(),
+                    triangles: triangles.clone(),
+                };
+                item.parts.push(ThreeMfPart { name: named.to_string(), extruder: None, mesh });
+            }
         }
         ObjKind::Components(refs) => {
             for r in refs {
                 let child_path = r.path.as_deref().unwrap_or(part_path);
-                flatten(parts, child_path, r.id, r.t.then(&t), mesh, name, depth + 1)?;
+                flatten(parts, child_path, r.id, r.t.then(&t), named, item, depth + 1)?;
             }
         }
     }
@@ -429,7 +584,7 @@ mod tests {
     use std::io::{Cursor, Write};
 
     /// Zip up a root model (at the conventional path, with rels) plus any
-    /// extra `.model` parts.
+    /// extra entries (`.model` parts, `Metadata/model_settings.config`, …).
     fn make_3mf(root_model: &str, extra: &[(&str, &str)]) -> Cursor<Vec<u8>> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let opts = zip::write::SimpleFileOptions::default();
@@ -477,9 +632,12 @@ mod tests {
         let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "square");
-        assert_eq!(items[0].mesh.vertices.len(), 4);
-        assert_eq!(items[0].mesh.triangles.len(), 2);
-        let (lo, hi) = bbox(&items[0].mesh);
+        assert_eq!(items[0].parts.len(), 1);
+        assert_eq!(items[0].parts[0].name, "square");
+        assert_eq!(items[0].parts[0].extruder, None);
+        assert_eq!(items[0].parts[0].mesh.vertices.len(), 4);
+        assert_eq!(items[0].parts[0].mesh.triangles.len(), 2);
+        let (lo, hi) = bbox(&items[0].parts[0].mesh);
         assert_eq!((lo[0], hi[0]), (5.0, 15.0), "item transform translates +5 in x");
     }
 
@@ -490,7 +648,7 @@ mod tests {
             <build><item objectid="1"/></build></model>"#
         );
         let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
-        let (_, hi) = bbox(&items[0].mesh);
+        let (_, hi) = bbox(&items[0].merged());
         assert_eq!(hi[0], 254.0, "10 in = 254 mm");
     }
 
@@ -510,9 +668,20 @@ mod tests {
         let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "pair");
-        assert_eq!(items[0].mesh.triangles.len(), 4);
-        let (lo, hi) = bbox(&items[0].mesh);
-        assert_eq!((lo[0], hi[0]), (0.0, 30.0), "second copy lands at 20..30");
+        // One part per leaf component, unnamed leaves inherit the ancestor.
+        assert_eq!(items[0].parts.len(), 2);
+        for p in &items[0].parts {
+            assert_eq!(p.name, "pair");
+            assert_eq!(p.mesh.triangles.len(), 2);
+        }
+        let (lo, hi) = bbox(&items[0].parts[0].mesh);
+        assert_eq!((lo[0], hi[0]), (0.0, 10.0), "first copy stays at 0..10");
+        let (lo, hi) = bbox(&items[0].parts[1].mesh);
+        assert_eq!((lo[0], hi[0]), (20.0, 30.0), "second copy lands at 20..30");
+        let merged = items[0].merged();
+        assert_eq!(merged.triangles.len(), 4);
+        let (lo, hi) = bbox(&merged);
+        assert_eq!((lo[0], hi[0]), (0.0, 30.0));
         assert_eq!((lo[2], hi[2]), (5.0, 5.0), "assembly lifted to z=5");
     }
 
@@ -532,7 +701,9 @@ mod tests {
             load_3mf_reader(make_3mf(root, &[("3D/Objects/object_1.model", &part)])).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "boat");
-        assert_eq!(items[0].mesh.triangles.len(), 2);
+        assert_eq!(items[0].parts.len(), 1);
+        assert_eq!(items[0].parts[0].name, "boat");
+        assert_eq!(items[0].parts[0].mesh.triangles.len(), 2);
     }
 
     #[test]
@@ -543,7 +714,7 @@ mod tests {
         );
         let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
         assert_eq!(items.len(), 2);
-        let (lo2, _) = bbox(&items[1].mesh);
+        let (lo2, _) = bbox(&items[1].merged());
         assert_eq!(lo2[0], 50.0);
     }
 
@@ -560,8 +731,102 @@ mod tests {
         );
         let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
         assert_eq!(items.len(), 1, "support object skipped, mesh object kept");
-        assert_eq!(items[0].mesh.triangles.len(), 1, "junk triangles dropped");
+        assert_eq!(items[0].parts.len(), 1);
+        assert_eq!(items[0].parts[0].mesh.triangles.len(), 1, "junk triangles dropped");
         // Not a zip at all:
         assert!(load_3mf_reader(Cursor::new(b"solid nope".to_vec())).is_err());
+    }
+
+    #[test]
+    fn part_names_leaf_over_ancestor() {
+        // A named leaf keeps its own name; an anonymous leaf inherits the
+        // nearest named ancestor on its path.
+        let model = format!(
+            r#"<model><resources>
+            <object id="1" name="wheel">{SQUARE_MESH}</object>
+            <object id="2">{SQUARE_MESH}</object>
+            <object id="3" name="cart"><components>
+                <component objectid="1"/>
+                <component objectid="2" transform="1 0 0 0 1 0 0 0 1 20 0 0"/>
+            </components></object></resources>
+            <build><item objectid="3"/></build></model>"#
+        );
+        let items = load_3mf_reader(make_3mf(&model, &[])).unwrap();
+        assert_eq!(items[0].name, "cart");
+        assert_eq!(items[0].parts.len(), 2);
+        assert_eq!(items[0].parts[0].name, "wheel");
+        assert_eq!(items[0].parts[1].name, "cart");
+    }
+
+    /// Two-part assembly with anonymous core-XML objects — the Bambu shape.
+    fn anonymous_pair_model() -> String {
+        format!(
+            r#"<model><resources>
+            <object id="1">{SQUARE_MESH}</object>
+            <object id="2">{SQUARE_MESH}</object>
+            <object id="3"><components>
+                <component objectid="1"/>
+                <component objectid="2" transform="1 0 0 0 1 0 0 0 1 20 0 0"/>
+            </components></object></resources>
+            <build><item objectid="3"/></build></model>"#
+        )
+    }
+
+    #[test]
+    fn model_settings_names_and_extruders() {
+        let config = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <config>
+              <object id="3">
+                <metadata key="name" value="Figurine"/>
+                <metadata key="extruder" value="1"/>
+                <part id="1" subtype="normal_part">
+                  <metadata key="name" value="hair"/>
+                  <metadata key="extruder" value="2"/>
+                </part>
+                <part id="2" subtype="normal_part">
+                  <metadata key="name" value="body"/>
+                </part>
+              </object>
+              <plate><metadata key="plater_id" value="1"/></plate>
+            </config>"#;
+        let items = load_3mf_reader(make_3mf(
+            &anonymous_pair_model(),
+            &[("Metadata/model_settings.config", config)],
+        ))
+        .unwrap();
+        assert_eq!(items[0].name, "Figurine", "empty core name adopts the config's");
+        assert_eq!(items[0].parts.len(), 2);
+        assert_eq!(items[0].parts[0].name, "hair");
+        assert_eq!(items[0].parts[0].extruder, Some(2));
+        assert_eq!(items[0].parts[1].name, "body");
+        assert_eq!(items[0].parts[1].extruder, Some(1), "object-level extruder inherited");
+    }
+
+    #[test]
+    fn model_settings_mismatch_and_junk_tolerated() {
+        // One config <part> for a two-part item: the overlapping prefix is
+        // assigned, the tail is untouched.
+        let config = r#"<config><object id="3">
+            <metadata key="extruder" value="1"/>
+            <part id="1"><metadata key="name" value="hair"/><metadata key="extruder" value="2"/></part>
+            </object></config>"#;
+        let items = load_3mf_reader(make_3mf(
+            &anonymous_pair_model(),
+            &[("Metadata/model_settings.config", config)],
+        ))
+        .unwrap();
+        assert_eq!(items[0].parts[0].name, "hair");
+        assert_eq!(items[0].parts[0].extruder, Some(2));
+        assert_eq!(items[0].parts[1].name, "");
+        assert_eq!(items[0].parts[1].extruder, None);
+
+        // Garbage config: loaded as if absent.
+        let items = load_3mf_reader(make_3mf(
+            &anonymous_pair_model(),
+            &[("Metadata/model_settings.config", "<<< not xml at all")],
+        ))
+        .unwrap();
+        assert_eq!(items[0].parts.len(), 2);
+        assert!(items[0].parts.iter().all(|p| p.extruder.is_none()));
     }
 }

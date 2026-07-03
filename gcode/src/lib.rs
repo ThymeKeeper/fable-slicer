@@ -41,6 +41,13 @@ impl GcodeBuilder {
         self.e_total
     }
 
+    /// Forget the last feed rate, so the next move re-asserts `F`. Call after a
+    /// raw block (a toolchange macro) that moves with its own F words — the
+    /// dedup cache no longer reflects the machine.
+    pub fn invalidate_feed(&mut self) {
+        self.last_feed = None;
+    }
+
     /// Appends a ` F{n}` token only when the feed rate has changed.
     fn push_feed(&mut self, feed_mm_min: f64) {
         if self.last_feed.map_or(true, |f| (f - feed_mm_min).abs() > 1.0e-6) {
@@ -133,5 +140,24 @@ impl GcodeBuilder {
 impl Default for GcodeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GcodeBuilder;
+
+    #[test]
+    fn invalidate_feed_forces_f_reassertion() {
+        let mut g = GcodeBuilder::new();
+        g.travel(0.0, 0.0, 6000.0);
+        g.travel(1.0, 0.0, 6000.0); // same feed: deduped
+        g.invalidate_feed();
+        g.travel(2.0, 0.0, 6000.0); // same feed, but the cache was dropped
+        let out = g.finish();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].ends_with("F6000"));
+        assert!(!lines[1].contains('F'), "dedup holds: {}", lines[1]);
+        assert!(lines[2].ends_with("F6000"), "F re-asserted: {}", lines[2]);
     }
 }

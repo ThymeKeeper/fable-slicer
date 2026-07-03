@@ -11,7 +11,6 @@ use eframe::egui;
 use render::Scene;
 
 use config::{FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Settings, Tier, TierKind};
-use engine::generate;
 use std::sync::Arc;
 
 /// The "ink & cream" palette: the wordmark's warm paper colors inverted into
@@ -114,6 +113,9 @@ struct ProfileDialog {
     kind: TierKind,
     name: String,
     delete: bool,
+    /// A toolchanger tab's save/delete: the slot whose per-tool diff (and
+    /// inherits parent) the save uses. None = the classic tier-row flow.
+    slot: Option<usize>,
 }
 
 /// A printer-host action requested from the controls panel; executed after
@@ -146,6 +148,8 @@ enum ColorBy {
     /// Per-layer print time: red = quick layers, little cooling before the
     /// nozzle returns.
     LayerTime,
+    /// Each path in its printing tool's filament color (toolchangers only).
+    Filament,
 }
 
 /// Which derivable settings the user has pinned to manual values. Unpinned
@@ -200,11 +204,17 @@ fn auto_slider(
 /// names every participant so the relationship is learnable from any corner:
 /// "max flow 21.0 mm³/s ÷ bead (line width 0.45 × layer height 0.20 mm) = ~258 mm/s".
 fn flow_ceiling_text(s: &config::Settings) -> String {
-    let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
+    flow_ceiling_parts_text(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm)
+}
+
+/// `flow_ceiling_text` from the raw triangle numbers — the toolchanger tabs
+/// speak it for the active slot's own melt ceiling.
+fn flow_ceiling_parts_text(max_flow_mm3_s: f64, line_width_mm: f64, layer_height_mm: f64) -> String {
+    let cap = config::flow_speed_cap_mm_s(max_flow_mm3_s, line_width_mm, layer_height_mm);
     if cap.is_finite() {
         format!(
             "max flow {:.1} mm³/s ÷ bead (line width {:.2} × layer height {:.2} mm) = ~{:.0} mm/s",
-            s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm, cap
+            max_flow_mm3_s, line_width_mm, layer_height_mm, cap
         )
     } else {
         "max flow 0 = unlimited".into()
@@ -248,6 +258,232 @@ fn hslider_lockout(
         r
     })
     .inner
+}
+
+/// &mut views of every field the Filament card and Cooling section edit.
+/// One set of widget rows serves both surfaces: the flat fields on a
+/// single-tool machine, or the active tab's slot of `settings.tools` on a
+/// toolchanger — `config::ToolSettings` mirrors the flat filament tier
+/// field-for-field, so both constructors are total.
+struct FilamentFields<'a> {
+    nozzle_temp_c: &'a mut u32,
+    standby_temp_c: &'a mut u32,
+    bed_temp_c: &'a mut u32,
+    chamber_temp_c: &'a mut u32,
+    filament_diameter_mm: &'a mut f64,
+    extrusion_multiplier: &'a mut f64,
+    max_volumetric_speed_mm3_s: &'a mut f64,
+    pressure_advance: &'a mut f64,
+    bridge_flow: &'a mut f64,
+    bridge_speed_mm_s: &'a mut f64,
+    fan_speed: &'a mut f64,
+    bridge_fan_speed: &'a mut f64,
+    fan_off_layers: &'a mut usize,
+    aux_fan_speed: &'a mut f64,
+    exhaust_fan_speed: &'a mut f64,
+}
+
+impl<'a> FilamentFields<'a> {
+    /// The single-tool surface: the flat fields, exactly as before.
+    fn flat(s: &'a mut Settings) -> Self {
+        Self {
+            nozzle_temp_c: &mut s.nozzle_temp_c,
+            standby_temp_c: &mut s.standby_temp_c,
+            bed_temp_c: &mut s.bed_temp_c,
+            chamber_temp_c: &mut s.chamber_temp_c,
+            filament_diameter_mm: &mut s.filament_diameter_mm,
+            extrusion_multiplier: &mut s.extrusion_multiplier,
+            max_volumetric_speed_mm3_s: &mut s.max_volumetric_speed_mm3_s,
+            pressure_advance: &mut s.pressure_advance,
+            bridge_flow: &mut s.bridge_flow,
+            bridge_speed_mm_s: &mut s.bridge_speed_mm_s,
+            fan_speed: &mut s.fan_speed,
+            bridge_fan_speed: &mut s.bridge_fan_speed,
+            fan_off_layers: &mut s.fan_off_layers,
+            aux_fan_speed: &mut s.aux_fan_speed,
+            exhaust_fan_speed: &mut s.exhaust_fan_speed,
+        }
+    }
+
+    /// One toolchanger slot's surface (the active tab).
+    fn tool(t: &'a mut config::ToolSettings) -> Self {
+        Self {
+            nozzle_temp_c: &mut t.nozzle_temp_c,
+            standby_temp_c: &mut t.standby_temp_c,
+            bed_temp_c: &mut t.bed_temp_c,
+            chamber_temp_c: &mut t.chamber_temp_c,
+            filament_diameter_mm: &mut t.filament_diameter_mm,
+            extrusion_multiplier: &mut t.extrusion_multiplier,
+            max_volumetric_speed_mm3_s: &mut t.max_volumetric_speed_mm3_s,
+            pressure_advance: &mut t.pressure_advance,
+            bridge_flow: &mut t.bridge_flow,
+            bridge_speed_mm_s: &mut t.bridge_speed_mm_s,
+            fan_speed: &mut t.fan_speed,
+            bridge_fan_speed: &mut t.bridge_fan_speed,
+            fan_off_layers: &mut t.fan_off_layers,
+            aux_fan_speed: &mut t.aux_fan_speed,
+            exhaust_fan_speed: &mut t.exhaust_fan_speed,
+        }
+    }
+}
+
+/// The App-side state the guided flow-calibration row drives: arming the
+/// test print, the measured wall, and the status line it reports to.
+struct FlowCalUi<'a> {
+    host_ready: bool,
+    start: &'a mut bool,
+    measured_mm: &'a mut f64,
+    status: &'a mut String,
+}
+
+/// The Filament packaging-card rows, written once for both surfaces (see
+/// [`FilamentFields`]). `show_standby` = toolchanger (docked tools carry a
+/// standby setpoint); line width and layer height are read-only context for
+/// the flow hints and the calibration math.
+fn filament_card_rows(
+    ui: &mut egui::Ui,
+    f: FilamentFields<'_>,
+    show_standby: bool,
+    line_width_mm: f64,
+    layer_height_mm: f64,
+    cal: FlowCalUi<'_>,
+) {
+    hslider(ui, true, egui::Slider::new(f.nozzle_temp_c, config::NOZZLE_TEMP_MIN_C..=config::NOZZLE_TEMP_MAX_C), "nozzle °C",
+        "Operating nozzle temperature from the spool. The first layer adds the material's adhesion bump on top.");
+    if show_standby {
+        hslider(ui, true, egui::Slider::new(f.standby_temp_c, 80..=config::NOZZLE_TEMP_MAX_C), "standby °C",
+            "Setpoint while this tool sits docked longer than the machine's \
+             standby threshold — hot enough to restart in seconds, cool enough \
+             not to ooze and cook. Auto: operating temperature − 50.");
+    }
+    hslider(ui, true, egui::Slider::new(f.bed_temp_c, 0..=120), "bed °C",
+        "Bed temperature from the packaging.");
+    hslider(ui, true, egui::Slider::new(f.chamber_temp_c, 0..=70), "chamber soak °C",
+        "Hold during the start g-code — after the bed soak, before the nozzle \
+         finishes heating — until the chamber reaches this (the heated bed does \
+         the soaking, via TEMPERATURE_WAIT on the chamber sensor). Needs a chamber \
+         sensor declared under Machine & motion; Send pings the printer for it \
+         first and won't start a soak it can't honor. 0 = off. Auto: the material \
+         class's value — ABS/ASA soak at 50 against warping and layer splits; PLA \
+         must stay 0 (a hot chamber means heat creep and sag).");
+    hslider(ui, true, egui::Slider::new(f.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
+        "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
+    // Measured calibration — the slicer is blind to the true output, so
+    // these are pinned from a test, not derived (default 1.0 / conservative;
+    // nudge after a flow test or a pressure-advance tower). Density,
+    // flow-derate and the heat ceiling are material physics —
+    // class-derived, not knobs.
+    let flow = f.extrusion_multiplier;
+    hslider(ui, true, egui::Slider::new(&mut *flow, 0.8..=1.2), "flow ×",
+        "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a single-wall flow test.");
+    // Guided flow calibration: print a single-wall cube at the current
+    // settings, caliper a wall, enter it → pin flow × (the active tab's
+    // multiplier on a toolchanger).
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow test"))
+            .on_hover_text("Print a single-wall 20 mm cube at your current settings, then caliper a side wall's thickness — the ~line-width dimension, on a flat face mid-height, away from the seam (not the height or the 20 mm width) — and enter it below to pin flow ×. Clear the bed first.")
+            .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
+            .clicked()
+        {
+            *cal.start = true;
+        }
+        ui.add(
+            egui::DragValue::new(cal.measured_mm)
+                .speed(0.01)
+                .range(0.0..=2.0)
+                .fixed_decimals(2)
+                .suffix(" mm"),
+        )
+        .on_hover_text(format!("Wall *thickness* off the cube — a flat side, mid-height, away from the seam (not the height or the 20 mm width). Should read ≈{line_width_mm:.2} mm (your line width); thicker = over-extruding."));
+        if ui
+            .button("apply")
+            .on_hover_text("Pin flow × = current × line width ÷ measured wall thickness.")
+            .clicked()
+            && *cal.measured_mm > 0.0
+        {
+            let before = *flow;
+            *flow = engine::flow_from_wall(before, line_width_mm, *cal.measured_mm);
+            *cal.status = format!(
+                "flow × {before:.3} → {:.3} (wall {:.2} mm vs {:.2} target)",
+                *flow, *cal.measured_mm, line_width_mm
+            );
+        }
+    });
+    let mf_hint = format!(
+        "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
+        flow_ceiling_parts_text(*f.max_volumetric_speed_mm3_s, line_width_mm, layer_height_mm)
+    );
+    hslider(ui, true, egui::Slider::new(f.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
+        mf_hint);
+    hslider(ui, true, egui::Slider::new(f.pressure_advance, 0.0..=0.2), "pressure advance",
+        "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+    hslider(ui, true, egui::Slider::new(f.bridge_flow, 0.3..=2.0), "bridge flow",
+        "Extrusion multiplier for bridge strands and arc overhangs. <1 thins them so they pull taut over air; >1 fattens them to grip when cooling is poor.");
+    hslider(ui, true, egui::Slider::new(f.bridge_speed_mm_s, 5.0..=100.0), "bridge speed mm/s",
+        "Print speed for bridge strands. Slow lets each strand cool and set before the next is laid.");
+}
+
+/// The Cooling section rows — the same one-source treatment (see
+/// [`FilamentFields`]); aux/exhaust knobs appear only where the printer
+/// declares the hardware.
+fn cooling_rows(ui: &mut egui::Ui, f: FilamentFields<'_>, has_aux_fan: bool, has_exhaust_fan: bool) {
+    hslider(ui, true, egui::Slider::new(f.fan_speed, 0.0..=1.0), "fan",
+        "Part-cooling fan duty while printing. Auto: the class's policy.");
+    hslider(ui, true, egui::Slider::new(f.bridge_fan_speed, 0.0..=1.0), "bridge fan",
+        "Fan duty on bridges and arc overhangs.");
+    hslider(ui, true, egui::Slider::new(f.fan_off_layers, 0..=5), "fan off layers",
+        "Keep the fan off for this many first layers (bed adhesion).");
+    // Aux/exhaust duties appear only when the printer profile declares the
+    // hardware — no fan, no knob, no M106 emitted.
+    if has_aux_fan {
+        hslider(ui, true, egui::Slider::new(f.aux_fan_speed, 0.0..=1.0), "aux fan",
+            "Auxiliary part-cooling duty (M106 P2).");
+    }
+    if has_exhaust_fan {
+        hslider(ui, true, egui::Slider::new(f.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
+            "Chamber-exhaust duty (M106 P3), whole print.");
+    }
+}
+
+/// The tool-tab row atop the Filament card: one spool-colored dot per slot —
+/// ring = the active tab, small amber dot = unsaved (*) edits on that slot.
+/// Returns the active tab, clamped to the loaded slots.
+fn tool_tab_row(
+    ui: &mut egui::Ui,
+    active: &mut usize,
+    tools: &[config::ToolSettings],
+    dirty: &[bool],
+) -> usize {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, t) in tools.iter().enumerate() {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::click());
+            let c = rect.center();
+            ui.painter().circle_filled(c, 5.5, rgb32(t.color_rgb));
+            if *active == i {
+                ui.painter().circle_stroke(c, 8.0, egui::Stroke::new(1.5, palette::BLUSH));
+            } else if resp.hovered() {
+                ui.painter().circle_stroke(c, 8.0, egui::Stroke::new(1.0, palette::HAIRLINE_LOUD));
+            }
+            let is_dirty = dirty.get(i).copied().unwrap_or(false);
+            if is_dirty {
+                // The tier rows' * mark at dot scale: unsaved edits here.
+                ui.painter().circle_filled(c + egui::vec2(7.5, -7.0), 2.5, palette::WARN);
+            }
+            let hover = format!(
+                "T{i} — {}{}",
+                t.filament_name,
+                if is_dirty { " (unsaved * edits)" } else { "" }
+            );
+            if resp.on_hover_text(hover).clicked() {
+                *active = i;
+            }
+        }
+    });
+    *active = (*active).min(tools.len().saturating_sub(1));
+    *active
 }
 
 /// The default accent (brass): ONE hue drives every 3D-view color — the
@@ -395,12 +631,35 @@ fn tier_section(
     ui.add_space(2.0);
 }
 
-/// One object placed on the bed: shared mesh geometry plus an editable placement
-/// (Euler rotation, uniform scale, and a bed-plane position for the footprint
-/// center). The object always rests on z=0 — its baked transform drops it there.
-struct SceneObject {
+/// What paints a part: a plain tool slot, or a pseudo color from the blend
+/// palette (an index into `App::blends`), realized at slice time by layer
+/// dithering. Blend indices can dangle after a delete — every consumer reads
+/// them through `App::paint_display_rgb` / `App::paint_engine`, which fall
+/// back to neutral / tool 0.
+#[derive(Clone, Copy, PartialEq)]
+enum PartColor {
+    Tool(u32),
+    Blend(usize),
+}
+
+/// One leaf mesh of a scene object: on a toolchanger each part keeps its own
+/// paint (tool slot or blend); single-tool machines print everything on
+/// tool 0. Parts share the object's one placement — they move as a body.
+struct ScenePart {
     name: String,
     mesh: Arc<mesh::Mesh>,
+    /// The tool or blend that prints this part. Clamped to the machine's
+    /// tool count at bake time.
+    paint: PartColor,
+}
+
+/// One object placed on the bed: its parts (shared mesh geometry) plus an
+/// editable placement (Euler rotation, uniform scale, and a bed-plane position
+/// for the footprint center). The object always rests on z=0 — its baked
+/// transform drops it there.
+struct SceneObject {
+    name: String,
+    parts: Vec<ScenePart>,
     /// Euler rotation in degrees, applied X then Y then Z.
     rot_deg: [f64; 3],
     scale: f64,
@@ -410,14 +669,20 @@ struct SceneObject {
 
 impl SceneObject {
     fn new(name: String, mesh: mesh::Mesh) -> Self {
-        Self { name, mesh: Arc::new(mesh), rot_deg: [0.0; 3], scale: 1.0, pos: [0.0, 0.0] }
+        Self {
+            name,
+            parts: vec![ScenePart { name: String::new(), mesh: Arc::new(mesh), paint: PartColor::Tool(0) }],
+            rot_deg: [0.0; 3],
+            scale: 1.0,
+            pos: [0.0, 0.0],
+        }
     }
 
-    /// Footprint of the rotated+scaled mesh (no placement): (minx,miny,maxx,maxy,minz).
+    /// Footprint of the rotated+scaled parts (no placement): (minx,miny,maxx,maxy,minz).
     fn footprint(&self) -> (f64, f64, f64, f64, f64) {
         let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
         let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX);
-        for &v in &self.mesh.vertices {
+        for &v in self.parts.iter().flat_map(|p| &p.mesh.vertices) {
             let p = lin.apply_linear(v);
             b.0 = b.0.min(p[0]);
             b.1 = b.1.min(p[1]);
@@ -428,12 +693,12 @@ impl SceneObject {
         b
     }
 
-    /// Printed height (mm): the z-span of the rotated/scaled mesh. The object
+    /// Printed height (mm): the z-span of the rotated/scaled parts. The object
     /// rests on z=0 (its transform drops it there), so it occupies [0, h].
     fn height(&self) -> f64 {
         let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
         let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-        for &v in &self.mesh.vertices {
+        for &v in self.parts.iter().flat_map(|p| &p.mesh.vertices) {
             let z = lin.apply_linear(v)[2];
             lo = lo.min(z);
             hi = hi.max(z);
@@ -572,7 +837,8 @@ fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
 
 fn main() -> eframe::Result<()> {
     // Headless one-shot render (no window): `--render-layer N [--walls W]
-    // [--mode arachne|distributed|classic] [--out p.png] [--size WxH] file.stl`.
+    // [--out p.png] [--size WxH] model.stl|model.3mf` (a 3MF slices per part
+    // on the tools its extruder hints name — see offscreen.rs env knobs).
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--render-layer") {
         if let Err(e) = run_offscreen(&argv) {
@@ -616,13 +882,30 @@ fn main() -> eframe::Result<()> {
             .with_icon(icon),
         ..Default::default()
     };
-    eframe::run_native("Fable Slicer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    // An optional model path on the command line opens on startup (shell use,
+    // file associations, and scripted GUI checks).
+    let open_path = argv
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .map(std::path::PathBuf::from);
+    eframe::run_native(
+        "Fable Slicer",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(cc);
+            if let Some(p) = open_path {
+                app.import_model(p);
+            }
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 /// Parse the headless-render CLI and run it (see the `--render-layer` branch).
 fn run_offscreen(argv: &[String]) -> Result<(), String> {
     let mut a = offscreen::Args {
-        stl: std::path::PathBuf::new(),
+        model: std::path::PathBuf::new(),
         out: std::path::PathBuf::from("/tmp/offscreen.png"),
         layer: 1,
         walls: 99,
@@ -672,14 +955,14 @@ fn run_offscreen(argv: &[String]) -> Result<(), String> {
                 i += 2;
             }
             s if !s.starts_with("--") => {
-                a.stl = std::path::PathBuf::from(s);
+                a.model = std::path::PathBuf::from(s);
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    if a.stl.as_os_str().is_empty() {
-        return Err("no STL path given".into());
+    if a.model.as_os_str().is_empty() {
+        return Err("no model path given".into());
     }
     offscreen::run(&a)
 }
@@ -693,6 +976,11 @@ struct SliceSummary {
     secs: f64,
     filament_m: f64,
     grams: f64,
+    /// Per used tool: (tool, length_mm, grams). Rendered only on toolchangers.
+    per_tool: Vec<(u32, f64, f64)>,
+    /// Tool switches across consecutive printable paths over the whole print
+    /// (layer boundaries included) — exactly where the g-code swaps tools.
+    toolchanges: usize,
 }
 
 /// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
@@ -712,6 +1000,23 @@ struct App {
     profiles: Profiles,
     printer: String,
     filament: String,
+    /// Filament profile loaded in each tool slot (toolchangers). Slot 0 IS
+    /// `filament` — the tier row and the tools strip edit the same selection;
+    /// length always tracks `settings.tool_count` (see `sync_tool_slots`).
+    tools: Vec<String>,
+    /// Loaded-spool color per slot: an override of the slot filament's
+    /// profile color, remembered with the filament it was picked for — a slot
+    /// whose filament changes drops it (new spool, new color story).
+    tool_colors: Vec<Option<(String, [f32; 3])>>,
+    /// Per-slot hex-entry buffers ("#RRGGBB" typed off a spool label);
+    /// refreshed from the effective color whenever the field isn't focused.
+    tool_hex: Vec<String>,
+    /// The blend palette: pseudo colors dithered from the tool slots,
+    /// assignable to parts alongside the plain tools.
+    blends: Vec<config::BlendState>,
+    /// Which blend's inline weight editor is open in the panel (one at a
+    /// time — the 320 px panel can't afford stacked editors).
+    blend_edit: Option<usize>,
     process: String,
     /// Program state as last written to the dotfile folder — compared each
     /// frame, so every path that changes a selection persists it.
@@ -735,6 +1040,12 @@ struct App {
     /// A profile switch requested while settings carry unsaved (*) edits —
     /// held here until the user confirms discarding them.
     pending_switch: Option<(String, String, String)>,
+    /// A tool slot's filament switch requested while THAT slot carries
+    /// unsaved (*) edits — same confirm pattern, scoped to one slot.
+    pending_slot: Option<(usize, String)>,
+    /// The slot the Filament/Cooling cards edit on a toolchanger (the tab
+    /// row on the Filament card); clamped whenever the tool count changes.
+    active_tool_tab: usize,
     /// Auto/pinned state of the derivable settings.
     pins: Pins,
     objects: Vec<SceneObject>,
@@ -892,6 +1203,12 @@ impl App {
             pick(&state.filament, profiles.filament_names(), "pla"),
             pick(&state.process, profiles.process_names(), "standard"),
         );
+        // Tool slots restore per-slot (a vanished profile falls back alone).
+        let mut tools: Vec<String> = state
+            .tool_filaments()
+            .iter()
+            .map(|t| pick(t, profiles.filament_names(), "pla"))
+            .collect();
         let mut settings = match profiles.resolve(&printer, &filament, &process) {
             Ok(s) => s,
             Err(_) => {
@@ -900,6 +1217,20 @@ impl App {
                 profiles.resolve(&printer, &filament, &process).unwrap_or_default()
             }
         };
+        // The slot list tracks the machine's tool count (slot 0 IS the
+        // filament tier); a toolchanger re-resolves through every slot so
+        // cross-tool facts (bed temp, flow ceiling, per-slot colors) are real.
+        tools.truncate(settings.tool_count.max(1));
+        while tools.len() < settings.tool_count.max(1) {
+            tools.push(filament.clone());
+        }
+        tools[0] = filament.clone();
+        if settings.tool_count > 1 {
+            let names: Vec<&str> = tools.iter().map(String::as_str).collect();
+            if let Ok(s) = profiles.resolve_tools(&printer, &names, &process) {
+                settings = s;
+            }
+        }
         settings.auto_center_on_bed = false; // objects are placed explicitly on the bed
         let baseline = settings.clone();
         let pins = match (
@@ -915,10 +1246,28 @@ impl App {
             _ => Pins::default(),
         };
         let last_bed = (settings.bed_size_x_mm, settings.bed_size_y_mm);
-        Self {
+        // Loaded-spool colors ride with the slot list they were saved beside;
+        // apply_tool_colors below lays them over the resolved tool table.
+        let tool_colors: Vec<Option<(String, [f32; 3])>> = tools
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                state
+                    .tool_colors
+                    .get(i)
+                    .and_then(|h| config::parse_hex_color(h))
+                    .map(|c| (name.clone(), c))
+            })
+            .collect();
+        let mut app = Self {
             profiles,
             printer,
             filament,
+            tools,
+            tool_colors,
+            tool_hex: Vec::new(),
+            blends: state.blends.clone(),
+            blend_edit: None,
             process,
             // Seed with the file's content as-loaded: if the fallbacks above
             // corrected anything, the first persist pass rewrites the file.
@@ -938,6 +1287,8 @@ impl App {
             start_flow_cal: false,
             flow_cal_mm: 0.0,
             pending_switch: None,
+            pending_slot: None,
+            active_tool_tab: 0,
             pins,
             objects: Vec::new(),
             selected: None,
@@ -981,7 +1332,9 @@ impl App {
             msgs_overlay_rect: None,
             msgs_dismissed: None,
             slice_gen: 0,
-        }
+        };
+        app.apply_tool_colors();
+        app
     }
 
     /// Index of the object whose surface the ray (world origin/dir) first hits.
@@ -993,11 +1346,13 @@ impl App {
                 let q = t.apply(p);
                 glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
             };
-            for k in 0..obj.mesh.triangles.len() {
-                let tri = obj.mesh.triangle(k);
-                if let Some(dist) = ray_triangle(o, d, v(tri[0]), v(tri[1]), v(tri[2])) {
-                    if best.map_or(true, |(bd, _)| dist < bd) {
-                        best = Some((dist, i));
+            for part in &obj.parts {
+                for k in 0..part.mesh.triangles.len() {
+                    let tri = part.mesh.triangle(k);
+                    if let Some(dist) = ray_triangle(o, d, v(tri[0]), v(tri[1]), v(tri[2])) {
+                        if best.map_or(true, |(bd, _)| dist < bd) {
+                            best = Some((dist, i));
+                        }
                     }
                 }
             }
@@ -1038,9 +1393,20 @@ impl App {
     }
 
     fn reresolve(&mut self) {
-        if let Ok(s) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
-            self.settings = s;
+        // The flat resolve reads the machine's tool count (a printer-tier
+        // fact), the slot list syncs to it, then a toolchanger re-resolves
+        // through every loaded slot so the cross-tool facts (shared bed temp,
+        // the binding flow ceiling, per-slot colors) are real.
+        if let Ok(flat) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
+            self.sync_tool_slots(flat.tool_count);
+            self.settings = if flat.tool_count > 1 {
+                let names: Vec<&str> = self.tools.iter().map(String::as_str).collect();
+                self.profiles.resolve_tools(&self.printer, &names, &self.process).unwrap_or(flat)
+            } else {
+                flat
+            };
             self.settings.auto_center_on_bed = false;
+            self.apply_tool_colors();
             self.baseline = self.settings.clone();
             self.sliced = None;
             self.slice_summary = None;
@@ -1049,6 +1415,68 @@ impl App {
             self.refit_camera = true;
         }
         self.refresh_pins();
+    }
+
+    /// Keep the slot list in step with the machine: `count` entries, slot 0
+    /// mirroring the filament tier, new slots opening with the same spool.
+    fn sync_tool_slots(&mut self, count: usize) {
+        let n = count.max(1);
+        self.tools.truncate(n);
+        while self.tools.len() < n {
+            self.tools.push(self.filament.clone());
+        }
+        self.tools[0] = self.filament.clone();
+        self.active_tool_tab = self.active_tool_tab.min(n - 1);
+        if n == 1 && self.color_by == ColorBy::Filament {
+            self.color_by = ColorBy::Feature; // the mode only exists on a toolchanger
+        }
+    }
+
+    /// Re-resolve just the per-slot `ToolSettings` (colors, temps, names)
+    /// after the slot list or the tool count changed — unlike `reresolve`,
+    /// panel edits outside the tool table are kept.
+    fn resync_tools(&mut self) {
+        self.sync_tool_slots(self.settings.tool_count);
+        // A slot naming a vanished profile (deleted user filament) falls back
+        // to the tier selection instead of erroring the whole resolve.
+        for t in &mut self.tools[1..] {
+            if !self.profiles.filament_names().contains(&t.as_str()) {
+                *t = self.filament.clone();
+            }
+        }
+        let names: Vec<&str> = self.tools.iter().map(String::as_str).collect();
+        let resolved = match self.profiles.resolve_tools(&self.printer, &names, &self.process) {
+            Ok(s) => s.tools,
+            Err(_) => self.tools.iter().map(|n| self.settings.flat_tool(n.clone())).collect(),
+        };
+        if self.settings.tool_count > 1 {
+            // The tabs edit `settings.tools` directly, so a resync must not
+            // wipe unsaved (*) edits on slots it didn't move: a slot whose
+            // fresh resolve matches its baseline keeps the edited view, one
+            // whose profile changed (slot switch, save, delete fallback)
+            // snaps to the fresh resolve. The baseline follows the SAME
+            // resolve, so a bare slot switch never reads as dirty.
+            let mut tools = resolved.clone();
+            for (i, t) in tools.iter_mut().enumerate() {
+                let unmoved = self.baseline.tools.get(i).is_some_and(|b| {
+                    b.filament_name == t.filament_name
+                        && FilamentProfile::diff_tool(b, t).is_empty()
+                });
+                if unmoved {
+                    if let Some(edited) = self.settings.tools.get(i) {
+                        *t = edited.clone();
+                    }
+                }
+            }
+            self.settings.tools = tools;
+            self.baseline.tools = resolved;
+        } else {
+            self.settings.tools = resolved;
+            // Slot 0 mirrors the flat filament fields — unsaved edits included.
+            let t0 = self.settings.flat_tool(self.filament.clone());
+            self.settings.tools[0] = t0;
+        }
+        self.apply_tool_colors();
     }
 
     /// Pin state comes from the selected profiles: a field the profile chain
@@ -1080,6 +1508,12 @@ impl App {
         }
         s.first_layer_nozzle_temp_c =
             config::derived_first_layer_temp_c(s.nozzle_temp_c, s.material);
+        // Per-tool the same derivation: the tabs edit each slot's operating
+        // temperature, and its first-layer temp follows (never a slider).
+        for t in &mut s.tools {
+            t.first_layer_nozzle_temp_c =
+                config::derived_first_layer_temp_c(t.nozzle_temp_c, t.material);
+        }
         s.print_speed_mm_s = config::derived_print_speed_mm_s(s.machine_speed_mm_s, s.speed_quality);
         let cap = config::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
         s.external_perimeter_speed_mm_s =
@@ -1105,19 +1539,45 @@ impl App {
         }
     }
 
+    /// Does slot `i` carry unsaved per-tool edits? (Toolchanger tabs edit
+    /// `settings.tools[i]`; the diff excludes spool color and the derived
+    /// first-layer temperature by construction.)
+    fn tool_dirty(&self, i: usize) -> bool {
+        match (self.settings.tools.get(i), self.baseline.tools.get(i)) {
+            (Some(cur), Some(base)) => !FilamentProfile::diff_tool(cur, base).is_empty(),
+            _ => false,
+        }
+    }
+
     /// Per-tier dirty flags vs. the baseline, ignoring unpinned auto fields.
+    /// On a toolchanger the filament entry is any slot's per-tool dirt — the
+    /// flat fields are only the tool-0 mirror there, not an edit surface.
     fn tier_dirty_masked(&self) -> [bool; 3] {
         let mut pr = PrinterProfile::diff(&self.settings, &self.baseline);
         self.mask_auto_printer(&mut pr);
-        let fl = FilamentProfile::diff(&self.settings, &self.baseline);
+        let fl_dirty = if self.settings.tool_count > 1 {
+            (0..self.settings.tools.len()).any(|i| self.tool_dirty(i))
+        } else {
+            !FilamentProfile::diff(&self.settings, &self.baseline).is_empty()
+        };
         let pc = ProcessProfile::diff(&self.settings, &self.baseline);
-        [!pr.is_empty(), !fl.is_empty(), !pc.is_empty()]
+        [!pr.is_empty(), fl_dirty, !pc.is_empty()]
     }
 
     /// Re-resolve only the dirty baseline (after a save) — keeps the user's
     /// current panel edits in other tiers intact.
     fn refresh_baseline(&mut self) {
-        if let Ok(mut b) = self.profiles.resolve(&self.printer, &self.filament, &self.process) {
+        // Freshen the slot table first (a filament save may have renamed the
+        // tier selection — slot 0 must follow).
+        self.resync_tools();
+        let names: Vec<String> = self.tools.clone();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let b = if refs.len() > 1 {
+            self.profiles.resolve_tools(&self.printer, &refs, &self.process)
+        } else {
+            self.profiles.resolve(&self.printer, &self.filament, &self.process)
+        };
+        if let Ok(mut b) = b {
             b.auto_center_on_bed = false;
             self.baseline = b;
         }
@@ -1190,6 +1650,10 @@ impl App {
                 TierKind::Process => "standard".to_string(),
             };
             self.refresh_baseline();
+        } else if kind == TierKind::Filament {
+            // A non-selected filament may still be loaded in a tool slot —
+            // those fall back to the tier selection.
+            self.resync_tools();
         }
         Ok(())
     }
@@ -1211,11 +1675,13 @@ impl App {
                 }
                 Ok(items) => {
                     let n = items.len();
-                    let tris: usize = items.iter().map(|it| it.mesh.triangles.len()).sum();
+                    let tris: usize =
+                        items.iter().flat_map(|it| &it.parts).map(|p| p.mesh.triangles.len()).sum();
                     // Imports land on a fresh bed; existing beds are never
                     // disturbed.
                     let dest = self.first_empty_bed();
                     let first_new = self.objects.len();
+                    let tool_cap = self.settings.tool_count.saturating_sub(1) as u32;
                     for (k, it) in items.into_iter().enumerate() {
                         let name = if !it.name.is_empty() {
                             it.name
@@ -1224,7 +1690,23 @@ impl App {
                         } else {
                             format!("{file} #{}", k + 1)
                         };
-                        let mut obj = SceneObject::new(name, it.mesh);
+                        // Parts keep their identity — and their extruder hint
+                        // (1-based) becomes the tool slot, clamped to what
+                        // this machine has.
+                        let parts: Vec<ScenePart> = it
+                            .parts
+                            .into_iter()
+                            .enumerate()
+                            .map(|(j, p)| ScenePart {
+                                name: if p.name.is_empty() { format!("part {}", j + 1) } else { p.name },
+                                paint: PartColor::Tool(
+                                    p.extruder.map(|e| e.saturating_sub(1)).unwrap_or(0).min(tool_cap),
+                                ),
+                                mesh: Arc::new(p.mesh),
+                            })
+                            .collect();
+                        let mut obj =
+                            SceneObject { name, parts, rot_deg: [0.0; 3], scale: 1.0, pos: [0.0, 0.0] };
                         // pos = the baked footprint center reproduces the
                         // file's build placement (SceneObject::transform
                         // recenters the footprint on pos).
@@ -1299,7 +1781,11 @@ impl App {
         }
         let copy = SceneObject {
             name: format!("{} copy", src.name),
-            mesh: Arc::clone(&src.mesh),
+            parts: src
+                .parts
+                .iter()
+                .map(|p| ScenePart { name: p.name.clone(), mesh: Arc::clone(&p.mesh), paint: p.paint })
+                .collect(),
             rot_deg: src.rot_deg,
             scale: src.scale,
             pos,
@@ -1459,43 +1945,250 @@ impl App {
         }
     }
 
-    /// Bake the ACTIVE bed's objects into one mesh, in that bed's local
-    /// coordinates (the engine plans in [0, bed] space).
-    fn combined_mesh(&self) -> Option<mesh::Mesh> {
+    /// The blend's weights that name a slot this machine actually has, with
+    /// zero/negative shares dropped. Empty = the blend references only
+    /// missing tools (shrunk `tool_count`) and reads as neutral/tool 0.
+    fn valid_weights(&self, blend: &config::BlendState) -> Vec<(u32, f32)> {
+        blend
+            .weights
+            .iter()
+            .filter(|&&(t, w)| (t as usize) < self.settings.tool_count && w > 0.0)
+            .copied()
+            .collect()
+    }
+
+    /// The blend's dither repeat (mm) at the CURRENT layer height, when it
+    /// overflows the blend band — the loud signal that the layers grew (or
+    /// the band shrank) under an existing mix. Weights never rewrite
+    /// themselves; the consequence surfaces here. None = fuses fine.
+    fn blend_banding_mm(&self, blend: &config::BlendState) -> Option<f64> {
+        let valid = self.valid_weights(blend);
+        let period = config::blend_repeat_layers(&valid) as f64;
+        let h = period * self.settings.layer_height_mm;
+        (h > self.settings.blend_band_mm + 1e-6).then_some(h)
+    }
+
+    /// What a paint looks like: the tool slot's spool color, or the blend's
+    /// linear-light mix over its valid weights (`mix_colors_linear` — what
+    /// the interleaved layers read as at viewing distance). A blend with no
+    /// valid weights, or a dangling index, reads the neutral grey.
+    fn paint_display_rgb(&self, paint: PartColor) -> [f32; 3] {
+        match paint {
+            PartColor::Tool(t) => self.settings.tool(t as usize).color_rgb,
+            PartColor::Blend(b) => match self.blends.get(b) {
+                Some(blend) => {
+                    let entries: Vec<([f32; 3], f32)> = self
+                        .valid_weights(blend)
+                        .into_iter()
+                        .map(|(t, w)| (self.settings.tool(t as usize).color_rgb, w))
+                        .collect();
+                    if entries.is_empty() {
+                        config::NEUTRAL_FILAMENT_RGB
+                    } else {
+                        config::mix_colors_linear(&entries)
+                    }
+                }
+                None => config::NEUTRAL_FILAMENT_RGB,
+            },
+        }
+    }
+
+    /// What a paint prints as: the tool clamped to the machine's slots, or
+    /// the blend's valid weights for the engine's layer dither. A blend with
+    /// nothing valid degrades to tool 0.
+    fn paint_engine(&self, paint: PartColor) -> engine::PartPaint {
+        let cap = self.settings.tool_count.saturating_sub(1) as u32;
+        match paint {
+            PartColor::Tool(t) => engine::PartPaint::Tool(t.min(cap)),
+            PartColor::Blend(b) => {
+                let weights: Vec<(u32, f64)> = self
+                    .blends
+                    .get(b)
+                    .map(|blend| {
+                        self.valid_weights(blend).into_iter().map(|(t, w)| (t, w as f64)).collect()
+                    })
+                    .unwrap_or_default();
+                if weights.is_empty() {
+                    engine::PartPaint::Tool(0)
+                } else {
+                    engine::PartPaint::Blend(weights)
+                }
+            }
+        }
+    }
+
+    /// Bake the ACTIVE bed's parts into placed meshes, each paired with its
+    /// paint, in that bed's local coordinates (the engine plans in [0, bed]
+    /// space). Tools and blend weights clamp to the machine's slot count
+    /// here (see `paint_engine`).
+    fn baked_parts(&self) -> Vec<(mesh::Mesh, engine::PartPaint)> {
         let ox = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
-        let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+        let mut out: Vec<(mesh::Mesh, engine::PartPaint)> = Vec::new();
         for obj in self.objects.iter().filter(|o| self.bed_of(o) == self.active_bed) {
             let mut t = obj.transform();
             t.translation[0] -= ox;
-            for i in 0..obj.mesh.triangles.len() {
-                let tri = obj.mesh.triangle(i);
-                tris.push([t.apply(tri[0]), t.apply(tri[1]), t.apply(tri[2])]);
+            for part in &obj.parts {
+                let mut tris: Vec<[[f64; 3]; 3]> = Vec::with_capacity(part.mesh.triangles.len());
+                for i in 0..part.mesh.triangles.len() {
+                    let tri = part.mesh.triangle(i);
+                    tris.push([t.apply(tri[0]), t.apply(tri[1]), t.apply(tri[2])]);
+                }
+                if !tris.is_empty() {
+                    out.push((mesh::Mesh::from_triangle_soup(&tris), self.paint_engine(part.paint)));
+                }
             }
         }
-        if tris.is_empty() {
-            return None;
+        out
+    }
+
+    /// Slot 0 IS the flat filament view. Single-tool, the flat fields are
+    /// the edit surface — copy them into the tool table before anything
+    /// consumes `settings.tools`. On a toolchanger the arrow REVERSES: the
+    /// per-tool tabs edit `settings.tools`, the flat fields are only the
+    /// estimate/summary mirror, and copying flat over tools[0] here would
+    /// erase T0's tab edits. Bed and chamber stay the shared-hardware
+    /// aggregates (hottest tool wins), exactly as `resolve_tools` builds
+    /// them — the emitter reads the flat values for both.
+    fn refresh_tool0(&mut self) {
+        let s = &mut self.settings;
+        if s.tool_count > 1 {
+            let Some(t0) = s.tools.first().cloned() else { return };
+            let bed = s.tools.iter().map(|t| t.bed_temp_c).max().unwrap_or(t0.bed_temp_c);
+            let chamber =
+                s.tools.iter().map(|t| t.chamber_temp_c).max().unwrap_or(t0.chamber_temp_c);
+            s.filament_color_rgb = t0.color_rgb;
+            s.material = t0.material;
+            s.filament_diameter_mm = t0.filament_diameter_mm;
+            s.filament_density_g_cm3 = t0.filament_density_g_cm3;
+            s.nozzle_temp_c = t0.nozzle_temp_c;
+            s.first_layer_nozzle_temp_c = t0.first_layer_nozzle_temp_c;
+            s.max_volumetric_speed_mm3_s = t0.max_volumetric_speed_mm3_s;
+            s.max_flow_derate_per_c = t0.max_flow_derate_per_c;
+            s.extrusion_multiplier = t0.extrusion_multiplier;
+            s.pressure_advance = t0.pressure_advance;
+            s.bridge_flow = t0.bridge_flow;
+            s.bridge_speed_mm_s = t0.bridge_speed_mm_s;
+            s.fan_speed = t0.fan_speed;
+            s.bridge_fan_speed = t0.bridge_fan_speed;
+            s.fan_off_layers = t0.fan_off_layers;
+            s.aux_fan_speed = t0.aux_fan_speed;
+            s.exhaust_fan_speed = t0.exhaust_fan_speed;
+            s.standby_temp_c = t0.standby_temp_c;
+            s.bed_temp_c = bed;
+            s.chamber_temp_c = chamber;
+        } else {
+            let t0 = s.flat_tool(self.filament.clone());
+            if let Some(slot) = s.tools.first_mut() {
+                *slot = t0;
+            }
         }
-        Some(mesh::Mesh::from_triangle_soup(&tris))
+    }
+
+    /// Load a different filament into slot `i` (any dirty-slot confirm has
+    /// already happened). Slot 0 also moves the tier selection — the
+    /// `filament ≡ tools[0]` invariant feeds resolve and persistence.
+    fn apply_slot_switch(&mut self, i: usize, name: String) {
+        if i == 0 {
+            self.filament = name;
+        } else if let Some(t) = self.tools.get_mut(i) {
+            *t = name;
+        }
+        self.resync_tools();
+        // The plan carries per-path tools and temps — stale.
+        // (scene_dirty minus its camera/bounds side: the rebuild refreshes
+        // tints and bumps content_version.)
+        self.sliced = None;
+        self.slice_summary = None;
+        self.view_preview = false;
+        self.needs_rebuild = true;
+    }
+
+    /// Save slot `slot`'s per-tool diff as the user filament profile `name` —
+    /// the tab counterpart of `save_profile`, same overwrite/inherit
+    /// semantics against the slot's own profile instead of the tier row's.
+    fn save_tool_profile(&mut self, slot: usize, name: &str) -> Result<(), String> {
+        let mut diff = match (self.settings.tools.get(slot), self.baseline.tools.get(slot)) {
+            (Some(cur), Some(base)) => FilamentProfile::diff_tool(cur, base),
+            _ => return Err(format!("no tool slot {slot}")),
+        };
+        let slot_profile =
+            self.tools.get(slot).cloned().unwrap_or_else(|| self.filament.clone());
+        if name == slot_profile && self.profiles.is_user(TierKind::Filament, name) {
+            let existing = self.profiles.get_filament(name).cloned().unwrap_or_default();
+            let parent = existing.parent().map(str::to_string);
+            diff = diff.over(existing);
+            diff.inherits = parent;
+        } else {
+            diff.inherits = Some(slot_profile);
+        }
+        self.profiles.save_user_filament(name, diff)?;
+        if let Some(t) = self.tools.get_mut(slot) {
+            *t = name.to_string();
+        }
+        if slot == 0 {
+            self.filament = name.to_string();
+        }
+        self.refresh_baseline();
+        Ok(())
+    }
+
+    /// Lay the loaded-spool colors over the resolved tool table. An override
+    /// remembered for a different filament than the slot now holds is
+    /// dropped — the profile's own color takes over. Slot 0 also writes the
+    /// flat color, so `refresh_tool0`'s snapshot carries it.
+    fn apply_tool_colors(&mut self) {
+        self.tool_colors.resize(self.settings.tool_count.max(1), None);
+        for i in 0..self.settings.tools.len() {
+            let slot_name =
+                if i == 0 { &self.filament } else { self.tools.get(i).unwrap_or(&self.filament) };
+            match &self.tool_colors[i] {
+                Some((name, c)) if name == slot_name => {
+                    self.settings.tools[i].color_rgb = *c;
+                    if i == 0 {
+                        self.settings.filament_color_rgb = *c;
+                    }
+                }
+                Some(_) => self.tool_colors[i] = None,
+                None => {}
+            }
+        }
     }
 
     fn slice(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        let Some(m) = self.combined_mesh() else {
+        self.refresh_tool0();
+        let parts = self.baked_parts();
+        if parts.is_empty() {
             return;
-        };
+        }
         // A re-slice keeps the layer the user was viewing (clamped below); only the
         // first slice of a fresh model jumps the slider to the top.
         let resliced = self.sliced.is_some();
-        let layers = generate(&m, &self.settings);
+        let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
+            parts.iter().map(|(m, paint)| (m, paint.clone())).collect();
+        let layers = engine::generate_painted(&refs, &self.settings);
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
         let secs = engine::estimate_seconds(&layers, &self.settings);
         let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
+        let per_tool = engine::estimate_filament_per_tool(&layers, &self.settings);
+        // Tool switches: transitions between consecutive printable paths,
+        // across layer boundaries too (where the g-code swaps tools).
+        let mut toolchanges = 0usize;
+        let mut last_tool: Option<u32> = None;
+        for path in layers.iter().flat_map(|l| &l.paths).filter(|p| p.points.len() >= 2) {
+            if last_tool.is_some_and(|t| t != path.tool) {
+                toolchanges += 1;
+            }
+            last_tool = Some(path.tool);
+        }
         self.slice_summary = Some(SliceSummary {
             layers: n,
             toolpaths: paths,
             secs,
             filament_m: fil_mm / 1000.0,
             grams,
+            per_tool,
+            toolchanges,
         });
         self.status.clear();
         self.slice_gen += 1;
@@ -1534,32 +2227,49 @@ impl App {
         self.joint_layer_ends = joint_ends;
     }
 
-    /// The active metric mapped to ramp colors, per path — or None in feature
-    /// mode (`build_instances` then colors by path kind). Layer time is one
-    /// color per layer broadcast to its paths; heat load is also scored per
-    /// layer (its joules over the layer's print time and footprint).
+    /// The active metric mapped to per-path colors — or None in feature mode
+    /// (`build_instances` then colors by path kind). Layer time is one ramp
+    /// color per layer broadcast to its paths; filament is each path's
+    /// printing tool wearing its slot's color.
     fn layer_color_table(&self) -> Option<Vec<Vec<[f32; 3]>>> {
-        if self.color_by == ColorBy::Feature || self.layer_stats.is_empty() {
-            return None;
-        }
         let layers = self.sliced.as_ref()?;
-        let acc = accent_hsl(self.accent);
-        // Only LayerTime reaches here (Feature returned above).
-        let logs: Vec<f64> = self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
-        let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
-        let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let span = (hi - lo).max(1e-12);
-        Some(
-            layers
-                .iter()
-                .zip(&logs)
-                .map(|(layer, &l)| {
-                    // Inverted: short layers = least cooling = the hot end.
-                    let u = 1.0 - ((l - lo) / span) as f32;
-                    vec![heat_ramp(u, acc); layer.paths.len()]
-                })
-                .collect(),
-        )
+        match self.color_by {
+            ColorBy::Feature => None,
+            ColorBy::Filament => Some(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .paths
+                            .iter()
+                            .map(|p| self.settings.tool(p.tool as usize).color_rgb)
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            ColorBy::LayerTime => {
+                if self.layer_stats.is_empty() {
+                    return None;
+                }
+                let acc = accent_hsl(self.accent);
+                let logs: Vec<f64> =
+                    self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
+                let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
+                let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let span = (hi - lo).max(1e-12);
+                Some(
+                    layers
+                        .iter()
+                        .zip(&logs)
+                        .map(|(layer, &l)| {
+                            // Inverted: short layers = least cooling = the hot end.
+                            let u = 1.0 - ((l - lo) / span) as f32;
+                            vec![heat_ramp(u, acc); layer.paths.len()]
+                        })
+                        .collect(),
+                )
+            }
+        }
     }
 
     /// The one-line status plus the last slice's summary — the body of the
@@ -1578,10 +2288,59 @@ impl App {
                 sum.grams
             ))
             .on_hover_text("Estimated print time and filament length / weight.");
+            // Toolchanger breakdown: each used slot's share, and how many
+            // swaps the print costs.
+            if self.settings.tool_count > 1 && !sum.per_tool.is_empty() {
+                for &(t, mm, g) in &sum.per_tool {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            dot.center(),
+                            5.0,
+                            rgb32(self.settings.tool(t as usize).color_rgb),
+                        );
+                        ui.label(format!("T{t} {:.1} m ({g:.0} g)", mm / 1000.0)).on_hover_text(
+                            format!(
+                                "Filament this print draws from slot {t} ({}).",
+                                self.settings.tool(t as usize).filament_name
+                            ),
+                        );
+                    });
+                }
+                ui.label(format!("{} toolchanges", sum.toolchanges)).on_hover_text(
+                    "Tool swaps over the whole print — each costs the per-change time \
+                     under Machine & motion.",
+                );
+                // Painted blends whose repeat outgrew the band (a layer-height
+                // change after picking): the print will stripe — say so here,
+                // where the person deciding to Send is looking.
+                let mut warned: Vec<usize> = Vec::new();
+                for part in self.objects.iter().flat_map(|o| &o.parts) {
+                    if let PartColor::Blend(b) = part.paint {
+                        if !warned.contains(&b) && b < self.blends.len() {
+                            if let Some(mm) = self.blend_banding_mm(&self.blends[b]) {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xC8, 0x8A, 0x4B),
+                                    format!(
+                                        "\"{}\" repeats every {mm:.1} mm — bands will show \
+                                         (blend band {:.1} mm)",
+                                        elide(&self.blends[b].name, 18),
+                                        self.settings.blend_band_mm,
+                                    ),
+                                );
+                                warned.push(b);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     fn export(&mut self) {
+        self.refresh_tool0();
         let Some(layers) = self.sliced.as_ref() else { return };
         let mut dialog = rfd::FileDialog::new()
             .add_filter("g-code", &["gcode"])
@@ -1607,6 +2366,19 @@ impl App {
             printer: self.printer.clone(),
             filament: self.filament.clone(),
             process: self.process.clone(),
+            tools: self.tools.clone(),
+            // A slot's color entry only survives while the override still
+            // names its loaded filament; anything else writes empty.
+            tool_colors: (0..self.tools.len())
+                .map(|i| {
+                    let slot = if i == 0 { &self.filament } else { &self.tools[i] };
+                    match self.tool_colors.get(i) {
+                        Some(Some((name, c))) if name == slot => config::hex_color(*c),
+                        _ => String::new(),
+                    }
+                })
+                .collect(),
+            blends: self.blends.clone(),
             last_model_dir: self.last_model_dir.clone(),
             last_export_dir: self.last_export_dir.clone(),
             accent: Some(accent_to_hex(self.accent)),
@@ -1690,14 +2462,22 @@ impl App {
             .collect();
 
         // The selected object is flagged for highlight; unprintable objects
-        // (off the bed or overlapping, any bed) get the warning tint.
+        // (off the bed or overlapping, any bed) get the warning tint. One
+        // upload entry PER PART: on a toolchanger each part wears its paint's
+        // display color (slot color, or a blend's MIX — the preview shows the
+        // dithered truth); single-tool keeps the accent-porcelain tint exactly
+        // as before.
         let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
-        let objs: Vec<(&mesh::Mesh, mesh::Transform, bool, bool)> = self
-            .objects
-            .iter()
-            .enumerate()
-            .map(|(i, o)| (o.mesh.as_ref(), o.transform(), self.selected == Some(i), blocked[i]))
-            .collect();
+        let multi = self.settings.tool_count > 1;
+        let (unsel_tint, _) = mesh_tints(self.accent);
+        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)> = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            let t = o.transform();
+            for part in &o.parts {
+                let rgb = if multi { self.paint_display_rgb(part.paint) } else { unsel_tint };
+                objs.push((part.mesh.as_ref(), t, rgb, self.selected == Some(i), blocked[i]));
+            }
+        }
         let bounds = self.scene.set_mesh(&rs.device, &objs);
         // Only re-frame on scene changes (import/duplicate/delete/arrange/profile),
         // not when the user merely selects an object.
@@ -1870,6 +2650,19 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
 
+        // Multi-tool edits requested inside the panel closure (which borrows
+        // settings mutably); handled after it returns.
+        let mut tool_count_changed = false;
+        let mut filament_color_changed = false;
+        // Parts on the active bed — the engine ignores spiral vase for
+        // multi-part plates, and the vase toggle mirrors that lockout.
+        let active_bed_parts: usize = self
+            .objects
+            .iter()
+            .filter(|o| self.bed_of(o) == self.active_bed)
+            .map(|o| o.parts.len())
+            .sum();
+
         // label + auto badge ≈ 287). Content wider than the panel doesn't just
         // clip: egui reserves the overflowed width, pushing the central panel
         // right and leaving an unpainted band between the two (egui #4475) —
@@ -2006,6 +2799,596 @@ impl eframe::App for App {
 
             ui.separator();
 
+            // Tool slots — one row per toolchanger slot: swatch, slot number,
+            // loaded filament. Slot 0 IS the Filament tier row below; editing
+            // either edits the same selection, through the same unsaved-edits
+            // guard. Hidden on single-tool machines.
+            if self.settings.tool_count > 1 {
+                let filaments: Vec<String> =
+                    self.profiles.filament_names().iter().map(|s| s.to_string()).collect();
+                let mut slot_pick: Option<(usize, String)> = None;
+                let mut color_pick: Option<(usize, [f32; 3])> = None;
+                self.tool_hex.resize(self.settings.tool_count, String::new());
+                for i in 0..self.settings.tool_count {
+                    ui.horizontal(|ui| {
+                        ui.scope(|ui| {
+                            ui.set_width(78.0);
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            // The loaded spool's color — editable per slot,
+                            // overriding the filament profile's default.
+                            let c = self.settings.tool(i).color_rgb;
+                            let mut rgb8 = [
+                                (c[0] * 255.0).round() as u8,
+                                (c[1] * 255.0).round() as u8,
+                                (c[2] * 255.0).round() as u8,
+                            ];
+                            if ui
+                                .color_edit_button_srgb(&mut rgb8)
+                                .on_hover_text(
+                                    "The color of the spool loaded in this slot — tints its \
+                                     parts, blends, and the filament preview. Overrides the \
+                                     filament profile's color; changing the slot's filament \
+                                     returns to the profile's own.",
+                                )
+                                .changed()
+                            {
+                                color_pick = Some((
+                                    i,
+                                    [
+                                        rgb8[0] as f32 / 255.0,
+                                        rgb8[1] as f32 / 255.0,
+                                        rgb8[2] as f32 / 255.0,
+                                    ],
+                                ));
+                            }
+                            ui.label(format!("T{i}")).on_hover_text(
+                                "The filament loaded in this tool slot — its values are \
+                                 edited on the Filament card's matching tab below.",
+                            );
+                        });
+                        let mut sel =
+                            self.tools.get(i).cloned().unwrap_or_else(|| self.filament.clone());
+                        egui::ComboBox::from_id_salt(("tool_slot", i))
+                            .width(136.0)
+                            .selected_text(sel.clone())
+                            .show_ui(ui, |ui| {
+                                for opt in &filaments {
+                                    if ui.selectable_value(&mut sel, opt.clone(), opt).changed() {
+                                        slot_pick = Some((i, sel.clone()));
+                                    }
+                                }
+                            });
+                        // The spool label's code, typed straight in: applies
+                        // on enter/blur; the field snaps back to the current
+                        // color whenever it isn't being edited.
+                        let cur_hex = config::hex_color(self.settings.tool(i).color_rgb);
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.tool_hex[i])
+                                .desired_width(56.0)
+                                .hint_text("#RRGGBB"),
+                        );
+                        if field.lost_focus() {
+                            if let Some(c) = config::parse_hex_color(&self.tool_hex[i]) {
+                                color_pick = Some((i, c));
+                            }
+                        }
+                        if !field.has_focus() {
+                            self.tool_hex[i] = cur_hex;
+                        }
+                        field.on_hover_text(
+                            "Type the spool's color code from its label (#RRGGBB or \
+                             #RGB) and press enter.",
+                        );
+                    });
+                }
+                if let Some((i, c)) = color_pick {
+                    let slot_name =
+                        if i == 0 { self.filament.clone() } else { self.tools[i].clone() };
+                    self.tool_colors.resize(self.settings.tool_count.max(1), None);
+                    self.tool_colors[i] = Some((slot_name, c));
+                    if let Some(t) = self.settings.tools.get_mut(i) {
+                        t.color_rgb = c;
+                    }
+                    if i == 0 {
+                        self.settings.filament_color_rgb = c;
+                    }
+                    filament_color_changed = true;
+                }
+                if let Some((i, name)) = slot_pick {
+                    let cur = if i == 0 { &self.filament } else { &self.tools[i] };
+                    if name != *cur {
+                        if self.tool_dirty(i) {
+                            // The slot carries unsaved (*) tab edits —
+                            // switching re-reads it from disk, so park the
+                            // pick behind the per-slot confirm.
+                            self.pending_slot = Some((i, name));
+                        } else {
+                            self.apply_slot_switch(i, name);
+                        }
+                    }
+                }
+
+                // The blend palette: named pseudo colors mixed from the slots
+                // above, realized at slice time by alternating whole layers
+                // (engine PartPaint::Blend). Parts pick them in the same
+                // dropdowns as plain tools. Editors expand INLINE in the
+                // panel flow — never a floating Area (bottom-pivoted Areas
+                // feed back their own rect; see the messages pane).
+                let tool_count = self.settings.tool_count;
+                let slot_colors: Vec<[f32; 3]> =
+                    (0..tool_count).map(|t| self.settings.tool(t).color_rgb).collect();
+                // The dither cycle the blend band affords: mixes quantize to
+                // whole layers of it, so every offered color actually fuses.
+                let layer_h = self.settings.layer_height_mm;
+                let band_mm = self.settings.blend_band_mm;
+                let dither_cycle = ((band_mm / layer_h.max(0.01)).floor() as usize).max(1);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label("blends").on_hover_text(
+                        "Pseudo colors mixed from the tool slots — e.g. 3 parts white + \
+                         1 part black reads as 25% grey. Printed by alternating whole \
+                         layers between the tools in that ratio; paint parts with them \
+                         in the object list.",
+                    );
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("Add a blend (an even mix of the first and last slot to start).")
+                        .clicked()
+                    {
+                        self.blends.push(config::BlendState {
+                            name: format!("blend {}", self.blends.len() + 1),
+                            weights: vec![(0, 1.0), (tool_count.saturating_sub(1) as u32, 1.0)],
+                            // A fresh blend opens on every spool; narrow it
+                            // with the spool toggles in the editor.
+                            tools: Vec::new(),
+                        });
+                        self.blend_edit = Some(self.blends.len() - 1);
+                    }
+                });
+                let mut delete_blend: Option<usize> = None;
+                let mut weights_edited: Option<usize> = None;
+                // Out-of-band repeats, precomputed (the loop holds the
+                // blends mutably; banding needs &self).
+                let banding: Vec<Option<f64>> =
+                    self.blends.iter().map(|b| self.blend_banding_mm(b)).collect();
+                for (k, blend) in self.blends.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        // Mixed swatch — recomputed every frame, so weight
+                        // drags recolor it live. No valid weights = neutral.
+                        let entries: Vec<([f32; 3], f32)> = blend
+                            .weights
+                            .iter()
+                            .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
+                            .map(|&(t, w)| (slot_colors[t as usize], w))
+                            .collect();
+                        let rgb = if entries.is_empty() {
+                            config::NEUTRAL_FILAMENT_RGB
+                        } else {
+                            config::mix_colors_linear(&entries)
+                        };
+                        let (dot, dot_resp) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 5.0, rgb32(rgb));
+                        // Out of the blend band at the current layer height:
+                        // an amber ring, visible without opening the editor.
+                        if banding[k].is_some() {
+                            ui.painter().circle_stroke(
+                                dot.center(),
+                                7.0,
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(0xC8, 0x8A, 0x4B)),
+                            );
+                        }
+                        if entries.is_empty() {
+                            dot_resp.on_hover_text("references missing tools");
+                        } else if let Some(mm) = banding[k] {
+                            dot_resp.on_hover_text(format!(
+                                "Repeats every {mm:.1} mm at this layer height — past the \
+                                 blend band, so the layers will read as stripes. Open the \
+                                 editor and re-pick (or \"fit band\"), or use finer layers."
+                            ));
+                        }
+                        ui.scope(|ui| {
+                            ui.set_width(150.0);
+                            ui.add(egui::Label::new(elide(&blend.name, 22)).truncate());
+                        });
+                        // ✏/✖, the file's established edit/dismiss glyphs
+                        // (✎ and ✕ are missing from the default fonts —
+                        // they'd render as boxes, like "●" does).
+                        let editing = self.blend_edit == Some(k);
+                        if ui
+                            .small_button(if editing { "▾" } else { "✏" })
+                            .on_hover_text("Edit this blend's name and mix.")
+                            .clicked()
+                        {
+                            self.blend_edit = if editing { None } else { Some(k) };
+                        }
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text(
+                                "Delete this blend — parts painted with it fall back \
+                                 to its heaviest tool.",
+                            )
+                            .clicked()
+                        {
+                            delete_blend = Some(k);
+                        }
+                    });
+                    if self.blend_edit == Some(k) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut blend.name)
+                                    .desired_width(136.0)
+                                    .hint_text("name"),
+                            );
+                        });
+                        // The blend's own sub-palette: which spools it draws
+                        // from. The mix surface follows THIS count — narrow
+                        // an eight-tool machine to two spools and you get the
+                        // ramp back, three the triangle.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.add_space(16.0);
+                            for t in 0..tool_count as u32 {
+                                let inside =
+                                    blend.tools.is_empty() || blend.tools.contains(&t);
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    if inside { 5.0 } else { 3.5 },
+                                    rgb32(slot_colors[t as usize]),
+                                );
+                                if inside {
+                                    ui.painter().circle_stroke(
+                                        rect.center(),
+                                        7.0,
+                                        egui::Stroke::new(
+                                            1.5,
+                                            ui.visuals().strong_text_color(),
+                                        ),
+                                    );
+                                }
+                                let resp = resp.on_hover_text(format!(
+                                    "T{t} — click to {} this blend's palette.",
+                                    if inside { "drop it from" } else { "add it to" }
+                                ));
+                                if resp.clicked() {
+                                    let mut set: Vec<u32> = if blend.tools.is_empty() {
+                                        (0..tool_count as u32).collect()
+                                    } else {
+                                        blend.tools.clone()
+                                    };
+                                    if inside {
+                                        // Never below one spool; dropping one
+                                        // takes its share of the mix along.
+                                        if set.len() > 1 {
+                                            set.retain(|&x| x != t);
+                                            blend.weights.retain(|&(bt, _)| bt != t);
+                                            weights_edited = Some(k);
+                                        }
+                                    } else {
+                                        set.push(t);
+                                        set.sort_unstable();
+                                    }
+                                    blend.tools = set;
+                                }
+                            }
+                            ui.weak("spools");
+                        });
+                        // The chosen spools, resolved (legacy empty = all).
+                        let participants: Vec<u32> = if blend.tools.is_empty() {
+                            (0..tool_count as u32).collect()
+                        } else {
+                            blend
+                                .tools
+                                .iter()
+                                .copied()
+                                .filter(|&t| (t as usize) < tool_count)
+                                .collect()
+                        };
+                        let sub_colors: Vec<[f32; 3]> =
+                            participants.iter().map(|&t| slot_colors[t as usize]).collect();
+                        // Subset fractions → stored weights on real slot ids.
+                        let apply = |fracs: &[f32]| -> Vec<(u32, f32)> {
+                            participants
+                                .iter()
+                                .zip(config::quantize_blend_fractions(fracs, dither_cycle))
+                                .filter(|&(_, n)| n > 0)
+                                .map(|(&t, n)| (t, n as f32))
+                                .collect()
+                        };
+                        // The palette: every color the chosen spools can
+                        // dither to within the band, one chip per whole-layer
+                        // recipe — the same format at every spool count,
+                        // sorted neutral-ramp-first then by hue.
+                        let lat = config::blend_lattice(&sub_colors, dither_cycle, 168);
+                        if let Some(lat) = &lat {
+                            if let Some(w) =
+                                lattice_chips(ui, lat, &participants, &blend.weights)
+                            {
+                                blend.weights = w;
+                                weights_edited = Some(k);
+                            }
+                        } else {
+                            // Too many mixes to lay out (many spools × fine
+                            // layers): fall back to pick-and-snap — choose any
+                            // color, land on the nearest printable mix.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                ui.add_space(16.0);
+                                let entries: Vec<([f32; 3], f32)> = blend
+                                    .weights
+                                    .iter()
+                                    .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
+                                    .map(|&(t, w)| (slot_colors[t as usize], w))
+                                    .collect();
+                                let cur = if entries.is_empty() {
+                                    config::NEUTRAL_FILAMENT_RGB
+                                } else {
+                                    config::mix_colors_linear(&entries)
+                                };
+                                let mut rgb8 = [
+                                    (cur[0] * 255.0).round() as u8,
+                                    (cur[1] * 255.0).round() as u8,
+                                    (cur[2] * 255.0).round() as u8,
+                                ];
+                                if ui
+                                    .color_edit_button_srgb(&mut rgb8)
+                                    .on_hover_text(
+                                        "Too many printable mixes to lay out as swatches — \
+                                         pick any color and the mix snaps to the closest one \
+                                         this blend's spools can dither to.",
+                                    )
+                                    .changed()
+                                {
+                                    let target = [
+                                        rgb8[0] as f32 / 255.0,
+                                        rgb8[1] as f32 / 255.0,
+                                        rgb8[2] as f32 / 255.0,
+                                    ];
+                                    blend.weights = apply(&config::blend_weights_for_color(
+                                        target,
+                                        &sub_colors,
+                                    ));
+                                    weights_edited = Some(k);
+                                }
+                                ui.label("pick");
+                            });
+                        }
+                        // One row per CHOSEN spool: parts (relative shares,
+                        // not percentages). 0 keeps the spool, drops its share.
+                        for &pt in &participants {
+                            let (t, slot_rgb) = (pt as usize, slot_colors[pt as usize]);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                ui.add_space(16.0);
+                                let (dot, _) = ui
+                                    .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                ui.painter().circle_filled(dot.center(), 5.0, rgb32(slot_rgb));
+                                ui.label(format!("T{t}"));
+                                let mut w = blend
+                                    .weights
+                                    .iter()
+                                    .find(|&&(bt, _)| bt as usize == t)
+                                    .map(|&(_, w)| w)
+                                    .unwrap_or(0.0);
+                                if ui
+                                    .add(egui::DragValue::new(&mut w).speed(1.0).range(0.0..=100.0))
+                                    .on_hover_text(
+                                        "This slot's share of the mix (relative parts — the \
+                                         picker writes whole layers of the dither cycle). \
+                                         0 drops the slot.",
+                                    )
+                                    .changed()
+                                {
+                                    blend.weights.retain(|&(bt, _)| bt as usize != t);
+                                    if w > 0.0 {
+                                        blend.weights.push((t as u32, w));
+                                    }
+                                    // Slot order keeps the engine's dither
+                                    // deterministic (ties go to the earliest-
+                                    // listed tool).
+                                    blend.weights.sort_by_key(|&(bt, _)| bt);
+                                    weights_edited = Some(k);
+                                }
+                            });
+                        }
+                        // The realized repeat, loud when it outgrows the
+                        // band: picker-made mixes fit BY CONSTRUCTION at the
+                        // layer height they were picked under — a later
+                        // layer-height (or band) change re-judges them here,
+                        // live, and "fit band" re-snaps to the new cycle.
+                        let valid: Vec<(u32, f32)> = blend
+                            .weights
+                            .iter()
+                            .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
+                            .copied()
+                            .collect();
+                        if valid.len() > 1 {
+                            let period = config::blend_repeat_layers(&valid);
+                            let height = period as f64 * layer_h;
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                if height <= band_mm + 1e-6 {
+                                    ui.weak(format!("cycle: {period} layers · {height:.1} mm"));
+                                } else {
+                                    // Terse: the fit-band button must still fit
+                                    // the 320 px panel beside this label.
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0xC8, 0x8A, 0x4B),
+                                        format!("bands: repeats {height:.1} mm"),
+                                    )
+                                    .on_hover_text(format!(
+                                        "The dither repeats every {height:.1} mm at this \
+                                         layer height — past the {band_mm:.1} mm blend band, \
+                                         so it prints as stripes, not a color."
+                                    ));
+                                    if ui
+                                        .small_button("fit band")
+                                        .on_hover_text(
+                                            "Re-snap to the nearest mix the band affords at \
+                                             the current layer height (the color moves to the \
+                                             closest printable one).",
+                                        )
+                                        .clicked()
+                                    {
+                                        let mut frac = vec![0.0f32; tool_count];
+                                        for &(t, w) in &valid {
+                                            frac[t as usize] = w;
+                                        }
+                                        blend.weights = snap_weights(&frac, dither_cycle);
+                                        weights_edited = Some(k);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                if let Some(k) = delete_blend {
+                    // Parts painted with it fall back to its heaviest valid
+                    // tool; parts on later blends keep their blend (the index
+                    // shifts down with the removal).
+                    let fallback = self
+                        .valid_weights(&self.blends[k])
+                        .into_iter()
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(t, _)| t)
+                        .unwrap_or(0);
+                    self.blends.remove(k);
+                    let mut repainted = false;
+                    for part in self.objects.iter_mut().flat_map(|o| &mut o.parts) {
+                        match part.paint {
+                            PartColor::Blend(b) if b == k => {
+                                part.paint = PartColor::Tool(fallback);
+                                repainted = true;
+                            }
+                            PartColor::Blend(b) if b > k => part.paint = PartColor::Blend(b - 1),
+                            _ => {}
+                        }
+                    }
+                    self.blend_edit = match self.blend_edit {
+                        Some(e) if e == k => None,
+                        Some(e) if e > k => Some(e - 1),
+                        e => e,
+                    };
+                    // Same invalidation as a tool reassignment — only when a
+                    // part actually changed paint (index shifts are identity).
+                    if repainted {
+                        self.sliced = None;
+                        self.slice_summary = None;
+                        self.view_preview = false;
+                    }
+                    self.needs_rebuild = true; // swatch rows changed; tints may have
+                }
+                if let Some(k) = weights_edited {
+                    // The swatch is already live (recomputed above per frame);
+                    // a part wearing this blend needs its model tint refreshed
+                    // (rebuild_scene bumps content_version — RenderSig won't
+                    // catch a tint change on its own) and its plan is stale.
+                    if self
+                        .objects
+                        .iter()
+                        .flat_map(|o| &o.parts)
+                        .any(|p| p.paint == PartColor::Blend(k))
+                    {
+                        self.sliced = None;
+                        self.slice_summary = None;
+                        self.view_preview = false;
+                        self.needs_rebuild = true;
+                    }
+                    ui.ctx().request_repaint();
+                }
+                ui.separator();
+            }
+
+            // Objects & parts: the active bed's manifest. A row selects its
+            // object; on a toolchanger each part row assigns the tool that
+            // prints it. An inline ScrollArea, NOT a floating Area (bottom-
+            // pivoted Areas feed back their own rect — see the messages pane).
+            let bed_objects: Vec<usize> = (0..self.objects.len())
+                .filter(|&i| self.bed_of(&self.objects[i]) == self.active_bed)
+                .collect();
+            if !bed_objects.is_empty() {
+                let multi = self.settings.tool_count > 1;
+                let tool_opts: Vec<([f32; 3], String)> = (0..self.settings.tool_count)
+                    .map(|t| {
+                        let ts = self.settings.tool(t);
+                        (ts.color_rgb, ts.filament_name.clone())
+                    })
+                    .collect();
+                // Blend entries ride the same pickers: mixed swatch + name.
+                let blend_opts: Vec<([f32; 3], String)> = (0..self.blends.len())
+                    .map(|b| (self.paint_display_rgb(PartColor::Blend(b)), self.blends[b].name.clone()))
+                    .collect();
+                let mut select: Option<usize> = None;
+                let mut assign: Option<(usize, usize, PartColor)> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("outliner")
+                    .max_height(132.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for &i in &bed_objects {
+                            let obj = &self.objects[i];
+                            if ui
+                                .selectable_label(self.selected == Some(i), elide(&obj.name, 34))
+                                .on_hover_text("Select this object (its transform card opens in the view).")
+                                .clicked()
+                            {
+                                select = Some(i);
+                            }
+                            if multi {
+                                for (j, part) in obj.parts.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(16.0);
+                                        let (dot, _) = ui.allocate_exact_size(
+                                            egui::vec2(10.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let c = paint_rgb_from(&tool_opts, &blend_opts, part.paint);
+                                        ui.painter().circle_filled(dot.center(), 5.0, rgb32(c));
+                                        ui.scope(|ui| {
+                                            ui.set_width(150.0);
+                                            let name = if part.name.is_empty() {
+                                                format!("part {}", j + 1)
+                                            } else {
+                                                part.name.clone()
+                                            };
+                                            ui.add(egui::Label::new(elide(&name, 22)).truncate());
+                                        });
+                                        if let Some(p) = paint_combo(
+                                            ui,
+                                            ("outliner_tool", i, j),
+                                            part.paint,
+                                            &tool_opts,
+                                            &blend_opts,
+                                        ) {
+                                            assign = Some((i, j, p));
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
+                if let Some(i) = select {
+                    self.selected = Some(i);
+                    self.needs_rebuild = true; // selection highlight
+                }
+                if let Some((i, j, p)) = assign {
+                    self.objects[i].parts[j].paint = p;
+                    // The plan is stale (paths carry tools); the tint refresh
+                    // rides the rebuild, which bumps content_version.
+                    self.sliced = None;
+                    self.slice_summary = None;
+                    self.view_preview = false;
+                    self.needs_rebuild = true;
+                }
+                ui.separator();
+            }
+
             let printers: Vec<String> = self.profiles.printer_names().iter().map(|s| s.to_string()).collect();
             let filaments: Vec<String> = self.profiles.filament_names().iter().map(|s| s.to_string()).collect();
             let processes: Vec<String> = self.profiles.process_names().iter().map(|s| s.to_string()).collect();
@@ -2023,6 +3406,12 @@ impl eframe::App for App {
                         "Print-quality profile (layer height, walls, speeds, supports…). Edits below override it until you switch or save."),
                 ];
                 for (kind, sel, names, is_dirty, hover) in rows {
+                    // On a toolchanger the Filament tier row would just be
+                    // "tool 0 with privileges" — every slot picks its
+                    // filament in the strip and edits it on the card's tabs.
+                    if kind == TierKind::Filament && self.settings.tool_count > 1 {
+                        continue;
+                    }
                     ui.horizontal(|ui| {
                         let title = match kind {
                             TierKind::Printer => "Printer",
@@ -2069,7 +3458,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             let name = if is_user { sel.clone() } else { format!("{sel}-custom") };
-                            open_dialog = Some(ProfileDialog { kind, name, delete: false });
+                            open_dialog = Some(ProfileDialog { kind, name, delete: false, slot: None });
                         }
                         if is_user
                             && ui
@@ -2077,7 +3466,8 @@ impl eframe::App for App {
                                 .on_hover_text("Delete this user profile from disk.")
                                 .clicked()
                         {
-                            open_dialog = Some(ProfileDialog { kind, name: sel.clone(), delete: true });
+                            open_dialog =
+                                Some(ProfileDialog { kind, name: sel.clone(), delete: true, slot: None });
                         }
                     });
                 }
@@ -2246,6 +3636,10 @@ impl eframe::App for App {
             if self.accent_rebake && !ui.ctx().input(|i| i.pointer.any_down()) {
                 self.accent_rebake = false;
                 self.set_preview_instances(&rs);
+                // The model tint bakes into the mesh vertices now (per-part
+                // colors) — re-upload them on the same release.
+                self.needs_rebuild = true;
+                ui.ctx().request_repaint();
             }
             if self.view_preview && n_layers > 0 {
                 // The layer slider itself lives on the right edge of the 3D pane
@@ -2264,18 +3658,23 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label("color").on_hover_text(
                         "What the preview colors encode. Feature type is the classic view; layer time \
-                         shows where the nozzle returns quickly (little cooling time), scored per layer. \
-                         Both reflect the last slice — re-slice after changing toggles.",
+                         shows where the nozzle returns quickly (little cooling time), scored per layer; \
+                         filament (toolchangers) paints each path in its tool's spool color. \
+                         All reflect the last slice — re-slice after changing toggles.",
                     );
                     let before = self.color_by;
                     egui::ComboBox::from_id_salt("preview_color_by")
                         .selected_text(match self.color_by {
                             ColorBy::Feature => "feature type",
                             ColorBy::LayerTime => "layer time",
+                            ColorBy::Filament => "filament",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.color_by, ColorBy::Feature, "feature type");
                             ui.selectable_value(&mut self.color_by, ColorBy::LayerTime, "layer time");
+                            if self.settings.tool_count > 1 {
+                                ui.selectable_value(&mut self.color_by, ColorBy::Filament, "filament");
+                            }
                         });
                     if self.color_by != before {
                         self.set_preview_instances(&rs);
@@ -2319,6 +3718,11 @@ impl eframe::App for App {
             ui.separator();
 
             // Settings, grouped into collapsible categories (Orca-style) and scrolled.
+            // Per-slot dirty flags for the toolchanger tabs (computed before
+            // the sections borrow settings mutably) + the dialog they open.
+            let tool_dirty_flags: Vec<bool> =
+                (0..self.settings.tools.len()).map(|i| self.tool_dirty(i)).collect();
+            let mut tool_dialog: Option<ProfileDialog> = None;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let s = &mut self.settings;
                 let pins = &mut self.pins;
@@ -2342,6 +3746,15 @@ impl eframe::App for App {
                         .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
                     hslider(ui, true, egui::Slider::new(&mut s.elephant_foot_mm, 0.0..=0.5), "elephant foot mm",
                         "Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
+                    if s.tool_count > 1 {
+                        hslider(ui, true, egui::Slider::new(&mut s.blend_band_mm, 0.2..=3.0), "blend band mm",
+                            "Tallest dither repeat a blend may have and still read as one color \
+                             at viewing distance. Sets the blend picker's palette: mixes quantize \
+                             to whole layers of a band ÷ layer-height cycle, so a ratio that \
+                             would stripe visibly (one layer in ten = a 2 mm band) simply isn't \
+                             offered. Tighten it for saturated colors; close greys fuse at \
+                             longer repeats.");
+                    }
                     hslider(ui, true, egui::Slider::new(&mut s.xy_compensation_mm, -0.5..=0.5), "XY comp mm",
                         "Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
                     let vase = s.spiral_vase;
@@ -2355,8 +3768,10 @@ impl eframe::App for App {
                         "Total jitter band, centered on the wall line.");
                     hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(&mut s.fuzzy_skin_point_dist_mm, 0.2..=2.0), "fuzzy point dist mm",
                         "Spacing between jittered points — smaller is noisier.");
-                    ui.checkbox(&mut s.spiral_vase, "spiral vase")
-                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).");
+                    // The engine ignores vase for multi-part plates — mirror it.
+                    ui.add_enabled(active_bed_parts <= 1, egui::Checkbox::new(&mut s.spiral_vase, "spiral vase"))
+                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).")
+                        .on_disabled_hover_text("The active bed holds multiple parts — spiral vase is one continuous wall, so the engine ignores it on multi-part plates.");
                 });
                 tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
                     let vase = s.spiral_vase;
@@ -2428,90 +3843,88 @@ impl eframe::App for App {
                     // class itself is profile data — switching filament
                     // profiles changes it — and supplies every derived value
                     // here until a calibration entry pins it.
-                    hslider(ui, true, egui::Slider::new(&mut s.nozzle_temp_c, config::NOZZLE_TEMP_MIN_C..=config::NOZZLE_TEMP_MAX_C), "nozzle °C",
-                        "Operating nozzle temperature from the spool. The first layer adds the material's adhesion bump on top.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bed_temp_c, 0..=120), "bed °C",
-                        "Bed temperature from the packaging.");
-                    hslider(ui, true, egui::Slider::new(&mut s.chamber_temp_c, 0..=70), "chamber soak °C",
-                        "Hold during the start g-code — after the bed soak, before the nozzle \
-                         finishes heating — until the chamber reaches this (the heated bed does \
-                         the soaking, via TEMPERATURE_WAIT on the chamber sensor). Needs a chamber \
-                         sensor declared under Machine & motion; Send pings the printer for it \
-                         first and won't start a soak it can't honor. 0 = off. Auto: the material \
-                         class's value — ABS/ASA soak at 50 against warping and layer splits; PLA \
-                         must stay 0 (a hot chamber means heat creep and sag).");
-                    hslider(ui, true, egui::Slider::new(&mut s.filament_diameter_mm, 1.0..=3.0), "filament Ø mm",
-                        "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
-                    // Measured calibration — the slicer is blind to the true
-                    // output, so these are pinned from a test, not derived
-                    // (default 1.0 / conservative; nudge after a flow test or a
-                    // pressure-advance tower). Density, flow-derate and the heat
-                    // ceiling are material physics — class-derived, not knobs.
-                    hslider(ui, true, egui::Slider::new(&mut s.extrusion_multiplier, 0.8..=1.2), "flow ×",
-                        "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a single-wall flow test.");
-                    // Guided flow calibration: print a single-wall cube at the
-                    // current settings, caliper a wall, enter it → pin flow ×.
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(host_set && !host_busy, egui::Button::new("⟲ print flow test"))
-                            .on_hover_text("Print a single-wall 20 mm cube at your current settings, then caliper a side wall's thickness — the ~line-width dimension, on a flat face mid-height, away from the seam (not the height or the 20 mm width) — and enter it below to pin flow ×. Clear the bed first.")
-                            .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
-                            .clicked()
-                        {
-                            self.start_flow_cal = true;
-                        }
-                        ui.add(
-                            egui::DragValue::new(&mut self.flow_cal_mm)
-                                .speed(0.01)
-                                .range(0.0..=2.0)
-                                .fixed_decimals(2)
-                                .suffix(" mm"),
-                        )
-                        .on_hover_text(format!("Wall *thickness* off the cube — a flat side, mid-height, away from the seam (not the height or the 20 mm width). Should read ≈{:.2} mm (your line width); thicker = over-extruding.", s.line_width_mm));
-                        if ui
-                            .button("apply")
-                            .on_hover_text("Pin flow × = current × line width ÷ measured wall thickness.")
-                            .clicked()
-                            && self.flow_cal_mm > 0.0
-                        {
-                            let before = s.extrusion_multiplier;
-                            s.extrusion_multiplier =
-                                engine::flow_from_wall(before, s.line_width_mm, self.flow_cal_mm);
-                            self.status = format!(
-                                "flow × {before:.3} → {:.3} (wall {:.2} mm vs {:.2} target)",
-                                s.extrusion_multiplier, self.flow_cal_mm, s.line_width_mm
+                    // Spool color moved to the Tools strip: every slot has its
+                    // own picker there — the loaded spool, not the profile,
+                    // owns the color.
+                    let (line_w, layer_h) = (s.line_width_mm, s.layer_height_mm);
+                    let cal = FlowCalUi {
+                        host_ready: host_set && !host_busy,
+                        start: &mut self.start_flow_cal,
+                        measured_mm: &mut self.flow_cal_mm,
+                        status: &mut self.status,
+                    };
+                    if s.tool_count > 1 {
+                        // The per-slot edit surface: the tabs share
+                        // `active_tool_tab` with Cooling below, and every row
+                        // binds to the active slot only — the flat fields are
+                        // just the tool-0 mirror (see `refresh_tool0`), so a
+                        // save can never write one profile over another.
+                        let tab =
+                            tool_tab_row(ui, &mut self.active_tool_tab, &s.tools, &tool_dirty_flags);
+                        let name = self.tools.get(tab).cloned().unwrap_or_default();
+                        let is_user = self.profiles.is_user(TierKind::Filament, &name);
+                        let is_dirty = tool_dirty_flags.get(tab).copied().unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            let text = format!(
+                                "T{tab} · {}{}",
+                                elide(&name, 15),
+                                if is_dirty { " *" } else { "" }
                             );
-                        }
-                    });
-                    let mf_hint = format!(
-                        "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
-                        flow_ceiling_text(s)
-                    );
-                    hslider(ui, true, egui::Slider::new(&mut s.max_volumetric_speed_mm3_s, 0.0..=80.0), "max flow mm³/s",
-                        mf_hint);
-                    hslider(ui, true, egui::Slider::new(&mut s.pressure_advance, 0.0..=0.2), "pressure advance",
-                        "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_flow, 0.3..=2.0), "bridge flow",
-                        "Extrusion multiplier for bridge strands and arc overhangs. <1 thins them so they pull taut over air; >1 fattens them to grip when cooling is poor.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_speed_mm_s, 5.0..=100.0), "bridge speed mm/s",
-                        "Print speed for bridge strands. Slow lets each strand cool and set before the next is laid.");
+                            let label = if is_dirty {
+                                egui::RichText::new(text).color(palette::CREAM)
+                            } else {
+                                egui::RichText::new(text).color(palette::CREAM_DIM)
+                            };
+                            ui.label(label).on_hover_text(
+                                "The filament profile loaded in this slot; * = edits below \
+                                 not yet saved to it.",
+                            );
+                            if ui
+                                .small_button("💾")
+                                .on_hover_text(if is_dirty {
+                                    "Save this tab's * changes as a user profile (only changed fields are written)."
+                                } else {
+                                    "Save a copy as a user profile."
+                                })
+                                .clicked()
+                            {
+                                let dlg = if is_user { name.clone() } else { format!("{name}-custom") };
+                                tool_dialog = Some(ProfileDialog {
+                                    kind: TierKind::Filament,
+                                    name: dlg,
+                                    delete: false,
+                                    slot: Some(tab),
+                                });
+                            }
+                            if is_user
+                                && ui
+                                    .small_button("🗑")
+                                    .on_hover_text("Delete this user profile from disk.")
+                                    .clicked()
+                            {
+                                tool_dialog = Some(ProfileDialog {
+                                    kind: TierKind::Filament,
+                                    name: name.clone(),
+                                    delete: true,
+                                    slot: Some(tab),
+                                });
+                            }
+                        });
+                        filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), true, line_w, layer_h, cal);
+                    } else {
+                        filament_card_rows(ui, FilamentFields::flat(s), false, line_w, layer_h, cal);
+                    }
                 });
                 tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
-                    hslider(ui, true, egui::Slider::new(&mut s.fan_speed, 0.0..=1.0), "fan",
-                        "Part-cooling fan duty while printing. Auto: the class's policy.");
-                    hslider(ui, true, egui::Slider::new(&mut s.bridge_fan_speed, 0.0..=1.0), "bridge fan",
-                        "Fan duty on bridges and arc overhangs.");
-                    hslider(ui, true, egui::Slider::new(&mut s.fan_off_layers, 0..=5), "fan off layers",
-                        "Keep the fan off for this many first layers (bed adhesion).");
-                    // Aux/exhaust duties appear only when the printer profile
-                    // declares the hardware — no fan, no knob, no M106 emitted.
-                    if s.has_aux_fan {
-                        hslider(ui, true, egui::Slider::new(&mut s.aux_fan_speed, 0.0..=1.0), "aux fan",
-                            "Auxiliary part-cooling duty (M106 P2).");
-                    }
-                    if s.has_exhaust_fan {
-                        hslider(ui, true, egui::Slider::new(&mut s.exhaust_fan_speed, 0.0..=1.0), "exhaust fan",
-                            "Chamber-exhaust duty (M106 P3), whole print.");
+                    let (aux, exhaust) = (s.has_aux_fan, s.has_exhaust_fan);
+                    if s.tool_count > 1 {
+                        // Bound to the same tab as the Filament card above.
+                        let tab = self.active_tool_tab.min(s.tools.len().saturating_sub(1));
+                        let name = self.tools.get(tab).cloned().unwrap_or_default();
+                        ui.weak(format!("T{tab} · {}", elide(&name, 18)));
+                        cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), aux, exhaust);
+                    } else {
+                        cooling_rows(ui, FilamentFields::flat(s), aux, exhaust);
                     }
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
@@ -2533,6 +3946,45 @@ impl eframe::App for App {
                         "Maximum build height (Z).");
                     hslider(ui, true, egui::Slider::new(&mut s.nozzle_diameter_mm, 0.1..=1.2), "nozzle mm",
                         "Nozzle diameter.");
+                    // Toolchanger datasheet facts: how many physical tool
+                    // slots, and what one swap costs the estimate.
+                    ui.horizontal(|ui| {
+                        let before = s.tool_count;
+                        ui.add(egui::DragValue::new(&mut s.tool_count).range(1..=8));
+                        ui.label("tools").on_hover_text(
+                            "Physical tool (extruder) slots — 2+ = a toolchanger \
+                             (StealthChanger and kin). Each slot loads a filament in the \
+                             strip at the top of the panel; parts pick their tool in the \
+                             object list.",
+                        );
+                        if s.tool_count != before {
+                            tool_count_changed = true;
+                        }
+                        if s.tool_count > 1 {
+                            ui.add(
+                                egui::DragValue::new(&mut s.toolchange_seconds)
+                                    .speed(0.5)
+                                    .range(0.0..=300.0)
+                                    .suffix(" s"),
+                            );
+                            ui.label("s/change").on_hover_text(
+                                "Seconds one tool swap takes, dock to dock — feeds the \
+                                 print-time estimate.",
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut s.standby_after_s)
+                                    .speed(5.0)
+                                    .range(0.0..=3600.0)
+                                    .suffix(" s"),
+                            );
+                            ui.label("standby after").on_hover_text(
+                                "Docked longer than this and a tool drops to its filament's \
+                                 standby temperature, reheating a layer ahead of its next \
+                                 pickup. Short docks (blend dithering) stay at print \
+                                 temperature. 0 disables standby entirely.",
+                            );
+                        }
+                    });
                     hslider(ui, true, egui::Slider::new(&mut s.machine_speed_mm_s, 10.0..=700.0), "rated mm/s",
                         "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine.");
                     hslider(ui, true, egui::Slider::new(&mut s.first_layer_speed_mm_s, 5.0..=100.0), "1st layer mm/s",
@@ -2616,11 +4068,47 @@ impl eframe::App for App {
                             .desired_rows(4)
                             .desired_width(f32::INFINITY),
                     );
+                    if s.tool_count > 1 {
+                        ui.label("Toolchange g-code ({tool})").on_hover_text(
+                            "Emitted at every tool switch. Placeholder: {tool} — the slot \
+                             being selected; the default \"T{tool}\" is the bare \
+                             Klipper/StealthChanger select.",
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut s.toolchange_gcode)
+                                .code_editor()
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
                 });
                 ui.add_space(6.0);
                 ui.weak("drag: orbit · right-drag: pan · scroll: zoom");
                 });
+            if let Some(d) = tool_dialog {
+                self.profile_dialog = Some(d);
+            }
         });
+
+        // A tool-count edit resizes the slot list and re-resolves the tool
+        // table; the plan is stale (tools were clamped to the old count).
+        if tool_count_changed {
+            self.resync_tools();
+            self.sliced = None;
+            self.slice_summary = None;
+            self.view_preview = false;
+            self.needs_rebuild = true;
+            ui.ctx().request_repaint();
+        }
+        // A spool-color edit re-tints tool-0 parts (and the filament preview
+        // mode); single-tool models keep the accent tint, nothing to do.
+        if filament_color_changed && self.settings.tool_count > 1 {
+            self.needs_rebuild = true;
+            if self.color_by == ColorBy::Filament && self.sliced.is_some() {
+                self.set_preview_instances(&rs);
+            }
+            ui.ctx().request_repaint();
+        }
 
         // Execute any printer-host action requested above, on a worker thread.
         // Frameless: the viewport texture runs edge-to-edge against the panel
@@ -2956,6 +4444,18 @@ impl eframe::App for App {
                 let (mut dup, mut del) = (false, false);
                 // Checked before the mutable borrow below (reads the cache).
                 let problem = self.obj_problem(i);
+                // Tool + blend tables snapshotted before the closure mutably
+                // borrows the object (colors + names for the per-part pickers).
+                let multi = self.settings.tool_count > 1;
+                let tool_opts: Vec<([f32; 3], String)> = (0..self.settings.tool_count)
+                    .map(|t| {
+                        let ts = self.settings.tool(t);
+                        (ts.color_rgb, ts.filament_name.clone())
+                    })
+                    .collect();
+                let blend_opts: Vec<([f32; 3], String)> = (0..self.blends.len())
+                    .map(|b| (self.paint_display_rgb(PartColor::Blend(b)), self.blends[b].name.clone()))
+                    .collect();
                 let area = egui::Area::new(egui::Id::new("transform_overlay"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
@@ -3011,6 +4511,41 @@ impl eframe::App for App {
                                         changed = true;
                                     }
                                 });
+                                // Per-part paint assignment (toolchangers) —
+                                // the outliner rows, compacted onto the card.
+                                if multi {
+                                    ui.separator();
+                                    for (j, part) in obj.parts.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                            let (dot, _) = ui.allocate_exact_size(
+                                                egui::vec2(10.0, 10.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            let c = paint_rgb_from(&tool_opts, &blend_opts, part.paint);
+                                            ui.painter().circle_filled(dot.center(), 5.0, rgb32(c));
+                                            ui.scope(|ui| {
+                                                ui.set_width(96.0);
+                                                let name = if part.name.is_empty() {
+                                                    format!("part {}", j + 1)
+                                                } else {
+                                                    part.name.clone()
+                                                };
+                                                ui.add(egui::Label::new(elide(&name, 14)).truncate());
+                                            });
+                                            if let Some(p) = paint_combo(
+                                                ui,
+                                                ("overlay_tool", i, j),
+                                                part.paint,
+                                                &tool_opts,
+                                                &blend_opts,
+                                            ) {
+                                                part.paint = p;
+                                                changed = true;
+                                            }
+                                        });
+                                    }
+                                }
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     if ui
@@ -3249,6 +4784,41 @@ impl eframe::App for App {
             }
         }
 
+        // A slot filament pick while that slot's tab carries unsaved (*)
+        // edits: confirm the discard — the tier-switch pattern above, scoped
+        // to the one slot (the others keep their edits).
+        if let Some((slot, name)) = self.pending_slot.clone() {
+            let mut act = false;
+            let mut open = true;
+            egui::Window::new("Discard this tool's unsaved changes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Loading '{name}' re-reads slot T{slot} from disk — the tab's \
+                         edits marked with * would be lost."
+                    ));
+                    ui.label("Save them first (💾 on the Filament card), or discard and switch.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard & switch").clicked() {
+                            act = true;
+                            open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            if act {
+                self.apply_slot_switch(slot, name);
+            }
+            if !open {
+                self.pending_slot = None;
+            }
+        }
+
         // Dispatch host actions after both panels have run — the left panel
         // and the live-print overlay both request them via `host_op`.
         if let Some(op) = host_op {
@@ -3261,6 +4831,7 @@ impl eframe::App for App {
                     })
                 }),
                 HostOp::Send { start } => {
+                    self.refresh_tool0();
                     if let Some(layers) = self.sliced.as_ref() {
                         let gcode = engine::to_gcode(layers, &self.settings);
                         let filename = self.upload_filename();
@@ -3270,11 +4841,18 @@ impl eframe::App for App {
                         // mid-startup on the machine.
                         let chamber_temp = self.settings.chamber_temp_c;
                         let chamber_sensor = self.settings.chamber_sensor.clone();
+                        // Tools this job actually prints with, for the
+                        // does-the-machine-have-them preflight below.
+                        let used = engine::used_tools(layers);
+                        let needs_t_macros = self.settings.toolchange_gcode.contains("T{tool}");
                         self.spawn_host_op(&ctx, false, move |c| {
                             if chamber_temp > 0 {
                                 if let Err(e) = c.ensure_chamber_sensor(&chamber_sensor, chamber_temp) {
                                     return HostReply::SendDone { ok: false, msg: e };
                                 }
+                            }
+                            if let Err(e) = c.ensure_tools(&used, needs_t_macros) {
+                                return HostReply::SendDone { ok: false, msg: e };
                             }
                             match c.upload(&filename, gcode.as_bytes(), start) {
                                 Ok(()) if start => HostReply::SendDone { ok: true, msg: format!("Printing {filename}.") },
@@ -3347,16 +4925,21 @@ impl eframe::App for App {
                             ui.label(format!("profile '{}' from disk?", dlg.name));
                         });
                     } else {
+                        // A tab save inherits the SLOT's profile; a tier-row
+                        // save inherits the tier selection.
+                        let parent = match dlg.slot {
+                            Some(i) => self.tools.get(i).unwrap_or(&self.filament),
+                            None => match dlg.kind {
+                                TierKind::Printer => &self.printer,
+                                TierKind::Filament => &self.filament,
+                                TierKind::Process => &self.process,
+                            },
+                        };
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Save as a");
                             ui.label(tier);
                             ui.label(format!(
-                                "profile (inherits '{}', stores only changed fields):",
-                                match dlg.kind {
-                                    TierKind::Printer => &self.printer,
-                                    TierKind::Filament => &self.filament,
-                                    TierKind::Process => &self.process,
-                                }
+                                "profile (inherits '{parent}', stores only changed fields):"
                             ));
                         });
                         ui.text_edit_singleline(&mut dlg.name);
@@ -3373,7 +4956,12 @@ impl eframe::App for App {
                 });
             if act {
                 let result = if dlg.delete {
+                    // Slot deletes share the tier fallback: the slot (and any
+                    // other naming the vanished profile) re-resolves through
+                    // `delete_profile`'s existing paths.
                     self.delete_profile(dlg.kind, &dlg.name)
+                } else if let Some(slot) = dlg.slot {
+                    self.save_tool_profile(slot, &dlg.name)
                 } else {
                     self.save_profile(dlg.kind, &dlg.name)
                 };
@@ -3406,6 +4994,84 @@ impl eframe::App for App {
     }
 }
 
+/// A resolved tool color as an egui color (the GPU side stays f32).
+fn rgb32(c: [f32; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (c[0] * 255.0).round() as u8,
+        (c[1] * 255.0).round() as u8,
+        (c[2] * 255.0).round() as u8,
+    )
+}
+
+/// Elide to `n` chars with an ellipsis — free-text labels in the fixed-width
+/// panel must never overflow it (egui #4475: overflow widens the whole panel).
+fn elide(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
+/// Display color for a paint from the snapshotted option tables (used where
+/// the object is mutably borrowed): tool rows clamp to the last slot, a
+/// dangling blend index reads the neutral grey.
+fn paint_rgb_from(
+    tools: &[([f32; 3], String)],
+    blends: &[([f32; 3], String)],
+    paint: PartColor,
+) -> [f32; 3] {
+    match paint {
+        PartColor::Tool(t) => tools[(t as usize).min(tools.len() - 1)].0,
+        PartColor::Blend(b) => blends.get(b).map(|o| o.0).unwrap_or(config::NEUTRAL_FILAMENT_RGB),
+    }
+}
+
+/// Part-paint picker: compact face ("T{n}", or the blend's name), popup rows
+/// carrying every tool slot (color dot + filament name) then every blend
+/// (mixed dot + name). Returns the newly chosen paint, if any.
+fn paint_combo(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    current: PartColor,
+    tools: &[([f32; 3], String)],
+    blends: &[([f32; 3], String)],
+) -> Option<PartColor> {
+    let face = match current {
+        PartColor::Tool(t) => format!("T{t}"),
+        PartColor::Blend(b) => blends.get(b).map(|(_, n)| elide(n, 8)).unwrap_or_else(|| "?".into()),
+    };
+    let mut picked = None;
+    let mut row = |ui: &mut egui::Ui, rgb: [f32; 3], selected: bool, text: String, paint: PartColor| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 5.0, rgb32(rgb));
+            if ui.selectable_label(selected, text).clicked() {
+                picked = Some(paint);
+            }
+        });
+    };
+    egui::ComboBox::from_id_salt(id)
+        .width(56.0)
+        .selected_text(face)
+        .show_ui(ui, |ui| {
+            for (t, (rgb, name)) in tools.iter().enumerate() {
+                let paint = PartColor::Tool(t as u32);
+                row(ui, *rgb, current == paint, format!("T{t} {}", elide(name, 16)), paint);
+            }
+            for (b, (rgb, name)) in blends.iter().enumerate() {
+                let paint = PartColor::Blend(b);
+                row(ui, *rgb, current == paint, elide(name, 16), paint);
+            }
+        })
+        .response
+        .on_hover_text("The tool (filament slot) or blend that prints this part.");
+    picked
+}
+
 fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPattern) -> egui::Response {
     use config::InfillPattern::*;
     egui::ComboBox::from_label(label)
@@ -3419,6 +5085,94 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
             ui.selectable_value(current, Gyroid, "gyroid");
         })
         .response
+}
+
+/// Solver fractions → stored blend weights: whole LAYERS of the dither
+/// cycle (largest-remainder), zeros dropped, slot order preserved (the
+/// engine's tie-break wants stable order). Storing the layer counts keeps
+/// the blend honest — its repeat height is sum/gcd × layer height by
+/// construction, within the blend band.
+fn snap_weights(fractions: &[f32], cycle: usize) -> Vec<(u32, f32)> {
+    config::quantize_blend_fractions(fractions, cycle)
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, n)| n > 0)
+        .map(|(t, n)| (t as u32, n as f32))
+        .collect()
+}
+
+/// The printable palette as clickable swatches — THE mix picker, at every
+/// spool count (a continuous surface is only honest through three colors,
+/// and the band makes the real palette finite anyway, so show it outright).
+/// One chip per distinct mixable color, neutral ramp first then hue
+/// families dark→light; a ring marks the blend's current recipe.
+fn lattice_chips(
+    ui: &mut egui::Ui,
+    lattice: &[(Vec<u32>, [f32; 3])],
+    slot_ids: &[u32],
+    current: &[(u32, f32)],
+) -> Option<Vec<(u32, f32)>> {
+    // Compositions are indexed by the blend's sub-palette; `slot_ids` maps
+    // them back to real tool slots. Ratios compare after dividing out common
+    // factors, so a hand-dialed 50/50 still rings the 2:2 chip.
+    let reduce = |v: Vec<u64>| -> Vec<u64> {
+        let g = v.iter().fold(0u64, |a, &b| config_gcd(a, b)).max(1);
+        v.into_iter().map(|x| x / g).collect()
+    };
+    let cur_key: Vec<u64> = {
+        let mut v = vec![0u64; slot_ids.len()];
+        for &(t, w) in current {
+            if let Some(pos) = slot_ids.iter().position(|&s| s == t) {
+                if w >= 0.5 {
+                    v[pos] = w.round() as u64;
+                }
+            }
+        }
+        reduce(v)
+    };
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+            for (comp, rgb) in lattice {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::click());
+                ui.painter().rect_filled(rect, 2.0, rgb32(*rgb));
+                let is_current =
+                    reduce(comp.iter().map(|&n| n as u64).collect()) == cur_key;
+                if is_current {
+                    ui.painter().rect_stroke(
+                        rect.expand(1.5),
+                        3.0,
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                let recipe: Vec<String> = comp
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &n)| n > 0)
+                    .map(|(i, &n)| format!("{n}·T{}", slot_ids[i]))
+                    .collect();
+                let resp = resp.on_hover_text(format!("{} layers", recipe.join(" + ")));
+                if resp.clicked() {
+                    picked = Some(
+                        comp.iter()
+                            .enumerate()
+                            .filter(|&(_, &n)| n > 0)
+                            .map(|(i, &n)| (slot_ids[i], n as f32))
+                            .collect(),
+                    );
+                }
+            }
+        });
+    });
+    picked
+}
+
+fn config_gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { config_gcd(b, a % b) }
 }
 
 /// World-space ray (origin, normalized dir) through a screen position in `rect`.
@@ -3775,6 +5529,24 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_part_splits_filament_evenly() {
+        // A 50/50 blend layer-dithers a part between its two tools — the
+        // per-tool filament split lands near even (off by at most ~one
+        // layer's worth: odd layer counts and the taller first layer).
+        let m = mesh::Mesh::load_stl(std::path::Path::new("../fixtures/cube.stl")).unwrap();
+        let mut s = config::Settings::default();
+        s.tool_count = 2;
+        s.tools = (0..2).map(|i| s.flat_tool(format!("tool-{i}"))).collect();
+        let blend = engine::PartPaint::Blend(vec![(0, 1.0), (1, 1.0)]);
+        let layers = engine::generate_painted(&[(&m, blend)], &s);
+        let per = engine::estimate_filament_per_tool(&layers, &s);
+        assert_eq!(per.len(), 2, "both tools print: {per:?}");
+        let (a, b) = (per[0].1, per[1].1);
+        let share = a / (a + b);
+        assert!((share - 0.5).abs() < 0.05, "T0 share {share:.3} (T0 {a:.0} mm, T1 {b:.0} mm)");
+    }
 
     #[test]
     fn ray_plane_and_triangle_math() {

@@ -15,7 +15,7 @@ use mesh::Mesh;
 use rayon::prelude::*;
 
 use crate::fill::infill_lines;
-use crate::{slice_mesh, Layer, SliceParams};
+use crate::{Layer, SliceParams};
 
 /// What a toolpath represents — drives speed, ordering, and rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +93,11 @@ pub struct ToolPath {
     /// unsupported middle, stays one continuous bead (one seam, unbroken flow)
     /// instead of being cut into separate paths.
     pub segs: Option<Vec<SegAttr>>,
+    /// The tool (extruder) that prints this path — the part's assigned filament
+    /// slot on a toolchanger. Uniform per part, so the planner stamps it after a
+    /// part's paths are complete; ordering groups by it and emit changes tools at
+    /// group boundaries. 0 on a single-tool printer.
+    pub tool: u32,
 }
 
 impl ToolPath {
@@ -108,6 +113,7 @@ impl ToolPath {
             widths: None,
             overhang: 0.0,
             segs: None,
+            tool: 0,
         }
     }
 }
@@ -213,12 +219,83 @@ const NARROW_FILL_BEADS: f64 = 4.0;
 
 /// Slice and plan a whole model into per-layer toolpaths, centered on the bed.
 pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
+    generate_parts(&[(mesh, 0)], settings)
+}
+
+/// What a part prints with: one tool, or a layer-dithered blend of tools.
+///
+/// A blend holds `(tool, weight)` pairs (weights needn't sum to 1) and is
+/// realized by alternating whole layers between its tools in that proportion —
+/// at viewing distance the layer bands read as the mixed color (white, grey,
+/// and black dither into a full monochrome ramp). Each layer is an ordinary
+/// single-tool layer, so per-tool speeds, flow, and temperatures stay exact.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartPaint {
+    Tool(u32),
+    Blend(Vec<(u32, f64)>),
+}
+
+/// Slice and plan a multi-part model, one tool per part.
+/// See [`generate_painted`] — this is the uniform-paint convenience form.
+pub fn generate_parts(parts: &[(&Mesh, u32)], settings: &Settings) -> Vec<LayerPlan> {
+    let painted: Vec<(&Mesh, PartPaint)> =
+        parts.iter().map(|&(m, t)| (m, PartPaint::Tool(t))).collect();
+    generate_painted(&painted, settings)
+}
+
+/// The layer→tool schedule realizing a blend: weighted error diffusion (a
+/// smooth weighted round-robin) — every layer picks the most-owed tool, so any
+/// ratio spreads maximally evenly (each tool's count is exact to within one
+/// over any prefix). The schedule is a pure function of the weights and the
+/// ABSOLUTE layer index: every part sharing a blend prints the same tool on
+/// the same layer — aligned bands across parts, no extra toolchanges.
+fn blend_schedule(weights: &[(u32, f64)], n: usize) -> Vec<u32> {
+    let w: Vec<(u32, f64)> = weights.iter().filter(|&&(_, x)| x > 0.0).copied().collect();
+    if w.is_empty() {
+        return vec![0; n];
+    }
+    let total: f64 = w.iter().map(|&(_, x)| x).sum();
+    let mut credit = vec![0.0f64; w.len()];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        for (c, &(_, x)) in credit.iter_mut().zip(&w) {
+            *c += x / total;
+        }
+        let mut best = 0;
+        for k in 1..w.len() {
+            // Strict comparison with a float guard: ties keep the
+            // earliest-listed tool, so the schedule is deterministic.
+            if credit[k] > credit[best] + 1e-12 {
+                best = k;
+            }
+        }
+        out.push(w[best].0);
+        credit[best] -= 1.0;
+    }
+    out
+}
+
+/// Slice and plan a multi-part model: each part is a mesh (already placed, all
+/// sharing one bed) paired with the paint that prints it — a tool, or a
+/// layer-dithered blend of tools. Parts slice on ONE shared layer grid and
+/// plan independently — each keeps its own walls, skins and infill, so
+/// interfaces between parts get full shells (no show-through between
+/// filaments) — then merge per layer; ordering groups paths by tool so the
+/// emitter changes tools once per group, not per path.
+///
+/// Physical reality is shared: overhang, bridge, and support decisions test
+/// the union of ALL parts below, so a part resting on another is supported,
+/// not floating. Overlapping volumes resolve by order: the earlier part owns
+/// the overlap and later parts are trimmed around it.
+pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Vec<LayerPlan> {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
     // above the solid bottom, nothing that would interrupt the continuous loop.
+    // It is meaningless across parts, so a multi-part job ignores it.
     let mut norm_settings = settings.clone();
+    if parts.len() > 1 {
+        norm_settings.spiral_vase = false;
+    }
     if norm_settings.spiral_vase {
-        // Spiral vase rewrites the recipe: one wall, no sparse infill, no
-        // shells above the solid bottom, nothing interrupting the loop.
         norm_settings.wall_count = 1;
         norm_settings.infill_density = 0.0;
         norm_settings.top_layers = 0;
@@ -228,27 +305,205 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
     }
     let settings = &norm_settings;
 
-    let mut layers = slice_mesh(
-        mesh,
+    // One layer grid over the union z-range, so all parts share indices and
+    // print z's (a part starting above the bed just has empty lower layers).
+    let mut z_range: Option<(f64, f64)> = None;
+    for (m, _) in parts {
+        if let Some((lo, hi)) = m.z_bounds() {
+            z_range = Some(match z_range {
+                None => (lo, hi),
+                Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
+            });
+        }
+    }
+    let Some((zmin, zmax)) = z_range else {
+        return Vec::new();
+    };
+    let grid = crate::slice::layer_grid(
+        zmin,
+        zmax,
         SliceParams {
             layer_height_mm: settings.layer_height_mm,
             first_layer_height_mm: settings.first_layer_height_mm,
         },
     );
+    if grid.is_empty() {
+        return Vec::new();
+    }
+    let n = grid.len();
+
+    let mut part_layers: Vec<Vec<Layer>> =
+        parts.iter().map(|(m, _)| crate::slice::slice_mesh_on(m, &grid)).collect();
+
     // Contour-resolution cleanup: drop sub-resolution mesh-facet noise (0.01 mm,
     // Orca-style — preserves curve detail for arc fitting). Then dimensional
     // compensation: XY grow/shrink on every layer, and the first layer pulled in
     // to counter squish (elephant foot).
     let res = config::contour_resolution_mm();
-    layers.par_iter_mut().for_each(|layer| {
-        layer.polygons = simplify(&layer.polygons, res);
-        if settings.xy_compensation_mm != 0.0 {
-            layer.polygons = offset(&layer.polygons, settings.xy_compensation_mm);
+    for layers in &mut part_layers {
+        layers.par_iter_mut().for_each(|layer| {
+            layer.polygons = simplify(&layer.polygons, res);
+            if settings.xy_compensation_mm != 0.0 {
+                layer.polygons = offset(&layer.polygons, settings.xy_compensation_mm);
+            }
+            if layer.index == 0 && settings.elephant_foot_mm > 0.0 {
+                layer.polygons = offset(&layer.polygons, -settings.elephant_foot_mm);
+            }
+        });
+    }
+
+    // Overlap ownership: where parts interpenetrate (figurine assemblies often
+    // do), the earlier part keeps the volume and later parts are trimmed to
+    // what's left — planned independently, an overlap would print twice.
+    for p in 1..part_layers.len() {
+        let (done, rest) = part_layers.split_at_mut(p);
+        rest[0].par_iter_mut().enumerate().for_each(|(i, layer)| {
+            for prev in done.iter() {
+                if !layer.polygons.is_empty() && !prev[i].polygons.is_empty() {
+                    layer.polygons = difference(&layer.polygons, &prev[i].polygons);
+                }
+            }
+        });
+    }
+
+    // The physical union per layer — everything that exists at each z, all
+    // parts together. Overhang/bridge/support tests run against this (a part
+    // resting on another is supported); skin placement stays per part.
+    let phys: Vec<Polygons> = if parts.len() == 1 {
+        part_layers[0].iter().map(|l| l.polygons.clone()).collect()
+    } else {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut acc = Polygons::new();
+                for layers in &part_layers {
+                    if !layers[i].polygons.is_empty() {
+                        acc = union(&acc, &layers[i].polygons);
+                    }
+                }
+                acc
+            })
+            .collect()
+    };
+
+    // Plan each part independently.
+    let mut part_plans: Vec<Vec<LayerPlan>> = Vec::with_capacity(parts.len());
+    for layers in &part_layers {
+        let mut plans = plan_part(layers, &phys, settings);
+        add_supports(&mut plans, layers, &phys, settings);
+        part_plans.push(plans);
+    }
+
+    // Blend schedules — a pure function of the weights and the absolute layer
+    // index, so every part sharing a blend prints the same tool on the same
+    // layer (aligned bands, no extra toolchanges between them).
+    let schedules: Vec<Option<Vec<u32>>> = parts
+        .iter()
+        .map(|(_, paint)| match paint {
+            PartPaint::Tool(_) => None,
+            PartPaint::Blend(w) => Some(blend_schedule(w, n)),
+        })
+        .collect();
+
+    // Stamp each part's paint on every path — a uniform tool, or the blend's
+    // per-layer schedule (geometry is identical either way; only the tool that
+    // prints each layer varies).
+    for (m, plans) in part_plans.iter_mut().enumerate() {
+        let (_, paint) = &parts[m];
+        let schedule = &schedules[m];
+        for plan in plans.iter_mut() {
+            let i = plan.index;
+            let tool = match (paint, schedule) {
+                (PartPaint::Tool(t), _) => *t,
+                (_, Some(sched)) => sched[i],
+                _ => unreachable!(),
+            };
+            for path in &mut plan.paths {
+                path.tool = tool;
+            }
         }
-        if layer.index == 0 && settings.elephant_foot_mm > 0.0 {
-            layer.polygons = offset(&layer.polygons, -settings.elephant_foot_mm);
+    }
+
+    // Merge per layer: paths in part order (order_layers regroups by tool);
+    // outline = union of the parts' outlines (the combing domain). The single-
+    // part path hands its plans through untouched.
+    let mut plans: Vec<LayerPlan> = if part_plans.len() == 1 {
+        part_plans.pop().unwrap()
+    } else {
+        (0..n)
+            .map(|i| {
+                let mut paths = Vec::new();
+                let mut outline = Polygons::new();
+                for pp in &mut part_plans {
+                    paths.append(&mut pp[i].paths);
+                    if outline.is_empty() {
+                        outline = std::mem::take(&mut pp[i].outline);
+                    } else if !pp[i].outline.is_empty() {
+                        outline = union(&outline, &pp[i].outline);
+                    }
+                }
+                LayerPlan {
+                    index: i,
+                    print_z_mm: grid[i].print_z_mm,
+                    height_mm: grid[i].height_mm,
+                    paths,
+                    travels: Vec::new(),
+                    outline,
+                    speed_scale: 1.0,
+                    planned_temp_c: None,
+                    temp_command_c: None,
+                }
+            })
+            .collect()
+    };
+
+    // The tool that starts the print — lowest tool with material on layer 0.
+    // Brim and skirt prime it, and layer ordering leads with it.
+    let initial_tool = plans
+        .first()
+        .and_then(|p0| p0.paths.iter().map(|p| p.tool).min())
+        .unwrap_or(0);
+
+    // Brim: loops extending outward from the first-layer outline, touching the
+    // part for bed adhesion.
+    if settings.brim_loops > 0 {
+        if let Some(plan0) = plans.first_mut() {
+            let mut brim = brim_paths(&phys[0], settings);
+            for p in &mut brim {
+                p.tool = initial_tool;
+            }
+            plan0.paths.splice(0..0, brim);
         }
-    });
+    }
+
+    // Skirt: priming loops around the first layer, printed before anything else.
+    if settings.skirt_loops > 0 {
+        if let Some(plan0) = plans.first_mut() {
+            let mut skirt = skirt_paths(&phys[0], settings);
+            for p in &mut skirt {
+                p.tool = initial_tool;
+            }
+            plan0.paths.splice(0..0, skirt);
+        }
+    }
+
+    order_layers(&mut plans, settings.outer_wall_first);
+    order_unsupported_rings_outer_in(&mut plans, &phys, settings);
+    center_on_bed(&mut plans, parts, settings);
+    if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
+        align_seams(&mut plans, settings.seam_mode);
+    }
+    crate::emit::plan_travels(&mut plans, settings);
+    crate::emit::apply_min_layer_time(&mut plans, settings);
+    plans
+}
+
+/// Plan one part's layers into per-layer toolpaths — everything that reads only
+/// this part's own material. `phys` is the per-layer union of ALL parts: the
+/// "is there something below me" physical tests (overhang walls, bridges,
+/// enclosed ceilings) run against it, while top/bottom skin placement
+/// deliberately stays per part so interfaces between parts get full shells.
+fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<LayerPlan> {
     let lw = settings.line_width_mm;
     let n = layers.len();
 
@@ -302,7 +557,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // Carve reach: clears inner perimeters out of the hollow + the
                 // foothold band, but keeps the rings beyond it.
                 let foothold = settings.bridge_foothold_mm;
-                enclosed_ceiling_sheet(&layer.polygons, &layers[layer.index - 1].polygons, lw, allowance, foothold)
+                enclosed_ceiling_sheet(&layer.polygons, &phys[layer.index - 1], lw, allowance, foothold)
             } else {
                 Polygons::new()
             };
@@ -366,6 +621,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                                 widths: None,
                                 overhang: 0.0,
                                 segs: None,
+                                tool: 0,
                             });
                         }
                     }
@@ -390,7 +646,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
             let mut walls = if layer.index > 0 && !settings.spiral_vase {
-                let below = offset(&layers[layer.index - 1].polygons, 0.05);
+                let below = offset(&phys[layer.index - 1], 0.05);
                 let unsupported = difference(&layer.polygons, &below);
                 if unsupported.is_empty() {
                     walls
@@ -442,7 +698,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         .collect();
 
     // Pass 2: assemble layers, splitting infill into solid shells + sparse core.
-    let mut plans: Vec<LayerPlan> = walls_per_layer
+    let plans: Vec<LayerPlan> = walls_per_layer
         .into_par_iter()
         .enumerate()
         .map(|(i, mut paths)| {
@@ -494,7 +750,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 && settings.bottom_layers > 0
                 && !enclosed_ceiling_sheet(
                     &layers[i].polygons,
-                    &layers[i - 1].polygons,
+                    &phys[i - 1],
                     lw,
                     settings.layer_height_mm
                         * settings.support_overhang_angle_deg.to_radians().tan(),
@@ -511,7 +767,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
             let overhang_region = if i > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
-                supported_below = offset(&layers[i - 1].polygons, allowance);
+                supported_below = offset(&phys[i - 1], allowance);
                 let oh = difference(&layers[i].polygons, &supported_below);
                 let oh = offset(&offset(&oh, -lw), lw); // open: drop slivers
                 // The hollow + its landing band bridges as one sheet, so the ends sit
@@ -521,7 +777,7 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // beyond the carve.
                 let ceiling = enclosed_ceiling_sheet(
                     &layers[i].polygons,
-                    &layers[i - 1].polygons,
+                    &phys[i - 1],
                     lw,
                     allowance,
                     settings.bridge_foothold_mm + sp,
@@ -643,13 +899,19 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
                 // hidden — and a light open drops the hair-thin ribbons the
                 // coverage differences leave behind.
                 let open = |p: Polygons| offset(&offset(&p, -lw * 0.1), lw * 0.1);
-                let skin_bottom = if i == 0 {
+                // An EMPTY neighbor layer takes the same exact-clone branch as
+                // the grid edge: differencing against nothing and then opening
+                // only rounds corners, and the crumbs of `internal` that leaves
+                // let absorb_into_solid swallow the whole exposed face. On the
+                // shared multi-part grid a part's first/last layers sit mid-grid
+                // with empty neighbors, so this is the everyday case there.
+                let skin_bottom = if i == 0 || layers[i - 1].polygons.is_empty() {
                     solid.clone()
                 } else {
                     open(difference(&solid, &offset(&layers[i - 1].polygons, 0.05)))
                 };
                 let buried = difference(&solid, &skin_bottom);
-                let skin_top = if i + 1 < n {
+                let skin_top = if i + 1 < n && !layers[i + 1].polygons.is_empty() {
                     open(difference(&buried, &offset(&layers[i + 1].polygons, 0.05)))
                 } else {
                     buried.clone()
@@ -947,32 +1209,6 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
         })
         .collect();
 
-    // Brim: loops extending outward from the first-layer outline, touching the
-    // part for bed adhesion.
-    if settings.brim_loops > 0 {
-        if let (Some(first), Some(plan0)) = (layers.first(), plans.first_mut()) {
-            let brim = brim_paths(&first.polygons, settings);
-            plan0.paths.splice(0..0, brim);
-        }
-    }
-
-    // Skirt: priming loops around the first layer, printed before anything else.
-    if settings.skirt_loops > 0 {
-        if let (Some(first), Some(plan0)) = (layers.first(), plans.first_mut()) {
-            let skirt = skirt_paths(&first.polygons, settings);
-            plan0.paths.splice(0..0, skirt);
-        }
-    }
-
-    add_supports(&mut plans, &layers, settings);
-    order_layers(&mut plans, settings.outer_wall_first);
-    order_unsupported_rings_outer_in(&mut plans, &layers, settings);
-    center_on_bed(&mut plans, mesh, settings);
-    if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
-        align_seams(&mut plans, settings.seam_mode);
-    }
-    crate::emit::plan_travels(&mut plans, settings);
-    crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
 }
 
@@ -980,7 +1216,12 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// is the region not over the layer below within a printable cantilever; this is
 /// projected downward and the support area (minus the part + clearance) is filled
 /// with sparse lines as `PathKind::Support`.
-fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
+///
+/// `layers` is the part being supported; `phys` is the per-layer union of ALL
+/// parts — overhangs resting on another part need no support, and a support
+/// column stops on (and keeps clearance from) whatever part it meets on the
+/// way down.
+fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], settings: &Settings) {
     // Only Grid mode adds support structure below; None leaves overhangs as-is.
     if settings.support_mode != SupportMode::Grid {
         return;
@@ -1003,7 +1244,7 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
             if i == 0 {
                 return Polygons::new();
             }
-            let supported = offset(&layers[i - 1].polygons, allowance);
+            let supported = offset(&phys[i - 1], allowance);
             let oh = difference(&layers[i].polygons, &supported);
             offset(&offset(&oh, -lw), lw) // morphological open
         })
@@ -1019,7 +1260,7 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
     let iface = settings.support_interface_layers;
     let mut accum = Polygons::new();
     for i in (0..n).rev() {
-        let blocked = offset(&layers[i].polygons, clearance);
+        let blocked = offset(&phys[i], clearance);
         let here = difference(&accum, &blocked);
         if !here.is_empty() {
             let angle = if i % 2 == 0 { 0.0 } else { 90.0 };
@@ -1040,7 +1281,7 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) 
                     settings.seam_mode, i, layers[i].z_mm);
             }
         }
-        accum = difference(&accum, &layers[i].polygons);
+        accum = difference(&accum, &phys[i]);
         // Defer adding this layer's overhang by `gap` layers so the support tops
         // out `gap` layers below it (leaving the removal gap).
         if i + gap < n {
@@ -2069,43 +2310,67 @@ fn extend_to_wall(p: Point, prev: Point, max: f64, inside_walls: &Polygons) -> P
 /// paths (monotonic fill) move as one block.
 fn order_layers(plans: &mut [LayerPlan], outer_first: bool) {
     let mut cur = Point::new(0, 0);
+    let mut cur_tool: Option<u32> = None;
     for plan in plans.iter_mut() {
         let all = std::mem::take(&mut plan.paths);
-        let (prime, rest): (Vec<_>, Vec<_>) =
-            all.into_iter().partition(|p| p.kind == PathKind::Skirt);
-        if let Some(last) = prime.last() {
-            cur = path_end(last);
+        // Group by tool first — a toolchange costs far more than any travel, so
+        // a layer prints everything one tool owns before switching. The tool
+        // already in hand goes first (consecutive layers then serpentine through
+        // the tools: each layer pays only the changes it must); the rest follow
+        // in ascending order. Single-tool prints have one group and none of
+        // this reorders anything.
+        let mut groups: std::collections::BTreeMap<u32, Vec<ToolPath>> =
+            std::collections::BTreeMap::new();
+        for p in all {
+            groups.entry(p.tool).or_default().push(p);
         }
-        let (iron, rest): (Vec<_>, Vec<_>) =
-            rest.into_iter().partition(|p| p.kind == PathKind::Ironing);
-        let mut paths = prime;
-        // Walls before fill: a bridge or solid must anchor on perimeters
-        // already laid THIS layer — a bridge strand whose ends sit on the inner
-        // rim (not the layer below) has nothing to grab if its perimeter prints
-        // afterwards, and flails. Order the wall block first, then the fill.
-        let (walls, fill): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| {
-            matches!(
-                p.kind,
-                PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
-            )
-        });
-        // Walls: explicit outer-vs-inner sequence per island. Fill: greedy travel.
-        let walls = order_walls(walls, cur, outer_first);
-        if let Some(last) = walls.last() {
-            cur = path_end(last);
+        let mut tool_order: Vec<u32> = groups.keys().copied().collect();
+        if let Some(ct) = cur_tool {
+            if let Some(k) = tool_order.iter().position(|&t| t == ct) {
+                tool_order.remove(k);
+                tool_order.insert(0, ct);
+            }
         }
-        paths.extend(walls);
-        if !fill.is_empty() {
-            let fill = order_paths(fill, cur);
-            if let Some(last) = fill.last() {
+        let mut paths = Vec::new();
+        for t in tool_order {
+            let group = groups.remove(&t).unwrap();
+            let (prime, rest): (Vec<_>, Vec<_>) =
+                group.into_iter().partition(|p| p.kind == PathKind::Skirt);
+            if let Some(last) = prime.last() {
                 cur = path_end(last);
             }
-            paths.extend(fill);
+            let (iron, rest): (Vec<_>, Vec<_>) =
+                rest.into_iter().partition(|p| p.kind == PathKind::Ironing);
+            paths.extend(prime);
+            // Walls before fill: a bridge or solid must anchor on perimeters
+            // already laid THIS layer — a bridge strand whose ends sit on the inner
+            // rim (not the layer below) has nothing to grab if its perimeter prints
+            // afterwards, and flails. Order the wall block first, then the fill.
+            let (walls, fill): (Vec<_>, Vec<_>) = rest.into_iter().partition(|p| {
+                matches!(
+                    p.kind,
+                    PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
+                )
+            });
+            // Walls: explicit outer-vs-inner sequence per island. Fill: greedy travel.
+            let walls = order_walls(walls, cur, outer_first);
+            if let Some(last) = walls.last() {
+                cur = path_end(last);
+            }
+            paths.extend(walls);
+            if !fill.is_empty() {
+                let fill = order_paths(fill, cur);
+                if let Some(last) = fill.last() {
+                    cur = path_end(last);
+                }
+                paths.extend(fill);
+            }
+            if let Some(last) = iron.last() {
+                cur = path_end(last);
+            }
+            paths.extend(iron); // already in boustrophedon order
+            cur_tool = Some(t);
         }
-        if let Some(last) = iron.last() {
-            cur = path_end(last);
-        }
-        paths.extend(iron); // already in boustrophedon order
         plan.paths = paths;
     }
 }
@@ -2119,7 +2384,7 @@ fn order_layers(plans: &mut [LayerPlan], outer_first: bool) {
 /// lay that unsupported span first — there's nothing to print supported-edge-first
 /// from. The test is geometric: reorder a run only when its outermost (largest)
 /// ring sits fully on the layer below and its innermost is over air.
-fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], settings: &Settings) {
+fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], phys: &[Polygons], settings: &Settings) {
     fn loop_area(p: &ToolPath) -> f64 {
         let pts = &p.points;
         let m = pts.len();
@@ -2172,7 +2437,7 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
         }
         let allowance =
             settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
-        let below = offset(&layers[plan.index - 1].polygons, allowance);
+        let below = offset(&phys[plan.index - 1], allowance);
         let paths = &mut plan.paths;
         let part_of_run = |p: &ToolPath| is_ring(p.kind);
         let mut i = 0;
@@ -2185,9 +2450,10 @@ fn order_unsupported_rings_outer_in(plans: &mut [LayerPlan], layers: &[Layer], s
             // ordering tucks among them. Overhang walls are kept whole now (mixed
             // support = per-segment annotation, not split arcs), so a void cap's
             // rings are all closed; `supported` uses a majority test so a ring that
-            // dips a little into the void still reads anchored.
+            // dips a little into the void still reads anchored. A run never crosses
+            // a tool boundary — rings of different parts must not swap.
             let mut j = i;
-            while j < paths.len() && part_of_run(&paths[j]) {
+            while j < paths.len() && part_of_run(&paths[j]) && paths[j].tool == paths[i].tool {
                 j += 1;
             }
             let area_at = |k: usize| loop_area(&paths[k]);
@@ -2474,11 +2740,20 @@ fn coverage(inners: &[Polygons], i: usize, dir: isize, count: usize, n: usize) -
 }
 
 /// Shift all toolpaths so the model's XY center sits at the bed center.
-fn center_on_bed(plans: &mut [LayerPlan], mesh: &Mesh, settings: &Settings) {
+fn center_on_bed(plans: &mut [LayerPlan], parts: &[(&Mesh, PartPaint)], settings: &Settings) {
     if !settings.auto_center_on_bed {
         return; // caller positioned the geometry already (e.g. GUI multi-object layout)
     }
-    let Some((min_x, min_y, max_x, max_y)) = mesh.xy_bounds() else {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    for (m, _) in parts {
+        if let Some((lo_x, lo_y, hi_x, hi_y)) = m.xy_bounds() {
+            bounds = Some(match bounds {
+                None => (lo_x, lo_y, hi_x, hi_y),
+                Some((ax, ay, bx, by)) => (ax.min(lo_x), ay.min(lo_y), bx.max(hi_x), by.max(hi_y)),
+            });
+        }
+    }
+    let Some((min_x, min_y, max_x, max_y)) = bounds else {
         return;
     };
     let model_cx = (min_x + max_x) / 2.0;
@@ -3786,4 +4061,160 @@ mod tests {
         let max_y = ext.points.iter().map(|p| p.y).max().unwrap();
         assert_eq!(ext.points[0].y, max_y, "seam should start at the rear-most vertex");
     }
+
+    #[test]
+    fn parts_group_by_tool_and_serpentine() {
+        // Two disjoint cubes on different tools: every layer prints all of one
+        // tool before the other (exactly one change per layer), and each layer
+        // leads with the tool already in hand from the layer before.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &s);
+        assert!(!plans.is_empty());
+        for plan in &plans {
+            let tools: Vec<u32> = plan.paths.iter().map(|p| p.tool).collect();
+            let changes = tools.windows(2).filter(|w| w[0] != w[1]).count();
+            assert_eq!(changes, 1, "layer {}: tools not grouped: {tools:?}", plan.index);
+        }
+        for w in plans.windows(2) {
+            let last = w[0].paths.last().unwrap().tool;
+            let first = w[1].paths.first().unwrap().tool;
+            assert_eq!(last, first, "layer {} does not lead with the tool in hand", w[1].index);
+        }
+    }
+
+    #[test]
+    fn stacked_part_is_supported_by_the_one_below() {
+        // Cube B rests directly on cube A (different tools). B's base is
+        // physically supported — no support columns, no bridges, no overhang
+        // walls — yet the interface still gets B's own bottom skin (full
+        // shells between filaments, no show-through).
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [20.0, 20.0, 10.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [5.0, 5.0, 10.0], [15.0, 15.0, 20.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.layer_height_mm = 0.2;
+        s.first_layer_height_mm = 0.2;
+        s.support_mode = SupportMode::Grid;
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &s);
+        assert_eq!(plans.len(), 100, "shared grid spans the union z-range");
+        let supports: usize = plans.iter().map(|l| count(l, PathKind::Support)).sum();
+        assert_eq!(supports, 0, "B rests on A — nothing to support");
+        // The interface layer: B's first layer, printed on A's top.
+        let interface = &plans[50];
+        assert_eq!(count(interface, PathKind::Bridge), 0, "supported base must not bridge");
+        assert_eq!(count(interface, PathKind::OverhangWall), 0, "supported walls aren't overhangs");
+        let skins: Vec<&ToolPath> =
+            interface.paths.iter().filter(|p| p.kind == PathKind::BottomSkin).collect();
+        assert!(!skins.is_empty(), "part interface must be skinned");
+        assert!(skins.iter().all(|p| p.tool == 1), "the interface skin belongs to the upper part");
+    }
+
+    #[test]
+    fn overlapping_parts_trim_to_the_earlier_owner() {
+        // Cubes overlapping 10 mm in x: the earlier part owns the overlap, the
+        // later part retreats to the boundary — nothing prints twice.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [20.0, 20.0, 6.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [10.0, 0.0, 0.0], [30.0, 20.0, 6.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.auto_center_on_bed = false;
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &s);
+        let mid = &plans[plans.len() / 2];
+        for p in &mid.paths {
+            if p.tool == 1 {
+                for pt in &p.points {
+                    assert!(
+                        pt.x_mm() > 19.5,
+                        "tool-1 path crosses into the owned overlap: x={:.2}",
+                        pt.x_mm()
+                    );
+                }
+            }
+        }
+        let t0_max = mid
+            .paths
+            .iter()
+            .filter(|p| p.tool == 0)
+            .flat_map(|p| &p.points)
+            .map(|pt| pt.x_mm())
+            .fold(f64::MIN, f64::max);
+        assert!(t0_max > 19.0, "tool-0 keeps its full footprint (max x {t0_max:.2})");
+    }
+
+    #[test]
+    fn blend_schedule_hits_the_ratio_evenly() {
+        // 30% tool 0 / 70% tool 2 over 100 layers: exact counts, and every
+        // prefix stays within one layer of the ideal (error diffusion, not
+        // clumping). 50/50 must strictly alternate.
+        let sched = blend_schedule(&[(0, 0.3), (2, 0.7)], 100);
+        assert_eq!(sched.iter().filter(|&&t| t == 0).count(), 30);
+        assert_eq!(sched.iter().filter(|&&t| t == 2).count(), 70);
+        let mut c0 = 0.0;
+        for (i, &t) in sched.iter().enumerate() {
+            if t == 0 {
+                c0 += 1.0;
+            }
+            let ideal = 0.3 * (i + 1) as f64;
+            assert!((c0 - ideal).abs() <= 1.0, "prefix {i}: {c0} vs {ideal}");
+        }
+        let ab = blend_schedule(&[(1, 1.0), (0, 1.0)], 10);
+        for w in ab.windows(2) {
+            assert_ne!(w[0], w[1], "50/50 must alternate: {ab:?}");
+        }
+        // Degenerate blends: one entry = that tool; empty = tool 0.
+        assert!(blend_schedule(&[(3, 2.0)], 5).iter().all(|&t| t == 3));
+        assert!(blend_schedule(&[], 5).iter().all(|&t| t == 0));
+        // Deterministic.
+        assert_eq!(sched, blend_schedule(&[(0, 0.3), (2, 0.7)], 100));
+    }
+
+    #[test]
+    fn painted_blend_dithers_layers_and_aligns_across_parts() {
+        // Two cubes sharing a 50/50 blend of tools 0 and 1: each layer is one
+        // tool for BOTH parts (aligned bands — no toolchange between them),
+        // consecutive layers alternate, and the geometry is untouched (same
+        // paths as the same cubes painted with a single tool).
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 4.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, 0.0], [40.0, 10.0, 4.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        let blend = PartPaint::Blend(vec![(0, 1.0), (1, 1.0)]);
+        let plans =
+            generate_painted(&[(&a, blend.clone()), (&b, blend.clone())], &s);
+        let mut per_layer_tool = Vec::new();
+        for plan in &plans {
+            let tools: Vec<u32> = plan.paths.iter().map(|p| p.tool).collect();
+            assert!(!tools.is_empty());
+            assert!(tools.windows(2).all(|w| w[0] == w[1]), "layer {} mixes tools", plan.index);
+            per_layer_tool.push(tools[0]);
+        }
+        for w in per_layer_tool.windows(2) {
+            assert_ne!(w[0], w[1], "a 50/50 blend alternates every layer");
+        }
+        let uniform = generate_parts(&[(&a, 0), (&b, 0)], &s);
+        assert_eq!(plans.len(), uniform.len());
+        for (bl, un) in plans.iter().zip(&uniform) {
+            assert_eq!(bl.paths.len(), un.paths.len(), "blend must not change geometry");
+        }
+    }
+
 }

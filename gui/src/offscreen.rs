@@ -1,15 +1,23 @@
-//! Headless offscreen render: slice an STL and render one preview layer to a
+//! Headless offscreen render: slice a model and render one preview layer to a
 //! PNG through the *same* `Scene`/`render_to` path the GUI uses — no window, no
 //! egui. This is the reliable visual oracle for wall-generation changes: a fix
 //! is a single command, pixel-faithful to the GUI, with none of the xdotool
 //! fragility of driving the live app.
+//!
+//! A `.3mf` slices multi-material: every item's parts in document order, each
+//! on the tool its extruder hint names (1-based hint − 1; 0 when absent),
+//! overridable per part via `TOOLS=0,1,2,…`. A TOOLS entry may also be a
+//! blend literal `w:t+w:t…` (`50:0+50:2` = a 50/50 layer dither of tools 0
+//! and 2 — the GUI's pseudo colors); `COLOR=filament` colors the beads by
+//! tool instead of by feature.
 
 use crate::{build_instances, render::Scene};
 use eframe::wgpu;
 use glam::{Mat4, Vec3};
 
 pub struct Args {
-    pub stl: std::path::PathBuf,
+    /// Model to slice — `.stl`, or `.3mf` (parts print per-tool; see above).
+    pub model: std::path::PathBuf,
     pub out: std::path::PathBuf,
     pub layer: usize,
     pub walls: usize,
@@ -38,7 +46,6 @@ pub fn run(a: &Args) -> Result<(), String> {
     .map_err(|e| format!("no GPU device: {e:?}"))?;
 
     // Slice.
-    let mesh = mesh::Mesh::load_stl(&a.stl).map_err(|e| format!("load {}: {e}", a.stl.display()))?;
     let mut settings = config::Settings::default();
     settings.wall_count = a.walls;
     // Debug env overrides so the offscreen render can reproduce GUI experiments.
@@ -60,15 +67,71 @@ pub fn run(a: &Args) -> Result<(), String> {
     if std::env::var("SUPPORT").is_ok() {
         settings.support_mode = config::SupportMode::Grid;
     }
-    let layers = engine::generate(&mesh, &settings);
+    let is_3mf = a.model.extension().map(|e| e.eq_ignore_ascii_case("3mf")).unwrap_or(false);
+    let layers = if is_3mf {
+        // Every item's parts in document order; paint = extruder hint − 1
+        // (0 when absent), each overridable in order via TOOLS entries —
+        // plain slot indices or blend literals (see the module doc).
+        let items = mesh::load_3mf(&a.model).map_err(|e| format!("load {}: {e}", a.model.display()))?;
+        let mut parts: Vec<(mesh::Mesh, engine::PartPaint)> = items
+            .into_iter()
+            .flat_map(|it| it.parts)
+            .map(|p| {
+                let tool = p.extruder.map(|e| e.saturating_sub(1)).unwrap_or(0);
+                (p.mesh, engine::PartPaint::Tool(tool))
+            })
+            .collect();
+        if parts.is_empty() {
+            return Err("no printable parts in the 3MF".into());
+        }
+        if let Ok(list) = std::env::var("TOOLS") {
+            for (part, tok) in parts.iter_mut().zip(list.split(',')) {
+                part.1 = parse_paint(tok.trim())?;
+            }
+        }
+        let max_tool = |p: &engine::PartPaint| match p {
+            engine::PartPaint::Tool(t) => *t,
+            engine::PartPaint::Blend(w) => w.iter().map(|&(t, _)| t).max().unwrap_or(0),
+        };
+        settings.tool_count = parts.iter().map(|(_, p)| max_tool(p)).max().unwrap_or(0) as usize + 1;
+        // Deterministic slot colors (no profiles load here): three greys the
+        // eye orders instantly, then a hue spread for bigger changers.
+        settings.tools = (0..settings.tool_count)
+            .map(|i| {
+                let mut t = settings.flat_tool(format!("tool-{i}"));
+                t.color_rgb = oracle_tool_color(i);
+                t
+            })
+            .collect();
+        let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
+            parts.iter().map(|(m, p)| (m, p.clone())).collect();
+        engine::generate_painted(&refs, &settings)
+    } else {
+        let mesh =
+            mesh::Mesh::load_stl(&a.model).map_err(|e| format!("load {}: {e}", a.model.display()))?;
+        engine::generate(&mesh, &settings)
+    };
     if layers.is_empty() {
         return Err("slice produced no layers".into());
     }
     let layer = a.layer.clamp(1, layers.len());
 
-    // Same bead geometry the GUI builds.
+    // Same bead geometry the GUI builds. COLOR=filament swaps the feature
+    // palette for each path's tool color (the slot table above).
     let accent = (190.0, 0.25, 0.55);
-    let (inst, ends, joints, joint_ends) = build_instances(&layers, 0.0, None, accent, 0.0);
+    let path_colors: Option<Vec<Vec<[f32; 3]>>> = match std::env::var("COLOR").as_deref() {
+        Ok("filament") => Some(
+            layers
+                .iter()
+                .map(|l| {
+                    l.paths.iter().map(|p| settings.tool(p.tool as usize).color_rgb).collect()
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    let (inst, ends, joints, joint_ends) =
+        build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0);
     let count = ends.get(layer - 1).copied().unwrap_or(0);
     let joint_count = joint_ends.get(layer - 1).copied().unwrap_or(0);
 
@@ -118,7 +181,41 @@ pub fn run(a: &Args) -> Result<(), String> {
         a.walls,
         a.out.display()
     );
+    // Multi-material: the per-slot filament split (the toolchanger oracle).
+    if settings.tool_count > 1 {
+        for (t, mm, g) in engine::estimate_filament_per_tool(&layers, &settings) {
+            eprintln!("offscreen: T{t} {:.2} m ({g:.1} g)", mm / 1000.0);
+        }
+    }
     Ok(())
+}
+
+/// One TOOLS= entry: a plain slot index, or a blend literal `w:t+w:t…`
+/// (weights are relative shares — `50:0+50:2` and `1:0+1:2` are the same mix).
+fn parse_paint(tok: &str) -> Result<engine::PartPaint, String> {
+    if !tok.contains(':') {
+        return tok.parse::<u32>().map(engine::PartPaint::Tool).map_err(|_| format!("bad TOOLS entry {tok:?}"));
+    }
+    let mut weights = Vec::new();
+    for term in tok.split('+') {
+        let (w, t) = term.split_once(':').ok_or_else(|| format!("bad TOOLS blend term {term:?}"))?;
+        weights.push((
+            t.trim().parse::<u32>().map_err(|_| format!("bad blend tool {t:?}"))?,
+            w.trim().parse::<f64>().map_err(|_| format!("bad blend weight {w:?}"))?,
+        ));
+    }
+    Ok(engine::PartPaint::Blend(weights))
+}
+
+/// Slot colors for the headless oracle, where no profiles load: white → grey →
+/// dark grey read instantly in a monochrome PNG; slots past 2 spread hues.
+fn oracle_tool_color(i: usize) -> [f32; 3] {
+    match i {
+        0 => [0.82, 0.82, 0.82],
+        1 => [0.55, 0.55, 0.55],
+        2 => [0.28, 0.28, 0.28],
+        n => crate::hsl_to_rgb(((n - 3) as f32 * 67.0) % 360.0, 0.55, 0.55),
+    }
 }
 
 /// XY centre + bounding radius of all toolpath points through `up_to` layers.

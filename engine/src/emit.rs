@@ -9,18 +9,124 @@
 //! Output targets Klipper: relative extrusion (`M83`) and a retraction before
 //! every travel between separate extrusions. The start/end g-code comes from the
 //! printer profile (see `config`); `{placeholders}` are substituted here.
+//!
+//! On a toolchanger (`tool_count > 1`) each path carries a tool id and the plan
+//! groups paths by tool (serpentine across layers). The toolchange template is
+//! emitted at group boundaries; the dock macro invalidates feed/Z/PA/fan state,
+//! which is re-established with the new tool's filament settings.
 
-use config::Settings;
+use config::{Settings, ToolSettings};
 use gcode::GcodeBuilder;
 use geo2d::{Point, Polygons};
 use rayon::prelude::*;
 
 use crate::plan::{LayerPlan, PathKind, ToolPath, Travel};
 
+/// Per-path filament view. On a toolchanger the slot table is authoritative; on
+/// a single-tool machine the flat fields are — `tools[0]` mirrors them only at
+/// resolve time, and callers may have adjusted the flat fields since.
+struct Tools<'a> {
+    s: &'a Settings,
+    flat: ToolSettings,
+}
+
+impl Tools<'_> {
+    fn new(s: &Settings) -> Tools<'_> {
+        Tools { s, flat: s.flat_tool(String::new()) }
+    }
+
+    fn get(&self, tool: u32) -> &ToolSettings {
+        if self.s.tool_count > 1 {
+            self.s.tool(tool as usize)
+        } else {
+            &self.flat
+        }
+    }
+}
+
+/// Cross-sectional area (mm²) of a tool's filament — the per-slot mirror of
+/// `Settings::filament_area_mm2`.
+fn tool_area_mm2(tool: &ToolSettings) -> f64 {
+    let r = tool.filament_diameter_mm / 2.0;
+    std::f64::consts::PI * r * r
+}
+
+/// A path counts (for tool bookkeeping, volumes, timing) only if it can print.
+fn printable(p: &ToolPath) -> bool {
+    p.points.len() >= 2
+}
+
+/// Distinct tools over all printable paths, in first-use order. Public for
+/// the front-ends' pre-send checks (does the connected machine have these?).
+pub fn used_tools(layers: &[LayerPlan]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for layer in layers {
+        for p in layer.paths.iter().filter(|p| printable(p)) {
+            if !out.contains(&p.tool) {
+                out.push(p.tool);
+            }
+        }
+    }
+    out
+}
+
+/// The tool of the first printable path — what the print opens with.
+fn initial_tool(layers: &[LayerPlan]) -> u32 {
+    layers.iter().flat_map(|l| &l.paths).find(|p| printable(p)).map_or(0, |p| p.tool)
+}
+
+/// Distinct tools printing the first non-empty layer (they want their
+/// first-layer temperature from the start; the rest idle at print temp).
+fn first_layer_tools(layers: &[LayerPlan]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Some(l) = layers.iter().find(|l| l.paths.iter().any(printable)) {
+        for p in l.paths.iter().filter(|p| printable(p)) {
+            if !out.contains(&p.tool) {
+                out.push(p.tool);
+            }
+        }
+    }
+    out
+}
+
+/// Tool in hand entering each layer (the previous layer's last printable
+/// path's tool; None before anything has printed). The estimators charge a
+/// toolchange against this exactly where `to_gcode` emits one.
+fn entry_tools(layers: &[LayerPlan]) -> Vec<Option<u32>> {
+    let mut out = Vec::with_capacity(layers.len());
+    let mut last: Option<u32> = None;
+    for layer in layers {
+        out.push(last);
+        if let Some(p) = layer.paths.iter().rev().find(|p| printable(p)) {
+            last = Some(p.tool);
+        }
+    }
+    out
+}
+
+/// One tool selection: the marker comment + the profile's toolchange template
+/// (may be multi-line), `{tool}` substituted.
+fn emit_toolchange(g: &mut GcodeBuilder, s: &Settings, tool: u32) {
+    g.comment(&format!("toolchange T{tool}"));
+    let text = s.toolchange_gcode.replace("{tool}", &tool.to_string());
+    for line in text.lines() {
+        if !line.trim().is_empty() {
+            g.raw(line.trim_end());
+        }
+    }
+}
+
 /// Emit complete G-code for a planned model.
 pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let mut g = GcodeBuilder::new();
-    let area = s.filament_area_mm2();
+    let tools = Tools::new(s);
+    // A toolchanger print. tool_count is authoritative: it alone gates every
+    // T-form line, so a single-tool profile emits exactly the classic bytes.
+    let multi = s.tool_count > 1;
+    let used = used_tools(layers);
+    let init_tool = initial_tool(layers);
+    let layer0_tools = first_layer_tools(layers);
+    let init = tools.get(init_tool);
     let travel_f = s.travel_speed_mm_s * 60.0;
     let retract_f = s.retract_speed_mm_s * 60.0;
     // Hopped travels lift by this much.
@@ -32,20 +138,74 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         let travel_v = s.travel_speed_mm_s.max(1.0);
         let mut acc = 0.0;
         let mut prev_z = 0.0;
-        for layer in layers {
+        for (layer, entry) in layers.iter().zip(entry_tools(layers)) {
             acc += (layer.print_z_mm - prev_z).abs() / travel_v;
             prev_z = layer.print_z_mm;
-            acc += layer_print_seconds(layer, s, layer.speed_scale);
+            acc += layer_print_seconds(layer, s, &tools, layer.speed_scale, entry);
             cum_secs.push(acc);
         }
     }
     let total_secs = cum_secs.last().copied().unwrap_or(0.0);
     let (fil_mm, fil_g) = estimate_filament(layers, s);
 
+    // Standby plan for docked tools: a tool released for longer than
+    // standby_after_s (layer-level estimate) drops to its filament's standby
+    // temperature at the swap, reheats a layer ahead of its pickup, and the
+    // pickup swap confirms with a blocking wait (normally instant — the lead
+    // layer absorbs the reheat; the wait is unmodeled in the estimates).
+    // Short docks — blend dithering alternates tools every layer — stay at
+    // print temperature: thermal cycling would cost more than it saves.
+    let mut drop_at_swap: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut confirm_at_swap: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    let mut reheat_at_layer: Vec<Vec<u32>> = vec![Vec::new(); layers.len()];
+    if multi && s.standby_after_s > 0.0 {
+        // The swap sequence exactly as the emission loop below will see it.
+        let mut events: Vec<(usize, u32, u32)> = Vec::new(); // (layer, from, to)
+        let mut t = init_tool;
+        for (li, layer) in layers.iter().enumerate() {
+            for p in layer.paths.iter().filter(|p| printable(p)) {
+                if p.tool != t {
+                    events.push((li, t, p.tool));
+                    t = p.tool;
+                }
+            }
+        }
+        for (i, &(li, from, _)) in events.iter().enumerate() {
+            let pickup =
+                events[i + 1..].iter().position(|&(_, _, to)| to == from).map(|k| i + 1 + k);
+            let docked = match pickup {
+                // Whole layers strictly between release and pickup.
+                Some(j) => cum_secs[events[j].0.saturating_sub(1)] - cum_secs[li],
+                // Released for good: it would otherwise sit at print
+                // temperature until the end g-code shuts it off.
+                None => total_secs - cum_secs[li],
+            };
+            if docked <= s.standby_after_s {
+                continue;
+            }
+            drop_at_swap.insert(i, from);
+            if let Some(j) = pickup {
+                let lj = events[j].0;
+                confirm_at_swap.insert(j, from);
+                // A layer ahead of the pickup — never before the release.
+                let rl = lj.saturating_sub(1).clamp(li + 1, lj);
+                reheat_at_layer[rl].push(from);
+            }
+        }
+    }
+    let mut swap_seq = 0usize;
+    let mut in_standby: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
     g.comment("generated by Fable Slicer");
     g.comment(&format!("estimated printing time = {}", format_duration(total_secs)));
     g.comment(&format!("filament used [mm] = {fil_mm:.1}"));
     g.comment(&format!("filament used [g] = {fil_g:.1}"));
+    if multi {
+        for (n, mm, grams) in estimate_filament_per_tool(layers, s) {
+            g.comment(&format!("filament used [T{n}] = {mm:.0} mm ({grams:.1} g)"));
+        }
+    }
     g.comment(&format!("total layers = {}", layers.len()));
     if s.max_volumetric_speed_mm3_s > 0.0 {
         g.comment(&format!("flow limit = {:.1} mm3/s", s.max_volumetric_speed_mm3_s));
@@ -85,10 +245,29 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     // (chamber_temp_c) and emitted as a plain TEMPERATURE_WAIT — see
     // chamber_soak_block.
     let positioned_soak = s.start_gcode.contains("{chamber_soak}");
-    emit_template(&mut g, &s.start_gcode, s);
+    emit_template(&mut g, &s.start_gcode, s, init, init_tool);
     if !positioned_soak {
         for line in chamber_soak_block(s).lines() {
             g.raw(line);
+        }
+    }
+    if multi {
+        // Explicit initial selection (idempotent under Klipper toolchanger
+        // macros), then set every other used tool's idle setpoint so the first
+        // swap doesn't wait on heat. M104 T is klipper-toolchanger's per-tool
+        // setpoint form; a tool printing layer 0 wants its adhesion temp.
+        emit_toolchange(&mut g, s, init_tool);
+        for &n in &used {
+            if n == init_tool {
+                continue;
+            }
+            let tn = tools.get(n);
+            let temp = if layer0_tools.contains(&n) {
+                tn.first_layer_nozzle_temp_c
+            } else {
+                tn.nozzle_temp_c
+            };
+            g.raw(&format!("M104 T{n} S{temp}"));
         }
     }
     // Motion limits, set after PRINT_START so our values win. M204 S is understood
@@ -96,18 +275,19 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     // Acceleration then follows the feature being printed (M204 per change).
     let mut cur_accel = s.first_layer_accel_mm_s2;
     // Pressure advance in force (eased on unsupported beads, see `pa_for`); starts
-    // at the profile value the startup `SET_PRESSURE_ADVANCE` below establishes.
-    let mut cur_pa = s.pressure_advance;
+    // at the initial tool's value the startup `SET_PRESSURE_ADVANCE` establishes.
+    let mut cur_pa = init.pressure_advance;
     g.raw(&format!("M204 S{cur_accel:.0}"));
     g.raw(&format!("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={:.1}", s.jerk_mm_s));
     if let Some(c) = atd_cmd(cur_accel, s) {
         g.raw(&c);
     }
-    if s.pressure_advance > 0.0 {
-        g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}", s.pressure_advance));
+    if init.pressure_advance > 0.0 {
+        g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}", init.pressure_advance));
     }
     g.fan(0);
     let mut cur_fan = 0u32;
+    let mut cur_tool = init_tool;
 
     let fan_duty = |frac: f64| (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
     // Extra fans, gated on the printer declaring them — vanilla Klipper/Marlin
@@ -141,21 +321,53 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         }
         // Temperature: a per-layer setpoint override wins; otherwise the
         // one-shot drop from first-layer temp to printing temp. M104 either
-        // way — set without waiting.
+        // way — set without waiting. On a toolchanger every tool that printed
+        // layer 0 drops: bare M104 steers the tool in hand, the T-form the docked.
         if let Some(t) = layer.temp_command_c {
             g.raw(&format!("M104 S{t:.0}"));
-        } else if layer.index == 1 && s.first_layer_nozzle_temp_c != s.nozzle_temp_c {
-            g.raw(&format!("M104 S{}", s.nozzle_temp_c));
+        } else if layer.index == 1 {
+            if multi {
+                for &n in &used {
+                    let tn = tools.get(n);
+                    // A tool already dropped to standby keeps its standby
+                    // setpoint — its scheduled reheat targets print temp.
+                    if !layer0_tools.contains(&n)
+                        || tn.first_layer_nozzle_temp_c == tn.nozzle_temp_c
+                        || in_standby.contains(&n)
+                    {
+                        continue;
+                    }
+                    if n == cur_tool {
+                        g.raw(&format!("M104 S{}", tn.nozzle_temp_c));
+                    } else {
+                        g.raw(&format!("M104 T{n} S{}", tn.nozzle_temp_c));
+                    }
+                }
+            } else if s.first_layer_nozzle_temp_c != s.nozzle_temp_c {
+                g.raw(&format!("M104 S{}", s.nozzle_temp_c));
+            }
         }
-        // Part cooling: off for the first `fan_off_layers`, then the normal duty;
-        // bridges may override per path below.
-        let normal_fan = if layer.index < s.fan_off_layers { 0 } else { fan_duty(s.fan_speed) };
+        // Scheduled reheats: docked tools whose pickup is a layer away come
+        // back to print temperature now, so the swap doesn't wait on heat.
+        for &n in &reheat_at_layer[layer.index] {
+            g.raw(&format!("M104 T{n} S{}", tools.get(n).nozzle_temp_c));
+            in_standby.remove(&n);
+        }
+        // Part cooling: off for the first `fan_off_layers`, then the normal duty
+        // — both from the tool in hand; bridges may override per path below.
+        let active = tools.get(cur_tool);
+        let mut normal_fan =
+            if layer.index < active.fan_off_layers { 0 } else { fan_duty(active.fan_speed) };
         if normal_fan != cur_fan {
             g.fan(normal_fan);
             cur_fan = normal_fan;
         }
         if s.has_aux_fan {
-            let aux = if layer.index < s.fan_off_layers { 0 } else { fan_duty(s.aux_fan_speed) };
+            let aux = if layer.index < active.fan_off_layers {
+                0
+            } else {
+                fan_duty(active.aux_fan_speed)
+            };
             if aux != cur_aux_fan {
                 g.raw(&format!("M106 P2 S{aux}"));
                 cur_aux_fan = aux;
@@ -166,10 +378,12 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         // continuously from the previous layer's top to this one's.
         if s.spiral_vase && layer.index >= first_spiral {
             if let Some(path) = spiral_loop(layer) {
-                let feed = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
+                let t = tools.get(path.tool);
+                let feed = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
                     * layer.speed_scale;
-                let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
-                    * flow_factor(path, s);
+                let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale)
+                    / tool_area_mm2(t)
+                    * flow_factor(path, t);
                 g.raw(&format!(";TYPE:{}", type_label(path.kind)));
                 let accel = accel_for(path.kind, layer.index, s);
                 if (accel - cur_accel).abs() > 0.5 {
@@ -192,6 +406,70 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             if path.points.len() < 2 {
                 continue;
             }
+            let tr = &layer.travels[i];
+            let mut retract_done = false;
+            let mut force_z = false;
+            // Tool boundary: swap heads before the lead-in travel. The planned
+            // travel already carries retract+hop (plan_travels is tool-aware);
+            // its retract/wipe portion runs HERE, with the old tool, so the dock
+            // move doesn't drag ooze — the replay below skips it and keeps only
+            // the approach + unretract.
+            if multi && path.tool != cur_tool {
+                if tr.retract && s.retract_len_mm > 0.0 {
+                    g.retract(s.retract_len_mm, retract_f);
+                    if s.wipe_mm > 0.0 {
+                        if let Some(tail) = &wipe_tail {
+                            for p in tail {
+                                g.travel(p.x_mm(), p.y_mm(), travel_f);
+                            }
+                        }
+                    }
+                    retract_done = true;
+                }
+                wipe_tail = None;
+                // A pickup out of standby: the reheat went out a layer ago —
+                // confirm the tool is actually at temperature before docking
+                // the old one (normally an instant no-op wait).
+                if let Some(&n) = confirm_at_swap.get(&swap_seq) {
+                    g.raw(&format!("M109 T{n} S{}", tools.get(n).nozzle_temp_c));
+                }
+                let released = cur_tool;
+                emit_toolchange(&mut g, s, path.tool);
+                cur_tool = path.tool;
+                // The macro moved axes under its own F words and parked Z at the
+                // dock: forget the feed cache, re-issue the layer Z, and force
+                // ;TYPE/M204/PA/fan back out with the new tool's values.
+                g.invalidate_feed();
+                force_z = true;
+                cur_type = None;
+                cur_accel = -1.0;
+                cur_pa = -1.0;
+                cur_fan = u32::MAX;
+                let tn = tools.get(cur_tool);
+                normal_fan =
+                    if layer.index < tn.fan_off_layers { 0 } else { fan_duty(tn.fan_speed) };
+                if s.has_aux_fan {
+                    let aux = if layer.index < tn.fan_off_layers {
+                        0
+                    } else {
+                        fan_duty(tn.aux_fan_speed)
+                    };
+                    if aux != cur_aux_fan {
+                        g.raw(&format!("M106 P2 S{aux}"));
+                        cur_aux_fan = aux;
+                    }
+                }
+                // A long dock ahead for the tool just released: park it at
+                // its filament's standby temperature.
+                if let Some(&n) = drop_at_swap.get(&swap_seq) {
+                    debug_assert_eq!(n, released);
+                    g.raw(&format!("M104 T{n} S{}", tools.get(n).standby_temp_c));
+                    in_standby.insert(n);
+                }
+                swap_seq += 1;
+            }
+            let t = tools.get(path.tool);
+            let area = tool_area_mm2(t);
             let n_pts = path.points.len();
             let n_segs = if path.closed { n_pts } else { n_pts - 1 };
             // Per-segment attribute lookup: the override when present (an overhang or
@@ -213,22 +491,21 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // it, everything else the normal duty. PA eases the same way (see `pa_for`).
             let (fk, fo) = seg(0);
             set_seg_attrs(
-                &mut g, fk, fo, layer, normal_fan, s, &mut cur_type, &mut cur_accel, &mut cur_pa,
-                &mut cur_fan,
+                &mut g, fk, fo, layer, normal_fan, t, s, &mut cur_type, &mut cur_accel,
+                &mut cur_pa, &mut cur_fan,
             );
 
             let z = layer.print_z_mm;
             let feed =
-                feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s)
+                feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
                     * layer.speed_scale;
             let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
-                * flow_factor(path, s);
+                * flow_factor(path, t);
             let start = path.points[0];
 
             // The travel (combed route, or a retracted/z-hopped hop over a void)
             // was planned in `plan_travels` — replay it, at this path's Z.
-            let tr = &layer.travels[i];
-            if tr.retract && s.retract_len_mm > 0.0 {
+            if !retract_done && tr.retract && s.retract_len_mm > 0.0 {
                 g.retract(s.retract_len_mm, retract_f);
                 // Wipe back along the printed bead: the pressure-release ooze
                 // smears onto plastic instead of blobbing the seam.
@@ -242,7 +519,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             }
             if tr.hop && hop_mm > 0.0 {
                 g.move_z(z + hop_mm, travel_f);
-            } else if (z - cur_z).abs() > 1.0e-9 {
+            } else if force_z || (z - cur_z).abs() > 1.0e-9 {
                 g.move_z(z, travel_f);
             }
             for pt in &tr.points {
@@ -261,7 +538,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // width, so the bead tapers continuously. Arc fitting assumes a
                 // constant width, so it's skipped here.
                 let h = layer.height_mm * path.height_scale;
-                let ff = flow_factor(path, s);
+                let ff = flow_factor(path, t);
                 let mut prev = start;
                 for k in 0..n_pts - 1 {
                     let w = (ws[k] + ws[k + 1]) * 0.5;
@@ -276,23 +553,23 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // accel/PA/fan — at each run boundary, but never lifting the nozzle.
                 // No arc fitting (feed varies within the path). The first run's
                 // attributes were already set before the lead-in travel above.
-                let flow_cap = layer_flow_cap_mm3_s(layer, s);
+                let flow_cap = layer_flow_cap_mm3_s(layer, t);
                 let bead = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale);
                 let mut run = seg(0);
-                let mut rfeed = feed_for_seg(run.0, run.1, path, layer.index, layer.height_mm, flow_cap, s)
+                let mut rfeed = feed_for_seg(run.0, run.1, path, layer.index, layer.height_mm, flow_cap, t, s)
                     * layer.speed_scale;
-                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, s);
+                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, t);
                 let mut prev = start;
                 for k in 0..n_segs {
                     let a = seg(k);
                     if a != run {
                         set_seg_attrs(
-                            &mut g, a.0, a.1, layer, normal_fan, s, &mut cur_type, &mut cur_accel,
-                            &mut cur_pa, &mut cur_fan,
+                            &mut g, a.0, a.1, layer, normal_fan, t, s, &mut cur_type,
+                            &mut cur_accel, &mut cur_pa, &mut cur_fan,
                         );
-                        rfeed = feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, s)
+                        rfeed = feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, t, s)
                             * layer.speed_scale;
-                        rcoeff = bead / area * flow_factor_kind(a.0, path.flow, s);
+                        rcoeff = bead / area * flow_factor_kind(a.0, path.flow, t);
                         run = a;
                     }
                     let p = path.points[(k + 1) % n_pts];
@@ -330,7 +607,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     if s.has_exhaust_fan && s.exhaust_fan_speed > 0.0 {
         g.raw("M106 P3 S0");
     }
-    emit_template(&mut g, &s.end_gcode, s);
+    if multi {
+        // Leave no idle heater on: the end template only knows the active tool.
+        for &n in &used {
+            g.raw(&format!("M104 T{n} S0"));
+        }
+    }
+    emit_template(&mut g, &s.end_gcode, s, init, init_tool);
 
     g.finish()
 }
@@ -397,8 +680,16 @@ fn emit_spiral_layer(
 }
 
 /// Substitute `{placeholders}` in a template and emit it line by line.
-fn emit_template(g: &mut GcodeBuilder, template: &str, s: &Settings) {
-    let text = substitute(template, s);
+/// Nozzle temperatures resolve from the initial tool's slot — the head the
+/// start macro heats first (toolchanger START_PRINT macros take INITIAL_TOOL=).
+fn emit_template(
+    g: &mut GcodeBuilder,
+    template: &str,
+    s: &Settings,
+    init: &ToolSettings,
+    init_tool: u32,
+) {
+    let text = substitute(template, s, init, init_tool);
     for line in text.lines() {
         if !line.trim().is_empty() {
             g.raw(line.trim_end());
@@ -431,10 +722,12 @@ fn chamber_soak_block(s: &Settings) -> String {
     )
 }
 
-fn substitute(template: &str, s: &Settings) -> String {
+fn substitute(template: &str, s: &Settings, init: &ToolSettings, init_tool: u32) -> String {
     template
-        .replace("{nozzle_temp}", &s.nozzle_temp_c.to_string())
-        .replace("{first_layer_nozzle_temp}", &s.first_layer_nozzle_temp_c.to_string())
+        .replace("{nozzle_temp}", &init.nozzle_temp_c.to_string())
+        .replace("{first_layer_nozzle_temp}", &init.first_layer_nozzle_temp_c.to_string())
+        .replace("{initial_tool}", &init_tool.to_string())
+        .replace("{tool_count}", &s.tool_count.to_string())
         .replace("{bed_temp}", &s.bed_temp_c.to_string())
         .replace("{chamber_temp}", &s.chamber_temp_c.to_string())
         .replace("{chamber_soak}", &chamber_soak_block(s))
@@ -446,8 +739,15 @@ fn substitute(template: &str, s: &Settings) -> String {
         .replace("{nozzle_diameter}", &format!("{:.3}", s.nozzle_diameter_mm))
 }
 
-/// The configured speed (mm/s) for a feature, before any limits.
-fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Settings) -> f64 {
+/// The configured speed (mm/s) for a feature, before any limits. Bridge pace is
+/// filament physics, so it comes from the path's tool slot.
+fn nominal_speed_mm_s(
+    kind: PathKind,
+    overhang: f32,
+    layer_index: usize,
+    tool: &ToolSettings,
+    s: &Settings,
+) -> f64 {
     if layer_index == 0 {
         return s.first_layer_speed_mm_s; // first layer is slow everywhere
     }
@@ -459,10 +759,10 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
         PathKind::Ironing => s.ironing_speed_mm_s,
         PathKind::Support => s.support_speed_mm_s,
         // Bridges print into air anchored on both ends.
-        PathKind::Bridge => s.bridge_speed_mm_s,
+        PathKind::Bridge => tool.bridge_speed_mm_s,
         // Internal bridge: the first buried solid layer over low-density sparse,
         // spanning mostly air between the infill lines — print it at bridge speed.
-        PathKind::InternalBridge => s.bridge_speed_mm_s,
+        PathKind::InternalBridge => tool.bridge_speed_mm_s,
         // Wall stretches past the layer below slow by how far they overhang:
         // graduated from the outer-wall pace (a barely-unsupported bead) down to
         // the overhang floor (bridge speed) when the bead is fully airborne.
@@ -477,32 +777,32 @@ fn nominal_speed_mm_s(kind: PathKind, overhang: f32, layer_index: usize, s: &Set
 }
 
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
-/// (ironing), per-kind flow (bridges), and the global multiplier.
-fn flow_factor(path: &ToolPath, s: &Settings) -> f64 {
-    flow_factor_kind(path.kind, path.flow, s)
+/// (ironing), per-kind flow (bridges), and the tool's filament multiplier.
+fn flow_factor(path: &ToolPath, tool: &ToolSettings) -> f64 {
+    flow_factor_kind(path.kind, path.flow, tool)
 }
 
 /// [`flow_factor`] for one segment kind (so a bridge stretch inside an otherwise
 /// solid bead still gets bridge flow). `path_flow` is the bead's own multiplier.
-fn flow_factor_kind(kind: PathKind, path_flow: f64, s: &Settings) -> f64 {
+fn flow_factor_kind(kind: PathKind, path_flow: f64, tool: &ToolSettings) -> f64 {
     // Bridges and internal bridges (solid over open sparse) both span air — the
     // stretched strand wants the reduced bridge flow so it doesn't droop.
     let kind_flow = if matches!(kind, PathKind::Bridge | PathKind::InternalBridge) {
-        s.bridge_flow
+        tool.bridge_flow
     } else {
         1.0
     };
-    path_flow * kind_flow * s.extrusion_multiplier
+    path_flow * kind_flow * tool.extrusion_multiplier
 }
 
 /// The nozzle temperature for a layer: a per-layer planned override when the
 /// plan carries one, else the first-layer adhesion temp (layer 0) or the
 /// profile printing temperature.
-fn layer_nozzle_c(layer: &LayerPlan, s: &Settings) -> f64 {
+fn layer_nozzle_c(layer: &LayerPlan, tool: &ToolSettings) -> f64 {
     layer.planned_temp_c.unwrap_or(if layer.index == 0 {
-        s.first_layer_nozzle_temp_c as f64
+        tool.first_layer_nozzle_temp_c as f64
     } else {
-        s.nozzle_temp_c as f64
+        tool.nozzle_temp_c as f64
     })
 }
 
@@ -510,14 +810,14 @@ fn layer_nozzle_c(layer: &LayerPlan, s: &Settings) -> f64 {
 /// cap at the profile temperature, derated linearly when a layer's planned
 /// temperature runs below base. Never raised on warmer layers — the profile
 /// cap is the calibrated number.
-fn layer_flow_cap_mm3_s(layer: &LayerPlan, s: &Settings) -> f64 {
-    let cap = s.max_volumetric_speed_mm3_s;
+fn layer_flow_cap_mm3_s(layer: &LayerPlan, tool: &ToolSettings) -> f64 {
+    let cap = tool.max_volumetric_speed_mm3_s;
     if cap <= 0.0 {
         return 0.0;
     }
-    let below = s.nozzle_temp_c as f64 - layer_nozzle_c(layer, s);
+    let below = tool.nozzle_temp_c as f64 - layer_nozzle_c(layer, tool);
     if below > 0.0 {
-        (cap - s.max_flow_derate_per_c.max(0.0) * below).max(1.0)
+        (cap - tool.max_flow_derate_per_c.max(0.0) * below).max(1.0)
     } else {
         cap
     }
@@ -534,9 +834,12 @@ fn feed_for(
     layer_index: usize,
     layer_height_mm: f64,
     flow_cap_mm3_s: f64,
+    tool: &ToolSettings,
     s: &Settings,
 ) -> f64 {
-    feed_for_seg(path.kind, path.overhang, path, layer_index, layer_height_mm, flow_cap_mm3_s, s)
+    feed_for_seg(
+        path.kind, path.overhang, path, layer_index, layer_height_mm, flow_cap_mm3_s, tool, s,
+    )
 }
 
 /// [`feed_for`] for one segment's `(kind, overhang)`, keeping the bead's own width /
@@ -550,12 +853,13 @@ fn feed_for_seg(
     layer_index: usize,
     layer_height_mm: f64,
     flow_cap_mm3_s: f64,
+    tool: &ToolSettings,
     s: &Settings,
 ) -> f64 {
-    let mut v = nominal_speed_mm_s(kind, overhang, layer_index, s);
+    let mut v = nominal_speed_mm_s(kind, overhang, layer_index, tool, s);
     if flow_cap_mm3_s > 0.0 {
         let mm3_per_mm = config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale)
-            * flow_factor_kind(kind, path.flow, s);
+            * flow_factor_kind(kind, path.flow, tool);
         if mm3_per_mm > 1.0e-9 {
             v = v.min(flow_cap_mm3_s / mm3_per_mm);
         }
@@ -569,6 +873,7 @@ fn feed_for_seg(
 /// header, the CLI summary, and the GUI status line.
 pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f64, f64)> {
     use std::collections::BTreeMap;
+    let tools = Tools::new(s);
     let mut worst: BTreeMap<&'static str, (PathKind, f64, f64)> = BTreeMap::new();
     for layer in layers {
         if layer.index == 0 {
@@ -578,8 +883,11 @@ pub fn audit_flow_clamps(layers: &[LayerPlan], s: &Settings) -> Vec<(PathKind, f
             if path.points.len() < 2 {
                 continue;
             }
-            let nominal = nominal_speed_mm_s(path.kind, path.overhang, layer.index, s);
-            let clamped = feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, s), s) / 60.0;
+            let t = tools.get(path.tool);
+            let nominal = nominal_speed_mm_s(path.kind, path.overhang, layer.index, t, s);
+            let clamped =
+                feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
+                    / 60.0;
             if clamped < nominal - 1.0e-6 {
                 worst
                     .entry(kind_label(path.kind))
@@ -677,8 +985,8 @@ const OVERHANG_PA_FLOOR: f64 = 0.5;
 /// code sidesteps for it. Its droop is already handled by the reduced bridge flow.
 /// Pressure advance (mm of filament per mm/s of flow) for one segment's
 /// `(kind, overhang)`.
-fn pa_for_kind(kind: PathKind, overhang: f32, s: &Settings) -> f64 {
-    let base = s.pressure_advance;
+fn pa_for_kind(kind: PathKind, overhang: f32, tool: &ToolSettings) -> f64 {
+    let base = tool.pressure_advance;
     if base <= 0.0 {
         return 0.0;
     }
@@ -701,6 +1009,7 @@ fn set_seg_attrs(
     overhang: f32,
     layer: &LayerPlan,
     normal_fan: u32,
+    tool: &ToolSettings,
     s: &Settings,
     cur_type: &mut Option<&'static str>,
     cur_accel: &mut f64,
@@ -720,22 +1029,22 @@ fn set_seg_attrs(
         }
         *cur_accel = accel;
     }
-    if s.pressure_advance > 0.0 {
-        let pa = pa_for_kind(kind, overhang, s);
+    if tool.pressure_advance > 0.0 {
+        let pa = pa_for_kind(kind, overhang, tool);
         if (pa - *cur_pa).abs() > 1.0e-4 {
             g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
             *cur_pa = pa;
         }
     }
-    let want_fan = if layer.index < s.fan_off_layers {
+    let want_fan = if layer.index < tool.fan_off_layers {
         normal_fan
     } else {
         let frac = match kind {
-            PathKind::Bridge | PathKind::BottomSkin => s.bridge_fan_speed,
+            PathKind::Bridge | PathKind::BottomSkin => tool.bridge_fan_speed,
             PathKind::OverhangWall => {
-                s.fan_speed + (s.bridge_fan_speed - s.fan_speed) * overhang as f64
+                tool.fan_speed + (tool.bridge_fan_speed - tool.fan_speed) * overhang as f64
             }
-            _ => s.fan_speed,
+            _ => tool.fan_speed,
         };
         ((frac.clamp(0.0, 1.0) * 255.0).round() as u32).max(normal_fan)
     };
@@ -920,13 +1229,14 @@ fn arc_span_len(run: &[(f64, f64)], cx: f64, cy: f64) -> f64 {
 /// look-ahead. Mirrors the move sequence `to_gcode` emits; heating/homing in the
 /// start g-code is not counted.
 pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
+    let tools = Tools::new(s);
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let mut total = 0.0;
     let mut prev_z = 0.0;
-    for layer in layers {
+    for (layer, entry) in layers.iter().zip(entry_tools(layers)) {
         total += (layer.print_z_mm - prev_z).abs() / travel_v;
         prev_z = layer.print_z_mm;
-        total += layer_print_seconds(layer, s, layer.speed_scale);
+        total += layer_print_seconds(layer, s, &tools, layer.speed_scale, entry);
     }
     total
 }
@@ -934,7 +1244,16 @@ pub fn estimate_seconds(layers: &[LayerPlan], s: &Settings) -> f64 {
 /// Extrusion + intra-layer travel time for one layer, at the given speed scale,
 /// using the planned travels. Acceleration follows the per-feature M204s the
 /// emitter writes, so the estimate tracks what the printer is actually told.
-fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
+/// Toolchanges cost a flat `toolchange_seconds` each, charged to the layer they
+/// happen in — including a lead swap when the layer opens on a different tool
+/// than `entry_tool` (the one left in hand by the layer before).
+fn layer_print_seconds(
+    layer: &LayerPlan,
+    s: &Settings,
+    tools: &Tools,
+    scale: f64,
+    entry_tool: Option<u32>,
+) -> f64 {
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let retract_t = if s.retract_len_mm > 0.0 {
         2.0 * s.retract_len_mm / s.retract_speed_mm_s.max(1.0)
@@ -972,9 +1291,18 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
                 t += hop_t;
             }
         }
-        t += path_extrusion_seconds(layer, i, s, scale);
+        t += path_extrusion_seconds(layer, i, s, tools, scale);
         last_pos = Some(path_end(path));
         prev_path_len = path.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
+    }
+    if s.tool_count > 1 && s.toolchange_seconds > 0.0 {
+        let mut in_hand = entry_tool;
+        for path in layer.paths.iter().filter(|p| printable(p)) {
+            if in_hand.is_some_and(|n| n != path.tool) {
+                t += s.toolchange_seconds;
+            }
+            in_hand = Some(path.tool);
+        }
     }
     t
 }
@@ -988,14 +1316,17 @@ fn layer_print_seconds(layer: &LayerPlan, s: &Settings, scale: f64) -> f64 {
 /// layer's travels (including its comb graph, the expensive part) are planned in
 /// parallel.
 pub(crate) fn plan_travels(plans: &mut [LayerPlan], s: &Settings) {
-    // Entry state per layer: nozzle position after the previous layer.
-    let mut entries: Vec<Option<Point>> = Vec::with_capacity(plans.len());
+    // Entry state per layer: nozzle position (and tool in hand) after the
+    // previous layer.
+    let mut entries: Vec<(Option<Point>, Option<u32>)> = Vec::with_capacity(plans.len());
     let mut last_pos: Option<Point> = None;
+    let mut last_tool: Option<u32> = None;
     for plan in plans.iter() {
-        entries.push(last_pos);
+        entries.push((last_pos, last_tool));
         for path in &plan.paths {
             if path.points.len() >= 2 {
                 last_pos = Some(path_end(path));
+                last_tool = Some(path.tool);
             }
         }
     }
@@ -1003,12 +1334,20 @@ pub(crate) fn plan_travels(plans: &mut [LayerPlan], s: &Settings) {
     plans
         .par_iter_mut()
         .zip(entries)
-        .for_each(|(plan, entry_pos)| plan_layer_travels(plan, entry_pos, s));
+        .for_each(|(plan, (entry_pos, entry_tool))| {
+            plan_layer_travels(plan, entry_pos, entry_tool, s)
+        });
 }
 
 /// Plan one layer's travels, starting from the given entry position.
-fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, s: &Settings) {
+fn plan_layer_travels(
+    plan: &mut LayerPlan,
+    entry_pos: Option<Point>,
+    entry_tool: Option<u32>,
+    s: &Settings,
+) {
     let mut last_pos = entry_pos;
+    let mut last_tool = entry_tool;
     let mut travels: Vec<Travel> = Vec::with_capacity(plan.paths.len());
     let mut comb: Option<CombGraph> = None;
     for path in &plan.paths {
@@ -1017,7 +1356,16 @@ fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, s: &Settin
             continue;
         }
         let start = path.points[0];
+        // A toolchange precedes this path: the head re-enters from the dock, so
+        // the chained position is meaningless — one retracted, hopped, direct
+        // move to the start (combing from the stale point would be fiction).
+        let changes_tool = last_tool.is_some_and(|t| t != path.tool);
         let travel = match last_pos {
+            _ if changes_tool => Travel {
+                points: vec![start],
+                retract: s.retract_len_mm > 0.0,
+                hop: s.z_hop_mm > 0.0,
+            },
             None => Travel { points: vec![start], retract: false, hop: false },
             Some(prev) => {
                 let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
@@ -1038,6 +1386,7 @@ fn plan_layer_travels(plan: &mut LayerPlan, entry_pos: Option<Point>, s: &Settin
             }
         };
         last_pos = Some(path_end(path));
+        last_tool = Some(path.tool);
         travels.push(travel);
     }
     plan.travels = travels;
@@ -1049,9 +1398,14 @@ pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
     if s.min_layer_time_s <= 0.0 {
         return;
     }
+    let tools = Tools::new(s);
     let floor = s.min_print_speed_mm_s / s.print_speed_mm_s.max(1.0);
-    plans.par_iter_mut().for_each(|plan| {
-        let t = layer_print_seconds(plan, s, 1.0);
+    // The toolchange dwell counts as cooling time here (it's inside
+    // layer_print_seconds): a layer that spends the swap docked needs that much
+    // less slowing.
+    let entries = entry_tools(plans);
+    plans.par_iter_mut().zip(entries).for_each(|(plan, entry)| {
+        let t = layer_print_seconds(plan, s, &tools, 1.0, entry);
         if t > 0.0 && t < s.min_layer_time_s {
             plan.speed_scale = (t / s.min_layer_time_s).clamp(floor, 1.0);
         }
@@ -1155,7 +1509,7 @@ pub fn format_duration(seconds: f64) -> String {
 /// bridge flow, and the extrusion multiplier. Shared by the
 /// filament estimate and the heat stats so the preview maps can't disagree
 /// with the totals.
-fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, s: &Settings) -> f64 {
+fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings) -> f64 {
     let mut len = 0.0;
     for w in path.points.windows(2) {
         len += dist_mm(w[0], w[1]);
@@ -1163,24 +1517,27 @@ fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, s: &Settings) -> f64 {
     if path.closed && path.points.len() >= 2 {
         len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
     }
-    len * config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale) * flow_factor(path, s)
-}
-
-/// Deposited bead volume (mm³) for one layer.
-fn layer_volume_mm3(layer: &LayerPlan, s: &Settings) -> f64 {
-    layer.paths.iter().map(|p| path_volume_mm3(p, layer.height_mm, s)).sum()
+    len * config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale)
+        * flow_factor(path, tool)
 }
 
 /// Extrusion-only seconds for one path at a total speed multiplier — the
 /// trapezoid simulation the layer estimate uses, exposed so heat
 /// control budgets with the same numbers.
-fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale: f64) -> f64 {
+fn path_extrusion_seconds(
+    layer: &LayerPlan,
+    i: usize,
+    s: &Settings,
+    tools: &Tools,
+    total_scale: f64,
+) -> f64 {
     let path = &layer.paths[i];
     if path.points.len() < 2 {
         return 0.0;
     }
+    let tool = tools.get(path.tool);
     let accel = accel_for(path.kind, layer.index, s).max(1.0);
-    let cap = layer_flow_cap_mm3_s(layer, s);
+    let cap = layer_flow_cap_mm3_s(layer, tool);
     // Per-segment cruise speed: an overhang / bridge stretch inside the bead is timed
     // at its own (slower) pace, else the whole bead runs at the path speed.
     let n_pts = path.points.len();
@@ -1194,19 +1551,48 @@ fn path_extrusion_seconds(layer: &LayerPlan, i: usize, s: &Settings, total_scale
                 }
                 _ => (path.kind, path.overhang),
             };
-            feed_for_seg(kind, oh, path, layer.index, layer.height_mm, cap, s) / 60.0 * total_scale
+            feed_for_seg(kind, oh, path, layer.index, layer.height_mm, cap, tool, s) / 60.0
+                * total_scale
         })
         .collect();
     polyline_time(&path.points, path.closed, &v_seg, accel, s.jerk_mm_s.max(0.1), s.min_cruise_ratio)
 }
 
-/// Estimate filament used: `(length_mm, grams)`. Honors per-path flow
-/// (ironing), bridge flow, and the global extrusion multiplier.
+/// Estimate filament used: `(length_mm, grams)` over all tools. Honors per-path
+/// flow (ironing), bridge flow, and each tool's extrusion multiplier /
+/// filament diameter / density.
 pub fn estimate_filament(layers: &[LayerPlan], s: &Settings) -> (f64, f64) {
-    let volume: f64 = layers.iter().map(|l| layer_volume_mm3(l, s)).sum();
-    let length_mm = volume / s.filament_area_mm2();
-    let grams = volume / 1000.0 * s.filament_density_g_cm3; // 1000 mm³ = 1 cm³
-    (length_mm, grams)
+    estimate_filament_per_tool(layers, s)
+        .iter()
+        .fold((0.0, 0.0), |acc, (_, mm, grams)| (acc.0 + mm, acc.1 + grams))
+}
+
+/// Filament per used tool: `(tool, length_mm, grams)`, ascending tool number.
+/// Sums to [`estimate_filament`]; drives the per-slot header comments and any
+/// "will slot N run out" arithmetic.
+pub fn estimate_filament_per_tool(layers: &[LayerPlan], s: &Settings) -> Vec<(u32, f64, f64)> {
+    use std::collections::BTreeMap;
+    let tools = Tools::new(s);
+    let mut volume: BTreeMap<u32, f64> = BTreeMap::new();
+    for layer in layers {
+        // Per-layer subtotals, added layer by layer (keeps the aggregate's
+        // summation order — and its bytes — on a single-tool print).
+        let mut layer_vol: BTreeMap<u32, f64> = BTreeMap::new();
+        for path in layer.paths.iter().filter(|p| printable(p)) {
+            *layer_vol.entry(path.tool).or_insert(0.0) +=
+                path_volume_mm3(path, layer.height_mm, tools.get(path.tool));
+        }
+        for (n, v) in layer_vol {
+            *volume.entry(n).or_insert(0.0) += v;
+        }
+    }
+    volume
+        .into_iter()
+        .map(|(n, v)| {
+            let tool = tools.get(n);
+            (n, v / tool_area_mm2(tool), v / 1000.0 * tool.filament_density_g_cm3)
+        })
+        .collect()
 }
 
 /// Per-layer numbers behind the preview layer-time map.
@@ -1218,13 +1604,14 @@ pub struct LayerStats {
 /// Time per layer. Mirrors [`estimate_seconds`]'s per-layer terms, so the
 /// preview layer-time map tracks what the totals and M73 progress report.
 pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
+    let tools = Tools::new(s);
     let travel_v = s.travel_speed_mm_s.max(1.0);
     let mut prev_z = 0.0;
     let mut out = Vec::with_capacity(layers.len());
-    for layer in layers {
+    for (layer, entry) in layers.iter().zip(entry_tools(layers)) {
         let mut secs = (layer.print_z_mm - prev_z).abs() / travel_v;
         prev_z = layer.print_z_mm;
-        secs += layer_print_seconds(layer, s, layer.speed_scale);
+        secs += layer_print_seconds(layer, s, &tools, layer.speed_scale, entry);
         out.push(LayerStats { secs });
     }
     out
@@ -1456,7 +1843,8 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 mod tests {
     use super::{fit_arc, ARC_MIN_PTS};
     use crate::{
-        estimate_seconds, generate, per_layer_stats, to_gcode, LayerPlan, PathKind,
+        estimate_filament, estimate_filament_per_tool, estimate_seconds, generate, generate_parts,
+        per_layer_stats, to_gcode, LayerPlan, PathKind,
     };
     use config::Settings;
 
@@ -1828,6 +2216,248 @@ mod tests {
         assert!(g[l2..].contains("M106 S204"), "fan on from layer 2");
     }
 
+    // --- toolchanger ----------------------------------------------------------
+
+    fn push_box(tris: &mut Vec<[[f64; 3]; 3]>, lo: [f64; 3], hi: [f64; 3]) {
+        let v = [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
+        ];
+        for t in [
+            [0, 2, 1], [0, 3, 2],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [3, 6, 2], [3, 7, 6],
+            [0, 7, 3], [0, 4, 7],
+            [1, 2, 6], [1, 6, 5],
+        ] {
+            tris.push([v[t[0]], v[t[1]], v[t[2]]]);
+        }
+    }
+
+    /// Two 10 mm cubes 20 mm apart on tools 0 and 1; `raise_b_mm` lifts the
+    /// tool-1 cube off the bed (so tool 1 doesn't print on layer 0).
+    fn two_tool_plans(s: &Settings, raise_b_mm: f64) -> Vec<LayerPlan> {
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, raise_b_mm], [40.0, 10.0, 10.0 + raise_b_mm]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        generate_parts(&[(&a, 0), (&b, 1)], s)
+    }
+
+    /// A two-slot machine: tool 0 mirrors the flat fields, tool 1 runs hotter
+    /// with its own PA, filament diameter, and fan duty.
+    fn two_tool_settings() -> Settings {
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.min_layer_time_s = 0.0; // keep speed_scale at 1 (independent of swap time)
+        s.nozzle_temp_c = 210;
+        s.first_layer_nozzle_temp_c = 220;
+        s.pressure_advance = 0.04;
+        s.tool_count = 2;
+        let t0 = s.flat_tool("a".into());
+        let mut t1 = s.flat_tool("b".into());
+        t1.nozzle_temp_c = 250;
+        t1.first_layer_nozzle_temp_c = 255;
+        t1.pressure_advance = 0.08;
+        t1.filament_diameter_mm = 2.85;
+        t1.fan_speed = 0.5;
+        t1.bridge_fan_speed = 0.5;
+        s.tools = vec![t0, t1];
+        s
+    }
+
+    /// The tool of the first printable path of a layer (its lead group).
+    fn lead_tool(plan: &LayerPlan) -> u32 {
+        plan.paths.iter().find(|p| p.points.len() >= 2).expect("printable path").tool
+    }
+
+    #[test]
+    fn toolchanges_once_per_serpentine_layer() {
+        let s = two_tool_settings();
+        let plans = two_tool_plans(&s, 0.0);
+        let g = to_gcode(&plans, &s);
+        let chunks: Vec<&str> = g.split("; LAYER ").collect();
+        assert_eq!(chunks.len(), plans.len() + 1);
+        // The preamble selects the initial tool once; each serpentine layer
+        // swaps exactly once, at its group boundary.
+        assert_eq!(chunks[0].matches("; toolchange T").count(), 1);
+        for (k, c) in chunks[1..].iter().enumerate() {
+            assert_eq!(c.matches("toolchange T").count(), 1, "layer {k}: one swap");
+        }
+        // The default template is the bare Klipper selection macro.
+        assert!(g.lines().any(|l| l == "T1"), "T1 macro line emitted");
+        // Every used tool is shut off before the end g-code.
+        assert!(g.contains("M104 T0 S0") && g.contains("M104 T1 S0"));
+    }
+
+    #[test]
+    fn preamble_selects_initial_tool_and_preheats_the_rest() {
+        let mut s = two_tool_settings();
+        s.start_gcode =
+            "PRINT_START INITIAL_TOOL={initial_tool} TOOLS={tool_count} EXTRUDER={first_layer_nozzle_temp}"
+                .into();
+        let plans = two_tool_plans(&s, 0.0);
+        let init = lead_tool(&plans[0]);
+        let other = 1 - init;
+        let g = to_gcode(&plans, &s);
+        let pre = &g[..g.find("; LAYER 0 ").unwrap()];
+        // Placeholders resolve from the initial tool's slot.
+        let want = format!(
+            "PRINT_START INITIAL_TOOL={init} TOOLS=2 EXTRUDER={}",
+            s.tool(init as usize).first_layer_nozzle_temp_c
+        );
+        assert!(pre.contains(&want), "start template substituted:\n{pre}");
+        // Selection follows the start template; the docked tool preheats to its
+        // own first-layer temp (it prints on layer 0).
+        let sel = pre.find(&format!("; toolchange T{init}")).expect("initial selection");
+        assert!(sel > pre.find("PRINT_START").unwrap());
+        let preheat =
+            format!("M104 T{other} S{}", s.tool(other as usize).first_layer_nozzle_temp_c);
+        assert!(pre.contains(&preheat), "docked preheat:\n{pre}");
+
+        // A part that starts above layer 0 idles at its printing temp instead.
+        let plans = two_tool_plans(&s, 2.0);
+        assert_eq!(lead_tool(&plans[0]), 0, "only the bed cube prints layer 0");
+        let g = to_gcode(&plans, &s);
+        let pre = &g[..g.find("; LAYER 0 ").unwrap()];
+        assert!(pre.contains("M104 T1 S250"), "idle tool preheats to print temp:\n{pre}");
+    }
+
+    #[test]
+    fn layer_one_drops_first_layer_temps_per_tool() {
+        let s = two_tool_settings();
+        let plans = two_tool_plans(&s, 0.0);
+        let g = to_gcode(&plans, &s);
+        let chunk = &g[g.find("; LAYER 1 ").unwrap()..g.find("; LAYER 2 ").unwrap()];
+        // Both tools printed layer 0 and both run hotter there: the tool in
+        // hand drops via bare M104, the docked one via the T-form.
+        let lead = lead_tool(&plans[1]);
+        let docked = 1 - lead;
+        let active_drop = format!("M104 S{}", s.tool(lead as usize).nozzle_temp_c);
+        let docked_drop = format!("M104 T{docked} S{}", s.tool(docked as usize).nozzle_temp_c);
+        assert!(chunk.contains(&active_drop), "active drop missing:\n{chunk}");
+        assert!(chunk.contains(&docked_drop), "docked drop missing:\n{chunk}");
+    }
+
+    #[test]
+    fn toolchange_reestablishes_z_pa_fan_and_feed() {
+        let s = two_tool_settings();
+        let plans = two_tool_plans(&s, 0.0);
+        let g = to_gcode(&plans, &s);
+        // The swap inside layer 1 — the part fan is live there.
+        let chunk = &g[g.find("; LAYER 1 ").unwrap()..g.find("; LAYER 2 ").unwrap()];
+        let at = chunk.find("; toolchange T").unwrap();
+        let after = &chunk[at..];
+        let new_tool: u32 =
+            after["; toolchange T".len()..].lines().next().unwrap().trim().parse().unwrap();
+        // Up to the first extruding move: Z re-issued, accel/PA/fan forced back
+        // out at the new tool's values.
+        let block = &after[..after.find("G1 X").unwrap()];
+        assert!(block.lines().any(|l| l.starts_with("G1 Z")), "Z re-issued:\n{block}");
+        assert!(block.contains("M204 S"), "accel re-asserted:\n{block}");
+        let want_pa = format!(
+            "SET_PRESSURE_ADVANCE ADVANCE={:.4}",
+            s.tool(new_tool as usize).pressure_advance
+        );
+        assert!(block.contains(&want_pa), "new tool's PA:\n{block}");
+        let want_fan =
+            format!("M106 S{}", (s.tool(new_tool as usize).fan_speed * 255.0).round() as u32);
+        assert!(block.contains(&want_fan), "new tool's fan duty:\n{block}");
+        // The macro moves under its own F words: the first motion after it must
+        // re-assert F even though the requested feed never changed.
+        let first_motion = after
+            .lines()
+            .find(|l| l.starts_with("G0 ") || l.starts_with("G1 "))
+            .expect("motion after the macro");
+        assert!(first_motion.contains(" F"), "feed re-asserted: {first_motion}");
+    }
+
+    #[test]
+    fn toolchange_seconds_add_per_swap() {
+        let mut s = two_tool_settings();
+        s.toolchange_seconds = 0.0;
+        let plans = two_tool_plans(&s, 0.0);
+        let base = estimate_seconds(&plans, &s);
+        s.toolchange_seconds = 12.0;
+        let with = estimate_seconds(&plans, &s);
+        // Emitted swaps (the per-layer boundaries, not the initial selection)
+        // are exactly what the estimate charges for.
+        let g = to_gcode(&plans, &s);
+        let swaps = g.matches("; toolchange T").count() - 1;
+        assert_eq!(swaps, plans.len(), "serpentine: one swap per layer");
+        assert!(
+            (with - base - 12.0 * swaps as f64).abs() < 1.0e-6,
+            "{with} vs {base} + 12 x {swaps}"
+        );
+        // The per-layer map shares the same term.
+        let sum: f64 = per_layer_stats(&plans, &s).iter().map(|st| st.secs).sum();
+        assert!((sum - with).abs() < with * 1.0e-9);
+    }
+
+    #[test]
+    fn per_tool_filament_sums_to_aggregate() {
+        let s = two_tool_settings();
+        let plans = two_tool_plans(&s, 0.0);
+        let per = estimate_filament_per_tool(&plans, &s);
+        assert_eq!(per.len(), 2);
+        assert_eq!((per[0].0, per[1].0), (0, 1), "ascending tool order");
+        let (mm, grams) = estimate_filament(&plans, &s);
+        let (mm_sum, g_sum) = per.iter().fold((0.0, 0.0), |a, p| (a.0 + p.1, a.1 + p.2));
+        assert!((mm_sum - mm).abs() < 1.0e-9 * mm.max(1.0));
+        assert!((g_sum - grams).abs() < 1.0e-9 * grams.max(1.0));
+        // Equal geometry through a fatter filament: fewer mm by the area ratio.
+        let ratio = (2.85f64 / 1.75).powi(2);
+        assert!(
+            (per[0].1 / per[1].1 - ratio).abs() < 0.02,
+            "mm ratio {} vs {ratio}",
+            per[0].1 / per[1].1
+        );
+        // And the header reports each slot.
+        let g = to_gcode(&plans, &s);
+        assert!(g.contains("; filament used [T0] = "));
+        assert!(g.contains("; filament used [T1] = "));
+    }
+
+    #[test]
+    fn multiline_toolchange_template_emits_verbatim() {
+        let mut s = two_tool_settings();
+        s.toolchange_gcode =
+            "SAVE_GCODE_STATE NAME=tc\nT{tool}\nRESTORE_GCODE_STATE NAME=tc".into();
+        let plans = two_tool_plans(&s, 0.0);
+        let g = to_gcode(&plans, &s);
+        let at = g.find("; toolchange T1").unwrap();
+        let mut lines = g[at..].lines().skip(1);
+        assert_eq!(lines.next(), Some("SAVE_GCODE_STATE NAME=tc"));
+        assert_eq!(lines.next(), Some("T1"));
+        assert_eq!(lines.next(), Some("RESTORE_GCODE_STATE NAME=tc"));
+    }
+
+    #[test]
+    fn single_tool_output_has_no_tool_vocabulary() {
+        let m = mesh::Mesh::cube(10.0);
+        let s = Settings::default();
+        let plans = generate(&m, &s);
+        let g = to_gcode(&plans, &s);
+        assert!(!g.contains("toolchange"), "no selection on a single-tool machine");
+        assert!(!g.contains("M104 T"), "no T-form setpoints");
+        assert!(!g.lines().any(|l| l == "T0"), "no bare T macro");
+        assert!(!g.contains("filament used [T"), "no per-tool header lines");
+        // The per-tool estimate degenerates to the aggregate.
+        let per = estimate_filament_per_tool(&plans, &s);
+        let (mm, grams) = estimate_filament(&plans, &s);
+        assert_eq!(per.len(), 1);
+        assert!((per[0].1 - mm).abs() < 1.0e-12 && (per[0].2 - grams).abs() < 1.0e-12);
+    }
+
     #[test]
     fn spiral_vase_ramps_z_continuously() {
         let m = mesh::Mesh::cube(20.0);
@@ -1858,5 +2488,79 @@ mod tests {
         let spiral_start = g.find("; LAYER 3 ").unwrap();
         let tail = &g[spiral_start..g.find("M73 P100").unwrap()];
         assert!(tail.matches("G1 E-").count() <= 1, "no retractions inside the spiral");
+    }
+
+    #[test]
+    fn tool_done_early_drops_to_standby_for_the_rest_of_the_print() {
+        // Tool 1 finishes near the bottom of a tall tool-0 print: at its final
+        // release it parks at standby (250 − 50 = 200) instead of cooking at
+        // print temperature for the remaining hour; never reheated after.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 20.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, 0.0], [40.0, 10.0, 4.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = two_tool_settings();
+        s.standby_after_s = 5.0;
+        s.tools[1].standby_temp_c = 200; // what resolve derives for a 250° spool
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &s);
+        let g = to_gcode(&plans, &s);
+        let park = g.find("M104 T1 S200").expect("tool 1 parks at standby");
+        assert!(!g[park..].contains("M104 T1 S25"), "never reheated after its last use");
+        assert!(!g.contains("M109 T"), "no pickup, no blocking wait");
+        // Tool 0 works to the end: it never parks (its standby is 160).
+        assert!(!g.contains("M104 T0 S160"), "tool 0 has no standby drop");
+    }
+
+    #[test]
+    fn long_dock_reheats_a_layer_ahead_and_confirms_at_pickup() {
+        // Tool 1 prints the bottom band and a top band of the same part with a
+        // long tool-0-only stretch between: it drops at the release, gets its
+        // M104 reheat one layer before the pickup, and the pickup swap opens
+        // with a blocking M109 confirm.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 20.0]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, 0.0], [40.0, 10.0, 2.0]);
+        push_box(&mut tb, [30.0, 0.0, 16.0], [40.0, 10.0, 20.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = two_tool_settings();
+        s.standby_after_s = 5.0;
+        s.tools[1].standby_temp_c = 200;
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &s);
+        // The pickup layer: tool 1's first appearance above the gap.
+        let pickup = plans
+            .iter()
+            .find(|p| p.print_z_mm > 10.0 && p.paths.iter().any(|q| q.tool == 1 && q.points.len() >= 2))
+            .map(|p| p.index)
+            .expect("tool 1 returns for the top band");
+        let g = to_gcode(&plans, &s);
+        let park = g.find("M104 T1 S200").expect("tool 1 parks during the gap");
+        let reheat = g[park..].find("M104 T1 S250").map(|i| park + i).expect("reheat scheduled");
+        let confirm = g[reheat..].find("M109 T1 S250").map(|i| reheat + i).expect("pickup confirms");
+        // The reheat lands in the layer BEFORE the pickup; the confirm sits at
+        // the pickup swap itself, after that layer starts.
+        let lead_mark = format!("; LAYER {} ", pickup - 1);
+        let pickup_mark = format!("; LAYER {pickup} ");
+        let lead_at = g.find(&lead_mark).unwrap();
+        let pickup_at = g.find(&pickup_mark).unwrap();
+        assert!(lead_at < reheat && reheat < pickup_at, "reheat rides the lead layer");
+        assert!(confirm > pickup_at, "confirm at the swap, not earlier");
+        assert!(g[confirm..].find("; toolchange T1").is_some(), "confirm precedes the swap");
+    }
+
+    #[test]
+    fn quick_alternation_never_thermally_cycles() {
+        // The serpentine two-cube print swaps every layer — docks last seconds.
+        // With the default threshold nothing drops, nothing waits: dithered
+        // blends must not thermal-cycle the hotends.
+        let s = two_tool_settings();
+        let plans = two_tool_plans(&s, 0.0);
+        let g = to_gcode(&plans, &s);
+        assert!(!g.contains("M104 T1 S160"), "no standby drops on quick alternation");
+        assert!(!g.contains("M104 T0 S160"), "tool 0 likewise");
+        assert!(!g.contains("M109 T"), "no blocking waits");
     }
 }

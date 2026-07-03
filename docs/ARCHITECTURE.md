@@ -29,8 +29,15 @@ the core testable and is what structurally keeps us independent of a monolith.
 
 ## The pipeline
 
-1. **Load & repair** — STL/3MF → indexed mesh; tolerate imperfect input.
+1. **Load & repair** — STL/3MF → indexed mesh; tolerate imperfect input. A 3MF
+   keeps its per-part identity (leaf meshes, names, and extruder hints from
+   Bambu/Orca's `Metadata/model_settings.config`).
 2. **Slice** — intersect each z-plane with the mesh → closed layer polygons.
+   Multi-part models slice per part on ONE shared layer grid
+   (`engine::generate_parts`): each part plans its own walls/skins/infill
+   (interfaces between parts get full shells), physical tests (overhang,
+   bridge, support) run against the per-layer union of all parts, and layers
+   merge with paths grouped by tool for toolchange-minimal ordering.
 3. **2D ops** — boolean + offset on polygons (Clipper2).
 4. **Walls** — concentric inward offsets.
 5. **Infill** — clip a pattern to the wall interior; solid vs. sparse regions.
@@ -71,9 +78,18 @@ to the integer grid. All segments are stitched **undirected**: on a manifold
 mesh each cut point has degree two, so the segments form simple cycles we can
 walk directly. Direction is irrelevant because winding is fixed afterward.
 
-This deliberately avoids a half-edge structure for now — integer snapping gives
-exact connectivity for clean meshes. Topology-aware stitching is a later
-robustness upgrade for messy inputs (see PLAN.md → M0 robustness pass).
+Cut segments are **directed from the triangle winding** (material on the
+left), so stitched outers come out CCW and holes CW straight from the
+geometry, and each layer is then normalized under the **positive fill rule**
+— material where the winding count is > 0. This is what makes geometrically
+self-intersecting meshes slice correctly: a chamfer surface punching through
+a wall (topologically manifold, so no repair pass flags it) yields crossing
+contours whose nesting parity is meaningless, but whose winding still knows
+where the material is. A mesh with enough flipped facets that the directed
+walk can't close its loops falls back per layer to the tolerant undirected
+stitcher (orientation by nesting parity), then normalizes the same way.
+This deliberately avoids a half-edge structure — integer snapping gives
+exact connectivity for clean meshes.
 
 ## Why these dependencies
 

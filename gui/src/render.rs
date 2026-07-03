@@ -27,7 +27,9 @@ struct U {
     light: vec4<f32>,
     // x = current (top visible) layer, y = dim factor, z = category bitmask, w = unused
     ctrl: vec4<f32>,
-    // Accent-derived model tints (rgb; w unused).
+    // Accent-derived model tints (rgb; w unused). The base (unselected) tint
+    // now rides each mesh vertex (per-part colors); mesh_unsel stays in the
+    // block only to keep the uniform layout, unread.
     mesh_unsel: vec4<f32>,
     mesh_sel: vec4<f32>,
     label_color: vec4<f32>,
@@ -35,11 +37,12 @@ struct U {
 @group(0) @binding(0) var<uniform> u: U;
 
 // --- mesh (shaded) ---
-struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) @interpolate(flat) sel: f32, @location(2) @interpolate(flat) invalid: f32 };
-@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) sel: f32, @location(3) invalid: f32) -> MeshOut {
+struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) rgb: vec3<f32>, @location(2) @interpolate(flat) sel: f32, @location(3) @interpolate(flat) invalid: f32 };
+@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) rgb: vec3<f32>, @location(3) sel: f32, @location(4) invalid: f32) -> MeshOut {
     var o: MeshOut;
     o.clip = u.mvp * vec4<f32>(p, 1.0);
     o.normal = n;
+    o.rgb = rgb;
     o.sel = sel;
     o.invalid = invalid;
     return o;
@@ -47,13 +50,15 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
     let l = normalize(u.light.xyz);
     let d = max(dot(normalize(i.normal), l), 0.0);
-    // Accent-derived: unselected = the accent sunk into porcelain,
-    // selected = the accent proper (see main.rs mesh_tints). An invalid
-    // object (outside the build volume, or overlapping another) overrides
-    // both with terracotta (the theme's error color) — and when that invalid
-    // object is also the selection it gets a brighter coral, so you can tell
-    // which of two colliding parts is selected. It can't print until fixed.
-    var base = mix(u.mesh_unsel.rgb, u.mesh_sel.rgb, i.sel);
+    // Per-vertex base tint: the part's filament color on a toolchanger, or
+    // the accent sunk into porcelain on a single tool (main.rs bakes either
+    // into the buffer). Selected mixes toward the accent proper exactly as
+    // before. An invalid object (outside the build volume, or overlapping
+    // another) overrides both with terracotta (the theme's error color) —
+    // and when that invalid object is also the selection it gets a brighter
+    // coral, so you can tell which of two colliding parts is selected — so
+    // the warning reads over any filament color. It can't print until fixed.
+    var base = mix(i.rgb, u.mesh_sel.rgb, i.sel);
     let warn = mix(vec3<f32>(0.862, 0.420, 0.320), vec3<f32>(0.980, 0.670, 0.520), i.sel);
     base = mix(base, warn, i.invalid);
     return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
@@ -158,14 +163,16 @@ struct Vertex {
     normal: [f32; 3],
 }
 
-/// Mesh vertex with state flags: `sel` 1 = selected highlight; `invalid` 1 =
-/// can't be printed (outside the build volume or overlapping another object) —
-/// drawn with the warning tint.
+/// Mesh vertex with its base tint and state flags: `rgb` = the part's color
+/// (filament on a toolchanger, accent porcelain otherwise); `sel` 1 = selected
+/// highlight; `invalid` 1 = can't be printed (outside the build volume or
+/// overlapping another object) — drawn with the warning tint.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MeshVertex {
     pos: [f32; 3],
     normal: [f32; 3],
+    rgb: [f32; 3],
     sel: f32,
     invalid: f32,
 }
@@ -301,7 +308,7 @@ impl Scene {
             &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<MeshVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32, 4 => Float32],
             }],
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
@@ -503,18 +510,18 @@ impl Scene {
         self.mesh_count = 0;
     }
 
-    /// Upload a mesh, translated by `offset` (used to center the model on the bed).
-    /// Upload all scene objects (each: mesh, placement, selected?) as one buffer,
-    /// baking the transform into bed coordinates and flagging the selected object
-    /// for highlight. Returns the combined bounding box (min, max), or None if empty.
+    /// Upload all scene parts (each: mesh, placement, base tint, selected?,
+    /// invalid?) as one buffer, baking the transform into bed coordinates and
+    /// the tint/flags into each vertex. Returns the combined bounding box
+    /// (min, max), or None if empty.
     pub fn set_mesh(
         &mut self,
         device: &wgpu::Device,
-        objects: &[(&mesh::Mesh, mesh::Transform, bool, bool)],
+        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)],
     ) -> Option<([f32; 3], [f32; 3])> {
         let mut verts: Vec<MeshVertex> = Vec::new();
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for (mesh, t, selected, invalid) in objects {
+        for (mesh, t, rgb, selected, invalid) in objects {
             let sel = if *selected { 1.0 } else { 0.0 };
             let invalid = if *invalid { 1.0 } else { 0.0 };
             for i in 0..mesh.triangles.len() {
@@ -527,7 +534,7 @@ impl Scene {
                         lo[k] = lo[k].min(pos[k]);
                         hi[k] = hi[k].max(pos[k]);
                     }
-                    verts.push(MeshVertex { pos, normal: n, sel, invalid });
+                    verts.push(MeshVertex { pos, normal: n, rgb: *rgb, sel, invalid });
                 }
             }
         }

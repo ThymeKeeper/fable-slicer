@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 mod profile;
 pub use profile::{tier_dirty, FilamentProfile, PrinterProfile, ProcessProfile, Profiles, Tier, TierKind};
 mod state;
-pub use state::{config_dir, AppState};
+pub use state::{config_dir, AppState, BlendState};
 
 /// Default start g-code. `{placeholders}` are substituted by the emitter; used
 /// when a printer profile sets no `start_gcode`. The order mirrors the presoak
@@ -273,8 +273,40 @@ impl SupportMode {
     }
 }
 
+/// One tool slot's resolved filament settings on a toolchanger — a mirror of
+/// [`Settings`]' filament-tier fields. `Settings::tools` always holds at least
+/// one; tool 0 mirrors the flat fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolSettings {
+    /// The filament profile loaded in this slot.
+    pub filament_name: String,
+    /// Display color for preview/part tinting.
+    pub color_rgb: [f32; 3],
+    pub material: Material,
+    pub filament_diameter_mm: f64,
+    pub filament_density_g_cm3: f64,
+    pub nozzle_temp_c: u32,
+    pub first_layer_nozzle_temp_c: u32,
+    pub bed_temp_c: u32,
+    pub max_volumetric_speed_mm3_s: f64,
+    pub max_flow_derate_per_c: f64,
+    pub extrusion_multiplier: f64,
+    pub pressure_advance: f64,
+    pub bridge_flow: f64,
+    pub bridge_speed_mm_s: f64,
+    pub fan_speed: f64,
+    pub bridge_fan_speed: f64,
+    pub fan_off_layers: usize,
+    pub aux_fan_speed: f64,
+    pub exhaust_fan_speed: f64,
+    pub chamber_temp_c: u32,
+    /// Nozzle setpoint while this tool sits docked long enough to matter —
+    /// hot enough to restart quickly, cool enough not to ooze and cook.
+    pub standby_temp_c: u32,
+}
+
 /// Fully-resolved settings the pipeline runs on.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     // --- machine ---
     pub nozzle_diameter_mm: f64,
@@ -390,6 +422,12 @@ pub struct Settings {
     /// anchored bridge lines across the gap. Wider gaps fall back to the ordered
     /// bottom shell.
     pub max_bridge_span_mm: f64,
+    /// Tallest dither repeat (mm) a blend may have and still fuse into one
+    /// perceived color at viewing distance. Bounds the blend picker's gamut:
+    /// weights quantize to whole layers of a `blend_band_mm / layer_height`
+    /// cycle, so extreme ratios (one layer in ten = a visible stripe every
+    /// 2 mm) are simply not offered.
+    pub blend_band_mm: f64,
 
     // --- retraction ---
     pub retract_len_mm: f64,
@@ -509,6 +547,26 @@ pub struct Settings {
     /// (ABS/ASA soak at 50, everything else 0).
     pub chamber_temp_c: u32,
 
+    // --- tools (toolchanger) ---
+    /// Number of tool slots on the machine (1 = ordinary single-tool printer).
+    pub tool_count: usize,
+    /// Template emitted at each tool change; `{tool}` = the target tool number.
+    pub toolchange_gcode: String,
+    /// Estimated seconds per tool change (time estimate / M73).
+    pub toolchange_seconds: f64,
+    /// Tool-0 / flat-view standby temperature (docked-tool setpoint).
+    pub standby_temp_c: u32,
+    /// Docked longer than this (estimated seconds) and a tool drops to its
+    /// standby temperature, reheating a layer ahead of its next pickup.
+    /// Short docks — blend dithering alternates tools every layer — stay at
+    /// print temperature; thermal cycling would cost more than it saves.
+    pub standby_after_s: f64,
+    /// Tool-0 / flat-view filament display color.
+    pub filament_color_rgb: [f32; 3],
+    /// Per-slot filament settings — never empty (a single-filament resolve
+    /// carries one entry, mirroring the flat fields).
+    pub tools: Vec<ToolSettings>,
+
     // --- g-code templates (with {placeholders}) ---
     pub start_gcode: String,
     pub end_gcode: String,
@@ -516,7 +574,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             nozzle_diameter_mm: 0.4,
             filament_diameter_mm: 1.75,
             filament_density_g_cm3: 1.24,
@@ -566,6 +624,9 @@ impl Default for Settings {
             support_z_gap_layers: 1,
             support_interface_layers: 2,
             max_bridge_span_mm: 18.0,
+            // 0.8 mm: 4 layers at 0.2 — greys fuse comfortably past arm's
+            // length; tighten for saturated colors, at a sparser palette.
+            blend_band_mm: 0.8,
             retract_len_mm: 0.8,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
@@ -603,9 +664,19 @@ impl Default for Settings {
             exhaust_fan_speed: 0.0,
             chamber_sensor: String::new(),
             chamber_temp_c: Material::Pla.chamber_temp_c(),
+            tool_count: 1,
+            toolchange_gcode: "T{tool}".to_string(),
+            toolchange_seconds: 10.0,
+            standby_temp_c: derived_standby_temp_c(210),
+            standby_after_s: 120.0,
+            filament_color_rgb: NEUTRAL_FILAMENT_RGB,
+            tools: Vec::new(),
             start_gcode: GENERIC_START_GCODE.to_string(),
             end_gcode: GENERIC_END_GCODE.to_string(),
-        }
+        };
+        // `tools` is never empty: tool 0 mirrors the flat defaults.
+        s.tools = vec![s.flat_tool(String::new())];
+        s
     }
 }
 
@@ -614,6 +685,39 @@ impl Settings {
     pub fn filament_area_mm2(&self) -> f64 {
         let r = self.filament_diameter_mm / 2.0;
         PI * r * r
+    }
+
+    /// The tool at slot `i`, clamped to the last loaded slot (`tools` is
+    /// never empty — a single-filament resolve carries one entry).
+    pub fn tool(&self, i: usize) -> &ToolSettings {
+        &self.tools[i.min(self.tools.len() - 1)]
+    }
+
+    /// The per-filament view of the flat fields — what tool 0 mirrors.
+    pub fn flat_tool(&self, filament_name: String) -> ToolSettings {
+        ToolSettings {
+            filament_name,
+            color_rgb: self.filament_color_rgb,
+            material: self.material,
+            filament_diameter_mm: self.filament_diameter_mm,
+            filament_density_g_cm3: self.filament_density_g_cm3,
+            nozzle_temp_c: self.nozzle_temp_c,
+            first_layer_nozzle_temp_c: self.first_layer_nozzle_temp_c,
+            bed_temp_c: self.bed_temp_c,
+            max_volumetric_speed_mm3_s: self.max_volumetric_speed_mm3_s,
+            max_flow_derate_per_c: self.max_flow_derate_per_c,
+            extrusion_multiplier: self.extrusion_multiplier,
+            pressure_advance: self.pressure_advance,
+            bridge_flow: self.bridge_flow,
+            bridge_speed_mm_s: self.bridge_speed_mm_s,
+            fan_speed: self.fan_speed,
+            bridge_fan_speed: self.bridge_fan_speed,
+            fan_off_layers: self.fan_off_layers,
+            aux_fan_speed: self.aux_fan_speed,
+            exhaust_fan_speed: self.exhaust_fan_speed,
+            chamber_temp_c: self.chamber_temp_c,
+            standby_temp_c: self.standby_temp_c,
+        }
     }
 }
 
@@ -627,10 +731,296 @@ impl Settings {
 pub const NOZZLE_TEMP_MIN_C: u32 = 150;
 pub const NOZZLE_TEMP_MAX_C: u32 = 320;
 
+/// Standby temperature for a docked tool: 50 °C under the operating
+/// temperature — no meaningful ooze or heat damage, a few seconds to recover —
+/// floored where reheating stops being quick.
+pub fn derived_standby_temp_c(nozzle_temp_c: u32) -> u32 {
+    nozzle_temp_c.saturating_sub(50).max(110)
+}
+
 /// First-layer temperature: the operating temperature + the material's
 /// adhesion bump, clipped to the hotend ceiling.
 pub fn derived_first_layer_temp_c(nozzle_temp_c: u32, material: Material) -> u32 {
     (nozzle_temp_c + material.first_layer_bump_c()).min(NOZZLE_TEMP_MAX_C)
+}
+
+/// Filament display color when a profile sets none — a neutral grey.
+pub const NEUTRAL_FILAMENT_RGB: [f32; 3] = [0.66, 0.66, 0.66];
+
+/// Parse a display color: "#RRGGBB", bare "RRGGBB", or short "#RGB".
+/// Anything else is `None` — callers fall back to the neutral default.
+pub fn parse_hex_color(s: &str) -> Option<[f32; 3]> {
+    let digits: Vec<f32> = s
+        .trim()
+        .trim_start_matches('#')
+        .chars()
+        .map(|c| c.to_digit(16).map(|v| v as f32))
+        .collect::<Option<_>>()?;
+    match digits[..] {
+        [r1, r0, g1, g0, b1, b0] => Some([
+            (r1 * 16.0 + r0) / 255.0,
+            (g1 * 16.0 + g0) / 255.0,
+            (b1 * 16.0 + b0) / 255.0,
+        ]),
+        [r, g, b] => Some([r * 17.0 / 255.0, g * 17.0 / 255.0, b * 17.0 / 255.0]),
+        _ => None,
+    }
+}
+
+/// Format a color back to the profile/TOML "#RRGGBB" form.
+pub fn hex_color(rgb: [f32; 3]) -> String {
+    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02X}{:02X}{:02X}", ch(rgb[0]), ch(rgb[1]), ch(rgb[2]))
+}
+
+/// What interleaved filaments read as at viewing distance: the weighted
+/// average in LINEAR light (spatial/partitive mixing is additive in light,
+/// not in gamma-encoded sRGB — an sRGB average would render every blend too
+/// dark). Inputs and output are sRGB; weights are relative shares.
+pub fn mix_colors_linear(entries: &[([f32; 3], f32)]) -> [f32; 3] {
+    let to_lin = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let to_srgb = |c: f32| {
+        if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    let total: f32 = entries.iter().map(|&(_, w)| w.max(0.0)).sum();
+    if total <= 0.0 {
+        return NEUTRAL_FILAMENT_RGB;
+    }
+    let mut lin = [0.0f32; 3];
+    for &(rgb, w) in entries {
+        let w = w.max(0.0) / total;
+        for (l, &c) in lin.iter_mut().zip(&rgb) {
+            *l += to_lin(c) * w;
+        }
+    }
+    [to_srgb(lin[0]), to_srgb(lin[1]), to_srgb(lin[2])]
+}
+
+/// The mix of `palette` colors that lands nearest `target` — the inverse of
+/// [`mix_colors_linear`]: least squares in linear light over the simplex
+/// (weights ≥ 0 summing to 1), by projected gradient descent (a handful of
+/// colors, a few hundred tiny steps — exact enough for a picker). A target
+/// outside the achievable gamut snaps to its closest mixable color.
+pub fn blend_weights_for_color(target: [f32; 3], palette: &[[f32; 3]]) -> Vec<f32> {
+    let to_lin = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let n = palette.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let t: Vec<f32> = target.iter().map(|&c| to_lin(c)).collect();
+    let p: Vec<[f32; 3]> = palette
+        .iter()
+        .map(|c| [to_lin(c[0]), to_lin(c[1]), to_lin(c[2])])
+        .collect();
+    let mut w = vec![1.0f32 / n as f32; n];
+    for _ in 0..500 {
+        // Residual of the current mix, then one gradient step per weight.
+        let mut mix = [0.0f32; 3];
+        for (wi, pi) in w.iter().zip(&p) {
+            for (m, &c) in mix.iter_mut().zip(pi) {
+                *m += wi * c;
+            }
+        }
+        let r = [mix[0] - t[0], mix[1] - t[1], mix[2] - t[2]];
+        for (wi, pi) in w.iter_mut().zip(&p) {
+            *wi -= 0.5 * (r[0] * pi[0] + r[1] * pi[1] + r[2] * pi[2]);
+        }
+        project_onto_simplex(&mut w);
+    }
+    w
+}
+
+/// Quantize blend fractions to whole layers of a `cycle`-layer dither
+/// (largest-remainder apportionment; the counts sum to `cycle`). Rational
+/// weights n/cycle make the engine's error diffusion exactly periodic in
+/// `cycle` layers — the credits net to zero each cycle — so the pattern's
+/// repeat height is bounded by cycle × layer height: every offered mix
+/// actually fuses within the blend band. The price is a discrete palette:
+/// a 90/10 ask at cycle 4 lands on pure (4:0), not a 2 mm stripe.
+pub fn quantize_blend_fractions(fractions: &[f32], cycle: usize) -> Vec<u32> {
+    let n = fractions.len();
+    let cycle = cycle.max(1);
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: f32 = fractions.iter().map(|&f| f.max(0.0)).sum();
+    if total <= 0.0 {
+        let mut out = vec![0u32; n];
+        out[0] = cycle as u32;
+        return out;
+    }
+    let ideal: Vec<f32> =
+        fractions.iter().map(|&f| f.max(0.0) / total * cycle as f32).collect();
+    let mut out: Vec<u32> = ideal.iter().map(|&x| x.floor() as u32).collect();
+    let mut left = cycle as u32 - out.iter().sum::<u32>();
+    // Hand the remaining layers to the largest remainders (ties → lowest
+    // slot, matching the dither's own tie-break).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let (ra, rb) = (ideal[a] - ideal[a].floor(), ideal[b] - ideal[b].floor());
+        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    let mut oi = 0usize;
+    while left > 0 {
+        out[order[oi % n]] += 1;
+        left -= 1;
+        oi += 1;
+    }
+    out
+}
+
+/// Every printable mix of `palette` at a `cycle`-layer dither — the finite
+/// lattice the blend band affords: all whole-layer compositions of the
+/// cycle, deduplicated by resulting color (slots sharing a spool color
+/// collapse; the simplest recipe wins), sorted dark → light. `None` when
+/// the lattice exceeds `cap` compositions — too rich to enumerate usefully,
+/// the caller falls back to pick-and-snap.
+pub fn blend_lattice(
+    palette: &[[f32; 3]],
+    cycle: usize,
+    cap: usize,
+) -> Option<Vec<(Vec<u32>, [f32; 3])>> {
+    let k = palette.len();
+    if k == 0 {
+        return Some(Vec::new());
+    }
+    // C(cycle + k − 1, k − 1), bailing early — the sequential product stays
+    // integral, so no factorial blowup.
+    let mut count: u128 = 1;
+    for i in 1..k {
+        count = count * (cycle + i) as u128 / i as u128;
+        if count > cap as u128 {
+            return None;
+        }
+    }
+    fn fill(
+        palette: &[[f32; 3]],
+        comp: &mut Vec<u32>,
+        slot: usize,
+        left: u32,
+        out: &mut Vec<(Vec<u32>, [f32; 3])>,
+    ) {
+        if slot + 1 == comp.len() {
+            comp[slot] = left;
+            let entries: Vec<([f32; 3], f32)> =
+                palette.iter().copied().zip(comp.iter().map(|&n| n as f32)).collect();
+            out.push((comp.clone(), mix_colors_linear(&entries)));
+            return;
+        }
+        for n in 0..=left {
+            comp[slot] = n;
+            fill(palette, comp, slot + 1, left - n, out);
+        }
+    }
+    let mut all = Vec::new();
+    fill(palette, &mut vec![0u32; k], 0, cycle as u32, &mut all);
+    // Dedupe by displayed color; among lookalikes keep the fewest spools.
+    let mut best: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    let key = |c: [f32; 3]| {
+        [
+            (c[0] * 255.0).round() as u8,
+            (c[1] * 255.0).round() as u8,
+            (c[2] * 255.0).round() as u8,
+        ]
+    };
+    for (i, (comp, rgb)) in all.iter().enumerate() {
+        let parts = comp.iter().filter(|&&n| n > 0).count();
+        match best.entry(key(*rgb)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let cur = all[*e.get()].0.iter().filter(|&&n| n > 0).count();
+                if parts < cur {
+                    e.insert(i);
+                }
+            }
+        }
+    }
+    let mut keep: Vec<usize> = best.into_values().collect();
+    // Palette order, not a jumble: the neutral run first (greys dark→light),
+    // then the chromatic chips grouped into hue families, each family
+    // dark→light. A monochrome palette is thus one clean ramp.
+    let luma = |c: &[f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sort_key = |c: &[f32; 3]| -> (u8, u8, u32) {
+        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let chroma = max - min;
+        if chroma < 0.10 {
+            return (0, 0, (luma(c) * 1e6) as u32);
+        }
+        let h = if max == c[0] {
+            60.0 * ((c[1] - c[2]) / chroma).rem_euclid(6.0)
+        } else if max == c[1] {
+            60.0 * ((c[2] - c[0]) / chroma + 2.0)
+        } else {
+            60.0 * ((c[0] - c[1]) / chroma + 4.0)
+        };
+        (1, (h / 30.0).clamp(0.0, 11.0) as u8, (luma(c) * 1e6) as u32)
+    };
+    keep.sort_by(|&a, &b| {
+        sort_key(&all[a].1).cmp(&sort_key(&all[b].1)).then(all[a].0.cmp(&all[b].0))
+    });
+    Some(keep.into_iter().map(|i| all[i].clone()).collect())
+}
+
+/// A blend's dither repeat, in layers: the weights' sum after dividing out
+/// their common factor (error diffusion is exactly periodic in that many
+/// layers). Multiply by the layer height for the repeat's physical height —
+/// the thing that must stay inside the blend band to read as one color.
+/// Pure tools and empty blends trivially repeat every layer.
+pub fn blend_repeat_layers(weights: &[(u32, f32)]) -> u32 {
+    let ints: Vec<u64> =
+        weights.iter().filter(|&&(_, w)| w >= 0.5).map(|&(_, w)| w.round() as u64).collect();
+    if ints.len() < 2 {
+        return 1;
+    }
+    let g = ints.iter().fold(0u64, |acc, &b| gcd(acc, b)).max(1);
+    (ints.iter().sum::<u64>() / g) as u32
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Euclidean projection onto the probability simplex (Duchi et al.): shift
+/// everything down by the threshold that makes the clamped sum exactly 1.
+/// (Plain clamp-and-renormalize is NOT this — rescaling can cancel a gradient
+/// step and stall a solve short of the boundary.)
+fn project_onto_simplex(w: &mut [f32]) {
+    let mut u = w.to_vec();
+    u.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cumsum = 0.0f32;
+    let mut theta = 0.0f32;
+    for (k, &uk) in u.iter().enumerate() {
+        cumsum += uk;
+        let t = (cumsum - 1.0) / (k as f32 + 1.0);
+        if uk - t > 0.0 {
+            theta = t;
+        }
+    }
+    for wi in w.iter_mut() {
+        *wi = (*wi - theta).max(0.0);
+    }
 }
 
 /// Nominal print speed: the machine's rated speed × the finish↔speed factor
@@ -730,6 +1120,122 @@ mod tests {
         // enough to keep curve detail for arc fitting, coarse enough to drop
         // mesh-facet tessellation noise.
         assert!((contour_resolution_mm() - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hex_colors_parse_tolerantly() {
+        assert_eq!(parse_hex_color("#FF0000"), Some([1.0, 0.0, 0.0]));
+        assert_eq!(parse_hex_color("00ff00"), Some([0.0, 1.0, 0.0])); // bare, lowercase
+        assert_eq!(parse_hex_color(" #00F "), Some([0.0, 0.0, 1.0])); // short, padded
+        assert_eq!(parse_hex_color("#abc"), parse_hex_color("#AABBCC"));
+        assert_eq!(parse_hex_color("not-a-color"), None);
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("#12345"), None); // wrong length
+        // Formatting round-trips exactly for byte-derived channels.
+        let c = parse_hex_color("#8A2BE2").unwrap();
+        assert_eq!(hex_color(c), "#8A2BE2");
+    }
+
+    #[test]
+    fn default_settings_carry_a_mirroring_tool_zero() {
+        let s = Settings::default();
+        assert_eq!(s.tools.len(), 1);
+        assert_eq!(s.tools[0], s.flat_tool(String::new()));
+        assert_eq!(s.tool_count, 1);
+        assert_eq!(s.toolchange_gcode, "T{tool}");
+        assert_eq!(s.toolchange_seconds, 10.0);
+        // tool() clamps past the last loaded slot instead of panicking.
+        assert_eq!(s.tool(7), s.tool(0));
+    }
+
+    #[test]
+    fn blend_lattice_enumerates_the_printable_mixes() {
+        let w = [0.95, 0.95, 0.95];
+        let b = [0.10, 0.10, 0.10];
+        let g = [0.50, 0.50, 0.50];
+        // Two spools, 4-layer cycle: the five ramp steps, dark to light.
+        let lat = blend_lattice(&[w, b], 4, 200).unwrap();
+        assert_eq!(lat.len(), 5);
+        assert_eq!(lat.first().unwrap().0, vec![0, 4], "darkest first");
+        assert_eq!(lat.last().unwrap().0, vec![4, 0], "lightest last");
+        // Three spools: C(6,2) = 15 compositions.
+        assert_eq!(blend_lattice(&[w, g, b], 4, 200).unwrap().len(), 15);
+        // Two slots loaded with the SAME spool color collapse to one ramp
+        // point each — five compositions, one color.
+        assert_eq!(blend_lattice(&[w, w], 4, 200).unwrap().len(), 1);
+        // Eight spools at cycle 4 is 330 compositions: over a 168 cap → None;
+        // under a 400 cap they enumerate, then coincident mixes collapse (a
+        // grey ramp has MANY compositions landing on the same grey — that's
+        // the point of the dedupe), every survivor a whole 4-layer recipe.
+        let eight: Vec<[f32; 3]> = (0..8).map(|i| [i as f32 / 7.0; 3]).collect();
+        assert!(blend_lattice(&eight, 4, 168).is_none());
+        let lat = blend_lattice(&eight, 4, 400).unwrap();
+        assert!(lat.len() > 100 && lat.len() < 330, "deduped: {}", lat.len());
+        assert!(lat.iter().all(|(c, _)| c.iter().sum::<u32>() == 4));
+        // Palette order: with red + white + black loaded, the neutral
+        // white↔black ramp leads (dark→light), the pinks follow — greys never
+        // interleave with the chromatic run.
+        let lat = blend_lattice(&[[0.9, 0.1, 0.1], w, b], 4, 200).unwrap();
+        let chroma =
+            |c: &[f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        let first_chromatic = lat.iter().position(|(_, c)| chroma(c) >= 0.10).unwrap();
+        assert!(
+            lat[first_chromatic..].iter().all(|(_, c)| chroma(c) >= 0.10),
+            "achromatic ramp first, then hues"
+        );
+        for pair in lat[..first_chromatic].windows(2) {
+            let l = |c: &[f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            assert!(l(&pair[0].1) <= l(&pair[1].1), "neutral run is dark to light");
+        }
+    }
+
+    #[test]
+    fn blend_repeat_period_is_sum_over_gcd() {
+        // 3:1 repeats every 4 layers; 50:50 every 2; 72:18:10 every 50.
+        assert_eq!(blend_repeat_layers(&[(0, 3.0), (2, 1.0)]), 4);
+        assert_eq!(blend_repeat_layers(&[(0, 50.0), (1, 50.0)]), 2);
+        assert_eq!(blend_repeat_layers(&[(0, 72.0), (1, 18.0), (2, 10.0)]), 50);
+        // Pure tools and empty blends trivially repeat every layer.
+        assert_eq!(blend_repeat_layers(&[(1, 4.0)]), 1);
+        assert_eq!(blend_repeat_layers(&[]), 1);
+    }
+
+    #[test]
+    fn blend_fractions_quantize_to_whole_layers() {
+        // 75/25 at a 4-layer cycle: 3 layers + 1 layer.
+        assert_eq!(quantize_blend_fractions(&[0.75, 0.25], 4), vec![3, 1]);
+        // A 90/10 ask can't fit a 4-layer cycle — it lands on pure.
+        assert_eq!(quantize_blend_fractions(&[0.9, 0.1], 4), vec![4, 0]);
+        // …but an 8-layer cycle can hold one layer in eight.
+        assert_eq!(quantize_blend_fractions(&[0.9, 0.1], 8), vec![7, 1]);
+        // Equal thirds at cycle 4: the spare layer goes to the lowest slot.
+        assert_eq!(quantize_blend_fractions(&[1.0, 1.0, 1.0], 4), vec![2, 1, 1]);
+        // Counts always sum to the cycle.
+        for cycle in 1..=12 {
+            let q = quantize_blend_fractions(&[0.61, 0.29, 0.10], cycle);
+            assert_eq!(q.iter().sum::<u32>(), cycle as u32, "cycle {cycle}: {q:?}");
+        }
+        // Degenerate input still fills the cycle.
+        assert_eq!(quantize_blend_fractions(&[0.0, 0.0], 4), vec![4, 0]);
+    }
+
+    #[test]
+    fn blend_weights_invert_the_mix() {
+        let white = [0.95, 0.95, 0.95];
+        let black = [0.10, 0.10, 0.10];
+        let grey = [0.50, 0.50, 0.50];
+        // A palette color is itself: full weight on the matching slot.
+        let w = blend_weights_for_color(white, &[white, black]);
+        assert!(w[0] > 0.99, "white is pure white: {w:?}");
+        // The mix of any weights round-trips back to those weights.
+        let mixed = mix_colors_linear(&[(white, 0.3), (black, 0.7)]);
+        let w = blend_weights_for_color(mixed, &[white, black]);
+        assert!((w[0] - 0.3).abs() < 0.01 && (w[1] - 0.7).abs() < 0.01, "{w:?}");
+        // A target outside the gamut (saturated red over greys) still lands on
+        // a valid simplex point.
+        let w = blend_weights_for_color([1.0, 0.0, 0.0], &[white, grey, black]);
+        let sum: f32 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4 && w.iter().all(|&x| x >= 0.0), "{w:?}");
     }
 
     #[test]

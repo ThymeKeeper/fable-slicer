@@ -73,6 +73,19 @@ pub struct PrinterProfile {
     /// ("" / unset = the machine has none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chamber_sensor: Option<String>,
+    /// Number of tools (StealthChanger etc.); 1 / unset = single-tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u32>,
+    /// Template emitted at each tool change; `{tool}` = the target tool number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolchange_gcode: Option<String>,
+    /// Estimated seconds per tool change (time estimate / M73).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolchange_seconds: Option<f64>,
+    /// Docked longer than this (estimated seconds) and a tool drops to its
+    /// filament's standby temperature, reheating ahead of its next pickup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby_after_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_gcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +102,9 @@ pub struct FilamentProfile {
     /// drives every default below until a calibration value pins one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub material: Option<String>,
+    /// Display color "#RRGGBB" for preview/part tinting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filament_diameter_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +142,11 @@ pub struct FilamentProfile {
     /// sensor. Auto: the material class's value (ABS/ASA 50, others 0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chamber_temp_c: Option<u32>,
+    /// Nozzle setpoint (°C) while this tool sits docked on a toolchanger —
+    /// hot enough to restart quickly, cool enough not to ooze and cook.
+    /// Auto: operating temperature − 50, floored at 110.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby_temp_c: Option<u32>,
 }
 
 /// Process (print) tier: quality/geometry knobs.
@@ -184,6 +205,10 @@ pub struct ProcessProfile {
     /// How far (mm) an enclosed-ceiling bridge lands onto the supported rim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_foothold_mm: Option<f64>,
+    /// Tallest dither repeat (mm) a blend may have and still read as one
+    /// color — the blend picker only offers mixes whose layer cycle fits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blend_band_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infill_overlap: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,7 +258,9 @@ impl Tier for PrinterProfile {
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
-            aux_fan, exhaust_fan, chamber_sensor, start_gcode, end_gcode)
+            aux_fan, exhaust_fan, chamber_sensor,
+            tool_count, toolchange_gcode, toolchange_seconds, standby_after_s,
+            start_gcode, end_gcode)
     }
 }
 
@@ -242,13 +269,13 @@ impl Tier for FilamentProfile {
         self.inherits.as_deref()
     }
     fn over(self, base: Self) -> Self {
-        merge_fields!(self, base, material, filament_diameter_mm, density_g_cm3,
+        merge_fields!(self, base, material, color, filament_diameter_mm, density_g_cm3,
             nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             pressure_advance,
             fan_speed, bridge_fan_speed, bridge_flow, bridge_speed_mm_s,
             fan_off_layers, aux_fan_speed, exhaust_fan_speed,
-            chamber_temp_c)
+            chamber_temp_c, standby_temp_c)
     }
 }
 
@@ -262,7 +289,7 @@ impl Tier for ProcessProfile {
             infill_density, sparse_infill, top_infill, bottom_infill, solid_infill,
             skirt_loops, skirt_gap_mm, brim_loops, seam, support, support_overhang_angle_deg,
             support_density, support_xy_clearance_mm, support_z_gap_layers, support_interface_layers,
-            max_bridge_span_mm, bridge_foothold_mm,
+            max_bridge_span_mm, bridge_foothold_mm, blend_band_mm,
             infill_overlap, monotonic_solid,
             fuzzy_skin, fuzzy_skin_thickness_mm, fuzzy_skin_point_dist_mm,
             ironing,
@@ -312,6 +339,10 @@ impl PrinterProfile {
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             chamber_sensor: diff_field!(cur.chamber_sensor.clone(), base.chamber_sensor),
+            tool_count: diff_field!(cur.tool_count as u32, base.tool_count as u32),
+            toolchange_gcode: diff_field!(cur.toolchange_gcode.clone(), base.toolchange_gcode),
+            toolchange_seconds: diff_field!(cur.toolchange_seconds, base.toolchange_seconds),
+            standby_after_s: diff_field!(cur.standby_after_s, base.standby_after_s),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
             end_gcode: diff_field!(cur.end_gcode.clone(), base.end_gcode),
         }
@@ -331,6 +362,7 @@ impl FilamentProfile {
             filament_diameter_mm: diff_field!(cur.filament_diameter_mm, base.filament_diameter_mm),
             density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
             material: diff_field!(cur.material.label().to_string(), base.material.label().to_string()),
+            color: diff_field!(cur.filament_color_rgb, base.filament_color_rgb).map(crate::hex_color),
             nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
             bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
             extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
@@ -345,6 +377,38 @@ impl FilamentProfile {
             aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
             exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
             chamber_temp_c: diff_field!(cur.chamber_temp_c, base.chamber_temp_c),
+            standby_temp_c: diff_field!(cur.standby_temp_c, base.standby_temp_c),
+        }
+    }
+
+    /// The filament-tier fields where one tool slot's resolved view differs
+    /// from its baseline — the per-slot mirror of [`Self::diff`], for
+    /// toolchanger tabs that edit `Settings::tools[i]` directly. Two fields
+    /// are excluded by design: color (the loaded spool's override is slot
+    /// data, never auto-promoted into the profile) and the first-layer
+    /// temperature (always derived from the operating temp + material).
+    pub fn diff_tool(cur: &crate::ToolSettings, base: &crate::ToolSettings) -> Self {
+        Self {
+            inherits: None,
+            filament_diameter_mm: diff_field!(cur.filament_diameter_mm, base.filament_diameter_mm),
+            density_g_cm3: diff_field!(cur.filament_density_g_cm3, base.filament_density_g_cm3),
+            material: diff_field!(cur.material, base.material).map(|m| m.label().to_string()),
+            color: None,
+            nozzle_temp_c: diff_field!(cur.nozzle_temp_c, base.nozzle_temp_c),
+            bed_temp_c: diff_field!(cur.bed_temp_c, base.bed_temp_c),
+            extrusion_multiplier: diff_field!(cur.extrusion_multiplier, base.extrusion_multiplier),
+            max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
+            max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
+            pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
+            fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
+            bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
+            bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
+            bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
+            fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
+            aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
+            exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
+            chamber_temp_c: diff_field!(cur.chamber_temp_c, base.chamber_temp_c),
+            standby_temp_c: diff_field!(cur.standby_temp_c, base.standby_temp_c),
         }
     }
 
@@ -382,6 +446,7 @@ impl ProcessProfile {
             support_z_gap_layers: diff_field!(cur.support_z_gap_layers, base.support_z_gap_layers),
             support_interface_layers: diff_field!(cur.support_interface_layers, base.support_interface_layers),
             max_bridge_span_mm: diff_field!(cur.max_bridge_span_mm, base.max_bridge_span_mm),
+            blend_band_mm: diff_field!(cur.blend_band_mm, base.blend_band_mm),
             bridge_foothold_mm: diff_field!(cur.bridge_foothold_mm, base.bridge_foothold_mm),
             // print/first-layer speed are printer-tier (see PrinterProfile::diff).
             infill_overlap: diff_field!(cur.infill_overlap, base.infill_overlap),
@@ -629,32 +694,54 @@ impl Profiles {
         sorted_names(&self.processes)
     }
 
-    /// Resolve the three named profiles into flat [`Settings`].
+    /// Resolve the three named profiles into flat [`Settings`]. Exactly
+    /// [`Self::resolve_tools`] with a single filament.
     pub fn resolve(&self, printer: &str, filament: &str, process: &str) -> Result<Settings, String> {
+        self.resolve_tools(printer, &[filament], process)
+    }
+
+    /// Resolve one printer + process with a filament per tool slot (a
+    /// toolchanger loadout; `filaments` must be non-empty). Flat filament
+    /// fields mirror `filaments[0]` — the initial tool's view — except the
+    /// shared-hardware aggregates: bed and chamber targets take the **max**
+    /// over tools (the hottest requirement wins the shared heater), and the
+    /// derived feature speeds clamp to the **minimum** flow ceiling across
+    /// tools (conservative: any tool may print any feature). `tools[i]`
+    /// carries each filament's full per-tool view.
+    pub fn resolve_tools(&self, printer: &str, filaments: &[&str], process: &str) -> Result<Settings, String> {
         let pr = resolve_tier(&self.printers, printer, "printer")?;
-        let fl = resolve_tier(&self.filaments, filament, "filament")?;
         let pc = resolve_tier(&self.processes, process, "process")?;
+        if filaments.is_empty() {
+            return Err("resolve_tools needs at least one filament".into());
+        }
         let d = Settings::default();
-        // The material class off the box drives every filament default a
-        // calibration entry doesn't pin.
-        let material = fl.material.as_deref().and_then(crate::Material::parse).unwrap_or(d.material);
-        // The operating nozzle temperature: the spool's value, else the class.
-        let nozzle_temp = fl.nozzle_temp_c.unwrap_or_else(|| material.nozzle_temp_c());
+        let tools = filaments
+            .iter()
+            .map(|name| Ok(tool_settings(name, &resolve_tier(&self.filaments, name, "filament")?, &d)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let t0 = tools[0].clone();
         // The machine's rating × the finish↔speed dial → the nominal speed.
         let machine_v = pr.print_speed_mm_s.unwrap_or(d.machine_speed_mm_s);
         let quality = pc.speed_quality.unwrap_or(d.speed_quality);
         let print_v = crate::derived_print_speed_mm_s(machine_v, quality);
         let nozzle = pr.nozzle_diameter_mm.unwrap_or(d.nozzle_diameter_mm);
         // The flow triangle: speed × bead area (line width × layer height) must
-        // fit the filament's melt ceiling, so derived speeds balance against it.
+        // fit the filament's melt ceiling, so derived speeds balance against
+        // it. The slowest ceiling across loaded tools binds — any tool may
+        // print any feature.
         let line_w = pc.line_width_mm.unwrap_or_else(|| crate::derived_line_width_mm(nozzle));
         let layer_h = pc.layer_height_mm.unwrap_or(d.layer_height_mm);
-        let max_flow = fl.max_volumetric_speed_mm3_s.unwrap_or_else(|| material.max_flow_mm3_s());
-        let flow_cap = crate::flow_speed_cap_mm_s(max_flow, line_w, layer_h);
+        let flow_cap = tools
+            .iter()
+            .map(|t| crate::flow_speed_cap_mm_s(t.max_volumetric_speed_mm3_s, line_w, layer_h))
+            .fold(f64::INFINITY, f64::min);
+        // The bed and chamber are shared across tools: the hottest wish wins.
+        let bed_temp = tools.iter().map(|t| t.bed_temp_c).max().unwrap_or(d.bed_temp_c);
+        let chamber_temp = tools.iter().map(|t| t.chamber_temp_c).max().unwrap_or(d.chamber_temp_c);
         Ok(Settings {
             nozzle_diameter_mm: nozzle,
-            filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
-            filament_density_g_cm3: fl.density_g_cm3.unwrap_or_else(|| material.density_g_cm3()),
+            filament_diameter_mm: t0.filament_diameter_mm,
+            filament_density_g_cm3: t0.filament_density_g_cm3,
             bed_size_x_mm: pr.bed_size_x_mm.unwrap_or(d.bed_size_x_mm),
             bed_size_y_mm: pr.bed_size_y_mm.unwrap_or(d.bed_size_y_mm),
             bed_size_z_mm: pr.bed_size_z_mm.unwrap_or(d.bed_size_z_mm),
@@ -711,6 +798,7 @@ impl Profiles {
             support_z_gap_layers: pc.support_z_gap_layers.unwrap_or(d.support_z_gap_layers),
             support_interface_layers: pc.support_interface_layers.unwrap_or(d.support_interface_layers),
             max_bridge_span_mm: pc.max_bridge_span_mm.unwrap_or(d.max_bridge_span_mm),
+            blend_band_mm: pc.blend_band_mm.unwrap_or(d.blend_band_mm),
             bridge_foothold_mm: pc.bridge_foothold_mm.unwrap_or(d.bridge_foothold_mm),
             retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
@@ -718,10 +806,10 @@ impl Profiles {
             wipe_mm: pr.wipe_mm.unwrap_or(d.wipe_mm),
             host_url: pr.host_url.unwrap_or(d.host_url),
             api_key: pr.api_key.unwrap_or(d.api_key),
-            material,
-            nozzle_temp_c: nozzle_temp,
-            first_layer_nozzle_temp_c: crate::derived_first_layer_temp_c(nozzle_temp, material),
-            bed_temp_c: fl.bed_temp_c.unwrap_or_else(|| material.bed_temp_c()),
+            material: t0.material,
+            nozzle_temp_c: t0.nozzle_temp_c,
+            first_layer_nozzle_temp_c: t0.first_layer_nozzle_temp_c,
+            bed_temp_c: bed_temp,
             machine_speed_mm_s: machine_v,
             speed_quality: quality,
             print_speed_mm_s: print_v,
@@ -732,26 +820,32 @@ impl Profiles {
             external_perimeter_speed_mm_s: crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap),
             solid_speed_mm_s: crate::derived_solid_speed_mm_s(print_v, flow_cap),
             support_speed_mm_s: crate::derived_support_speed_mm_s(print_v, flow_cap),
-            bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
-            overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(
-                fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
-            ),
+            bridge_speed_mm_s: t0.bridge_speed_mm_s,
+            overhang_speed_mm_s: crate::derived_overhang_speed_mm_s(t0.bridge_speed_mm_s),
             min_layer_time_s: d.min_layer_time_s,
             min_print_speed_mm_s: d.min_print_speed_mm_s,
-            max_volumetric_speed_mm3_s: max_flow,
-            max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
-            extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
-            bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
-            pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
-            fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
-            bridge_fan_speed: fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1),
-            fan_off_layers: fl.fan_off_layers.unwrap_or_else(|| material.fan().2),
+            max_volumetric_speed_mm3_s: t0.max_volumetric_speed_mm3_s,
+            max_flow_derate_per_c: t0.max_flow_derate_per_c,
+            extrusion_multiplier: t0.extrusion_multiplier,
+            bridge_flow: t0.bridge_flow,
+            pressure_advance: t0.pressure_advance,
+            fan_speed: t0.fan_speed,
+            bridge_fan_speed: t0.bridge_fan_speed,
+            fan_off_layers: t0.fan_off_layers,
             has_aux_fan: pr.aux_fan.unwrap_or(d.has_aux_fan),
             has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
-            aux_fan_speed: fl.aux_fan_speed.unwrap_or_else(|| material.aux_exhaust().0),
-            exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or_else(|| material.aux_exhaust().1),
+            aux_fan_speed: t0.aux_fan_speed,
+            exhaust_fan_speed: t0.exhaust_fan_speed,
             chamber_sensor: pr.chamber_sensor.unwrap_or_else(|| d.chamber_sensor.clone()),
-            chamber_temp_c: fl.chamber_temp_c.unwrap_or_else(|| material.chamber_temp_c()),
+            chamber_temp_c: chamber_temp,
+            // A declared tool_count of 0 is meaningless — clamp to single-tool.
+            tool_count: pr.tool_count.map(|c| (c as usize).max(1)).unwrap_or(d.tool_count),
+            toolchange_gcode: pr.toolchange_gcode.unwrap_or_else(|| d.toolchange_gcode.clone()),
+            toolchange_seconds: pr.toolchange_seconds.unwrap_or(d.toolchange_seconds),
+            standby_temp_c: t0.standby_temp_c,
+            standby_after_s: pr.standby_after_s.unwrap_or(d.standby_after_s),
+            filament_color_rgb: t0.color_rgb,
+            tools,
             start_gcode: pr.start_gcode.unwrap_or_else(|| GENERIC_START_GCODE.to_string()),
             end_gcode: pr.end_gcode.unwrap_or_else(|| GENERIC_END_GCODE.to_string()),
         })
@@ -793,6 +887,44 @@ fn load_tier<T: for<'de> Deserialize<'de>>(
         map.insert(stem, profile);
     }
     Ok(skipped)
+}
+
+/// One tool slot's resolved view of a merged filament profile — the same
+/// fallback chain the flat fields use: the profile's value, else the material
+/// class off the box, else the code default.
+fn tool_settings(name: &str, fl: &FilamentProfile, d: &Settings) -> crate::ToolSettings {
+    let material = fl.material.as_deref().and_then(crate::Material::parse).unwrap_or(d.material);
+    // The operating nozzle temperature: the spool's value, else the class.
+    let nozzle_temp = fl.nozzle_temp_c.unwrap_or_else(|| material.nozzle_temp_c());
+    crate::ToolSettings {
+        filament_name: name.to_string(),
+        color_rgb: fl
+            .color
+            .as_deref()
+            .and_then(crate::parse_hex_color)
+            .unwrap_or(crate::NEUTRAL_FILAMENT_RGB),
+        material,
+        filament_diameter_mm: fl.filament_diameter_mm.unwrap_or(d.filament_diameter_mm),
+        filament_density_g_cm3: fl.density_g_cm3.unwrap_or_else(|| material.density_g_cm3()),
+        nozzle_temp_c: nozzle_temp,
+        first_layer_nozzle_temp_c: crate::derived_first_layer_temp_c(nozzle_temp, material),
+        bed_temp_c: fl.bed_temp_c.unwrap_or_else(|| material.bed_temp_c()),
+        max_volumetric_speed_mm3_s: fl.max_volumetric_speed_mm3_s.unwrap_or_else(|| material.max_flow_mm3_s()),
+        max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
+        extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
+        pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
+        bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
+        bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
+        fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
+        bridge_fan_speed: fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1),
+        fan_off_layers: fl.fan_off_layers.unwrap_or_else(|| material.fan().2),
+        aux_fan_speed: fl.aux_fan_speed.unwrap_or_else(|| material.aux_exhaust().0),
+        exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or_else(|| material.aux_exhaust().1),
+        chamber_temp_c: fl.chamber_temp_c.unwrap_or_else(|| material.chamber_temp_c()),
+        standby_temp_c: fl
+            .standby_temp_c
+            .unwrap_or_else(|| crate::derived_standby_temp_c(nozzle_temp)),
+    }
 }
 
 /// Resolve a profile's `inherits` chain into a single merged profile.
@@ -1110,6 +1242,180 @@ mod tests {
         assert_eq!(p.resolve("generic", "pla", "mine").unwrap().wall_count, 5);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_filament_resolve_tools_matches_resolve() {
+        // The multi-tool path with one filament IS the classic resolve —
+        // field for field, tools included.
+        let p = Profiles::builtin();
+        for (pr, fl) in [("sovol-zero", "pla"), ("voron24", "asa"), ("generic", "petg")] {
+            let a = p.resolve(pr, fl, "standard").unwrap();
+            let b = p.resolve_tools(pr, &[fl], "standard").unwrap();
+            assert_eq!(a, b, "{pr}/{fl}");
+            assert_eq!(a.tools.len(), 1);
+            assert_eq!(a.tools[0].filament_name, fl);
+        }
+        assert!(p.resolve_tools("generic", &[], "standard").is_err(), "no empty loadout");
+        assert!(p.resolve_tools("generic", &["pla", "nope"], "standard").is_err());
+    }
+
+    #[test]
+    fn resolve_tools_populates_per_tool_settings() {
+        let mut p = Profiles::builtin();
+        p.printers.insert(
+            "changer".into(),
+            PrinterProfile {
+                inherits: Some("generic".into()),
+                tool_count: Some(4),
+                toolchange_gcode: Some("TOOL_PICKUP T={tool}".into()),
+                toolchange_seconds: Some(6.5),
+                ..Default::default()
+            },
+        );
+        p.filaments.insert(
+            "red-pla".into(),
+            FilamentProfile { inherits: Some("pla".into()), color: Some("#FF0000".into()), ..Default::default() },
+        );
+        p.filaments.insert(
+            "mystery".into(),
+            FilamentProfile { inherits: Some("petg".into()), color: Some("banana".into()), ..Default::default() },
+        );
+        let s = p.resolve_tools("changer", &["red-pla", "mystery"], "standard").unwrap();
+        // The printer's toolchanger datasheet.
+        assert_eq!(s.tool_count, 4);
+        assert_eq!(s.toolchange_gcode, "TOOL_PICKUP T={tool}");
+        assert_eq!(s.toolchange_seconds, 6.5);
+        // Per-tool temps ride each slot's own filament.
+        assert_eq!(s.tools.len(), 2);
+        assert_eq!(s.tools[0].nozzle_temp_c, 210); // pla
+        assert_eq!(s.tools[1].nozzle_temp_c, 240); // petg
+        assert_eq!(s.tools[1].first_layer_nozzle_temp_c, 250); // +10 PETG bump
+        // Colors: parsed hex, garbage → the neutral fallback.
+        assert_eq!(s.tools[0].color_rgb, [1.0, 0.0, 0.0]);
+        assert_eq!(s.tools[1].color_rgb, crate::NEUTRAL_FILAMENT_RGB);
+        // The flat view is tool 0's.
+        assert_eq!(s.nozzle_temp_c, 210);
+        assert_eq!(s.filament_color_rgb, [1.0, 0.0, 0.0]);
+        // tool() clamps past the loadout instead of panicking.
+        assert_eq!(s.tool(9).filament_name, "mystery");
+        // An ordinary printer stays single-tool with the T{tool} default.
+        let single = p.resolve("generic", "pla", "standard").unwrap();
+        assert_eq!(single.tool_count, 1);
+        assert_eq!(single.toolchange_gcode, "T{tool}");
+        assert_eq!(single.toolchange_seconds, 10.0);
+    }
+
+    #[test]
+    fn shared_bed_and_chamber_take_the_hottest_tool() {
+        // Bed and chamber are shared hardware: the hottest tool's wish wins,
+        // whatever slot it sits in; the flat filament view stays tool 0's.
+        let p = Profiles::builtin();
+        let s = p.resolve_tools("sovol-zero", &["pla", "asa"], "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 210); // flat = pla (tool 0)
+        assert_eq!(s.bed_temp_c, 100); // asa's bed
+        assert_eq!(s.chamber_temp_c, 50); // asa's soak
+        let s = p.resolve_tools("sovol-zero", &["asa", "pla"], "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 255); // flat = asa (tool 0)
+        assert_eq!(s.bed_temp_c, 100);
+        assert_eq!(s.chamber_temp_c, 50);
+    }
+
+    #[test]
+    fn derived_speeds_clamp_to_the_slowest_tool() {
+        // Any tool may print any feature, so the derived feature speeds work
+        // under the minimum flow ceiling across the loadout — loading a
+        // slow-melt filament in another slot drags them all down, even though
+        // the flat filament fields stay tool 0's.
+        let mut p = Profiles::builtin();
+        p.filaments.insert(
+            "slow-melt".into(),
+            FilamentProfile {
+                inherits: Some("pla".into()),
+                max_volumetric_speed_mm3_s: Some(5.0),
+                ..Default::default()
+            },
+        );
+        let alone = p.resolve("sovol-zero", "pla", "standard").unwrap();
+        let s = p.resolve_tools("sovol-zero", &["pla", "slow-melt"], "standard").unwrap();
+        let cap = crate::flow_speed_cap_mm_s(5.0, s.line_width_mm, s.layer_height_mm);
+        assert_eq!(s.max_volumetric_speed_mm3_s, 21.0); // flat = tool 0 (pla)
+        assert_eq!(s.support_speed_mm_s, cap);
+        assert_eq!(s.solid_speed_mm_s, cap);
+        assert_eq!(s.external_perimeter_speed_mm_s, cap);
+        assert!(s.support_speed_mm_s < alone.support_speed_mm_s);
+    }
+
+    #[test]
+    fn toolchanger_fields_roundtrip_toml() {
+        let pr = PrinterProfile {
+            tool_count: Some(6),
+            toolchange_gcode: Some("T{tool}\nM400".into()),
+            toolchange_seconds: Some(8.0),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&pr).unwrap();
+        assert_eq!(toml::from_str::<PrinterProfile>(&text).unwrap(), pr);
+        let fl = FilamentProfile { color: Some("#DDDDDD".into()), ..Default::default() };
+        let text = toml::to_string_pretty(&fl).unwrap();
+        assert_eq!(toml::from_str::<FilamentProfile>(&text).unwrap(), fl);
+        // The plain profile-file form parses too.
+        let pr: PrinterProfile = toml::from_str("tool_count = 4\ntoolchange_seconds = 2.5\n").unwrap();
+        assert_eq!(pr.tool_count, Some(4));
+        assert_eq!(pr.toolchange_seconds, Some(2.5));
+    }
+
+    #[test]
+    fn toolchanger_and_color_fields_diff_to_their_tiers() {
+        let base = Settings::default();
+        let mut cur = base.clone();
+        cur.tool_count = 4;
+        cur.toolchange_gcode = "TOOL_PICKUP T={tool}".into();
+        cur.toolchange_seconds = 3.0;
+        cur.filament_color_rgb = [1.0, 0.0, 0.0];
+        let pr = PrinterProfile::diff(&cur, &base);
+        assert_eq!(pr.tool_count, Some(4));
+        assert_eq!(pr.toolchange_gcode.as_deref(), Some("TOOL_PICKUP T={tool}"));
+        assert_eq!(pr.toolchange_seconds, Some(3.0));
+        // The color round-trips as the hex string a profile carries.
+        let fl = FilamentProfile::diff(&cur, &base);
+        assert_eq!(fl.color.as_deref(), Some("#FF0000"));
+        assert!(FilamentProfile::diff(&base, &base).color.is_none());
+    }
+
+    #[test]
+    fn diff_tool_tracks_per_slot_edits() {
+        let base = Settings::default().flat_tool("pla".into());
+        // Identical views: nothing worth saving.
+        assert!(FilamentProfile::diff_tool(&base, &base).is_empty());
+        // Edited temp / PA / fan land in the diff; untouched fields stay unset.
+        let mut cur = base.clone();
+        cur.nozzle_temp_c = 245;
+        cur.pressure_advance = 0.05;
+        cur.fan_speed = 0.35;
+        let d = FilamentProfile::diff_tool(&cur, &base);
+        assert_eq!(d.nozzle_temp_c, Some(245));
+        assert_eq!(d.pressure_advance, Some(0.05));
+        assert_eq!(d.fan_speed, Some(0.35));
+        assert!(d.bed_temp_c.is_none(), "untouched fields stay unset");
+        assert!(!d.is_empty());
+        // Material compares as the label string, like `diff` does.
+        let mut petg = base.clone();
+        petg.material = crate::Material::Petg;
+        assert_eq!(FilamentProfile::diff_tool(&petg, &base).material.as_deref(), Some("PETG"));
+    }
+
+    #[test]
+    fn diff_tool_never_promotes_slot_data() {
+        let base = Settings::default().flat_tool("pla".into());
+        // A spool-color override alone is slot data, not profile data.
+        let mut painted = base.clone();
+        painted.color_rgb = [1.0, 0.0, 0.0];
+        assert!(FilamentProfile::diff_tool(&painted, &base).is_empty());
+        // The first-layer temperature is always derived — never diffed.
+        let mut fl = base.clone();
+        fl.first_layer_nozzle_temp_c += 15;
+        assert!(FilamentProfile::diff_tool(&fl, &base).is_empty());
     }
 
     #[test]

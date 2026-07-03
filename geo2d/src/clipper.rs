@@ -90,6 +90,21 @@ pub fn simplify(polys: &Polygons, epsilon_mm: f64) -> Polygons {
     from_paths(paths.simplify(epsilon_mm * UNITS_PER_MM, false))
 }
 
+/// Normalize a possibly self-intersecting / overlapping contour set into
+/// clean regions under the POSITIVE fill rule: material where the winding
+/// count is > 0. With geometry-derived winding (outers CCW, holes CW), a
+/// mesh whose surfaces pass through each other — a chamfer punching through
+/// a wall — resolves to the true material region instead of parity garbage,
+/// and negative slivers (hole boundary escaping the outer) vanish.
+pub fn normalize_positive(polys: &Polygons) -> Polygons {
+    let Some(p) = to_paths(polys) else {
+        return Polygons::new();
+    };
+    cl_union(p, Paths::new(Vec::new()), FillRule::Positive)
+        .map(from_paths)
+        .unwrap_or_else(|_| polys.clone())
+}
+
 /// Boolean union (`a ∪ b`).
 pub fn union(a: &Polygons, b: &Polygons) -> Polygons {
     match (to_paths(a), to_paths(b)) {

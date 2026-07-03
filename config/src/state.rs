@@ -37,6 +37,20 @@ fn adopt_legacy_dir(old: &Path, new: &Path) {
     }
 }
 
+/// A user-defined pseudo color: a named blend of tool slots, realized at
+/// slice time by layer dithering. Weights are relative shares (they needn't
+/// sum to anything); slots reference the `tools` list by index.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlendState {
+    pub name: String,
+    pub weights: Vec<(u32, f32)>,
+    /// The spools this blend draws from — its own sub-palette. The editor's
+    /// mix surface follows this count (two → ramp, three → triangle, more →
+    /// chip lattice). Empty = every loaded slot.
+    pub tools: Vec<u32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppState {
@@ -45,6 +59,17 @@ pub struct AppState {
     pub printer: String,
     pub filament: String,
     pub process: String,
+    /// Filament profile name per tool slot on a toolchanger. `filament`
+    /// stays the tool-0 legacy mirror: an old state without `tools` reads as
+    /// one slot (see [`Self::tool_filaments`]); saves write both.
+    pub tools: Vec<String>,
+    /// Loaded-spool color per slot ("#RRGGBB", "" = none): an override of the
+    /// slot filament's profile color, describing the spool physically loaded.
+    /// Aligned with `tools` as written — a slot whose filament changes drops
+    /// its override.
+    pub tool_colors: Vec<String>,
+    /// The blend palette — pseudo colors dithered from the tool slots.
+    pub blends: Vec<BlendState>,
     /// Where the STL import dialog last picked a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_model_dir: Option<PathBuf>,
@@ -84,8 +109,23 @@ impl AppState {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        // Write both spellings: `tools` (one name per slot) and the legacy
+        // `filament` as the tool-0 mirror.
+        let mut st = self.clone();
+        st.tools = st.tool_filaments();
+        st.filament = st.tools[0].clone();
+        let text = toml::to_string_pretty(&st).map_err(|e| e.to_string())?;
         std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+
+    /// The filament selection per tool slot: `tools`, or — legacy states
+    /// saved before toolchangers — the single `filament` as slot 0.
+    pub fn tool_filaments(&self) -> Vec<String> {
+        if self.tools.is_empty() {
+            vec![self.filament.clone()]
+        } else {
+            self.tools.clone()
+        }
     }
 }
 
@@ -101,12 +141,40 @@ mod tests {
             printer: "sovol-zero-custom".into(),
             filament: "pla".into(),
             process: "sovol-zero-custom".into(),
+            tools: vec!["pla".into(), "petg".into(), "asa".into()],
+            tool_colors: vec!["#F2F2F2".into(), String::new(), "#1A1A1A".into()],
+            blends: vec![BlendState {
+                name: "25% grey".into(),
+                weights: vec![(0, 3.0), (2, 1.0)],
+                tools: vec![0, 2],
+            }],
             last_model_dir: Some("/tmp/models".into()),
             last_export_dir: None,
             accent: Some("#D8A852".into()),
         };
         s.save_to(&path).unwrap();
         assert_eq!(AppState::load_from(&path), s);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn filament_stays_the_tool_zero_mirror() {
+        let dir = std::env::temp_dir().join(format!("slicer-state-tools-{}", std::process::id()));
+        let path = dir.join("state.toml");
+        // A legacy state (no `tools`) reads as a single slot...
+        let legacy = AppState { filament: "pla".into(), ..Default::default() };
+        assert_eq!(legacy.tool_filaments(), vec!["pla".to_string()]);
+        // ...and saving writes both spellings.
+        legacy.save_to(&path).unwrap();
+        let loaded = AppState::load_from(&path);
+        assert_eq!(loaded.tools, vec!["pla".to_string()]);
+        assert_eq!(loaded.filament, "pla");
+        // A save with slots keeps `filament` synced to tools[0] on disk.
+        let s = AppState { filament: "stale".into(), tools: vec!["asa".into(), "petg".into()], ..Default::default() };
+        s.save_to(&path).unwrap();
+        let loaded = AppState::load_from(&path);
+        assert_eq!(loaded.filament, "asa");
+        assert_eq!(loaded.tools, vec!["asa".to_string(), "petg".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

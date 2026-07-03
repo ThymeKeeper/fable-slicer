@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use geo2d::{Contour, Point, Polygons};
+use geo2d::{normalize_positive, Contour, Point, Polygons};
 use mesh::{Mesh, Vec3};
 use rayon::prelude::*;
 
@@ -45,8 +45,13 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
     let Some((zmin, zmax)) = mesh.z_bounds() else {
         return Vec::new();
     };
+    slice_mesh_on(mesh, &layer_grid(zmin, zmax, params))
+}
 
-    // Plan the layer z's first (cheap, sequential)…
+/// Plan the layer grid (z's, heights, print z's) for the band `zmin..zmax`,
+/// with empty polygons. Separated from slicing so multiple part meshes can
+/// share ONE grid (aligned indices and print z's) over their union z-range.
+pub(crate) fn layer_grid(zmin: f64, zmax: f64, params: SliceParams) -> Vec<Layer> {
     let mut metas: Vec<Layer> = Vec::new();
     let mut i = 0usize;
     let mut bottom = zmin; // world-z of the current layer's bottom face
@@ -70,8 +75,15 @@ pub fn slice_mesh(mesh: &Mesh, params: SliceParams) -> Vec<Layer> {
         bottom += h;
         i += 1;
     }
+    metas
+}
 
-    // …then slice all the planes at once (bucketed + parallel).
+/// Slice one mesh on a pre-planned grid. A layer whose plane misses the mesh's
+/// z-range just comes back empty. The written-back `z_mm` is the (possibly
+/// vertex-nudged) plane actually used for THIS mesh — per mesh, so never key
+/// cross-part logic on z_mm equality; `print_z_mm` is the shared truth.
+pub(crate) fn slice_mesh_on(mesh: &Mesh, grid: &[Layer]) -> Vec<Layer> {
+    let mut metas = grid.to_vec();
     let zs: Vec<f64> = metas.iter().map(|m| m.z_mm).collect();
     for (layer, (z, polys)) in metas.iter_mut().zip(slice_many(mesh, &zs)) {
         layer.z_mm = z; // the (possibly vertex-nudged) plane actually used
@@ -135,6 +147,15 @@ pub(crate) fn slice_many(mesh: &Mesh, zs: &[f64]) -> Vec<(f64, Polygons)> {
 }
 
 /// Intersect the bucketed triangles with one horizontal plane and stitch.
+///
+/// Segments come out DIRECTED from the triangle winding (material to the
+/// left ⇒ outers CCW, holes CW straight from the geometry), and the layer is
+/// normalized under the positive fill rule — so a mesh whose surfaces pass
+/// through each other (a chamfer punching through a wall: topologically
+/// manifold, geometrically self-intersecting) resolves to the true material
+/// region instead of nesting-parity garbage. A mesh with enough flipped
+/// facets that directed walking can't close its loops falls back, per layer,
+/// to the tolerant undirected stitcher.
 fn slice_at(mesh: &Mesh, tri_spans: &[(f64, f64)], bucket: &[u32], z: f64) -> Polygons {
     let mut segments: Vec<(Point, Point)> = Vec::new();
     for &t in bucket {
@@ -147,7 +168,58 @@ fn slice_at(mesh: &Mesh, tri_spans: &[(f64, f64)], bucket: &[u32], z: f64) -> Po
             segments.push(seg);
         }
     }
-    stitch(segments)
+    let total = segments.iter().filter(|(p, q)| p != q).count();
+    let (mut polys, consumed) = stitch_directed(&segments);
+    // Nearly-clean meshes close nearly everything; a junk mesh (flipped
+    // facets break the one-in-one-out walk) reverts to the old parity path.
+    if total > 0 && (consumed as f64) < 0.9 * total as f64 {
+        polys = stitch(segments);
+    }
+    normalize_positive(&polys)
+}
+
+/// Stitch DIRECTED segments by following out-edges; loops keep the winding
+/// the geometry gave them. Returns the contours and how many segments closed
+/// into loops (the caller's fallback signal).
+fn stitch_directed(segments: &[(Point, Point)]) -> (Polygons, usize) {
+    let mut out_edges: HashMap<Point, Vec<(Point, usize)>> = HashMap::new();
+    for (i, &(p, q)) in segments.iter().enumerate() {
+        if p == q {
+            continue;
+        }
+        out_edges.entry(p).or_default().push((q, i));
+    }
+    let mut used = vec![false; segments.len()];
+    let mut polys = Polygons::new();
+    let mut consumed = 0usize;
+    for (i, &(seed, _)) in segments.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        let mut current = seed;
+        let mut loop_pts: Vec<Point> = Vec::new();
+        let mut walked: Vec<usize> = Vec::new();
+        loop {
+            let next = out_edges
+                .get(&current)
+                .and_then(|ns| ns.iter().find(|&&(_, si)| !used[si]).copied());
+            let Some((next, si)) = next else { break };
+            used[si] = true;
+            walked.push(si);
+            loop_pts.push(current);
+            current = next;
+            if current == seed {
+                break;
+            }
+        }
+        if current == seed && loop_pts.len() >= 3 {
+            consumed += walked.len();
+            polys.push(Contour::new(loop_pts));
+        }
+        // A walk that dead-ended keeps its segments marked used — they are
+        // damage either way; the caller's ratio test decides the fallback.
+    }
+    (polys, consumed)
 }
 
 /// Nudge the slice plane by a tiny amount while it coincides with a vertex, so no
@@ -172,9 +244,12 @@ fn nudge_off_vertices(vert_zs: &[f64], z: f64) -> f64 {
     z
 }
 
-/// Intersect a single triangle with plane `z`, returning the cut segment if the
-/// triangle straddles the plane. Direction is arbitrary — stitching is
-/// undirected and winding is fixed afterwards.
+/// Intersect a single triangle with plane `z`, returning the cut segment if
+/// the triangle straddles the plane. The segment is DIRECTED with material on
+/// its left (walk direction = ẑ × n for the triangle's outward normal n), so
+/// stitched outers come out CCW and holes CW straight from the geometry —
+/// the winding the positive-fill normalization needs to resolve
+/// self-intersecting surfaces correctly.
 fn intersect_triangle(a: Vec3, b: Vec3, c: Vec3, z: f64) -> Option<(Point, Point)> {
     let verts = [a, b, c];
     let above = [a[2] > z, b[2] > z, c[2] > z];
@@ -195,6 +270,14 @@ fn intersect_triangle(a: Vec3, b: Vec3, c: Vec3, z: f64) -> Option<(Point, Point
 
     let p1 = lerp_to_z(verts[lone], verts[o1], z);
     let p2 = lerp_to_z(verts[lone], verts[o2], z);
+    // Orient along ẑ × n = (−n_y, n_x): material stays on the left.
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let (nx, ny) = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2]);
+    let (dx, dy) = (p2.x_mm() - p1.x_mm(), p2.y_mm() - p1.y_mm());
+    if dx * -ny + dy * nx < 0.0 {
+        return Some((p2, p1));
+    }
     Some((p1, p2))
 }
 
@@ -310,5 +393,25 @@ mod tests {
     fn empty_mesh_yields_no_layers() {
         let m = Mesh::default();
         assert!(slice_mesh(&m, SliceParams::default()).is_empty());
+    }
+
+    #[test]
+    fn overlapping_shells_resolve_to_their_union() {
+        // Two overlapping cubes fused into ONE mesh — the classic CAD export
+        // (also the shape of a self-intersecting surface's slice: crossing
+        // contours). Nesting-parity orientation reads the overlap as a hole
+        // (XOR); the geometry-directed winding + positive fill resolves the
+        // true material: the union.
+        let mut m = Mesh::cube(20.0);
+        let shift = mesh::Transform {
+            translation: [10.0, 10.0, 0.0],
+            ..mesh::Transform::IDENTITY
+        };
+        m.append(&Mesh::cube(20.0).transformed(&shift));
+        let layers = slice_mesh(&m, SliceParams::default());
+        let mid = &layers[layers.len() / 2];
+        let area = mid.polygons.net_area_mm2();
+        // 2 × 400 − 100 overlap = 700 mm² (XOR would read 600).
+        assert!((area - 700.0).abs() < 2.0, "expected the union, got {area} mm²");
     }
 }

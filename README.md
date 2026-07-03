@@ -12,6 +12,22 @@ Fable Slicer is a from-scratch FDM 3D-printing slicer written in Rust. It takes 
 - Mesh slicing by horizontal-plane intersection, parallelized with rayon, with triangle bucketing by z-span and integer/fixed-point XY coordinates
 - Contour stitching with orientation by nesting depth (CCW outers, CW holes)
 - Distinct first-layer height and layer height
+- Multi-part models sliced per part on one shared layer grid: each part keeps its own walls, skins, and infill (full shells at part interfaces — no show-through between filaments), while overhang, bridge, and support decisions see the union of all parts, so a part resting on another is supported, not floating; overlapping volumes are owned by the earlier part
+
+### Multi-material (toolchanger)
+- Per-part filament assignment for multi-part 3MF models — the printer profile declares its tool count, each tool slot maps to a filament profile, and every part of the model picks a tool
+- Per-slot spool colors: every tool slot in the GUI has its own color picker — the color describes the spool loaded in the slot (three slots can share one filament profile and differ only in color), overriding the profile's default and persisting with the slot; changing a slot's filament returns to the profile's own color
+- **Blend palette**: create pseudo colors as weighted mixes of the loaded tools (three greys dither into a full monochrome ramp) and paint parts with them — realized by layer dithering (weighted error diffusion alternates whole layers between the tools, exact to ±1 layer over any stretch; parts sharing a blend band in lockstep, so they add no extra toolchanges). The model view shows the mixed color; the filament-colored preview shows the physical layer bands
+- Blends are created by **picking a color, not dialing weights**: at every spool count the editor lays out the printable palette itself — one clickable swatch chip per distinct mixable color the blend band affords, sorted neutral-ramp-first then by hue family (dark→light), each chip one whole-layer recipe with a ring on the blend's current mix; when a palette is too rich to enumerate (many spools × fine layers) a free color picker takes over, snapping any color to the nearest achievable mix (constrained least squares in linear light), and the weight rows remain for fine-tuning
+- Spool colors are typed as well as picked: each tool slot's hex field takes the color code straight off the spool label (`#RRGGBB`, enter to apply)
+- On a toolchanger there is **no global filament selection**: the Filament card carries a tool-tab strip and edits each slot's own settings against that slot's own profile — per-tab dirty markers, and saving writes only the visible slot's changes to its own profile lineage, so one filament's values can never be saved over another's (single-tool printers keep the classic filament tier row)
+- Every blend carries its own **sub-palette**: toggle which spools it draws from, and the surface follows the *chosen* count — narrow an eight-tool machine to two spools and you get the ramp back, three the triangle; the solver, chips, and weight rows all confine themselves to the selection
+- The palette is **perception-bounded**: a process-tier *blend band* (default 0.8 mm) caps how tall a dither repeat may be and still fuse into one color, so mixes quantize to whole layers of the band ÷ layer-height cycle — the picker shows exactly that lattice of printable colors and refuses ratios that would stripe (one layer in ten is a 2 mm band, not a color); hand-dialed weights that exceed the band get a loud "will band" warning with the computed repeat height
+- 3MF part names and extruder assignments read from Bambu/Orca `Metadata/model_settings.config`, so imported projects arrive pre-named and pre-assigned
+- Within each layer, paths group by tool and consecutive layers serpentine through the tools, so a two-tool print pays one toolchange per layer
+- Klipper toolchanger G-code (StealthChanger-style `T0`/`T1`/… macros, template configurable per printer): per-tool temperatures with preheat and per-tool first-layer drop, per-tool pressure advance, fan, flow limits, and filament diameter, with full state re-establishment after each swap — and no purge tower, since every tool has its own nozzle
+- Standby temperature management for true multi-material jobs: a tool docked longer than the machine's threshold drops to its filament's standby temperature (auto: operating − 50 °C) instead of oozing and cooking at print temp, reheats a layer ahead of its next pickup, and the pickup swap confirms with a blocking wait; quick blend alternation never thermal-cycles
+- Per-tool filament usage estimates and a toolchange time term in the print-time estimate
 
 ### Walls, skins & infill
 - Concentric perimeter walls: an outer wall that hugs the true outline plus inner walls at correct bead spacing; configurable wall count and outer-wall-first ordering
@@ -43,7 +59,7 @@ Fable Slicer is a from-scratch FDM 3D-printing slicer written in Rust. It takes 
 - Guided flow calibration: prints a single-wall test cube and derives an extrusion multiplier from the measured wall thickness
 
 ### GUI
-- Import STL and 3MF (a 3MF splits into one object per build item, preserving plate layout)
+- Import STL and 3MF (a 3MF splits into one object per build item, preserving plate layout; an object keeps its named parts, each assignable to a tool)
 - Multi-object, multi-bed scene: place, rotate, scale, duplicate, drag, and auto-arrange objects across beds
 - Orbit/pan/zoom camera; Model and Preview views
 - Toolpath preview colored by feature type or by layer time (heat ramp), with per-category toggles and a vertical layer slider
@@ -78,6 +94,10 @@ Example CLI invocations:
 fable-slicer-cli model.stl --printer sovol-zero --filament petg --process standard \
     --walls 3 --infill 0.2 --seam aligned -o out.gcode
 
+# Multi-material on a toolchanger: one --filament per tool slot; a multi-part
+# 3MF's parts print on their embedded extruder assignments
+fable-slicer-cli figurine.3mf --filament pla-white --filament pla-grey --filament pla-black
+
 # List available profiles and exit
 fable-slicer-cli --list-profiles
 
@@ -91,9 +111,11 @@ Run the full test suite across all crates with `cargo test --workspace`.
 
 Settings are organized into three tiers, each field owned by exactly one tier:
 
-- **Printer** — machine geometry, motion limits, retraction, arc fitting, host connection, and start/end G-code
-- **Filament** — material class, temperatures, cooling, flow, pressure advance, and bridge settings
+- **Printer** — machine geometry, motion limits, retraction, arc fitting, host connection, start/end G-code, and the toolchanger declaration (tool count, toolchange G-code template, seconds per change)
+- **Filament** — material class, temperatures, cooling, flow, pressure advance, bridge settings, and display color
 - **Process** — layer heights, walls, infill, supports, seams, surface features, and the speed/quality dial
+
+On a toolchanger, one filament profile is loaded per tool slot. Shared heaters aggregate across the loaded filaments (hottest bed and chamber wish wins), and derived feature speeds respect the slowest filament's flow ceiling.
 
 Profiles use single-parent inheritance (`inherits = "name"`), resolved root-first with the child overriding its parent. Built-in profiles are embedded read-only; user profiles are saved as minimal diffs (only the fields you changed).
 
@@ -113,7 +135,7 @@ List everything available with `fable-slicer-cli --list-profiles`. A user profil
 
 ## Printer integration
 
-Both front-ends can talk to a Moonraker/Klipper host. The GUI offers a connection test, upload, upload-and-print, and a live-print card with a progress bar and pause/resume/cancel. The CLI exposes `--upload`, `--start-print`, and `--host` (falling back to the printer profile's host URL). Before sending, Fable Slicer runs a chamber-sensor pre-check when a chamber soak temperature is set, so a missing sensor is caught up front rather than mid-print.
+Both front-ends can talk to a Moonraker/Klipper host. The GUI offers a connection test, upload, upload-and-print, and a live-print card with a progress bar and pause/resume/cancel. The CLI exposes `--upload`, `--start-print`, and `--host` (falling back to the printer profile's host URL). Before sending, Fable Slicer runs pre-flight checks against the machine: the chamber-sensor check when a chamber soak is set, and — for multi-tool jobs — a tool check that every tool the slice uses actually exists on the connected Klipper (its extruders and `T<n>` macros), so slicing for the toolchanger and sending to the single-tool printer fails up front with a clear message instead of mid-print. The tool count itself is a declared printer-profile fact — the machine is never polled to configure anything, only to validate a send.
 
 ## Project layout
 

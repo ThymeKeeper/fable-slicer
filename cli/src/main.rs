@@ -1,15 +1,17 @@
 //! `slicer` — command-line front-end.
 //!
-//! Loads an STL, resolves printer/filament/process profiles into settings (with
-//! optional overrides), plans walls + infill, and emits Klipper-flavored g-code.
-//! Optionally dumps per-layer toolpath SVGs.
+//! Loads an STL or 3MF, resolves printer/filament/process profiles into
+//! settings (with optional overrides), plans walls + infill, and emits
+//! Klipper-flavored g-code. Repeating `--filament` loads one profile per tool
+//! slot on a toolchanger; a multi-part 3MF's parts then print on their
+//! embedded extruder assignments. Optionally dumps per-layer toolpath SVGs.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use config::Profiles;
-use engine::{generate, to_gcode, LayerPlan, PathKind};
+use engine::{to_gcode, LayerPlan, PathKind};
 use geo2d::{Aabb, Point, UNITS_PER_MM};
 
 #[derive(Parser)]
@@ -40,8 +42,11 @@ struct Args {
     // --- profiles ---
     #[arg(long, default_value = "generic")]
     printer: String,
+    /// Filament profile — repeat once per tool slot on a toolchanger
+    /// (--filament white --filament grey --filament black). A multi-part 3MF
+    /// then assigns each part its embedded extruder, clamped to the slots.
     #[arg(long, default_value = "pla")]
-    filament: String,
+    filament: Vec<String>,
     #[arg(long, default_value = "standard")]
     process: String,
     /// Load extra profiles from <dir>/{printer,filament,process}/*.toml.
@@ -147,9 +152,12 @@ fn main() -> Result<()> {
         .clone()
         .context("no input model given (use --list-profiles to see profiles)")?;
 
+    let filaments: Vec<&str> = args.filament.iter().map(String::as_str).collect();
     let mut settings = profiles
-        .resolve(&args.printer, &args.filament, &args.process)
+        .resolve_tools(&args.printer, &filaments, &args.process)
         .map_err(|e| anyhow!(e))?;
+    // Loading N filaments implies at least N tools, whatever the profile says.
+    settings.tool_count = settings.tool_count.max(filaments.len());
 
     // Apply overrides.
     if let Some(v) = args.layer_height {
@@ -200,9 +208,14 @@ fn main() -> Result<()> {
         settings.nozzle_temp_c = v;
         // Keep the first layer in lockstep unless pinned explicitly below.
         settings.first_layer_nozzle_temp_c = v;
+        // Temperature overrides speak about tool 0; the other slots keep
+        // their own profiles' temperatures.
+        settings.tools[0].nozzle_temp_c = v;
+        settings.tools[0].first_layer_nozzle_temp_c = v;
     }
     if let Some(v) = args.first_layer_nozzle_temp {
         settings.first_layer_nozzle_temp_c = v;
+        settings.tools[0].first_layer_nozzle_temp_c = v;
     }
     if let Some(v) = args.bed_temp {
         settings.bed_temp_c = v;
@@ -238,7 +251,7 @@ fn main() -> Result<()> {
     println!(
         "Profiles: printer={} filament={} process={} | bed {}x{} mm, layer {}mm",
         args.printer,
-        args.filament,
+        args.filament.join(", "),
         args.process,
         settings.bed_size_x_mm,
         settings.bed_size_y_mm,
@@ -246,24 +259,42 @@ fn main() -> Result<()> {
     );
 
     let is_3mf = input.extension().map(|e| e.eq_ignore_ascii_case("3mf")).unwrap_or(false);
-    let mesh = if is_3mf {
-        // The CLI slices one plate: a 3MF build's objects merge into it with
-        // their build placement baked.
+    // The plate to slice: one (mesh, tool) per part, build placement baked.
+    // With one filament everything is tool 0 (a merged 3MF plate, exactly the
+    // classic behavior); with several, each 3MF part follows its embedded
+    // extruder assignment, clamped to the loaded slots.
+    let last_tool = (settings.tool_count - 1) as u32;
+    let parts: Vec<(mesh::Mesh, u32)> = if is_3mf {
         let items = mesh::load_3mf(&input)
             .map_err(|e| anyhow::anyhow!(e))
             .with_context(|| format!("loading 3MF {}", input.display()))?;
-        let mut m = mesh::Mesh::default();
-        for it in &items {
-            m.append(&it.mesh);
-        }
         println!("Loaded {}: {} object(s)", input.display(), items.len());
-        m
+        if filaments.len() > 1 {
+            items
+                .into_iter()
+                .flat_map(|it| it.parts)
+                .map(|p| {
+                    let tool = p.extruder.map_or(0, |e| e.saturating_sub(1)).min(last_tool);
+                    (p.mesh, tool)
+                })
+                .collect()
+        } else {
+            let mut m = mesh::Mesh::default();
+            for p in items.iter().flat_map(|it| &it.parts) {
+                m.append(&p.mesh);
+            }
+            vec![(m, 0)]
+        }
     } else {
-        mesh::Mesh::load_stl(&input).with_context(|| format!("loading STL {}", input.display()))?
+        let m = mesh::Mesh::load_stl(&input)
+            .with_context(|| format!("loading STL {}", input.display()))?;
+        vec![(m, 0)]
     };
-    println!("Loaded {}: {} triangles", input.display(), mesh.triangles.len());
+    let tris: usize = parts.iter().map(|(m, _)| m.triangles.len()).sum();
+    println!("Loaded {}: {tris} triangles", input.display());
 
-    let layers = generate(&mesh, &settings);
+    let part_refs: Vec<(&mesh::Mesh, u32)> = parts.iter().map(|(m, t)| (m, *t)).collect();
+    let layers = engine::generate_parts(&part_refs, &settings);
     let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
     println!("Planned {} layers, {} toolpaths", layers.len(), path_count);
     println!(
@@ -272,6 +303,12 @@ fn main() -> Result<()> {
     );
     let (fil_mm, grams) = engine::estimate_filament(&layers, &settings);
     println!("Filament: {:.2} m, {:.1} g", fil_mm / 1000.0, grams);
+    if settings.tool_count > 1 {
+        for (n, mm, g) in engine::estimate_filament_per_tool(&layers, &settings) {
+            let name = &settings.tool(n as usize).filament_name;
+            println!("  T{n} ({name}): {:.2} m, {g:.1} g", mm / 1000.0);
+        }
+    }
     let (cross, combed, fb, fb_hole) = engine::audit_combing(&layers);
     println!("Combing: {cross} crossing travels — {combed} combed, {fb} straight ({fb_hole} cut a hole)");
 
@@ -294,6 +331,15 @@ fn main() -> Result<()> {
                 .ensure_chamber_sensor(&settings.chamber_sensor, settings.chamber_temp_c)
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
+        // A multi-tool job must land on a machine that has those tools —
+        // catches "sliced for the toolchanger, sent to the single-tool
+        // printer" before upload instead of mid-print.
+        client
+            .ensure_tools(
+                &engine::used_tools(&layers),
+                settings.toolchange_gcode.contains("T{tool}"),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
         let filename = args
             .output
             .file_name()

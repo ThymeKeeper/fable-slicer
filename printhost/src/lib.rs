@@ -151,6 +151,43 @@ impl Client {
         Ok(arr.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
     }
 
+    /// Pre-flight for a multi-tool job: every tool the slice uses must exist
+    /// on the connected machine — its extruder for the per-tool temperatures,
+    /// and, when the toolchange g-code invokes the standard `T{n}` macros,
+    /// the macro itself. Catches "sliced for the toolchanger, sent to the
+    /// single-tool printer" before upload instead of mid-print.
+    /// `needs_t_macros` = the profile's toolchange template uses `T{n}`.
+    pub fn ensure_tools(&self, used: &[u32], needs_t_macros: bool) -> Result<(), String> {
+        let multi = used.iter().any(|&t| t > 0);
+        if !multi {
+            return Ok(()); // a tool-0-only job runs on any machine
+        }
+        let objects = self.objects()?;
+        let have = |name: &str| objects.iter().any(|o| o == name);
+        let mut missing: Vec<String> = Vec::new();
+        for &t in used {
+            let ext = if t == 0 { "extruder".to_string() } else { format!("extruder{t}") };
+            if !have(&ext) {
+                missing.push(format!("[{ext}]"));
+            }
+            if needs_t_macros && !have(&format!("gcode_macro T{t}")) {
+                missing.push(format!("macro T{t}"));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let tools: Vec<String> = used.iter().map(|t| format!("T{t}")).collect();
+        Err(format!(
+            "This slice uses tools {} but the connected printer is missing {} — wrong printer, \
+             or the toolchanger isn't configured yet. It reports {} tool(s). Select the right \
+             printer profile (or host), or reassign the parts to the tools it has.",
+            tools.join("/"),
+            missing.join(", "),
+            count_tools(&objects),
+        ))
+    }
+
     /// Pre-flight for a chamber soak: a slice that soaks the chamber waits on
     /// `temperature_sensor <name>`, and Klipper aborts the print if that object
     /// isn't configured. Calling this before upload turns that late, cryptic
@@ -192,6 +229,23 @@ impl Client {
 }
 
 /// Compact, status-line-friendly error text.
+/// Count tools from a Klipper object list: extruders (`extruder`,
+/// `extruder1`, …) vs `gcode_macro T<n>` selection macros, larger wins.
+fn count_tools(objects: &[String]) -> usize {
+    let all_digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let mut extruders = 0usize;
+    let mut macros = 0usize;
+    for o in objects {
+        if o == "extruder" || o.strip_prefix("extruder").is_some_and(&all_digits) {
+            extruders += 1;
+        }
+        if o.strip_prefix("gcode_macro T").is_some_and(&all_digits) {
+            macros += 1;
+        }
+    }
+    extruders.max(macros).max(1)
+}
+
 fn err_str(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -377,5 +431,53 @@ mod tests {
         let client = Client::new("127.0.0.1:1", "");
         let err = client.ensure_chamber_sensor("  ", 50).unwrap_err();
         assert!(err.contains("names no chamber sensor"), "{err}");
+    }
+
+    #[test]
+    fn tools_are_counted_from_the_object_list() {
+        let objs = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A single-tool machine (the Sovol): one extruder, no T macros.
+        assert_eq!(count_tools(&objs(&["extruder", "heater_bed", "gcode_macro START_PRINT"])), 1);
+        // A StealthChanger: three extruders AND three selection macros.
+        assert_eq!(
+            count_tools(&objs(&[
+                "extruder", "extruder1", "extruder2",
+                "gcode_macro T0", "gcode_macro T1", "gcode_macro T2",
+                "gcode_macro TOOLCHANGER",
+            ])),
+            3
+        );
+        // Macros lead extruders (partially configured) — the larger wins;
+        // lookalikes (T without digits, TIMELAPSE) don't count.
+        assert_eq!(count_tools(&objs(&["extruder", "gcode_macro T0", "gcode_macro T1"])), 2);
+        assert_eq!(count_tools(&objs(&["extruder", "gcode_macro TIMELAPSE_TAKE_FRAME"])), 1);
+        // An empty/odd list still reports one hotend.
+        assert_eq!(count_tools(&objs(&[])), 1);
+    }
+
+    #[test]
+    fn multi_tool_jobs_are_checked_against_the_machine() {
+        // A tool-0-only job never even calls the printer.
+        let client = Client::new("127.0.0.1:1", "");
+        assert!(client.ensure_tools(&[0], true).is_ok());
+
+        // A T1 job against a single-tool machine: named missing pieces.
+        let (host, server) = one_shot(
+            r#"{"result":{"objects":["extruder","heater_bed","gcode_macro START_PRINT"]}}"#,
+        );
+        let client = Client::new(&host, "");
+        let err = client.ensure_tools(&[0, 1], true).unwrap_err();
+        assert!(err.contains("T0/T1"), "{err}");
+        assert!(err.contains("[extruder1]") && err.contains("macro T1"), "{err}");
+        assert!(err.contains("reports 1 tool"), "{err}");
+        server.join().unwrap();
+
+        // The same job against a real toolchanger passes.
+        let (host, server) = one_shot(
+            r#"{"result":{"objects":["extruder","extruder1","gcode_macro T0","gcode_macro T1"]}}"#,
+        );
+        let client = Client::new(&host, "");
+        assert!(client.ensure_tools(&[0, 1], true).is_ok());
+        server.join().unwrap();
     }
 }
