@@ -249,6 +249,8 @@ pub fn generate_parts(parts: &[(&Mesh, u32)], settings: &Settings) -> Vec<LayerP
 /// over any prefix). The schedule is a pure function of the weights and the
 /// ABSOLUTE layer index: every part sharing a blend prints the same tool on
 /// the same layer — aligned bands across parts, no extra toolchanges.
+/// `generate_painted` then applies one top-face correction per recipe — see
+/// `swap_dominant_to_top`.
 fn blend_schedule(weights: &[(u32, f64)], n: usize) -> Vec<u32> {
     let w: Vec<(u32, f64)> = weights.iter().filter(|&&(_, x)| x > 0.0).copied().collect();
     if w.is_empty() {
@@ -273,6 +275,88 @@ fn blend_schedule(weights: &[(u32, f64)], n: usize) -> Vec<u32> {
         credit[best] -= 1.0;
     }
     out
+}
+
+/// The blend's dominant tool as the SCHEDULE realizes it: the tool printing
+/// the most layers, by a margin of at least two. Deriving dominance from the
+/// schedule (not the weights) keeps every consumer consistent with what
+/// actually prints — duplicate weight entries aggregate, and two recipes too
+/// close for the schedule to distinguish (a 50/50 tie included) yield the
+/// same verdict no matter which member of a schedule-equal group asks.
+fn schedule_dominant(sched: &[u32]) -> Option<u32> {
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for &t in sched {
+        match counts.iter_mut().find(|(tool, _)| *tool == t) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((t, 1)),
+        }
+    }
+    if counts.len() < 2 {
+        return None;
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    (counts[0].1 >= counts[1].1 + 2).then_some(counts[0].0)
+}
+
+/// A blended part's top face shows exactly ONE layer's filament — the side
+/// walls average the whole stack, but no averaging can ever happen on top —
+/// so the topmost printed layer must land on the blend's dominant tool, not
+/// whatever the cycle happens to land on (a 90:10 blend would otherwise cap
+/// one part in ten with the minority color). Swap the dominant tool into the
+/// topmost printed layer from the nearest dominant layer below: a two-layer
+/// perturbation, so the ratio and the cycle's period are untouched (the
+/// toolchange count moves by at most one), and applied to the one schedule a
+/// recipe group shares, lockstep across its parts survives.
+///
+/// `printed[i]` says whether ANY group member lays paths at layer i — slice
+/// polygons are not enough (a sub-line-width top sliver slices to a contour
+/// but plans nothing, and "fixing" that phantom layer would drag the minority
+/// down onto the real cap). The donor must be printed too, or the traded
+/// minority layer vanishes from the physical print; `protected` holds the
+/// shorter members' own top layers, which must not become donors — stealing
+/// one would flip that part's visible cap to the minority.
+///
+/// A blend with no schedule-resolvable dominant (ties) and a span holding no
+/// eligible donor both leave the schedule alone.
+fn swap_dominant_to_top(sched: &mut [u32], printed: &[bool], protected: &[usize]) {
+    let Some(dominant) = schedule_dominant(sched) else { return };
+    let Some(top) = printed.iter().rposition(|&p| p) else { return };
+    if sched[top] == dominant {
+        return;
+    }
+    let Some(base) = printed.iter().position(|&p| p) else { return };
+    if let Some(j) = (base..top)
+        .rev()
+        .find(|&j| sched[j] == dominant && printed[j] && !protected.contains(&j))
+    {
+        sched.swap(j, top);
+    }
+}
+
+/// Whether an exposed face region justifies the dock trip its recolor costs.
+/// Erosion by FACE_ERODE_LW line widths first kills stair-step ribbons — the
+/// thin exposed ledges every layer of a curved or slanted top produces —
+/// which would otherwise recolor (and add a toolchange to) every layer of a
+/// dome; what survives must still hold FACE_MIN_AREA_MM2 of face.
+const FACE_MIN_AREA_MM2: f64 = 50.0;
+const FACE_ERODE_LW: f64 = 1.5;
+fn face_worth_a_dock_trip(exposed: &Polygons, line_width_mm: f64) -> bool {
+    let eroded = offset(exposed, -(FACE_ERODE_LW * line_width_mm));
+    eroded.net_area_mm2() >= FACE_MIN_AREA_MM2
+}
+
+/// Even-odd containment over a slice region (outers CCW, holes CW — a point
+/// under a shelf's hole is outside).
+fn region_contains(polys: &Polygons, p: geo2d::Point) -> bool {
+    polys.contours.iter().filter(|c| c.contains(p)).count() % 2 == 1
+}
+
+/// Whether any of up to eight evenly-spaced sample points of a path lies in
+/// the region — paths can straddle an exposure boundary (a solid line running
+/// from under a tower out onto the shelf), so one endpoint is not enough.
+fn path_touches(points: &[geo2d::Point], region: &Polygons) -> bool {
+    let step = (points.len() / 8).max(1);
+    points.iter().step_by(step).chain(points.last()).any(|&p| region_contains(region, p))
 }
 
 /// Slice and plan a multi-part model: each part is a mesh (already placed, all
@@ -394,23 +478,73 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
         part_plans.push(plans);
     }
 
-    // Blend schedules — a pure function of the weights and the absolute layer
-    // index, so every part sharing a blend prints the same tool on the same
-    // layer (aligned bands, no extra toolchanges between them).
-    let schedules: Vec<Option<Vec<u32>>> = parts
+    // A part's printed span comes from planned PATHS gated by its own slice
+    // polygons — a sub-line-width top sliver slices to a contour but plans
+    // nothing (a phantom top the swap must not decorate), and a support
+    // column lays paths on layers the body never reaches.
+    let occupied: Vec<Vec<bool>> = part_plans
+        .iter()
+        .zip(&part_layers)
+        .map(|(plans, layers)| {
+            (0..n).map(|i| !plans[i].paths.is_empty() && !layers[i].polygons.is_empty()).collect()
+        })
+        .collect();
+
+    // Blend schedules. Equal recipes yield byte-equal schedules (the schedule
+    // is a pure function of the weights), so grouping by schedule equality
+    // recovers exactly the lockstep sets — and dominance is read back off the
+    // shared schedule itself, so every member reaches the same verdict no
+    // matter its listing order. Each group gets ONE top-face swap at the
+    // group-wide topmost printed layer; a shorter carrier's own top must not
+    // become the donor (that would flip ITS visible cap to the minority) and
+    // is instead handled by the face override at stamping below.
+    let mut schedules: Vec<Option<Vec<u32>>> = parts
         .iter()
         .map(|(_, paint)| match paint {
             PartPaint::Tool(_) => None,
             PartPaint::Blend(w) => Some(blend_schedule(w, n)),
         })
         .collect();
+    let mut done = vec![false; parts.len()];
+    for i in 0..parts.len() {
+        if done[i] || schedules[i].is_none() {
+            continue;
+        }
+        let members: Vec<usize> =
+            (i..parts.len()).filter(|&j| !done[j] && schedules[j] == schedules[i]).collect();
+        let mut printed = vec![false; n];
+        let mut tops = Vec::new();
+        for &m in &members {
+            done[m] = true;
+            for (p, &occ) in printed.iter_mut().zip(&occupied[m]) {
+                *p |= occ;
+            }
+            tops.extend(occupied[m].iter().rposition(|&occ| occ));
+        }
+        let Some(group_top) = tops.iter().copied().max() else { continue };
+        let protected: Vec<usize> = tops.into_iter().filter(|&t| t < group_top).collect();
+        for &m in &members {
+            swap_dominant_to_top(schedules[m].as_mut().unwrap(), &printed, &protected);
+        }
+    }
 
     // Stamp each part's paint on every path — a uniform tool, or the blend's
     // per-layer schedule (geometry is identical either way; only the tool that
-    // prints each layer varies).
+    // prints each layer varies). Blends then get the FACE OVERRIDE: a layer
+    // whose exposed top/bottom face is big enough to justify the dock trip
+    // recolors that face's paths with the dominant tool — the shelf a stepped
+    // model shows from above, a floating part's underside, the bed face, and
+    // a shorter carrier's own top all read as the blend's color instead of
+    // whichever band the cycle dealt them. Buried paths and gate-rejected
+    // layers keep the schedule: the walls' dither is what mixes the color,
+    // and it must stay exact.
+    let lw = settings.line_width_mm;
+    let empty = Polygons::new();
     for (m, plans) in part_plans.iter_mut().enumerate() {
         let (_, paint) = &parts[m];
         let schedule = &schedules[m];
+        let dominant = schedule.as_deref().and_then(schedule_dominant);
+        let layers = &part_layers[m];
         for plan in plans.iter_mut() {
             let i = plan.index;
             let tool = match (paint, schedule) {
@@ -420,6 +554,30 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
             };
             for path in &mut plan.paths {
                 path.tool = tool;
+            }
+            let Some(dom) = dominant else { continue };
+            if dom == tool || !occupied[m][i] {
+                continue;
+            }
+            // Exposure is judged against the whole-scene union: a face
+            // pressed onto ANOTHER part is an interface, not a face, and not
+            // worth a dock trip. Supports are absent from phys on purpose —
+            // a supported underside is visible once the support strips. The
+            // 0.05 mm guard matches plan_part's skin exposure: a hairline
+            // misregistration between neighbors is not a face.
+            let above = if i + 1 < n { &phys[i + 1] } else { &empty };
+            let below = if i > 0 { &phys[i - 1] } else { &empty };
+            let exposed = union(
+                &difference(&layers[i].polygons, &offset(above, 0.05)),
+                &difference(&layers[i].polygons, &offset(below, 0.05)),
+            );
+            if exposed.is_empty() || !face_worth_a_dock_trip(&exposed, lw) {
+                continue;
+            }
+            for path in &mut plan.paths {
+                if path_touches(&path.points, &exposed) {
+                    path.tool = dom;
+                }
             }
         }
     }
@@ -4184,6 +4342,68 @@ mod tests {
     }
 
     #[test]
+    fn swap_puts_the_dominant_tool_on_top() {
+        // 90:10 — wherever the printed top lands in the cycle, after the swap
+        // it prints the dominant tool, the ratio is untouched, and at most
+        // two layers moved.
+        let raw = blend_schedule(&[(0, 9.0), (1, 1.0)], 30);
+        for top in 5..30 {
+            let mut s = raw.clone();
+            let mut printed = vec![false; 30];
+            printed[..=top].fill(true);
+            swap_dominant_to_top(&mut s, &printed, &[]);
+            assert_eq!(s[top], 0, "top layer must print the dominant tool");
+            assert_eq!(
+                s.iter().filter(|&&t| t == 1).count(),
+                raw.iter().filter(|&&t| t == 1).count(),
+                "swap must not change the ratio"
+            );
+            let moved = s.iter().zip(&raw).filter(|(a, b)| a != b).count();
+            assert!(moved <= 2, "swap perturbs at most two layers, got {moved}");
+        }
+        // No schedule-resolvable dominant: 50/50 stays byte-identical — even
+        // over an odd length, where the counts differ by one from parity alone.
+        let ab = blend_schedule(&[(0, 1.0), (1, 1.0)], 11);
+        let mut s = ab.clone();
+        swap_dominant_to_top(&mut s, &vec![true; 11], &[]);
+        assert_eq!(s, ab);
+        // A phantom top (slice contour, no paths) is not the face: the swap
+        // targets the topmost PRINTED layer and leaves the phantom alone.
+        let raw = blend_schedule(&[(0, 3.0), (1, 1.0)], 8); // [0,0,1,0,0,0,1,0]
+        let mut s = raw.clone();
+        let mut printed = vec![true; 8];
+        printed[7] = false;
+        swap_dominant_to_top(&mut s, &printed, &[]);
+        assert_eq!(s[6], 0, "the real cap must print the dominant tool");
+        assert_eq!(s[7], raw[7], "the phantom layer is not the swap's business");
+        // A shorter member's own top is protected from becoming the donor.
+        let mut s = vec![0, 0, 0, 1];
+        swap_dominant_to_top(&mut s, &vec![true; 4], &[2]);
+        assert_eq!(s, vec![0, 1, 0, 0], "donor must skip the protected top at 2");
+        // No printed dominant layer below the top: nothing to trade.
+        let mut s = vec![0, 0, 0, 1];
+        swap_dominant_to_top(&mut s, &[false, false, false, true], &[]);
+        assert_eq!(s, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn schedule_dominant_needs_a_real_margin() {
+        // Dominance is read off the schedule: aggregated per tool (duplicate
+        // weight entries collapse), and only granted with a ≥2-layer margin —
+        // ratios the schedule can't resolve are ties.
+        assert_eq!(schedule_dominant(&blend_schedule(&[(0, 3.0), (1, 1.0)], 40)), Some(0));
+        assert_eq!(schedule_dominant(&blend_schedule(&[(0, 1.0), (1, 1.0)], 10)), None);
+        assert_eq!(schedule_dominant(&blend_schedule(&[(0, 1.0), (1, 1.0)], 11)), None);
+        // Tool 0 owns 12/21 layers here even though tool 1 holds the single
+        // largest weight entry — the schedule is the truth.
+        assert_eq!(
+            schedule_dominant(&blend_schedule(&[(0, 2.0), (1, 3.0), (0, 2.0)], 21)),
+            Some(0)
+        );
+        assert_eq!(schedule_dominant(&[0; 5]), None);
+    }
+
+    #[test]
     fn painted_blend_dithers_layers_and_aligns_across_parts() {
         // Two cubes sharing a 50/50 blend of tools 0 and 1: each layer is one
         // tool for BOTH parts (aligned bands — no toolchange between them),
@@ -4217,4 +4437,154 @@ mod tests {
         }
     }
 
+    #[test]
+    fn painted_blend_caps_with_the_dominant_tool() {
+        // A skewed blend must print its dominant tool on the top face — the
+        // one surface with no layer averaging — while a shorter part sharing
+        // the recipe stays in lockstep. Heights are chosen so the raw cycle
+        // lands the MINORITY on the tall part's top layer (asserted below),
+        // so this genuinely exercises the swap.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [0.0, 0.0, 0.0], [10.0, 10.0, 2.2]);
+        let a = mesh::Mesh::from_triangle_soup(&ta);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [30.0, 0.0, 0.0], [40.0, 10.0, 1.0]);
+        let b = mesh::Mesh::from_triangle_soup(&tb);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        let weights = vec![(0u32, 3.0f64), (1u32, 1.0f64)];
+        let blend = PartPaint::Blend(weights.clone());
+        let plans = generate_painted(&[(&a, blend.clone()), (&b, blend)], &s);
+        let top = plans.iter().rposition(|p| !p.paths.is_empty()).unwrap();
+        let raw = blend_schedule(&weights, plans.len());
+        assert_eq!(raw[top], 1, "test setup: the raw cycle must land the minority on top");
+        for plan in &plans {
+            let tools: Vec<u32> = plan.paths.iter().map(|p| p.tool).collect();
+            assert!(tools.windows(2).all(|w| w[0] == w[1]), "layer {} mixes tools", plan.index);
+        }
+        assert_eq!(plans[top].paths[0].tool, 0, "the top face must print the dominant tool");
+        let minority =
+            plans.iter().filter(|p| p.paths.first().map(|q| q.tool) == Some(1)).count();
+        assert_eq!(
+            minority,
+            raw[..=top].iter().filter(|&&t| t == 1).count(),
+            "the swap must relocate the minority layer, not drop it"
+        );
+    }
+
+    #[test]
+    fn exposed_shelf_prints_the_dominant_tool() {
+        // A stepped part: 20×20 base with an 8×8 tower — the shelf around the
+        // tower is a visible top face on a mid-height layer. Heights put the
+        // shelf layer on a MINORITY band of the 3:1 cycle (asserted below):
+        // the face override must recolor the shelf's paths to the dominant
+        // tool while buried layers keep the schedule — the wall dither is
+        // what mixes the color, and it must stay exact.
+        let mut t = Vec::new();
+        push_box(&mut t, [0.0, 0.0, 0.0], [20.0, 20.0, 2.2]);
+        push_box(&mut t, [6.0, 6.0, 2.2], [14.0, 14.0, 4.2]);
+        let m = mesh::Mesh::from_triangle_soup(&t);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.auto_center_on_bed = false;
+        let weights = vec![(0u32, 3.0f64), (1u32, 1.0f64)];
+        let plans = generate_painted(&[(&m, PartPaint::Blend(weights.clone()))], &s);
+        let raw = blend_schedule(&weights, plans.len());
+        let shelf = 10;
+        assert_eq!(raw[shelf], 1, "test setup: the shelf layer must be a minority band");
+        let on_shelf = |p: &ToolPath| {
+            p.points.iter().any(|pt| {
+                pt.x_mm() < 5.5 || pt.x_mm() > 14.5 || pt.y_mm() < 5.5 || pt.y_mm() > 14.5
+            })
+        };
+        let mut face = 0;
+        for p in &plans[shelf].paths {
+            if on_shelf(p) {
+                face += 1;
+                assert_eq!(p.tool, 0, "shelf face paths must print the dominant tool");
+            }
+        }
+        assert!(face > 0, "the shelf layer must have face paths");
+        // Fully-buried paths on the shelf layer (the sparse infill under the
+        // tower) keep the minority band — only paths touching the face move.
+        let buried: Vec<&ToolPath> = plans[shelf]
+            .paths
+            .iter()
+            .filter(|p| {
+                p.points.iter().all(|pt| {
+                    pt.x_mm() > 6.05 && pt.x_mm() < 13.95 && pt.y_mm() > 6.05 && pt.y_mm() < 13.95
+                })
+            })
+            .collect();
+        assert!(!buried.is_empty(), "the shelf layer must have buried paths under the tower");
+        assert!(buried.iter().all(|p| p.tool == 1), "buried paths keep the minority band");
+        // A buried minority layer inside the base keeps its band untouched.
+        assert_eq!(raw[6], 1);
+        assert!(plans[6].paths.iter().all(|p| p.tool == 1), "buried bands keep the schedule");
+        // And the cap prints the dominant tool (the swap's job).
+        let top = plans.iter().rposition(|p| !p.paths.is_empty()).unwrap();
+        assert!(plans[top].paths.iter().all(|p| p.tool == 0), "the cap prints the dominant");
+        // Same step, but too small to be worth a dock trip: an 8×8 base with
+        // a 6×6 tower leaves a 1 mm ledge — eroded away, so the gate rejects
+        // it and the shelf layer keeps its minority band whole.
+        let mut t = Vec::new();
+        push_box(&mut t, [30.0, 0.0, 0.0], [38.0, 8.0, 2.2]);
+        push_box(&mut t, [31.0, 1.0, 2.2], [37.0, 7.0, 4.2]);
+        let m = mesh::Mesh::from_triangle_soup(&t);
+        let plans = generate_painted(&[(&m, PartPaint::Blend(weights))], &s);
+        assert!(
+            plans[shelf].paths.iter().all(|p| p.tool == 1),
+            "a sliver ledge must not trigger the override"
+        );
+    }
+
+    #[test]
+    fn floating_bottom_face_prints_the_dominant_tool() {
+        // A blended slab floating in the air beside a bed-sitting body (as
+        // over stripped supports): its underside is a visible face on a
+        // minority band — the override must recolor the whole layer, walls
+        // included. The slab's top gets the swap; the relocated minority
+        // band right below it stays buried and untouched. A slab RESTING on
+        // another part instead has an interface, not a face — no dock trip.
+        let mut tb = Vec::new();
+        push_box(&mut tb, [0.0, 0.0, 0.0], [14.0, 14.0, 2.0]);
+        let body = mesh::Mesh::from_triangle_soup(&tb);
+        let mut tc = Vec::new();
+        push_box(&mut tc, [30.0, 0.0, 2.0], [40.0, 10.0, 3.0]);
+        let slab = mesh::Mesh::from_triangle_soup(&tc);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.auto_center_on_bed = false;
+        let weights = vec![(0u32, 3.0f64), (1u32, 1.0f64)];
+        let plans = generate_painted(
+            &[(&body, PartPaint::Tool(3)), (&slab, PartPaint::Blend(weights.clone()))],
+            &s,
+        );
+        let raw = blend_schedule(&weights, plans.len());
+        let slab_base = 10;
+        assert_eq!(raw[slab_base], 1, "test setup: the slab's base must be a minority band");
+        assert!(
+            plans[slab_base].paths.iter().all(|p| p.tool == 0),
+            "the floating bottom face prints the dominant tool"
+        );
+        let top = plans.iter().rposition(|p| !p.paths.is_empty()).unwrap();
+        assert!(plans[top].paths.iter().all(|p| p.tool == 0), "the slab top gets the swap");
+        assert!(
+            plans[top - 1].paths.iter().all(|p| p.tool == 1),
+            "the relocated minority band below stays buried"
+        );
+        // Resting flush on the body instead: the underside is an interface,
+        // not a face — the minority band survives untouched.
+        let mut tr = Vec::new();
+        push_box(&mut tr, [2.0, 2.0, 2.0], [12.0, 12.0, 3.0]);
+        let resting = mesh::Mesh::from_triangle_soup(&tr);
+        let plans = generate_painted(
+            &[(&body, PartPaint::Tool(3)), (&resting, PartPaint::Blend(weights))],
+            &s,
+        );
+        assert!(
+            plans[slab_base].paths.iter().all(|p| p.tool == 1),
+            "an interface onto another part must not trigger the override"
+        );
+    }
 }
