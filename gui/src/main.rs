@@ -1280,6 +1280,7 @@ impl App {
                     .map(|c| (name.clone(), c))
             })
             .collect();
+        let multi_tool = settings.tool_count > 1;
         let mut app = Self {
             profiles,
             printer,
@@ -1320,7 +1321,10 @@ impl App {
             sliced: None,
             slice_summary: None,
             layer_stats: Vec::new(),
-            color_by: ColorBy::Feature,
+            // Filament colors are the point of a toolchanger preview; the
+            // mode doesn't exist on single-tool machines (see
+            // `sync_tool_slots`), where features carry the information.
+            color_by: if multi_tool { ColorBy::Filament } else { ColorBy::Feature },
             host_rx: None,
             sent_to_printer: false,
             printer_status: None,
@@ -1493,6 +1497,7 @@ impl App {
     /// mirroring the filament tier, new slots opening with the same spool.
     fn sync_tool_slots(&mut self, count: usize) {
         let n = count.max(1);
+        let was_single = self.tools.len() <= 1;
         self.tools.truncate(n);
         while self.tools.len() < n {
             self.tools.push(self.filament.clone());
@@ -1501,6 +1506,11 @@ impl App {
         self.active_tool_tab = self.active_tool_tab.min(n - 1);
         if n == 1 && self.color_by == ColorBy::Filament {
             self.color_by = ColorBy::Feature; // the mode only exists on a toolchanger
+        } else if n > 1 && was_single && self.color_by == ColorBy::Feature {
+            // Arriving at a toolchanger defaults the preview to filament
+            // colors — the mode that shows what the machine is for. An
+            // explicit LayerTime pick survives the trip.
+            self.color_by = ColorBy::Filament;
         }
     }
 
