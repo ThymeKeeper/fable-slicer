@@ -885,10 +885,51 @@ pub fn quantize_blend_fractions(fractions: &[f32], cycle: usize) -> Vec<u32> {
     out
 }
 
+/// OkLCh — perceptual lightness, chroma, hue° — of an sRGB color. Blends are
+/// ordered in this space rather than by luma/HSV: luma is red-blind (it
+/// weights green 0.72, red 0.21, so it barely "sees" a red's saturation) and
+/// HSV hue is unstable near neutral and seams at pure red. Oklab lightness is
+/// even, and its hue only seams out in the purples, away from the primaries.
+fn oklab_lch(rgb: [f32; 3]) -> [f32; 3] {
+    let to_lin = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (to_lin(rgb[0]), to_lin(rgb[1]), to_lin(rgb[2]));
+    let l = 0.412_221_47 * r + 0.536_332_54 * g + 0.051_445_995 * b;
+    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
+    let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+    let (l_, m_, s_) = (l.cbrt(), m.cbrt(), s.cbrt());
+    let big_l = 0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_;
+    let a = 1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_;
+    let bb = 0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_;
+    let chroma = (a * a + bb * bb).sqrt();
+    let hue = bb.atan2(a).to_degrees().rem_euclid(360.0);
+    [big_l, chroma, hue]
+}
+
+// Below this Oklab chroma a mix reads as grey and joins the neutral ramp.
+const BLEND_NEUTRAL_CHROMA: f32 = 0.02;
+// Hue-family width (degrees): wide enough that one spool's tints stay in a
+// single family (and never seam at pure red), narrow enough to keep visibly
+// distinct hues apart. Splitting hue finer than this would fracture a red
+// run, not order it — the ordering within a family is what does that work.
+const BLEND_HUE_STEP: f32 = 45.0;
+// Lightness band (Oklab L): within a hue family the chips are grouped into
+// bands this tall and sorted by chroma inside each. That makes chroma — the
+// axis a pure lightness sort drops on the floor — an ordered dimension, so a
+// family reads as a little tint-chart (dark→light down, dull→vivid across).
+const BLEND_L_BAND: f32 = 0.06;
+
 /// Every printable mix of `palette` at a `cycle`-layer dither — the finite
 /// lattice the blend band affords: all whole-layer compositions of the
 /// cycle, deduplicated by resulting color (slots sharing a spool color
-/// collapse; the simplest recipe wins), sorted dark → light. `None` when
+/// collapse; the simplest recipe wins), sorted into a natural ramp — greys
+/// first (dark→light), then each hue family as a lightness×chroma tint-chart
+/// (see [`oklab_lch`]). `None` when
 /// the lattice exceeds `cap` compositions — too rich to enumerate usefully,
 /// the caller falls back to pick-and-snap.
 pub fn blend_lattice(
@@ -954,24 +995,22 @@ pub fn blend_lattice(
         }
     }
     let mut keep: Vec<usize> = best.into_values().collect();
-    // Palette order, not a jumble: the neutral run first (greys dark→light),
-    // then the chromatic chips grouped into hue families, each family
-    // dark→light. A monochrome palette is thus one clean ramp.
-    let luma = |c: &[f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    let sort_key = |c: &[f32; 3]| -> (u8, u8, u32) {
-        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
-        let chroma = max - min;
-        if chroma < 0.10 {
-            return (0, 0, (luma(c) * 1e6) as u32);
+    // Order the palette so a colored run reads as naturally as a grey one:
+    // the neutral ramp first (greys, dark→light), then each hue family laid
+    // out as a little tint-chart — lightness bands top to bottom, chroma
+    // (dull→vivid) across each band. All in Oklab: sorting reds by luma is
+    // what made them look shuffled — luma is nearly blind to red saturation,
+    // and it never ordered chroma at all — while the greys, being purely a
+    // lightness ramp, happened to sort fine.
+    let sort_key = |c: &[f32; 3]| -> (u8, u8, i64, i64, i64) {
+        let [l, chroma, hue] = oklab_lch(*c);
+        if chroma < BLEND_NEUTRAL_CHROMA {
+            // A grey: one clean lightness ramp — hue and chroma don't apply.
+            return (0, 0, (l * 1e6) as i64, 0, 0);
         }
-        let h = if max == c[0] {
-            60.0 * ((c[1] - c[2]) / chroma).rem_euclid(6.0)
-        } else if max == c[1] {
-            60.0 * ((c[2] - c[0]) / chroma + 2.0)
-        } else {
-            60.0 * ((c[0] - c[1]) / chroma + 4.0)
-        };
-        (1, (h / 30.0).clamp(0.0, 11.0) as u8, (luma(c) * 1e6) as u32)
+        let family = (hue / BLEND_HUE_STEP) as u8;
+        let band = (l / BLEND_L_BAND) as i64;
+        (1, family, band, (chroma * 1e6) as i64, (l * 1e6) as i64)
     };
     keep.sort_by(|&a, &b| {
         sort_key(&all[a].1).cmp(&sort_key(&all[b].1)).then(all[a].0.cmp(&all[b].0))
@@ -1173,19 +1212,29 @@ mod tests {
         assert!(lat.len() > 100 && lat.len() < 330, "deduped: {}", lat.len());
         assert!(lat.iter().all(|(c, _)| c.iter().sum::<u32>() == 4));
         // Palette order: with red + white + black loaded, the neutral
-        // white↔black ramp leads (dark→light), the pinks follow — greys never
-        // interleave with the chromatic run.
+        // white↔black ramp leads (Oklab lightness, dark→light), the reds
+        // follow as one hue family, and greys never interleave with them.
         let lat = blend_lattice(&[[0.9, 0.1, 0.1], w, b], 4, 200).unwrap();
-        let chroma =
-            |c: &[f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
-        let first_chromatic = lat.iter().position(|(_, c)| chroma(c) >= 0.10).unwrap();
+        let is_neutral = |c: &[f32; 3]| oklab_lch(*c)[1] < BLEND_NEUTRAL_CHROMA;
+        let first_chromatic = lat.iter().position(|(_, c)| !is_neutral(c)).unwrap();
         assert!(
-            lat[first_chromatic..].iter().all(|(_, c)| chroma(c) >= 0.10),
-            "achromatic ramp first, then hues"
+            lat[first_chromatic..].iter().all(|(_, c)| !is_neutral(c)),
+            "achromatic ramp first, then the chromatic run — no interleaving"
         );
         for pair in lat[..first_chromatic].windows(2) {
-            let l = |c: &[f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-            assert!(l(&pair[0].1) <= l(&pair[1].1), "neutral run is dark to light");
+            assert!(
+                oklab_lch(pair[0].1)[0] <= oklab_lch(pair[1].1)[0],
+                "neutral run is dark to light in Oklab lightness"
+            );
+        }
+        // The reds are one hue family, ordered into lightness bands (chroma
+        // sorted within each): the band index never decreases across the run.
+        let band = |c: &[f32; 3]| (oklab_lch(*c)[0] / BLEND_L_BAND) as i64;
+        for pair in lat[first_chromatic..].windows(2) {
+            assert!(
+                band(&pair[0].1) <= band(&pair[1].1),
+                "reds are banded by lightness, dark to light"
+            );
         }
     }
 
