@@ -73,15 +73,23 @@ pub struct PrinterProfile {
     /// ("" / unset = the machine has none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chamber_sensor: Option<String>,
+    /// Machine kind: "toolchanger" (default) or "mmu" (single-nozzle Happy
+    /// Hare / ERCF / AMS). Unset = toolchanger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_kind: Option<String>,
     /// Number of tools (StealthChanger etc.); 1 / unset = single-tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_count: Option<u32>,
-    /// Template emitted at each tool change; `{tool}` = the target tool number.
+    /// Template emitted at each tool change; `{tool}` = the target tool number
+    /// (MMU swaps also get `{from_tool}` / `{to_temp}` / `{purge_mm3}` / `{purge_mm}`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolchange_gcode: Option<String>,
     /// Estimated seconds per tool change (time estimate / M73).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolchange_seconds: Option<f64>,
+    /// MMU only: static filament volume (mm³) purged per swap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge_volume_mm3: Option<f64>,
     /// Docked longer than this (estimated seconds) and a tool drops to its
     /// filament's standby temperature, reheating ahead of its next pickup.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,8 +267,8 @@ impl Tier for PrinterProfile {
             outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
             retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             aux_fan, exhaust_fan, chamber_sensor,
-            tool_count, toolchange_gcode, toolchange_seconds, standby_after_s,
-            start_gcode, end_gcode)
+            machine_kind, tool_count, toolchange_gcode, toolchange_seconds, purge_volume_mm3,
+            standby_after_s, start_gcode, end_gcode)
     }
 }
 
@@ -339,9 +347,14 @@ impl PrinterProfile {
             aux_fan: diff_field!(cur.has_aux_fan, base.has_aux_fan),
             exhaust_fan: diff_field!(cur.has_exhaust_fan, base.has_exhaust_fan),
             chamber_sensor: diff_field!(cur.chamber_sensor.clone(), base.chamber_sensor),
+            machine_kind: diff_field!(
+                cur.machine_kind.label().to_string(),
+                base.machine_kind.label().to_string()
+            ),
             tool_count: diff_field!(cur.tool_count as u32, base.tool_count as u32),
             toolchange_gcode: diff_field!(cur.toolchange_gcode.clone(), base.toolchange_gcode),
             toolchange_seconds: diff_field!(cur.toolchange_seconds, base.toolchange_seconds),
+            purge_volume_mm3: diff_field!(cur.purge_volume_mm3, base.purge_volume_mm3),
             standby_after_s: diff_field!(cur.standby_after_s, base.standby_after_s),
             start_gcode: diff_field!(cur.start_gcode.clone(), base.start_gcode),
             end_gcode: diff_field!(cur.end_gcode.clone(), base.end_gcode),
@@ -838,10 +851,16 @@ impl Profiles {
             exhaust_fan_speed: t0.exhaust_fan_speed,
             chamber_sensor: pr.chamber_sensor.unwrap_or_else(|| d.chamber_sensor.clone()),
             chamber_temp_c: chamber_temp,
+            machine_kind: pr
+                .machine_kind
+                .as_deref()
+                .and_then(crate::MachineKind::parse)
+                .unwrap_or(d.machine_kind),
             // A declared tool_count of 0 is meaningless — clamp to single-tool.
             tool_count: pr.tool_count.map(|c| (c as usize).max(1)).unwrap_or(d.tool_count),
             toolchange_gcode: pr.toolchange_gcode.unwrap_or_else(|| d.toolchange_gcode.clone()),
             toolchange_seconds: pr.toolchange_seconds.unwrap_or(d.toolchange_seconds),
+            purge_volume_mm3: pr.purge_volume_mm3.unwrap_or(d.purge_volume_mm3),
             standby_temp_c: t0.standby_temp_c,
             standby_after_s: pr.standby_after_s.unwrap_or(d.standby_after_s),
             filament_color_rgb: t0.color_rgb,

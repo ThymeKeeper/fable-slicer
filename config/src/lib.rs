@@ -200,6 +200,57 @@ impl SeamMode {
     }
 }
 
+/// How a multi-tool machine changes filament — described by its mechanism, not
+/// any product name. Two things actually vary and drive the g-code: whether
+/// there is one shared heater or a heater per tool (temperature handling), and
+/// whether the filaments share a melt zone that must be purged (waste).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MachineKind {
+    /// Independent hotends, one per tool — each its own nozzle, filament, and
+    /// live heater. A change docks one head and picks up another; nothing is
+    /// purged (every color stays in its own tip).
+    #[default]
+    IndependentHotends,
+    /// One nozzle fed by many filaments through a selector. A change unloads the
+    /// old filament, loads the new, and PURGES the old color out through the
+    /// shared melt zone. One heater, ramping between materials.
+    SharedNozzle,
+    /// Separate nozzles (one per filament, so nothing to purge) that take turns
+    /// in ONE shared heater. A change indexes the next nozzle into the heater
+    /// and waits for it to reach temperature. One heater, no flush.
+    SharedHeater,
+}
+
+impl MachineKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "independent-hotends" | "independent" | "toolchanger" | "changer" => {
+                Some(Self::IndependentHotends)
+            }
+            "shared-nozzle" | "shared_nozzle" | "mmu" => Some(Self::SharedNozzle),
+            "shared-heater" | "shared_heater" | "indexed-nozzles" | "indexed" => {
+                Some(Self::SharedHeater)
+            }
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IndependentHotends => "independent-hotends",
+            Self::SharedNozzle => "shared-nozzle",
+            Self::SharedHeater => "shared-heater",
+        }
+    }
+    /// User-facing dropdown label (mechanism, no brands).
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::IndependentHotends => "Independent hotends, dock & swap",
+            Self::SharedNozzle => "Shared nozzle, flush per swap",
+            Self::SharedHeater => "Separate nozzles + shared heater, no flush",
+        }
+    }
+}
+
 /// Infill pattern for a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InfillPattern {
@@ -547,13 +598,25 @@ pub struct Settings {
     /// (ABS/ASA soak at 50, everything else 0).
     pub chamber_temp_c: u32,
 
-    // --- tools (toolchanger) ---
+    // --- tools (toolchanger / MMU) ---
+    /// Physical toolchanger vs single-nozzle MMU (Happy Hare / ERCF / AMS).
+    pub machine_kind: MachineKind,
     /// Number of tool slots on the machine (1 = ordinary single-tool printer).
     pub tool_count: usize,
-    /// Template emitted at each tool change; `{tool}` = the target tool number.
+    /// Template emitted at each tool change. Placeholders: `{tool}` (target),
+    /// `{from_tool}` (previous), `{to_temp}` (target nozzle °C for this layer),
+    /// `{purge_mm3}` / `{purge_mm}` (MMU static purge as volume / filament
+    /// length). A toolchanger uses `T{tool}`; an MMU a swap macro like
+    /// `MMU_CHANGE_TOOL TOOL={tool}`.
     pub toolchange_gcode: String,
-    /// Estimated seconds per tool change (time estimate / M73).
+    /// Estimated seconds per tool change (time estimate / M73). On an MMU the
+    /// purge time (`purge_volume_mm3` / max flow) is added on top per swap.
     pub toolchange_seconds: f64,
+    /// MMU only: filament volume (mm³) purged at every swap — one static figure
+    /// handed to the swap macro (`{purge_mm3}` / `{purge_mm}`) and counted as
+    /// waste in the estimates. The firmware decides WHERE it goes (bucket /
+    /// blobifier); the slicer never lays a wipe tower.
+    pub purge_volume_mm3: f64,
     /// Tool-0 / flat-view standby temperature (docked-tool setpoint).
     pub standby_temp_c: u32,
     /// Docked longer than this (estimated seconds) and a tool drops to its
@@ -664,9 +727,11 @@ impl Default for Settings {
             exhaust_fan_speed: 0.0,
             chamber_sensor: String::new(),
             chamber_temp_c: Material::Pla.chamber_temp_c(),
+            machine_kind: MachineKind::default(),
             tool_count: 1,
             toolchange_gcode: "T{tool}".to_string(),
             toolchange_seconds: 10.0,
+            purge_volume_mm3: 80.0,
             standby_temp_c: derived_standby_temp_c(210),
             standby_after_s: 120.0,
             filament_color_rgb: NEUTRAL_FILAMENT_RGB,
@@ -685,6 +750,21 @@ impl Settings {
     pub fn filament_area_mm2(&self) -> f64 {
         let r = self.filament_diameter_mm / 2.0;
         PI * r * r
+    }
+
+    /// One shared heater: the temperature ramps between materials at each swap
+    /// (with a blocking wait) and idle tools can't be held at standby. True for
+    /// both single-heater machines (shared nozzle and shared heater), false for
+    /// independent per-tool hotends.
+    pub fn single_heater(&self) -> bool {
+        matches!(self.machine_kind, MachineKind::SharedNozzle | MachineKind::SharedHeater)
+    }
+
+    /// The filaments share a melt zone, so a swap must purge the old color out —
+    /// only the shared-nozzle machine. Separate nozzles (independent hotends or
+    /// shared heater) keep each color in its own tip and never flush.
+    pub fn purges(&self) -> bool {
+        self.machine_kind == MachineKind::SharedNozzle
     }
 
     /// The tool at slot `i`, clamped to the last loaded slot (`tools` is

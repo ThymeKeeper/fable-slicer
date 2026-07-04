@@ -105,10 +105,22 @@ fn entry_tools(layers: &[LayerPlan]) -> Vec<Option<u32>> {
 }
 
 /// One tool selection: the marker comment + the profile's toolchange template
-/// (may be multi-line), `{tool}` substituted.
-fn emit_toolchange(g: &mut GcodeBuilder, s: &Settings, tool: u32) {
-    g.comment(&format!("toolchange T{tool}"));
-    let text = s.toolchange_gcode.replace("{tool}", &tool.to_string());
+/// (may be multi-line), placeholders substituted. `{tool}` / `{from_tool}` are
+/// the target / previous tool; `{to_temp}` the target nozzle °C; `{purge_mm3}` /
+/// `{purge_mm}` the MMU static purge as volume / incoming-filament length. A
+/// toolchanger template uses only `{tool}`; the extras are harmless there.
+fn emit_toolchange(g: &mut GcodeBuilder, s: &Settings, from: u32, to: u32, purge_mm3: f64, to_temp: u32) {
+    g.comment(&format!("toolchange T{to}"));
+    let area = tool_area_mm2(s.tool(to as usize));
+    let purge_mm = if area > 0.0 { purge_mm3 / area } else { 0.0 };
+    // `{from_tool}` before `{tool}` so the shorter key can't clip the longer.
+    let text = s
+        .toolchange_gcode
+        .replace("{from_tool}", &from.to_string())
+        .replace("{to_temp}", &to_temp.to_string())
+        .replace("{purge_mm3}", &format!("{purge_mm3:.1}"))
+        .replace("{purge_mm}", &format!("{purge_mm:.2}"))
+        .replace("{tool}", &to.to_string());
     for line in text.lines() {
         if !line.trim().is_empty() {
             g.raw(line.trim_end());
@@ -123,6 +135,14 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     // A toolchanger print. tool_count is authoritative: it alone gates every
     // T-form line, so a single-tool profile emits exactly the classic bytes.
     let multi = s.tool_count > 1;
+    // A shared-heater machine (one nozzle multiplexing filament, or separate
+    // nozzles indexing into one heater): no per-tool T-form temps and no
+    // docked-tool standby — the one heater ramps between materials at each swap.
+    // `single_heater` is only ever true alongside `multi` in practice.
+    let single_heater = s.single_heater();
+    // Filaments share a melt zone → each swap purges the old color out (the
+    // shared-nozzle machine only; separate nozzles keep their own color).
+    let purges = s.purges();
     let used = used_tools(layers);
     let init_tool = initial_tool(layers);
     let layer0_tools = first_layer_tools(layers);
@@ -159,7 +179,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let mut confirm_at_swap: std::collections::HashMap<usize, u32> =
         std::collections::HashMap::new();
     let mut reheat_at_layer: Vec<Vec<u32>> = vec![Vec::new(); layers.len()];
-    if multi && s.standby_after_s > 0.0 {
+    if multi && !single_heater && s.standby_after_s > 0.0 {
         // The swap sequence exactly as the emission loop below will see it.
         let mut events: Vec<(usize, u32, u32)> = Vec::new(); // (layer, from, to)
         let mut t = init_tool;
@@ -252,22 +272,27 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         }
     }
     if multi {
-        // Explicit initial selection (idempotent under Klipper toolchanger
-        // macros), then set every other used tool's idle setpoint so the first
-        // swap doesn't wait on heat. M104 T is klipper-toolchanger's per-tool
-        // setpoint form; a tool printing layer 0 wants its adhesion temp.
-        emit_toolchange(&mut g, s, init_tool);
-        for &n in &used {
-            if n == init_tool {
-                continue;
+        // Explicit initial selection: load the first filament (idempotent under
+        // Klipper toolchanger AND MMU macros). The start g-code already heated
+        // the nozzle to the initial tool's first-layer temp.
+        emit_toolchange(&mut g, s, init_tool, init_tool, 0.0, init.first_layer_nozzle_temp_c);
+        // Independent hotends: preheat every OTHER used tool's idle setpoint so
+        // the first swap doesn't wait on heat (M104 T{n} is klipper's per-tool
+        // form; a tool printing layer 0 wants its adhesion temp). A shared heater
+        // has no T{n} to preheat, so this is skipped entirely.
+        if !single_heater {
+            for &n in &used {
+                if n == init_tool {
+                    continue;
+                }
+                let tn = tools.get(n);
+                let temp = if layer0_tools.contains(&n) {
+                    tn.first_layer_nozzle_temp_c
+                } else {
+                    tn.nozzle_temp_c
+                };
+                g.raw(&format!("M104 T{n} S{temp}"));
             }
-            let tn = tools.get(n);
-            let temp = if layer0_tools.contains(&n) {
-                tn.first_layer_nozzle_temp_c
-            } else {
-                tn.nozzle_temp_c
-            };
-            g.raw(&format!("M104 T{n} S{temp}"));
         }
     }
     // Motion limits, set after PRINT_START so our values win. M204 S is understood
@@ -288,6 +313,20 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     g.fan(0);
     let mut cur_fan = 0u32;
     let mut cur_tool = init_tool;
+    // Single-nozzle (MMU) heater state: the one nozzle's current setpoint,
+    // seeded at the initial tool's first-layer temp (the start g-code set it).
+    // Unused on a toolchanger / single-tool print.
+    let mut cur_set_temp = init.first_layer_nozzle_temp_c;
+    // The nozzle temp a tool wants on a given layer: its first-layer (adhesion)
+    // temp on layer 0, its print temp above. Drives the MMU heater ramp.
+    let temp_for = |tool: u32, layer_idx: usize| -> u32 {
+        let t = tools.get(tool);
+        if layer_idx == 0 {
+            t.first_layer_nozzle_temp_c
+        } else {
+            t.nozzle_temp_c
+        }
+    };
 
     let fan_duty = |frac: f64| (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
     // Extra fans, gated on the printer declaring them — vanilla Klipper/Marlin
@@ -325,8 +364,17 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         // layer 0 drops: bare M104 steers the tool in hand, the T-form the docked.
         if let Some(t) = layer.temp_command_c {
             g.raw(&format!("M104 S{t:.0}"));
+            cur_set_temp = t.round() as u32;
         } else if layer.index == 1 {
-            if multi {
+            if single_heater {
+                // One heater: drop the loaded tool from its first-layer adhesion
+                // temp to its print temp (a swap ramps the incoming tool itself).
+                let target = temp_for(cur_tool, layer.index);
+                if target != cur_set_temp {
+                    g.raw(&format!("M104 S{target}"));
+                    cur_set_temp = target;
+                }
+            } else if multi {
                 for &n in &used {
                     let tn = tools.get(n);
                     // A tool already dropped to standby keeps its standby
@@ -427,14 +475,35 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     retract_done = true;
                 }
                 wipe_tail = None;
-                // A pickup out of standby: the reheat went out a layer ago —
-                // confirm the tool is actually at temperature before docking
-                // the old one (normally an instant no-op wait).
-                if let Some(&n) = confirm_at_swap.get(&swap_seq) {
-                    g.raw(&format!("M109 T{n} S{}", tools.get(n).nozzle_temp_c));
+                let from = cur_tool;
+                let to = path.tool;
+                if single_heater {
+                    // One shared heater: ramp to the incoming filament's temp for
+                    // this layer — start it BEFORE the swap so it heats through
+                    // the change, WAIT after so the purge (if any) and print are
+                    // at temp. The macro does the physical swap; only a shared
+                    // NOZZLE flushes, so the purge volume is zero on a shared
+                    // heater with separate nozzles (its tip already holds its
+                    // color, waiting only on the reheat).
+                    let target = temp_for(to, layer.index);
+                    let ramp = target != cur_set_temp;
+                    if ramp {
+                        g.raw(&format!("M104 S{target}"));
+                    }
+                    let purge = if purges { s.purge_volume_mm3 } else { 0.0 };
+                    emit_toolchange(&mut g, s, from, to, purge, target);
+                    if ramp {
+                        g.raw(&format!("M109 S{target}"));
+                        cur_set_temp = target;
+                    }
+                } else {
+                    // Independent hotends: confirm the pre-reheated incoming tool
+                    // is up to temp (a pickup out of standby) before docking.
+                    if let Some(&n) = confirm_at_swap.get(&swap_seq) {
+                        g.raw(&format!("M109 T{n} S{}", tools.get(n).nozzle_temp_c));
+                    }
+                    emit_toolchange(&mut g, s, from, to, 0.0, tools.get(to).nozzle_temp_c);
                 }
-                let released = cur_tool;
-                emit_toolchange(&mut g, s, path.tool);
                 cur_tool = path.tool;
                 // The macro moved axes under its own F words and parked Z at the
                 // dock: forget the feed cache, re-issue the layer Z, and force
@@ -459,10 +528,11 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                         cur_aux_fan = aux;
                     }
                 }
-                // A long dock ahead for the tool just released: park it at
-                // its filament's standby temperature.
+                // A long dock ahead for the tool just released: park it at its
+                // filament's standby temperature. (MMU has one heater and an
+                // empty drop map, so this never fires there.)
                 if let Some(&n) = drop_at_swap.get(&swap_seq) {
-                    debug_assert_eq!(n, released);
+                    debug_assert_eq!(n, from);
                     g.raw(&format!("M104 T{n} S{}", tools.get(n).standby_temp_c));
                     in_standby.insert(n);
                 }
@@ -607,8 +677,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     if s.has_exhaust_fan && s.exhaust_fan_speed > 0.0 {
         g.raw("M106 P3 S0");
     }
-    if multi {
-        // Leave no idle heater on: the end template only knows the active tool.
+    if multi && !single_heater {
+        // Independent hotends: leave no idle heater on — the end template only
+        // knows the active tool. A shared heater is a single one the end
+        // template already turns off, so there is nothing per-tool to shut down.
         for &n in &used {
             g.raw(&format!("M104 T{n} S0"));
         }
@@ -1295,13 +1367,23 @@ fn layer_print_seconds(
         last_pos = Some(path_end(path));
         prev_path_len = path.points.windows(2).map(|w| dist_mm(w[0], w[1])).sum();
     }
-    if s.tool_count > 1 && s.toolchange_seconds > 0.0 {
-        let mut in_hand = entry_tool;
-        for path in layer.paths.iter().filter(|p| printable(p)) {
-            if in_hand.is_some_and(|n| n != path.tool) {
-                t += s.toolchange_seconds;
+    if s.tool_count > 1 {
+        // Per swap: the fixed change cost plus, on a shared-nozzle machine, the
+        // time to extrude the static purge at the machine's max volumetric flow.
+        let purge_secs = if s.purges() && s.max_volumetric_speed_mm3_s > 0.0 {
+            s.purge_volume_mm3 / s.max_volumetric_speed_mm3_s
+        } else {
+            0.0
+        };
+        let per_swap = s.toolchange_seconds + purge_secs;
+        if per_swap > 0.0 {
+            let mut in_hand = entry_tool;
+            for path in layer.paths.iter().filter(|p| printable(p)) {
+                if in_hand.is_some_and(|n| n != path.tool) {
+                    t += per_swap;
+                }
+                in_hand = Some(path.tool);
             }
-            in_hand = Some(path.tool);
         }
     }
     t
@@ -1584,6 +1666,20 @@ pub fn estimate_filament_per_tool(layers: &[LayerPlan], s: &Settings) -> Vec<(u3
         }
         for (n, v) in layer_vol {
             *volume.entry(n).or_insert(0.0) += v;
+        }
+    }
+    // Shared nozzle: every swap wastes a static purge of the INCOMING filament.
+    // Attribute it to that tool so per-slot grams and runout math see the true
+    // draw. (Separate-nozzle machines never flush, so this is skipped.)
+    if s.purges() && s.purge_volume_mm3 > 0.0 {
+        let mut in_hand: Option<u32> = Some(initial_tool(layers));
+        for layer in layers {
+            for path in layer.paths.iter().filter(|p| printable(p)) {
+                if in_hand.is_some_and(|n| n != path.tool) {
+                    *volume.entry(path.tool).or_insert(0.0) += s.purge_volume_mm3;
+                }
+                in_hand = Some(path.tool);
+            }
         }
     }
     volume

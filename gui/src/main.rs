@@ -2671,10 +2671,26 @@ impl App {
                         );
                     });
                 }
-                ui.label(format!("{} toolchanges", sum.toolchanges)).on_hover_text(
+                let swaps_label = if self.settings.single_heater() { "swaps" } else { "toolchanges" };
+                ui.label(format!("{} {swaps_label}", sum.toolchanges)).on_hover_text(
                     "Tool swaps over the whole print — each costs the per-change time \
                      under Machine & motion.",
                 );
+                // Shared nozzle: call out the purge waste (already in the totals).
+                if self.settings.purges() && self.settings.purge_volume_mm3 > 0.0 {
+                    let purge_g = sum.toolchanges as f64 * self.settings.purge_volume_mm3 / 1000.0
+                        * self.settings.filament_density_g_cm3;
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xC8, 0x8A, 0x4B),
+                        format!("≈ {purge_g:.0} g purged"),
+                    )
+                    .on_hover_text(format!(
+                        "Filament flushed at swaps ({} × {:.0} mm³) to clear the old color — \
+                         already counted in the totals above. The firmware purges it to a \
+                         bucket / dump; no wipe tower is printed.",
+                        sum.toolchanges, self.settings.purge_volume_mm3,
+                    ));
+                }
                 // Painted blends whose repeat outgrew the band (a layer-height
                 // change after picking): the print will stripe — say so here,
                 // where the person deciding to Send is looking.
@@ -3541,7 +3557,7 @@ impl eframe::App for App {
                     ui.label("color").on_hover_text(
                         "What the preview colors encode. Feature type is the classic view; layer time \
                          shows where the nozzle returns quickly (little cooling time), scored per layer; \
-                         filament (toolchangers) paints each path in its tool's spool color. \
+                         filament (multi-tool) paints each path in its tool's spool color. \
                          All reflect the last slice — re-slice after changing toggles.",
                     );
                     let before = self.color_by;
@@ -3557,7 +3573,7 @@ impl eframe::App for App {
                             ui.add_enabled_ui(self.settings.tool_count > 1, |ui| {
                                 ui.selectable_value(&mut self.color_by, ColorBy::Filament, "filament")
                                     .on_disabled_hover_text(
-                                        "Filament coloring needs a toolchanger (2+ tools).",
+                                        "Filament coloring needs a multi-tool machine (2+ tools).",
                                     );
                             });
                         });
@@ -4252,8 +4268,11 @@ impl eframe::App for App {
                         // section): part-fan duties are filament-tier facts,
                         // per material/spool, bound to the same active tab.
                         let (aux, exhaust) = (s.has_aux_fan, s.has_exhaust_fan);
+                        // Docked-tool standby only applies to independent hotends;
+                        // a shared heater ramps its one heater, so hide the row.
+                        let show_standby = !s.single_heater();
                         if s.tool_count > 1 {
-                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, true, line_w, layer_h, cal);
+                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, show_standby, line_w, layer_h, cal);
                             ui.separator();
                             cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, aux, exhaust);
                         } else {
@@ -4308,36 +4327,81 @@ impl eframe::App for App {
                     revert_row(ui, &mut s.tool_count, &self.baseline.tool_count, |ui, v| {
                         ui.add(egui::DragValue::new(v).range(1..=8));
                         ui.label("tools").on_hover_text(
-                            "Physical tool (extruder) slots — 2+ = a toolchanger \
-                             (StealthChanger and kin). Each slot loads its filament on \
-                             the Filament card's tabs; parts pick their tool in the \
-                             object list.",
+                            "Filament slots — 2+ = a multi-tool machine. Each slot loads \
+                             its filament on the Filament card's tabs; parts pick their \
+                             tool in the object list. How swaps happen is set below.",
                         );
                     });
                     if s.tool_count != before {
                         tool_count_changed = true;
                     }
                     ui.add_enabled_ui(s.tool_count > 1, |ui| {
+                        // How the machine changes filament — the mechanism, which
+                        // drives temperature (one heater vs a heater per tool) and
+                        // whether a swap has to purge (shared melt zone or not).
+                        revert_row(ui, &mut s.machine_kind, &self.baseline.machine_kind, |ui, v| {
+                            machine_combo(ui, v).on_hover_text(
+                                "How swaps work — pick the mechanism:\n\
+                                 • Independent hotends — a head per tool, docked and swapped. \
+                                 Each keeps its own filament; nothing is purged. Every tool \
+                                 holds its own live temperature.\n\
+                                 • Shared nozzle — one hotend fed by a selector. A swap unloads, \
+                                 loads, and FLUSHES the old color through the shared melt zone; \
+                                 the single heater ramps between materials.\n\
+                                 • Separate nozzles + shared heater — a nozzle per filament (so \
+                                 no flush) taking turns in ONE heater. A swap indexes the next \
+                                 nozzle in and waits for it to reach temperature.\n\
+                                 Set the swap macro under Custom g-code — placeholders {tool} / \
+                                 {from_tool} / {to_temp} / {purge_mm3} / {purge_mm}.",
+                            );
+                        });
                         revert_row(ui, &mut s.toolchange_seconds, &self.baseline.toolchange_seconds, |ui, v| {
                             ui.add(
                                 egui::DragValue::new(v).speed(0.5).range(0.0..=300.0).suffix(" s"),
                             );
                             ui.label("s/change").on_hover_text(
-                                "Seconds one tool swap takes, dock to dock — feeds the \
-                                 print-time estimate.",
+                                "Seconds one tool swap takes — feeds the print-time estimate. \
+                                 A shared nozzle adds the purge time on top; a shared heater's \
+                                 swap should include its nozzle reheat here (one heater can't \
+                                 preheat the next nozzle while printing).",
                             );
                         });
-                        revert_row(ui, &mut s.standby_after_s, &self.baseline.standby_after_s, |ui, v| {
-                            ui.add(
-                                egui::DragValue::new(v).speed(5.0).range(0.0..=3600.0).suffix(" s"),
-                            );
-                            ui.label("standby after").on_hover_text(
-                                "Docked longer than this and a tool drops to its filament's \
-                                 standby temperature, reheating a layer ahead of its next \
-                                 pickup. Short docks (blend dithering) stay at print \
-                                 temperature. 0 disables standby entirely.",
-                            );
-                        });
+                        match s.machine_kind {
+                            config::MachineKind::SharedNozzle => {
+                                // Shared melt zone: a static purge per swap, handed
+                                // to the macro and counted as waste. No standby row
+                                // (one heater).
+                                revert_row(ui, &mut s.purge_volume_mm3, &self.baseline.purge_volume_mm3, |ui, v| {
+                                    ui.add(
+                                        egui::DragValue::new(v).speed(1.0).range(0.0..=1000.0).suffix(" mm³"),
+                                    );
+                                    ui.label("purge/swap").on_hover_text(
+                                        "Filament flushed at every swap to clear the old color — \
+                                         handed to the swap macro as {purge_mm3} / {purge_mm} and \
+                                         counted as waste in the estimate. The firmware decides \
+                                         where it goes (a purge bucket / dump); the slicer lays \
+                                         no wipe tower.",
+                                    );
+                                });
+                            }
+                            config::MachineKind::IndependentHotends => {
+                                revert_row(ui, &mut s.standby_after_s, &self.baseline.standby_after_s, |ui, v| {
+                                    ui.add(
+                                        egui::DragValue::new(v).speed(5.0).range(0.0..=3600.0).suffix(" s"),
+                                    );
+                                    ui.label("standby after").on_hover_text(
+                                        "Docked longer than this and a tool drops to its filament's \
+                                         standby temperature, reheating a layer ahead of its next \
+                                         pickup. Short docks (blend dithering) stay at print \
+                                         temperature. 0 disables standby entirely.",
+                                    );
+                                });
+                            }
+                            // Separate nozzles + shared heater: no flush (each tip
+                            // holds its own color) and no standby (idle nozzles
+                            // cool) — the reheat rides s/change. Nothing to add.
+                            config::MachineKind::SharedHeater => {}
+                        }
                     });
                     revert_row(ui, &mut s.machine_speed_mm_s, &self.baseline.machine_speed_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 10.0..=700.0), "rated mm/s",
@@ -4454,10 +4518,12 @@ impl eframe::App for App {
                     );
                     if s.tool_count > 1 {
                         revert_row(ui, &mut s.toolchange_gcode, &self.baseline.toolchange_gcode, |ui, _| {
-                            ui.label("Toolchange g-code ({tool})").on_hover_text(
-                                "Emitted at every tool switch. Placeholder: {tool} — the slot \
-                                 being selected; the default \"T{tool}\" is the bare \
-                                 Klipper/StealthChanger select.",
+                            ui.label("Swap g-code").on_hover_text(
+                                "Emitted at every tool change. Placeholders: {tool} (incoming \
+                                 slot), {from_tool} (previous), {to_temp} (target nozzle °C), \
+                                 {purge_mm3} / {purge_mm} (shared-nozzle purge as volume / \
+                                 filament length). The default \"T{tool}\" is a bare tool select \
+                                 (which Klipper macros can remap to a full swap).",
                             );
                         });
                         ui.add(
@@ -5762,6 +5828,19 @@ fn ray_triangle(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3, c: g
     }
     let t = e2.dot(q) * inv;
     (t > 1e-4).then_some(t)
+}
+
+fn machine_combo(ui: &mut egui::Ui, current: &mut config::MachineKind) -> egui::Response {
+    use config::MachineKind::*;
+    egui::ComboBox::from_id_salt("machine_kind")
+        .selected_text(current.display())
+        .width(240.0)
+        .show_ui(ui, |ui| {
+            for kind in [IndependentHotends, SharedNozzle, SharedHeater] {
+                ui.selectable_value(current, kind, kind.display());
+            }
+        })
+        .response
 }
 
 fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) -> egui::Response {

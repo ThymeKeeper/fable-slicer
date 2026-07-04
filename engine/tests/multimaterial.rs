@@ -162,3 +162,88 @@ fn blended_cap_dithers_between_white_and_black() {
     let changes = gcode.matches("; toolchange T").count();
     assert!(changes >= cap_tools.len(), "dithered cap must swap about once per cap layer");
 }
+
+/// The same three-part figurine on a shared-nozzle machine: one heater ramping
+/// between materials, a swap macro carrying the static purge, and the purge
+/// counted as waste — no per-tool T-form temperatures anywhere.
+#[test]
+fn shared_nozzle_emits_single_heater_swaps_with_static_purge() {
+    let parts = fixture();
+    let mut s = three_tool_settings();
+    s.machine_kind = config::MachineKind::SharedNozzle;
+    s.purge_volume_mm3 = 100.0;
+    s.toolchange_gcode =
+        "MMU_CHANGE_TOOL TOOL={tool} FROM={from_tool} TEMP={to_temp} PURGE={purge_mm3}".to_string();
+
+    let refs: Vec<(&mesh::Mesh, u32)> = parts.iter().map(|(_, t, m)| (m, *t)).collect();
+    let plans = engine::generate_parts(&refs, &s);
+    let gcode = engine::to_gcode(&plans, &s);
+
+    // ONE heater: not a single per-tool T-form temperature command anywhere
+    // (those address hotends this machine doesn't have).
+    assert!(!gcode.contains("M104 T"), "shared nozzle must not set per-tool heaters (M104 T…)");
+    assert!(!gcode.contains("M109 T"), "shared nozzle must not wait on per-tool heaters (M109 T…)");
+
+    // Swaps run the MMU macro with every placeholder substituted, and ramp the
+    // shared nozzle with a blocking wait to the incoming filament's temp.
+    assert!(gcode.contains("MMU_CHANGE_TOOL TOOL=1"), "swap selects the incoming tool");
+    assert!(gcode.contains("FROM=0"), "{{from_tool}} substituted");
+    assert!(gcode.contains("PURGE=100.0"), "static purge volume substituted into the macro");
+    assert!(gcode.contains("M109 S"), "the one nozzle waits on its ramp at a swap");
+    // Tool 1 prints at 210 °C (200 + 1·10); an above-first-layer swap ramps there.
+    assert!(gcode.contains("M109 S210"), "ramps + waits to tool 1's print temp");
+
+    // The static purge is counted as waste: the MMU draws more filament than the
+    // identical job on a toolchanger, which purges nothing.
+    let swaps = gcode.matches("; toolchange T").count().saturating_sub(1); // initial select is free
+    assert!(swaps > 0, "the print swaps tools");
+    let (mmu_mm, mmu_g) = engine::estimate_filament(&plans, &s);
+    let mut tc = s.clone();
+    tc.machine_kind = config::MachineKind::IndependentHotends;
+    let (tc_mm, _) = engine::estimate_filament(&plans, &tc);
+    assert!(mmu_mm > tc_mm, "purge waste ({mmu_mm} mm) must exceed the no-purge job ({tc_mm} mm)");
+    assert!(mmu_g > 0.0);
+
+    // Purge lands on the INCOMING tools (1 and 2), so their per-slot totals grow.
+    let per_tool = engine::estimate_filament_per_tool(&plans, &s);
+    let tc_per = engine::estimate_filament_per_tool(&plans, &tc);
+    for &(n, mm, _) in &per_tool {
+        if n == 0 {
+            continue;
+        }
+        let base = tc_per.iter().find(|&&(m, ..)| m == n).map(|&(_, mm, _)| mm).unwrap_or(0.0);
+        assert!(mm > base, "incoming tool {n} carries its purge waste ({mm} > {base})");
+    }
+}
+
+/// Separate nozzles sharing ONE heater (indexed nozzles): the single-heater temp
+/// ramp of the shared-nozzle machine, but NO purge — each tip keeps its own
+/// color, so a swap only waits on the reheat and wastes nothing.
+#[test]
+fn shared_heater_ramps_temp_but_never_purges() {
+    let parts = fixture();
+    let mut s = three_tool_settings();
+    s.machine_kind = config::MachineKind::SharedHeater;
+    s.purge_volume_mm3 = 100.0; // set, but must be ignored (separate nozzles)
+    s.toolchange_gcode = "INDEX TOOL={tool} TEMP={to_temp} PURGE={purge_mm3}".to_string();
+
+    let refs: Vec<(&mesh::Mesh, u32)> = parts.iter().map(|(_, t, m)| (m, *t)).collect();
+    let plans = engine::generate_parts(&refs, &s);
+    let gcode = engine::to_gcode(&plans, &s);
+
+    // Single heater, exactly like the shared nozzle: no per-tool T-form temps,
+    // and a blocking ramp+wait at each swap.
+    assert!(!gcode.contains("M104 T"), "shared heater is one heater — no M104 T…");
+    assert!(!gcode.contains("M109 T"), "shared heater is one heater — no M109 T…");
+    assert!(gcode.contains("M109 S210"), "indexed nozzle waits on the reheat to tool 1's temp");
+
+    // But NOTHING is purged: the macro's purge placeholder resolves to 0, and the
+    // filament total matches the same job on independent hotends (no waste).
+    assert!(gcode.contains("PURGE=0.0"), "no flush on separate nozzles ({{purge_mm3}} = 0)");
+    assert!(!gcode.contains("PURGE=100"), "the static purge must be ignored here");
+    let (sh_mm, _) = engine::estimate_filament(&plans, &s);
+    let mut ih = s.clone();
+    ih.machine_kind = config::MachineKind::IndependentHotends;
+    let (ih_mm, _) = engine::estimate_filament(&plans, &ih);
+    assert!((sh_mm - ih_mm).abs() < 1e-6, "shared heater wastes nothing: {sh_mm} vs {ih_mm}");
+}
