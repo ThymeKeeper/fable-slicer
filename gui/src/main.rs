@@ -714,6 +714,42 @@ fn mesh_tints(accent: egui::Color32) -> ([f32; 3], [f32; 3]) {
     (hsl_to_rgb(h, s * 0.22, 0.72), hsl_to_rgb(h, s * 0.85, 0.60))
 }
 
+/// 2D convex hull (Andrew's monotone chain) of points in mm, returned in CCW
+/// order. Fewer than three distinct points passes them through unchanged.
+fn convex_hull_2d(mut pts: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    use std::cmp::Ordering::Equal;
+    pts.sort_by(|a, b| {
+        a[0].partial_cmp(&b[0]).unwrap_or(Equal).then(a[1].partial_cmp(&b[1]).unwrap_or(Equal))
+    });
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    // Cross product of OA × OB: > 0 is a CCW (left) turn.
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut lower: Vec<[f64; 2]> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<[f64; 2]> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    // Drop each chain's last point (it's the other chain's first); concatenate.
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
 /// Cool → hot ramp for the preview heat maps (u in 0..=1), riffed off the
 /// accent: its hue glowing up from a dark cool-drifted shade, through the
 /// accent itself, to a bright — but still saturated — top end (capped at
@@ -818,13 +854,6 @@ struct ScenePart {
     /// The tool or blend that prints this part. Clamped to the machine's
     /// tool count at bake time.
     paint: PartColor,
-    /// Per-face color: one paint (tool or blend) per `mesh` triangle. Empty
-    /// until the part is first brushed (`painted` flips true); then it drives
-    /// both the viewer's per-face color and the engine's `PartPaint::Painted`
-    /// at bake time. Kept aligned to `mesh` (not `display`), which is also what
-    /// `pick_face` hits.
-    paint_tri: Vec<PartColor>,
-    painted: bool,
 }
 
 /// One object placed on the bed: its parts (shared mesh geometry) plus an
@@ -850,8 +879,6 @@ impl SceneObject {
                 display: Arc::new(mesh.display_mesh()),
                 mesh: Arc::new(mesh),
                 paint: PartColor::Tool(0),
-                paint_tri: Vec::new(),
-                painted: false,
             }],
             rot_deg: [0.0; 3],
             scale: 1.0,
@@ -1195,9 +1222,6 @@ struct App {
     /// The blend palette: pseudo colors dithered from the tool slots,
     /// assignable to parts alongside the plain tools.
     blends: Vec<config::BlendState>,
-    /// Which blend's inline weight editor is open in the panel (one at a
-    /// time — the 320 px panel can't afford stacked editors).
-    blend_edit: Option<usize>,
     process: String,
     /// Every OTHER machine's loadout (spools, colors, blends, process),
     /// keyed by printer profile name — the active printer's lives in the
@@ -1323,15 +1347,6 @@ struct App {
     last_bed: (f64, f64),
     /// Object being dragged in the viewport (None = orbiting the camera).
     drag_obj: Option<usize>,
-    /// Paint mode: primary drag brushes colors onto faces (not moving).
-    paint_mode: bool,
-    /// The paint (tool or blend) the brush lays down.
-    brush_paint: PartColor,
-    /// Brush radius in mm — front-facing faces within this of the hit are painted.
-    brush_radius_mm: f64,
-    /// When set, a stroke flood-fills the contiguous surface up to sharp edges
-    /// instead of painting a disc.
-    fill_region: bool,
     /// Offset (bed XY) between the dragged object's pos and the cursor at grab time.
     drag_grab: [f64; 2],
     /// Screen rect of the transform overlay (so viewport input ignores clicks on it).
@@ -1479,7 +1494,6 @@ impl App {
             tool_colors,
             tool_hex: Vec::new(),
             blends: loadout.blends.clone(),
-            blend_edit: None,
             process,
             loadouts: state.loadouts.clone(),
             // Seed with the file's content as-loaded: if the fallbacks above
@@ -1524,10 +1538,6 @@ impl App {
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
-            paint_mode: false,
-            brush_paint: PartColor::Tool(1),
-            brush_radius_mm: 4.0,
-            fill_region: false,
             preview_layer: 1,
             show_walls: true,
             show_solid: true,
@@ -1578,150 +1588,6 @@ impl App {
             }
         }
         best.map(|(_, i)| i)
-    }
-
-    /// The object, part, and triangle index the ray first hits — the paint
-    /// brush's target. Tests the raw `mesh` (what `paint_tri` indexes), and
-    /// returns the world-space hit point so the caller can size a radius brush.
-    fn pick_face(&self, o: glam::Vec3, d: glam::Vec3) -> Option<(usize, usize, usize, glam::Vec3)> {
-        let mut best: Option<(f32, usize, usize, usize)> = None;
-        for (i, obj) in self.objects.iter().enumerate() {
-            let t = obj.transform();
-            let v = |p: [f64; 3]| {
-                let q = t.apply(p);
-                glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
-            };
-            for (pi, part) in obj.parts.iter().enumerate() {
-                for k in 0..part.mesh.triangles.len() {
-                    let tri = part.mesh.triangle(k);
-                    if let Some(dist) = ray_triangle(o, d, v(tri[0]), v(tri[1]), v(tri[2])) {
-                        if best.map_or(true, |(bd, ..)| dist < bd) {
-                            best = Some((dist, i, pi, k));
-                        }
-                    }
-                }
-            }
-        }
-        best.map(|(dist, i, pi, k)| (i, pi, k, o + d * dist))
-    }
-
-    /// Brush the current tool onto part `pi` of object `oi` at ray hit `hit`
-    /// (ray origin `eye`). Promotes the part to painted on first touch, then
-    /// either paints a radius disc or flood-fills the surface region.
-    fn paint_at(&mut self, oi: usize, pi: usize, tri: usize, hit: glam::Vec3, eye: glam::Vec3) {
-        let paint = self.brush_paint;
-        {
-            let part = &mut self.objects[oi].parts[pi];
-            let ntri = part.mesh.triangles.len();
-            if !part.painted || part.paint_tri.len() != ntri {
-                part.paint_tri = vec![part.paint; ntri];
-                part.painted = true;
-            }
-        }
-        let changed = if self.fill_region {
-            self.fill_region_paint(oi, pi, tri, paint)
-        } else {
-            self.radius_paint(oi, pi, hit, eye, paint)
-        };
-        if changed {
-            self.needs_rebuild = true;
-            self.sliced = None;
-            self.slice_summary = None;
-            self.view_preview = false;
-        }
-    }
-
-    /// Paint every front-facing face whose world centroid is within the brush
-    /// radius of `hit`. Front-facing (normal toward `eye`) keeps the stroke from
-    /// bleeding through to the far wall.
-    fn radius_paint(&mut self, oi: usize, pi: usize, hit: glam::Vec3, eye: glam::Vec3, paint: PartColor) -> bool {
-        let t = self.objects[oi].transform();
-        let r2 = (self.brush_radius_mm as f32).powi(2);
-        let v = |p: [f64; 3]| {
-            let q = t.apply(p);
-            glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
-        };
-        let part = &mut self.objects[oi].parts[pi];
-        let mut changed = false;
-        for k in 0..part.mesh.triangles.len() {
-            let [a, b, c] = part.mesh.triangle(k);
-            let (a, b, c) = (v(a), v(b), v(c));
-            let cen = (a + b + c) / 3.0;
-            if (cen - hit).length_squared() > r2 {
-                continue;
-            }
-            if (b - a).cross(c - a).dot(eye - cen) <= 0.0 {
-                continue;
-            }
-            if part.paint_tri[k] != paint {
-                part.paint_tri[k] = paint;
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Flood-fill the contiguous surface region from `start`, crossing an edge
-    /// only where the two faces meet at a shallow angle (no sharp crease).
-    fn fill_region_paint(&mut self, oi: usize, pi: usize, start: usize, paint: PartColor) -> bool {
-        use std::collections::HashMap;
-        let m = std::sync::Arc::clone(&self.objects[oi].parts[pi].mesh);
-        let ntri = m.triangles.len();
-        if start >= ntri {
-            return false;
-        }
-        let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
-        let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-        for (k, t) in m.triangles.iter().enumerate() {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                edges.entry(key(a, b)).or_default().push(k as u32);
-            }
-        }
-        let fnorm = |k: usize| -> [f64; 3] {
-            let [a, b, c] = m.triangle(k);
-            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
-            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            if l > 0.0 {
-                [n[0] / l, n[1] / l, n[2] / l]
-            } else {
-                [0.0, 0.0, 0.0]
-            }
-        };
-        let cos_thresh = 40f64.to_radians().cos();
-        let mut seen = vec![false; ntri];
-        let mut stack = vec![start as u32];
-        seen[start] = true;
-        let mut region = vec![start];
-        while let Some(k) = stack.pop() {
-            let nk = fnorm(k as usize);
-            let t = m.triangles[k as usize];
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                if let Some(nbrs) = edges.get(&key(a, b)) {
-                    for &nb in nbrs {
-                        if !seen[nb as usize] {
-                            let nn = fnorm(nb as usize);
-                            let dot = nk[0] * nn[0] + nk[1] * nn[1] + nk[2] * nn[2];
-                            if dot >= cos_thresh {
-                                seen[nb as usize] = true;
-                                stack.push(nb);
-                                region.push(nb as usize);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let part = &mut self.objects[oi].parts[pi];
-        let mut changed = false;
-        for k in region {
-            if part.paint_tri[k] != paint {
-                part.paint_tri[k] = paint;
-                changed = true;
-            }
-        }
-        changed
     }
 
     fn category_mask(&self) -> u32 {
@@ -1825,7 +1691,6 @@ impl App {
             })
             .collect();
         self.blends = lo.blends.clone();
-        self.blend_edit = None;
         if !lo.process.is_empty() && self.profiles.process_names().contains(&lo.process.as_str()) {
             self.process = lo.process.clone();
         }
@@ -2121,7 +1986,16 @@ impl App {
                     let first_new = self.objects.len();
                     let tool_cap = self.settings.tool_count.saturating_sub(1) as u32;
                     for (k, it) in items.into_iter().enumerate() {
-                        let name = if !it.name.is_empty() {
+                        // Bambu/Orca name a merged multi-part object after its
+                        // FIRST part (object 5 = "Beak", parts Beak.stl/Body.stl/
+                        // …), which reads as a mislabel in the outliner. Treat
+                        // that echo as anonymous and fall back to the file name.
+                        let named_after_first_part = it.parts.len() > 1
+                            && it
+                                .parts
+                                .first()
+                                .is_some_and(|p| it.name.as_str() == mesh_name_stem(&p.name));
+                        let name = if !it.name.is_empty() && !named_after_first_part {
                             it.name
                         } else if n == 1 {
                             file.clone()
@@ -2142,8 +2016,6 @@ impl App {
                                 ),
                                 display: Arc::new(p.mesh.display_mesh()),
                                 mesh: Arc::new(p.mesh),
-                                paint_tri: Vec::new(),
-                                painted: false,
                             })
                             .collect();
                         let mut obj =
@@ -2230,8 +2102,6 @@ impl App {
                     mesh: Arc::clone(&p.mesh),
                     display: Arc::clone(&p.display),
                     paint: p.paint,
-                    paint_tri: p.paint_tri.clone(),
-                    painted: p.painted,
                 })
                 .collect(),
             rot_deg: src.rot_deg,
@@ -2241,6 +2111,42 @@ impl App {
         self.objects.push(copy);
         self.selected = Some(self.objects.len() - 1);
         self.scene_dirty();
+    }
+
+    /// Split every part of the selected object into its connected components —
+    /// separate solids in one mesh (the goose's two feet in "Legs.stl") become
+    /// their own parts, each independently colorable. Single-body parts are
+    /// left as-is; a part's paint carries to all its bodies.
+    fn split_selected_parts(&mut self) {
+        let Some(i) = self.selected else { return };
+        let mut new_parts: Vec<ScenePart> = Vec::new();
+        let mut gained = 0usize;
+        for part in std::mem::take(&mut self.objects[i].parts) {
+            let bodies = part.mesh.split_connected();
+            if bodies.len() <= 1 {
+                new_parts.push(part);
+                continue;
+            }
+            gained += bodies.len() - 1;
+            let stem = mesh_name_stem(&part.name);
+            let base = if stem.is_empty() { "part".to_string() } else { stem.to_string() };
+            for (k, body) in bodies.into_iter().enumerate() {
+                new_parts.push(ScenePart {
+                    name: format!("{base} {}", k + 1),
+                    display: Arc::new(body.display_mesh()),
+                    mesh: Arc::new(body),
+                    paint: part.paint,
+                });
+            }
+        }
+        let count = new_parts.len();
+        self.objects[i].parts = new_parts;
+        if gained > 0 {
+            self.scene_dirty();
+            self.status = format!("Split ‘{}’ into {count} parts", self.objects[i].name);
+        } else {
+            self.status = "Nothing to split — every part is already a single body".into();
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -2466,45 +2372,6 @@ impl App {
     /// paint, in that bed's local coordinates (the engine plans in [0, bed]
     /// space). Tools and blend weights clamp to the machine's slot count
     /// here (see `paint_engine`).
-    /// Dedup a per-triangle `PartColor` list into a compact `(face, paints)`
-    /// palette for `PartPaint::Painted`: `face[t]` indexes `paints`.
-    fn face_paints(&self, paint_tri: &[PartColor]) -> (Vec<u32>, Vec<engine::FacePaint>) {
-        let mut order: Vec<PartColor> = Vec::new();
-        let face: Vec<u32> = paint_tri
-            .iter()
-            .map(|&pc| match order.iter().position(|&x| x == pc) {
-                Some(i) => i as u32,
-                None => {
-                    order.push(pc);
-                    (order.len() - 1) as u32
-                }
-            })
-            .collect();
-        let paints = order.iter().map(|&pc| self.face_paint_engine(pc)).collect();
-        (face, paints)
-    }
-
-    /// One face's paint in engine terms — the [`Self::paint_engine`] rule, but
-    /// yielding an [`engine::FacePaint`].
-    fn face_paint_engine(&self, paint: PartColor) -> engine::FacePaint {
-        let cap = self.settings.tool_count.saturating_sub(1) as u32;
-        match paint {
-            PartColor::Tool(t) => engine::FacePaint::Tool(t.min(cap)),
-            PartColor::Blend(b) => {
-                let weights: Vec<(u32, f64)> = self
-                    .blends
-                    .get(b)
-                    .map(|bl| self.valid_weights(bl).into_iter().map(|(t, w)| (t, w as f64)).collect())
-                    .unwrap_or_default();
-                if weights.is_empty() {
-                    engine::FacePaint::Tool(0)
-                } else {
-                    engine::FacePaint::Blend(weights)
-                }
-            }
-        }
-    }
-
     fn baked_parts(&self) -> Vec<(mesh::Mesh, engine::PartPaint)> {
         let ox = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
         let mut out: Vec<(mesh::Mesh, engine::PartPaint)> = Vec::new();
@@ -2512,16 +2379,6 @@ impl App {
             let mut t = obj.transform();
             t.translation[0] -= ox;
             for part in &obj.parts {
-                // A painted part bakes its placement via `transformed` (triangles
-                // stay 1:1, so `paint_tri` stays aligned) and slices per-face.
-                if part.painted && part.paint_tri.len() == part.mesh.triangles.len() {
-                    let baked = part.mesh.transformed(&t);
-                    if !baked.triangles.is_empty() {
-                        let (face, paints) = self.face_paints(&part.paint_tri);
-                        out.push((baked, engine::PartPaint::Painted { face, paints }));
-                    }
-                    continue;
-                }
                 let mut tris: Vec<[[f64; 3]; 3]> = Vec::with_capacity(part.mesh.triangles.len());
                 for i in 0..part.mesh.triangles.len() {
                     let tri = part.mesh.triangle(i);
@@ -2960,11 +2817,93 @@ impl App {
         });
     }
 
+    /// Geometry for the selection spotlight: a translucent gradient band on the
+    /// bed (z=0) that hugs the selected object's footprint — brightest at the
+    /// silhouette, fading out into the bed. Returned as `[x,y,z,r,g,b,a]` verts
+    /// (a triangle soup). Empty when nothing is selected. Uses the convex hull
+    /// of the object's world-projected vertices: a clean single loop, cheap
+    /// enough to rebuild on every drag/rotate frame (same order as the mesh
+    /// upload that already walks these vertices).
+    fn selection_spotlight(&self) -> Vec<[f32; 7]> {
+        let Some(i) = self.selected else { return Vec::new() };
+        let Some(obj) = self.objects.get(i) else { return Vec::new() };
+        let t = obj.transform();
+        let mut pts: Vec<[f64; 2]> = Vec::new();
+        for v in obj.parts.iter().flat_map(|p| &p.mesh.vertices) {
+            let w = t.apply(*v);
+            pts.push([w[0], w[1]]);
+        }
+        let hull = convex_hull_2d(pts);
+        let n = hull.len();
+        if n < 3 {
+            return Vec::new();
+        }
+
+        // Outward vertex normals: the average of the two adjacent edges'
+        // outward normals. In a CCW loop an edge a→b's outward normal is
+        // (dy, -dx). Averaging gives a miter direction with no corner spikes.
+        let edge_n = |a: [f64; 2], b: [f64; 2]| {
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+            [d[1] / l, -d[0] / l]
+        };
+        let mut nrm = vec![[0.0f64; 2]; n];
+        for k in 0..n {
+            let n0 = edge_n(hull[(k + n - 1) % n], hull[k]);
+            let n1 = edge_n(hull[k], hull[(k + 1) % n]);
+            let s = [n0[0] + n1[0], n0[1] + n1[1]];
+            let l = (s[0] * s[0] + s[1] * s[1]).sqrt();
+            nrm[k] = if l < 1e-6 { n1 } else { [s[0] / l, s[1] / l] };
+        }
+
+        // Pool width scales with the footprint, clamped to a sane range.
+        let (mut mnx, mut mny, mut mxx, mut mxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for p in &hull {
+            mnx = mnx.min(p[0]);
+            mny = mny.min(p[1]);
+            mxx = mxx.max(p[0]);
+            mxy = mxy.max(p[1]);
+        }
+        let diag = ((mxx - mnx).powi(2) + (mxy - mny).powi(2)).sqrt();
+        let width = (diag * 0.18).clamp(12.0, 45.0);
+
+        // Warm accent glow (the same "accent proper" the old highlight used).
+        let (_, col) = mesh_tints(self.accent);
+        // Concentric rings offset outward from the silhouette; alpha → 0.
+        let rings: [(f64, f32); 3] = [(0.0, 0.55), (width * 0.4, 0.20), (width, 0.0)];
+        let ring_at = |r: f64| -> Vec<[f64; 2]> {
+            (0..n).map(|k| [hull[k][0] + nrm[k][0] * r, hull[k][1] + nrm[k][1] * r]).collect()
+        };
+        let ring_pts: Vec<Vec<[f64; 2]>> = rings.iter().map(|&(r, _)| ring_at(r)).collect();
+
+        let vert = |p: [f64; 2], a: f32| -> [f32; 7] {
+            [p[0] as f32, p[1] as f32, 0.0, col[0], col[1], col[2], a]
+        };
+        let mut out: Vec<[f32; 7]> = Vec::new();
+        for b in 0..rings.len() - 1 {
+            let (inner, ai) = (&ring_pts[b], rings[b].1);
+            let (outer, ao) = (&ring_pts[b + 1], rings[b + 1].1);
+            for k in 0..n {
+                let k2 = (k + 1) % n;
+                let i0 = vert(inner[k], ai);
+                let i1 = vert(inner[k2], ai);
+                let o0 = vert(outer[k], ao);
+                let o1 = vert(outer[k2], ao);
+                out.extend_from_slice(&[i0, i1, o1, i0, o1, o0]);
+            }
+        }
+        out
+    }
+
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         self.content_version += 1;
         let bx = self.settings.bed_size_x_mm as f32;
         let by = self.settings.bed_size_y_mm as f32;
         self.scene.set_beds(&rs.device, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
+        // Selection cue: a warm spotlight pool tracing the selected object's
+        // footprint on the bed (in place of a color tint on the model).
+        let spotlight = self.selection_spotlight();
+        self.scene.set_spotlight(&rs.device, &spotlight);
 
         // Refresh the world-bounds cache from the meshes (the one place that
         // walks vertices), then derive per-object state from it.
@@ -2992,42 +2931,20 @@ impl App {
         let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
         let multi = self.settings.tool_count > 1;
         let (unsel_tint, _) = mesh_tints(self.accent);
-        // Per-face colors for painted parts (owned, so `objs` can borrow them);
-        // one slot per part in iteration order, None for unpainted parts. Shown
-        // regardless of the single-vs-multi tool gate.
-        let palettes: Vec<Option<Vec<[f32; 3]>>> = self
-            .objects
-            .iter()
-            .flat_map(|o| &o.parts)
-            .map(|part| {
-                (part.painted && part.paint_tri.len() == part.mesh.triangles.len()).then(|| {
-                    part.paint_tri
-                        .iter()
-                        .map(|&pc| render::visible_against_backdrop(self.paint_display_rgb(pc)))
-                        .collect()
-                })
-            })
-            .collect();
-        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool, Option<&[[f32; 3]]>)> =
-            Vec::new();
-        let mut pi = 0;
+        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)> = Vec::new();
         for (i, o) in self.objects.iter().enumerate() {
             let t = o.transform();
             for part in &o.parts {
-                let face = palettes[pi].as_deref();
-                pi += 1;
-                // A painted part draws its RAW mesh (aligned to paint_tri and
-                // pick_face); otherwise the ghost-stripped display with the
-                // part's uniform tint.
-                let (mesh_ref, rgb) = if face.is_some() {
-                    (part.mesh.as_ref(), unsel_tint)
-                } else if multi {
+                let (mesh_ref, rgb) = if multi {
                     let rgb = render::visible_against_backdrop(self.paint_display_rgb(part.paint));
                     (part.display.as_ref(), rgb)
                 } else {
                     (part.display.as_ref(), unsel_tint)
                 };
-                objs.push((mesh_ref, t, rgb, self.selected == Some(i), blocked[i], face));
+                // Selection no longer recolors the model — it's shown by the
+                // spotlight pool on the bed (set_spotlight, below). Only the
+                // print-blocking warning still tints a part.
+                objs.push((mesh_ref, t, rgb, false, blocked[i]));
             }
         }
         let bounds = self.scene.set_mesh(&rs.device, &objs);
@@ -3356,90 +3273,6 @@ impl eframe::App for App {
 
             ui.separator();
 
-            // Objects & parts: the active bed's manifest. A row selects its
-            // object; on a toolchanger each part row assigns the tool that
-            // prints it. An inline ScrollArea, NOT a floating Area (bottom-
-            // pivoted Areas feed back their own rect — see the messages pane).
-            let bed_objects: Vec<usize> = (0..self.objects.len())
-                .filter(|&i| self.bed_of(&self.objects[i]) == self.active_bed)
-                .collect();
-            if !bed_objects.is_empty() {
-                let multi = self.settings.tool_count > 1;
-                let tool_opts: Vec<([f32; 3], String)> = (0..self.settings.tool_count)
-                    .map(|t| {
-                        let ts = self.settings.tool(t);
-                        (ts.color_rgb, ts.filament_name.clone())
-                    })
-                    .collect();
-                // Blend entries ride the same pickers: mixed swatch + name.
-                let blend_opts: Vec<([f32; 3], String)> = (0..self.blends.len())
-                    .map(|b| (self.paint_display_rgb(PartColor::Blend(b)), self.blends[b].name.clone()))
-                    .collect();
-                let mut select: Option<usize> = None;
-                let mut assign: Option<(usize, usize, PartColor)> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("outliner")
-                    .max_height(132.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for &i in &bed_objects {
-                            let obj = &self.objects[i];
-                            if ui
-                                .selectable_label(self.selected == Some(i), elide(&obj.name, 34))
-                                .on_hover_text("Select this object (its transform card opens in the view).")
-                                .clicked()
-                            {
-                                select = Some(i);
-                            }
-                            if multi {
-                                for (j, part) in obj.parts.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(16.0);
-                                        let (dot, _) = ui.allocate_exact_size(
-                                            egui::vec2(10.0, 10.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        let c = paint_rgb_from(&tool_opts, &blend_opts, part.paint);
-                                        ui.painter().circle_filled(dot.center(), 5.0, rgb32(c));
-                                        ui.scope(|ui| {
-                                            ui.set_width(150.0);
-                                            let name = if part.name.is_empty() {
-                                                format!("part {}", j + 1)
-                                            } else {
-                                                part.name.clone()
-                                            };
-                                            ui.add(egui::Label::new(elide(&name, 22)).truncate());
-                                        });
-                                        if let Some(p) = paint_combo(
-                                            ui,
-                                            ("outliner_tool", i, j),
-                                            part.paint,
-                                            &tool_opts,
-                                            &blend_opts,
-                                        ) {
-                                            assign = Some((i, j, p));
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    });
-                if let Some(i) = select {
-                    self.selected = Some(i);
-                    self.needs_rebuild = true; // selection highlight
-                }
-                if let Some((i, j, p)) = assign {
-                    self.objects[i].parts[j].paint = p;
-                    // The plan is stale (paths carry tools); the tint refresh
-                    // rides the rebuild, which bumps content_version.
-                    self.sliced = None;
-                    self.slice_summary = None;
-                    self.view_preview = false;
-                    self.needs_rebuild = true;
-                }
-                ui.separator();
-            }
-
             let printers: Vec<String> = self.profiles.printer_names().iter().map(|s| s.to_string()).collect();
             let processes: Vec<String> = self.profiles.process_names().iter().map(|s| s.to_string()).collect();
             let dirty = self.tier_dirty_masked();
@@ -3656,77 +3489,6 @@ impl eframe::App for App {
                     self.view_preview = true;
                 }
             });
-            // Paint: brush per-face tool colors onto the model (Model view only).
-            if !self.view_preview {
-                ui.add_space(2.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 24.0],
-                        egui::Button::selectable(self.paint_mode, "🖌 Paint faces"),
-                    )
-                    .on_hover_text(
-                        "Brush tool colors onto the surface. Drag to paint a disc; turn on \
-                         Fill region to flood-fill up to sharp edges. Painted regions slice \
-                         on their tool — one continuous wall that changes color at the seam.",
-                    )
-                    .clicked()
-                {
-                    self.paint_mode = !self.paint_mode;
-                    if self.paint_mode {
-                        self.selected = None;
-                    }
-                }
-                if self.paint_mode {
-                    // Swatches: every tool, then every blend — brush any of them.
-                    let mut sel: Option<PartColor> = None;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                        let swatch = |ui: &mut egui::Ui, rgb: [f32; 3], selected: bool, tip: String| -> bool {
-                            let col = egui::Color32::from_rgb(
-                                (rgb[0] * 255.0) as u8,
-                                (rgb[1] * 255.0) as u8,
-                                (rgb[2] * 255.0) as u8,
-                            );
-                            let (r, resp) =
-                                ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                            ui.painter().rect_filled(r, 4.0, col);
-                            if selected {
-                                ui.painter().rect_stroke(
-                                    r.expand(1.0),
-                                    5.0,
-                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                                    egui::StrokeKind::Outside,
-                                );
-                            }
-                            resp.on_hover_text(tip).clicked()
-                        };
-                        for t in 0..self.settings.tool_count as u32 {
-                            let pc = PartColor::Tool(t);
-                            let rgb = self.paint_display_rgb(pc);
-                            if swatch(ui, rgb, self.brush_paint == pc, format!("Paint tool T{t}")) {
-                                sel = Some(pc);
-                            }
-                        }
-                        for b in 0..self.blends.len() {
-                            let pc = PartColor::Blend(b);
-                            let rgb = self.paint_display_rgb(pc);
-                            let tip = format!("Paint blend: {}", self.blends[b].name);
-                            if swatch(ui, rgb, self.brush_paint == pc, tip) {
-                                sel = Some(pc);
-                            }
-                        }
-                    });
-                    if let Some(pc) = sel {
-                        self.brush_paint = pc;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("size");
-                        ui.add(egui::Slider::new(&mut self.brush_radius_mm, 0.5..=20.0).suffix(" mm"));
-                    });
-                    ui.checkbox(&mut self.fill_region, "Fill region")
-                        .on_hover_text("Click fills the whole contiguous surface up to sharp edges.");
-                }
-            }
             // The accent picker: one hue drives the whole 3D view (model
             // tint, feature palette, heat ramps). The mesh tints ride shader
             // uniforms and follow the picker live; the baked preview colors
@@ -4089,7 +3851,6 @@ impl eframe::App for App {
                                 // with the spool toggles in the editor.
                                 tools: Vec::new(),
                             });
-                            self.blend_edit = Some(self.blends.len() - 1);
                         }
                     });
                     let mut delete_blend: Option<usize> = None;
@@ -4102,7 +3863,7 @@ impl eframe::App for App {
                         .map(|b| blend_banding_for(tool_count, layer_h, band_mm, b))
                         .collect();
                     for (k, blend) in self.blends.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
+                        let edit_resp = ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 5.0;
                             // Mixed swatch — recomputed every frame, so weight
                             // drags recolor it live. No valid weights = neutral.
@@ -4142,17 +3903,12 @@ impl eframe::App for App {
                                 ui.set_width(150.0);
                                 ui.add(egui::Label::new(elide(&blend.name, 22)).truncate());
                             });
-                            // ✏/✖, the file's established edit/dismiss glyphs
-                            // (✎ and ✕ are missing from the default fonts —
-                            // they'd render as boxes, like "●" does).
-                            let editing = self.blend_edit == Some(k);
-                            if ui
-                                .small_button(if editing { "▾" } else { "✏" })
-                                .on_hover_text("Edit this blend's name and mix.")
-                                .clicked()
-                            {
-                                self.blend_edit = if editing { None } else { Some(k) };
-                            }
+                            // ✏ opens the editor popup; ✖ deletes. (✎ and ✕ are
+                            // missing from the default fonts — they'd render as
+                            // boxes, like "●" does.)
+                            let edit_btn = ui
+                                .small_button("✏")
+                                .on_hover_text("Edit this blend — its color, spools, and name.");
                             if ui
                                 .small_button("✖")
                                 .on_hover_text(
@@ -4163,23 +3919,28 @@ impl eframe::App for App {
                             {
                                 delete_blend = Some(k);
                             }
-                        });
-                        if self.blend_edit == Some(k) {
-                            ui.horizontal(|ui| {
-                                ui.add_space(16.0);
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut blend.name)
-                                        .desired_width(136.0)
-                                        .hint_text("name"),
-                                );
-                            });
+                            edit_btn
+                        })
+                        .inner;
+                        // The editor is a breakout popup off the ✏ button: name,
+                        // the spool selector, and the printable-mix chip palette.
+                        // Clicks inside (spool toggles, chips) keep it open — only
+                        // a click outside dismisses it.
+                        egui::Popup::menu(&edit_resp)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                            ui.set_max_width(300.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut blend.name)
+                                    .desired_width(180.0)
+                                    .hint_text("name"),
+                            );
                             // The blend's own sub-palette: which spools it draws
                             // from. The mix surface follows THIS count — narrow
                             // an eight-tool machine to two spools and you get the
                             // ramp back, three the triangle.
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.add_space(16.0);
                                 for t in 0..tool_count as u32 {
                                     let inside =
                                         blend.tools.is_empty() || blend.tools.contains(&t);
@@ -4253,162 +4014,58 @@ impl eframe::App for App {
                             };
                             // The palette: every color the chosen spools can
                             // dither to within the band, one chip per whole-layer
-                            // recipe. It opens in a popup off a swatch button —
-                            // like a tool's color picker — so the editor stays
-                            // compact even when the grid is large.
+                            // recipe — click a chip to set this blend's color.
                             let lat = config::blend_lattice(&sub_colors, dither_cycle, 2000);
-                            let cur = {
-                                let entries: Vec<([f32; 3], f32)> = blend
-                                    .weights
-                                    .iter()
-                                    .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
-                                    .map(|&(t, w)| (slot_colors[t as usize], w))
-                                    .collect();
-                                if entries.is_empty() {
-                                    config::NEUTRAL_FILAMENT_RGB
-                                } else {
-                                    config::mix_colors_linear(&entries)
+                            if let Some(lat) = &lat {
+                                if let Some(w) =
+                                    lattice_chips(ui, lat, &participants, &blend.weights)
+                                {
+                                    blend.weights = w;
+                                    weights_edited = Some(k);
                                 }
-                            };
-                            let palette_btn = ui
-                                .horizontal(|ui| {
-                                    ui.add_space(16.0);
-                                    let (sw, _) = ui.allocate_exact_size(
-                                        egui::vec2(16.0, 16.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(sw, 3.0, rgb32(cur));
-                                    ui.button("colors…")
-                                        .on_hover_text("Pick this blend's color from the printable-mix palette.")
-                                })
-                                .inner;
-                            egui::Popup::menu(&palette_btn).show(|ui| {
-                                ui.set_max_width(260.0);
-                                if let Some(lat) = &lat {
-                                    if let Some(w) =
-                                        lattice_chips(ui, lat, &participants, &blend.weights)
-                                    {
-                                        blend.weights = w;
-                                        weights_edited = Some(k);
-                                    }
-                                } else {
-                                    // Too many mixes to lay out: pick-and-snap —
-                                    // choose any color, land on the nearest mix.
-                                    let mut rgb8 = [
-                                        (cur[0] * 255.0).round() as u8,
-                                        (cur[1] * 255.0).round() as u8,
-                                        (cur[2] * 255.0).round() as u8,
-                                    ];
-                                    if ui
-                                        .color_edit_button_srgb(&mut rgb8)
-                                        .on_hover_text(
-                                            "Too many printable mixes to lay out as swatches — \
-                                             pick any color; it snaps to the nearest mix this \
-                                             blend's spools can dither to.",
-                                        )
-                                        .changed()
-                                    {
-                                        let target = [
-                                            rgb8[0] as f32 / 255.0,
-                                            rgb8[1] as f32 / 255.0,
-                                            rgb8[2] as f32 / 255.0,
-                                        ];
-                                        blend.weights = apply(&config::blend_weights_for_color(
-                                            target,
-                                            &sub_colors,
-                                        ));
-                                        weights_edited = Some(k);
-                                    }
-                                }
-                            });
-                            // One row per CHOSEN spool: parts (relative shares,
-                            // not percentages). 0 keeps the spool, drops its share.
-                            for &pt in &participants {
-                                let (t, slot_rgb) = (pt as usize, slot_colors[pt as usize]);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
-                                    ui.add_space(16.0);
-                                    let (dot, _) = ui
-                                        .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                                    ui.painter().circle_filled(dot.center(), 5.0, rgb32(slot_rgb));
-                                    ui.label(format!("T{t}"));
-                                    let mut w = blend
+                            } else {
+                                // Too many mixes to lay out: pick-and-snap —
+                                // choose any color, land on the nearest mix.
+                                let cur = {
+                                    let entries: Vec<([f32; 3], f32)> = blend
                                         .weights
                                         .iter()
-                                        .find(|&&(bt, _)| bt as usize == t)
-                                        .map(|&(_, w)| w)
-                                        .unwrap_or(0.0);
-                                    if ui
-                                        .add(egui::DragValue::new(&mut w).speed(1.0).range(0.0..=100.0))
-                                        .on_hover_text(
-                                            "This slot's share of the mix (relative parts — the \
-                                             picker writes whole layers of the dither cycle). \
-                                             0 drops the slot.",
-                                        )
-                                        .changed()
-                                    {
-                                        blend.weights.retain(|&(bt, _)| bt as usize != t);
-                                        if w > 0.0 {
-                                            blend.weights.push((t as u32, w));
-                                        }
-                                        // Slot order keeps the engine's dither
-                                        // deterministic (ties go to the earliest-
-                                        // listed tool).
-                                        blend.weights.sort_by_key(|&(bt, _)| bt);
-                                        weights_edited = Some(k);
-                                    }
-                                });
-                            }
-                            // The realized repeat, loud when it outgrows the
-                            // band: picker-made mixes fit BY CONSTRUCTION at the
-                            // layer height they were picked under — a later
-                            // layer-height (or band) change re-judges them here,
-                            // live, and "fit band" re-snaps to the new cycle.
-                            let valid: Vec<(u32, f32)> = blend
-                                .weights
-                                .iter()
-                                .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
-                                .copied()
-                                .collect();
-                            if valid.len() > 1 {
-                                let period = config::blend_repeat_layers(&valid);
-                                let height = period as f64 * layer_h;
-                                ui.horizontal(|ui| {
-                                    ui.add_space(16.0);
-                                    if height <= band_mm + 1e-6 {
-                                        ui.weak(format!("cycle: {period} layers · {height:.1} mm"));
+                                        .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
+                                        .map(|&(t, w)| (slot_colors[t as usize], w))
+                                        .collect();
+                                    if entries.is_empty() {
+                                        config::NEUTRAL_FILAMENT_RGB
                                     } else {
-                                        // Terse: the fit-band button must still fit
-                                        // the 320 px panel beside this label.
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(0xC8, 0x8A, 0x4B),
-                                            format!("bands: repeats {height:.1} mm"),
-                                        )
-                                        .on_hover_text(format!(
-                                            "The dither repeats every {height:.1} mm at this \
-                                             layer height — past the {band_mm:.1} mm blend band, \
-                                             so it prints as stripes, not a color."
-                                        ));
-                                        if ui
-                                            .small_button("fit band")
-                                            .on_hover_text(
-                                                "Re-snap to the nearest mix the band affords at \
-                                                 the current layer height (the color moves to the \
-                                                 closest printable one).",
-                                            )
-                                            .clicked()
-                                        {
-                                            let mut frac = vec![0.0f32; tool_count];
-                                            for &(t, w) in &valid {
-                                                frac[t as usize] = w;
-                                            }
-                                            blend.weights = snap_weights(&frac, dither_cycle);
-                                            weights_edited = Some(k);
-                                        }
+                                        config::mix_colors_linear(&entries)
                                     }
-                                });
+                                };
+                                let mut rgb8 = [
+                                    (cur[0] * 255.0).round() as u8,
+                                    (cur[1] * 255.0).round() as u8,
+                                    (cur[2] * 255.0).round() as u8,
+                                ];
+                                if ui
+                                    .color_edit_button_srgb(&mut rgb8)
+                                    .on_hover_text(
+                                        "Too many printable mixes to lay out as swatches — \
+                                         pick any color; it snaps to the nearest mix this \
+                                         blend's spools can dither to.",
+                                    )
+                                    .changed()
+                                {
+                                    let target = [
+                                        rgb8[0] as f32 / 255.0,
+                                        rgb8[1] as f32 / 255.0,
+                                        rgb8[2] as f32 / 255.0,
+                                    ];
+                                    blend.weights = apply(&config::blend_weights_for_color(
+                                        target,
+                                        &sub_colors,
+                                    ));
+                                    weights_edited = Some(k);
+                                }
                             }
-                        }
+                        });
                     }
                     if let Some(k) = delete_blend {
                         // Parts painted with it fall back to its heaviest valid
@@ -4431,11 +4088,6 @@ impl eframe::App for App {
                                 _ => {}
                             }
                         }
-                        self.blend_edit = match self.blend_edit {
-                            Some(e) if e == k => None,
-                            Some(e) if e > k => Some(e - 1),
-                            e => e,
-                        };
                         // Same invalidation as a tool reassignment — only when a
                         // part actually changed paint (index shifts are identity).
                         if repainted {
@@ -4469,8 +4121,8 @@ impl eframe::App for App {
                     // The per-slot edit surface — identical shape at every
                     // tool count (a single-tool machine is a one-slot
                     // toolchanger here): tab dots, the slot row, the card
-                    // rows. The tabs share `active_tool_tab` with Cooling
-                    // below. Data still flows the old way underneath: on a
+                    // rows (temps/flow, then the cooling fans). Data still
+                    // flows the old way underneath: on a
                     // toolchanger every row binds the active slot only (the
                     // flat fields are just the tool-0 mirror, see
                     // `refresh_tool0`, so a save can never write one profile
@@ -4596,33 +4248,19 @@ impl eframe::App for App {
                         } else {
                             FilamentBaseline::flat(&self.baseline)
                         };
+                        // Cooling rides the filament card now (no separate
+                        // section): part-fan duties are filament-tier facts,
+                        // per material/spool, bound to the same active tab.
+                        let (aux, exhaust) = (s.has_aux_fan, s.has_exhaust_fan);
                         if s.tool_count > 1 {
                             filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, true, line_w, layer_h, cal);
+                            ui.separator();
+                            cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, aux, exhaust);
                         } else {
                             filament_card_rows(ui, FilamentFields::flat(s), &fb, false, line_w, layer_h, cal);
+                            ui.separator();
+                            cooling_rows(ui, FilamentFields::flat(s), &fb, aux, exhaust);
                         }
-                    }
-                });
-                tier_section(ui, "Cooling", TierKind::Filament, false, |ui| {
-                    let (aux, exhaust) = (s.has_aux_fan, s.has_exhaust_fan);
-                    // Bound to the same tab as the Filament card above —
-                    // labeled at every tool count, same shape throughout.
-                    let tab = self.active_tool_tab.min(s.tools.len().saturating_sub(1));
-                    let name = self.tools.get(tab).cloned().unwrap_or_default();
-                    ui.weak(format!("T{tab} · {}", elide(&name, 18)));
-                    let fb = if s.tool_count > 1 {
-                        self.baseline
-                            .tools
-                            .get(tab)
-                            .map(FilamentBaseline::tool)
-                            .unwrap_or_else(|| FilamentBaseline::flat(&self.baseline))
-                    } else {
-                        FilamentBaseline::flat(&self.baseline)
-                    };
-                    if s.tool_count > 1 {
-                        cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, aux, exhaust);
-                    } else {
-                        cooling_rows(ui, FilamentFields::flat(s), &fb, aux, exhaust);
                     }
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
@@ -4908,24 +4546,8 @@ impl eframe::App for App {
                 || over(self.print_overlay_rect)
                 || over(self.msgs_overlay_rect);
 
-            // Paint mode intercepts the primary button to brush faces; object
-            // move / orbit / selection are suppressed while it is on. Secondary
-            // drag (pan) and scroll (zoom) still navigate.
-            if edit && self.paint_mode {
-                if !blocked
-                    && (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
-                {
-                    if let Some(p) = response.interact_pointer_pos() {
-                        let (o, d) = pointer_ray(vp, rect, p);
-                        if let Some((oi, part, tri, hit)) = self.pick_face(o, d) {
-                            self.paint_at(oi, part, tri, hit, o);
-                        }
-                    }
-                }
-            }
-
             // Left-press on an object grabs it for dragging; on empty space, orbits.
-            if edit && !blocked && !self.paint_mode && response.drag_started_by(egui::PointerButton::Primary) {
+            if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
@@ -4940,7 +4562,7 @@ impl eframe::App for App {
                     }
                 }
             }
-            if !self.paint_mode && response.dragged_by(egui::PointerButton::Primary) {
+            if response.dragged_by(egui::PointerButton::Primary) {
                 match self.drag_obj {
                     Some(i) => {
                         if let Some(p) = response.interact_pointer_pos() {
@@ -4972,7 +4594,7 @@ impl eframe::App for App {
             // A plain click selects the object under the cursor (its bed
             // becomes active), or — on empty space — deselects and activates
             // the bed nearest the click.
-            if edit && !blocked && !self.paint_mode && response.clicked() {
+            if edit && !blocked && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
                     self.selected = self.pick(o, d);
@@ -5237,7 +4859,7 @@ impl eframe::App for App {
             if let (Some(i), false) = (self.selected, self.view_preview) {
                 let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
                 let mut changed = false;
-                let (mut dup, mut del) = (false, false);
+                let (mut dup, mut del, mut split) = (false, false, false);
                 // Checked before the mutable borrow below (reads the cache).
                 let problem = self.obj_problem(i);
                 // Tool + blend tables snapshotted before the closure mutably
@@ -5341,6 +4963,17 @@ impl eframe::App for App {
                                             }
                                         });
                                     }
+                                    if ui
+                                        .small_button("Split multi-body parts")
+                                        .on_hover_text(
+                                            "Break any part that is several separate solids (two \
+                                             feet exported in one mesh, say) into one part per \
+                                             solid, so each can take its own color.",
+                                        )
+                                        .clicked()
+                                    {
+                                        split = true;
+                                    }
                                 }
                                 ui.separator();
                                 ui.horizontal(|ui| {
@@ -5372,6 +5005,9 @@ impl eframe::App for App {
                 }
                 if dup {
                     self.duplicate_selected();
+                }
+                if split {
+                    self.split_selected_parts();
                 }
                 if del {
                     self.delete_selected();
@@ -5813,6 +5449,19 @@ fn elide(s: &str, n: usize) -> String {
     }
 }
 
+/// A part name minus a trailing mesh-file extension (case-insensitive) — Bambu/
+/// Orca store parts as e.g. "Beak.stl", so the stem is "Beak". Used to spot the
+/// merged-object name that just echoes the first part.
+fn mesh_name_stem(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    for ext in [".stl", ".obj", ".3mf", ".step", ".stp", ".ply", ".gltf", ".glb"] {
+        if lower.ends_with(ext) {
+            return &name[..name.len() - ext.len()];
+        }
+    }
+    name
+}
+
 /// Display color for a paint from the snapshotted option tables (used where
 /// the object is mutably borrowed): tool rows clamp to the last slot, a
 /// dangling blend index reads the neutral grey.
@@ -5885,20 +5534,6 @@ fn pattern_combo(ui: &mut egui::Ui, label: &str, current: &mut config::InfillPat
         .response
 }
 
-/// Solver fractions → stored blend weights: whole LAYERS of the dither
-/// cycle (largest-remainder), zeros dropped, slot order preserved (the
-/// engine's tie-break wants stable order). Storing the layer counts keeps
-/// the blend honest — its repeat height is sum/gcd × layer height by
-/// construction, within the blend band.
-fn snap_weights(fractions: &[f32], cycle: usize) -> Vec<(u32, f32)> {
-    config::quantize_blend_fractions(fractions, cycle)
-        .into_iter()
-        .enumerate()
-        .filter(|&(_, n)| n > 0)
-        .map(|(t, n)| (t as u32, n as f32))
-        .collect()
-}
-
 /// The printable palette as clickable swatches — THE mix picker, at every
 /// spool count (a continuous surface is only honest through three colors,
 /// and the band makes the real palette finite anyway, so show it outright).
@@ -5929,15 +5564,20 @@ fn lattice_chips(
         reduce(v)
     };
     let mut picked = None;
+    let mut sel_rgb: Option<[f32; 3]> = None;
+    let mut hov_rgb: Option<[f32; 3]> = None;
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        // A big palette (many spools / fine layers) scrolls in place instead of
-        // shoving the panel down — the whole grid stays reachable. The height is
-        // capped; a small palette shrinks to fit.
+        // A fixed, roomy height (about the spool color picker's): the grid fills
+        // it and renders from the top; a big palette scrolls in place.
+        let grid_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(grid_w, 300.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
         egui::ScrollArea::vertical()
             .id_salt("blend_chips")
-            .max_height(240.0)
-            .auto_shrink([false, true])
+            .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
@@ -5948,6 +5588,7 @@ fn lattice_chips(
                 let is_current =
                     reduce(comp.iter().map(|&n| n as u64).collect()) == cur_key;
                 if is_current {
+                    sel_rgb = Some(*rgb);
                     ui.painter().rect_stroke(
                         rect.expand(1.5),
                         3.0,
@@ -5962,6 +5603,9 @@ fn lattice_chips(
                     .map(|(i, &n)| format!("{n}·T{}", slot_ids[i]))
                     .collect();
                 let resp = resp.on_hover_text(format!("{} layers", recipe.join(" + ")));
+                if resp.hovered() {
+                    hov_rgb = Some(*rgb);
+                }
                 if resp.clicked() {
                     picked = Some(
                         comp.iter()
@@ -5974,6 +5618,27 @@ fn lattice_chips(
             }
         });
             });
+        });
+    });
+    // Hex readout: the hovered chip's exact printable color, falling back to
+    // the selected one. The row is ALWAYS present at the same size — even when
+    // nothing resolves — so hovering a chip only swaps the text; it never adds
+    // the row and grows the popup, which egui would then reposition, shoving
+    // the chips above it (the "chips move on hover" jitter).
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        let (sw, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        match hov_rgb.or(sel_rgb) {
+            Some(rgb) => {
+                ui.painter().rect_filled(sw, 2.0, rgb32(rgb));
+                ui.monospace(config::hex_color(rgb));
+            }
+            // No color yet: reserve the identical footprint (7-char hex width
+            // and line height) so the layout is byte-for-byte stable.
+            None => {
+                ui.monospace("       ");
+            }
+        }
     });
     picked
 }

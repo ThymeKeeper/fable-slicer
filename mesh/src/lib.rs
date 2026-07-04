@@ -103,6 +103,72 @@ impl Mesh {
         Mesh { vertices, triangles }
     }
 
+    /// Split into connected components — triangles that share a vertex land in
+    /// the same body. Returns one re-indexed mesh per component, in order of
+    /// first appearance; a single-body mesh (or an empty one) yields at most a
+    /// one-element Vec. Connectivity is by shared vertex INDEX, which is exactly
+    /// right for indexed meshes (3MF) and for `from_triangle_soup` output (it
+    /// welds coincident vertices), so two separate solids in one file — the two
+    /// feet of a "Legs.stl" — come apart cleanly.
+    pub fn split_connected(&self) -> Vec<Mesh> {
+        let nv = self.vertices.len();
+        if self.triangles.is_empty() {
+            return Vec::new();
+        }
+        // Union-find over vertices with path halving.
+        let mut parent: Vec<u32> = (0..nv as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
+            }
+            x
+        }
+        let union = |parent: &mut [u32], a: u32, b: u32| {
+            let (ra, rb) = (find(parent, a), find(parent, b));
+            if ra != rb {
+                parent[ra as usize] = rb;
+            }
+        };
+        for t in &self.triangles {
+            union(&mut parent, t[0], t[1]);
+            union(&mut parent, t[1], t[2]);
+        }
+        // Assign each component a dense index in first-appearance order.
+        let mut comp_index: HashMap<u32, usize> = HashMap::new();
+        let mut tri_comp: Vec<usize> = Vec::with_capacity(self.triangles.len());
+        for t in &self.triangles {
+            let r = find(&mut parent, t[0]);
+            let next = comp_index.len();
+            let ci = *comp_index.entry(r).or_insert(next);
+            tri_comp.push(ci);
+        }
+        let ncomp = comp_index.len();
+        if ncomp <= 1 {
+            return vec![self.clone()];
+        }
+        // Rebuild each body with its own vertices. A vertex belongs to exactly
+        // one component (a shared vertex would have merged them), so one global
+        // remap suffices.
+        let mut out: Vec<Mesh> =
+            (0..ncomp).map(|_| Mesh { vertices: Vec::new(), triangles: Vec::new() }).collect();
+        let mut remap = vec![u32::MAX; nv];
+        for (ti, t) in self.triangles.iter().enumerate() {
+            let mesh = &mut out[tri_comp[ti]];
+            let mut nt = [0u32; 3];
+            for k in 0..3 {
+                let v = t[k] as usize;
+                if remap[v] == u32::MAX {
+                    remap[v] = mesh.vertices.len() as u32;
+                    mesh.vertices.push(self.vertices[v]);
+                }
+                nt[k] = remap[v];
+            }
+            mesh.triangles.push(nt);
+        }
+        out
+    }
+
     /// A DISPLAY-ONLY copy without the faces that render as artifacts:
     /// zero-area triangles and GHOST faces — surface with the same winding
     /// number on both sides, bounding no material. That covers every
@@ -537,6 +603,32 @@ mod tests {
         assert_eq!(d.triangles.len(), 12, "only the cube's faces are displayed");
         assert_eq!(d.z_bounds(), Some((0.0, 1.0)), "the fin crest must not stretch display bounds");
         assert_eq!(m.z_bounds(), Some((0.0, 2.0)), "the raw mesh is untouched");
+    }
+
+    #[test]
+    fn split_connected_separates_disjoint_solids() {
+        // One cube is a single body; two cubes 10 mm apart are two.
+        let one = Mesh::cube(1.0);
+        assert_eq!(one.split_connected().len(), 1, "a lone cube is one body");
+
+        let mut two = Mesh::cube(1.0);
+        let mut far = Mesh::cube(1.0);
+        for v in &mut far.vertices {
+            v[0] += 10.0;
+        }
+        two.append(&far);
+        let bodies = two.split_connected();
+        assert_eq!(bodies.len(), 2, "two disjoint cubes split into two bodies");
+        // Every body is a whole, re-indexed cube — nothing lost or shared.
+        for b in &bodies {
+            assert_eq!(b.triangles.len(), 12, "each body keeps its 12 cube faces");
+            assert_eq!(b.vertices.len(), 8, "each body re-indexes to its own 8 verts");
+            for t in &b.triangles {
+                assert!(t.iter().all(|&idx| (idx as usize) < b.vertices.len()), "indices in range");
+            }
+        }
+        let total: usize = bodies.iter().map(|b| b.triangles.len()).sum();
+        assert_eq!(total, two.triangles.len(), "no triangle dropped or duplicated");
     }
 
     #[test]

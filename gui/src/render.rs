@@ -104,6 +104,21 @@ struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f3
     return vec4<f32>(i.color, 1.0);
 }
 
+// --- selection spotlight: a translucent gradient pool laid on z=0 that traces
+// the selected object's footprint. Straight (non-premultiplied) RGBA per vertex;
+// alpha fades from the silhouette outward. Depth is ignored (it paints over the
+// grid) but it is drawn before the opaque mesh, so the object overdraws its core. ---
+struct GlowOut { @builtin(position) clip: vec4<f32>, @location(0) rgba: vec4<f32> };
+@vertex fn vs_glow(@location(0) p: vec3<f32>, @location(1) rgba: vec4<f32>) -> GlowOut {
+    var o: GlowOut;
+    o.clip = u.mvp * vec4<f32>(p, 1.0);
+    o.rgba = rgba;
+    return o;
+}
+@fragment fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
+    return i.rgba;
+}
+
 // --- toolpath beads (instanced boxes) ---
 // base box vertex: lpos in (x:[0,1], y/z:[-0.5,0.5]); instance places/scales it.
 struct BeadOut {
@@ -212,6 +227,16 @@ struct LineVertex {
     color: [f32; 3],
 }
 
+/// A selection-spotlight vertex: a point on the bed plane and straight RGBA.
+/// Alpha carries the pool's falloff — opaque-ish at the selected object's
+/// footprint, fading to 0 at the outer rim.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GlowVertex {
+    pos: [f32; 3],
+    rgba: [f32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
@@ -256,6 +281,9 @@ pub struct Scene {
     mesh_count: u32,
     line_vbuf: Option<wgpu::Buffer>,
     line_count: u32,
+    glow_pipeline: wgpu::RenderPipeline,
+    glow_vbuf: Option<wgpu::Buffer>,
+    glow_count: u32,
     box_vbuf: wgpu::Buffer,
     box_count: u32,
     inst_vbuf: Option<wgpu::Buffer>,
@@ -341,6 +369,7 @@ impl Scene {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
             true,
+            wgpu::CompareFunction::Less,
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
@@ -352,6 +381,7 @@ impl Scene {
             wgpu::PrimitiveTopology::LineList,
             wgpu::BlendState::REPLACE,
             true,
+            wgpu::CompareFunction::Less,
         );
         let bead_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_bead", "fs_bead",
@@ -370,6 +400,7 @@ impl Scene {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
             true,
+            wgpu::CompareFunction::Less,
         );
         let joint_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_joint", "fs_bead",
@@ -388,6 +419,7 @@ impl Scene {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
             true,
+            wgpu::CompareFunction::Less,
         );
 
         // Bed-label pass: group(1) = its R8 font-atlas texture + sampler; alpha
@@ -449,6 +481,35 @@ impl Scene {
                 },
             },
             false,
+            wgpu::CompareFunction::Less,
+        );
+
+        // Selection spotlight: alpha-blended like the label, but keyed off the
+        // group(0) uniforms only (no texture), with depth reads OFF so the pool
+        // paints over the bed grid. Drawn before the opaque mesh, which
+        // overdraws the object's own footprint.
+        let glow_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_glow", "fs_glow",
+            &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GlowVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+            }],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+            wgpu::CompareFunction::Always,
         );
 
         let box_verts = bead_vertices();
@@ -483,6 +544,9 @@ impl Scene {
             mesh_count: 0,
             line_vbuf: None,
             line_count: 0,
+            glow_pipeline,
+            glow_vbuf: None,
+            glow_count: 0,
             box_vbuf,
             box_count: box_verts.len() as u32,
             inst_vbuf: None,
@@ -545,11 +609,11 @@ impl Scene {
     pub fn set_mesh(
         &mut self,
         device: &wgpu::Device,
-        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool, Option<&[[f32; 3]]>)],
+        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)],
     ) -> Option<([f32; 3], [f32; 3])> {
         let mut verts: Vec<MeshVertex> = Vec::new();
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for (mesh, t, rgb, selected, invalid, face_rgb) in objects {
+        for (mesh, t, rgb, selected, invalid) in objects {
             let sel = if *selected { 1.0 } else { 0.0 };
             let invalid = if *invalid { 1.0 } else { 0.0 };
             for i in 0..mesh.triangles.len() {
@@ -557,8 +621,7 @@ impl Scene {
                 let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
                 let p: [[f32; 3]; 3] = [f3(t.apply(tri[0])), f3(t.apply(tri[1])), f3(t.apply(tri[2]))];
                 let n = flat_normal(p[0], p[1], p[2]);
-                // Per-face paint (when present) overrides the part's uniform tint.
-                let c = face_rgb.and_then(|fc| fc.get(i).copied()).unwrap_or(*rgb);
+                let c = *rgb;
                 for pos in p {
                     for k in 0..3 {
                         lo[k] = lo[k].min(pos[k]);
@@ -620,6 +683,22 @@ impl Scene {
         }
         self.line_count = v.len() as u32;
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
+    }
+
+    /// Upload the selection spotlight: a triangle soup on the bed plane where
+    /// each vertex is `[x, y, z, r, g, b, a]`. An empty slice clears it.
+    pub fn set_spotlight(&mut self, device: &wgpu::Device, verts: &[[f32; 7]]) {
+        if verts.is_empty() {
+            self.glow_vbuf = None;
+            self.glow_count = 0;
+            return;
+        }
+        let gv: Vec<GlowVertex> = verts
+            .iter()
+            .map(|v| GlowVertex { pos: [v[0], v[1], v[2]], rgba: [v[3], v[4], v[5], v[6]] })
+            .collect();
+        self.glow_count = gv.len() as u32;
+        self.glow_vbuf = make_vbuf(device, "glow_vbuf", bytemuck::cast_slice(&gv));
     }
 
     /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat]`.
@@ -763,6 +842,17 @@ impl Scene {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.line_count, 0..1);
+            }
+
+            // The selection spotlight: right after the grid so the opaque model
+            // (drawn below) overdraws its core and the glow spills out around
+            // the footprint. Model view only.
+            if show_mesh && self.glow_count > 0 {
+                if let Some(buf) = &self.glow_vbuf {
+                    pass.set_pipeline(&self.glow_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.glow_count, 0..1);
+                }
             }
 
             if let Some(p) = &preview {
@@ -1032,6 +1122,7 @@ fn make_pipeline(
     topology: wgpu::PrimitiveTopology,
     blend: wgpu::BlendState,
     depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("scene_pipeline"),
@@ -1064,7 +1155,7 @@ fn make_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(depth_write),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
