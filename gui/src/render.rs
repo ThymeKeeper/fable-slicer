@@ -61,6 +61,10 @@ struct U {
     mesh_unsel: vec4<f32>,
     mesh_sel: vec4<f32>,
     label_color: vec4<f32>,
+    // xyz = world-space camera eye (stars ride an infinite sphere around it).
+    cam_eye: vec4<f32>,
+    // x,y = viewport pixels (round, aspect-correct star billboards).
+    viewport: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -197,6 +201,38 @@ struct LabelOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>
     let cov = textureSample(lbl_tex, lbl_samp, i.uv).r;
     return vec4<f32>(u.label_color.rgb, u.label_color.a * cov);
 }
+
+// --- night sky: real bright-star directions billboarded onto an infinite
+// celestial sphere centered on the eye, so orbiting the model sweeps across the
+// actual sky. Instance = (dir, apparent magnitude); base quad = corner in
+// [-1,1]^2. Drawn first with depth OFF (the backdrop), alpha over the ink. ---
+struct StarOut { @builtin(position) clip: vec4<f32>, @location(0) offset: vec2<f32>, @location(1) bright: f32 };
+@vertex fn vs_star(@location(0) corner: vec2<f32>, @location(1) dir: vec3<f32>, @location(2) mag: f32) -> StarOut {
+    // Any point on the ray from the eye projects to the same screen direction,
+    // so distance is arbitrary; 1000 keeps it inside the [near, far] frustum.
+    let world = u.cam_eye.xyz + dir * 1000.0;
+    var clip = u.mvp * vec4<f32>(world, 1.0);
+    // Apparent magnitude → brightness (lower mag = brighter; Sirius ≈ -1.5).
+    let bright = clamp(1.28 - mag * 0.15, 0.08, 1.10);
+    // Radius in pixels: brighter stars a touch larger, a floor so faint ones
+    // still register. Offset the corner in clip space (÷w cancels perspective).
+    let px = mix(0.95, 3.3, clamp(bright, 0.0, 1.0));
+    clip.x = clip.x + corner.x * (px * 2.0 / u.viewport.x) * clip.w;
+    clip.y = clip.y + corner.y * (px * 2.0 / u.viewport.y) * clip.w;
+    var o: StarOut;
+    o.clip = clip;
+    o.offset = corner;
+    o.bright = bright;
+    return o;
+}
+@fragment fn fs_star(i: StarOut) -> @location(0) vec4<f32> {
+    let r = length(i.offset);
+    if (r > 1.0) { discard; }
+    // Round falloff (fuller than a squared one, so the core reads); a faintly
+    // warm-white star. Bright stars clamp to a solid white core.
+    let a = clamp((1.0 - r * r) * i.bright, 0.0, 1.0);
+    return vec4<f32>(vec3<f32>(0.99, 0.98, 0.94) * a, a);
+}
 "#;
 
 #[repr(C)]
@@ -246,6 +282,8 @@ struct Uniforms {
     mesh_unsel: [f32; 4],
     mesh_sel: [f32; 4],
     label_color: [f32; 4],
+    cam_eye: [f32; 4],
+    viewport: [f32; 4],
 }
 
 /// How to draw the toolpaths this frame.
@@ -284,6 +322,16 @@ pub struct Scene {
     glow_pipeline: wgpu::RenderPipeline,
     glow_vbuf: Option<wgpu::Buffer>,
     glow_count: u32,
+    // Night-sky backdrop: a fixed catalog of star billboards (base quad +
+    // per-star instance = direction + magnitude), drawn first with depth off.
+    star_pipeline: wgpu::RenderPipeline,
+    star_quad_vbuf: wgpu::Buffer,
+    star_inst_vbuf: wgpu::Buffer,
+    star_count: u32,
+    /// Opaque backdrop-colored bed fill (glow pipeline), so stars don't show
+    /// through the grid. Built by `set_beds`.
+    bed_fill_vbuf: Option<wgpu::Buffer>,
+    bed_fill_count: u32,
     box_vbuf: wgpu::Buffer,
     box_count: u32,
     inst_vbuf: Option<wgpu::Buffer>,
@@ -512,6 +560,56 @@ impl Scene {
             wgpu::CompareFunction::Always,
         );
 
+        // Night-sky stars: instanced billboards, alpha-over like the glow, depth
+        // off (the backdrop). Base quad at @location 0; per-star instance =
+        // direction (loc 1) + apparent magnitude (loc 2).
+        let star_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_star", "fs_star",
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: (2 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (4 * 4) as u64, // dir.xyz + magnitude
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32],
+                },
+            ],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+            wgpu::CompareFunction::Always,
+        );
+        let star_quad: [[f32; 2]; 6] =
+            [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let star_quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("star_quad"),
+            contents: bytemuck::cast_slice(&star_quad[..]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        // Real Yale Bright Star Catalogue: [dir.x, dir.y, dir.z, magnitude] f32
+        // per star (unit directions on the celestial sphere), packed offline.
+        const STAR_DATA: &[u8] = include_bytes!("stars.bin");
+        let star_inst_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("star_inst"),
+            contents: STAR_DATA,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let star_count = (STAR_DATA.len() / (4 * 4)) as u32;
+
         let box_verts = bead_vertices();
         let box_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bead_base"),
@@ -547,6 +645,12 @@ impl Scene {
             glow_pipeline,
             glow_vbuf: None,
             glow_count: 0,
+            star_pipeline,
+            star_quad_vbuf,
+            star_inst_vbuf,
+            star_count,
+            bed_fill_vbuf: None,
+            bed_fill_count: 0,
             box_vbuf,
             box_count: box_verts.len() as u32,
             inst_vbuf: None,
@@ -654,8 +758,17 @@ impl Scene {
     ) {
         let step = 20.0_f32;
         let mut v = Vec::new();
+        // A backdrop-colored fill under each bed (z=0), drawn between the stars
+        // and the grid so the sky doesn't show THROUGH the plate — stars sit
+        // only in the surrounding sky, not in the grid cells.
+        let mut fill: Vec<GlowVertex> = Vec::new();
+        let bg = [BACKDROP_RGB[0], BACKDROP_RGB[1], BACKDROP_RGB[2], 1.0];
         for k in 0..n.max(1) {
             let ox = k as f32 * (bed_x + gap);
+            let q = [[ox, 0.0], [ox + bed_x, 0.0], [ox + bed_x, bed_y], [ox, bed_y]];
+            for &idx in &[0usize, 1, 2, 0, 2, 3] {
+                fill.push(GlowVertex { pos: [q[idx][0], q[idx][1], 0.0], rgba: bg });
+            }
             let (grid, border) = if k == active {
                 ([0.28, 0.25, 0.20], [0.64, 0.60, 0.51]) // warm ink + cream
             } else {
@@ -687,6 +800,8 @@ impl Scene {
         }
         self.line_count = v.len() as u32;
         self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
+        self.bed_fill_count = fill.len() as u32;
+        self.bed_fill_vbuf = make_vbuf(device, "bed_fill", bytemuck::cast_slice(&fill));
     }
 
     /// Upload the selection spotlight: a triangle soup on the bed plane where
@@ -766,17 +881,23 @@ impl Scene {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         rs: &RenderState,
         view_proj: glam::Mat4,
+        cam_eye: glam::Vec3,
+        show_stars: bool,
         show_mesh: bool,
         preview: Option<Preview>,
         mesh_unsel: [f32; 3],
         mesh_sel: [f32; 3],
         label_color: [f32; 4],
     ) {
-        self.render_to(&rs.device, &rs.queue, view_proj, show_mesh, preview, mesh_unsel, mesh_sel, label_color);
+        self.render_to(
+            &rs.device, &rs.queue, view_proj, cam_eye, show_stars, show_mesh, preview, mesh_unsel,
+            mesh_sel, label_color,
+        );
     }
 
     /// Device/queue render path — used directly by the headless offscreen
@@ -787,6 +908,8 @@ impl Scene {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         view_proj: glam::Mat4,
+        cam_eye: glam::Vec3,
+        show_stars: bool,
         show_mesh: bool,
         preview: Option<Preview>,
         mesh_unsel: [f32; 3],
@@ -804,6 +927,8 @@ impl Scene {
             mesh_unsel: [mesh_unsel[0], mesh_unsel[1], mesh_unsel[2], 0.0],
             mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
             label_color,
+            cam_eye: [cam_eye.x, cam_eye.y, cam_eye.z, 0.0],
+            viewport: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -841,6 +966,25 @@ impl Scene {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
+
+            // Night sky FIRST — the backdrop, drawn with depth off so the bed
+            // grid and everything else compose over it.
+            if show_stars && self.star_count > 0 {
+                pass.set_pipeline(&self.star_pipeline);
+                pass.set_vertex_buffer(0, self.star_quad_vbuf.slice(..));
+                pass.set_vertex_buffer(1, self.star_inst_vbuf.slice(..));
+                pass.draw(0..6, 0..self.star_count);
+                // Then paint the plate's footprint back to backdrop (opaque, over
+                // the stars via the glow pipeline) so the sky shows only AROUND
+                // the plate — never through the grid cells.
+                if let Some(buf) = &self.bed_fill_vbuf {
+                    if self.bed_fill_count > 0 {
+                        pass.set_pipeline(&self.glow_pipeline);
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.draw(0..self.bed_fill_count, 0..1);
+                    }
+                }
+            }
 
             if let Some(buf) = &self.line_vbuf {
                 pass.set_pipeline(&self.line_pipeline);

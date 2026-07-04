@@ -178,7 +178,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         dim,
         mask,
     };
-    scene.render_to(&device, &queue, view_proj, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);
+    scene.render_to(&device, &queue, view_proj, eye, false, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);
 
     let (w, h, rgba) = scene.read_rgba(&device, &queue);
     write_png(&a.out, w, h, &rgba).map_err(|e| format!("write png: {e}"))?;

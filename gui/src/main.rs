@@ -1322,6 +1322,8 @@ struct App {
     show_travel: bool,
     show_seams: bool,
     show_ironing: bool,
+    /// Night-sky star field on the viewport backdrop (Model + Preview).
+    show_stars: bool,
     needs_rebuild: bool,
     /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
     /// render-skip below can tell a content change from a static frame.
@@ -1547,6 +1549,7 @@ impl App {
             show_support: true,
             show_travel: false,
             show_seams: false,
+            show_stars: true,
             show_ironing: true,
             needs_rebuild: true,
             content_version: 0,
@@ -2992,6 +2995,7 @@ impl App {
 struct RenderSig {
     vp: glam::Mat4,
     show_mesh: bool,
+    show_stars: bool,
     /// (count, joint_count, current_layer bits, dim bits, mask), or None in model mode.
     preview: Option<(u32, u32, u32, u32, u32)>,
     accent: egui::Color32,
@@ -3530,6 +3534,12 @@ impl eframe::App for App {
                     self.accent = DEFAULT_ACCENT;
                     self.accent_rebake = true;
                 }
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.show_stars, "stars").on_hover_text(
+                    "Plot the real night sky — the ~9,000 naked-eye stars of the Yale \
+                     Bright Star Catalogue — on the viewport backdrop. It's a celestial \
+                     sphere, so it rotates as you orbit. Off for a plain background.",
+                );
             });
             if self.accent_rebake && !ui.ctx().input(|i| i.pointer.any_down()) {
                 self.accent_rebake = false;
@@ -4744,6 +4754,7 @@ impl eframe::App for App {
             let sig = RenderSig {
                 vp,
                 show_mesh,
+                show_stars: self.show_stars,
                 preview: preview_sig,
                 accent: self.accent,
                 size: (w, h),
@@ -4754,7 +4765,10 @@ impl eframe::App for App {
                 // The dim taupe the egui overlay used, in the scene's perceptual
                 // space (mesh/grid shaders don't linearize either).
                 let label_color = [104.0 / 255.0, 98.0 / 255.0, 86.0 / 255.0, 1.0];
-                self.scene.render(&rs, vp, show_mesh, preview, mesh_unsel, mesh_sel, label_color);
+                self.scene.render(
+                    &rs, vp, self.camera.eye(), self.show_stars, show_mesh, preview, mesh_unsel,
+                    mesh_sel, label_color,
+                );
                 self.last_render_sig = Some(sig);
             }
 
