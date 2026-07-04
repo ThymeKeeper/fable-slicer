@@ -203,6 +203,18 @@ impl Affine {
         }
         Affine(c)
     }
+
+    /// Whether this transform mirrors the geometry (negative determinant of its
+    /// linear part). A mirrored placement — common for a left/right pair built
+    /// from one mesh — flips triangle winding when baked in, turning the mesh
+    /// inside-out; the caller must reverse the winding to keep it outward-facing.
+    fn flips_orientation(&self) -> bool {
+        let m = &self.0;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        det < 0.0
+    }
 }
 
 /// A reference from a component to another object, possibly in another part.
@@ -561,9 +573,17 @@ fn flatten(
     match &obj.kind {
         ObjKind::Mesh { vertices, triangles } => {
             if !triangles.is_empty() {
+                // A mirrored placement flips winding when baked — reverse it
+                // back so normals face outward (else the viewer shades it dark
+                // and the winding-directed slicer fills it to nothing).
+                let triangles: Vec<[u32; 3]> = if t.flips_orientation() {
+                    triangles.iter().map(|&[a, b, c]| [a, c, b]).collect()
+                } else {
+                    triangles.clone()
+                };
                 let mesh = Mesh {
                     vertices: vertices.iter().map(|&v| t.apply(v)).collect(),
-                    triangles: triangles.clone(),
+                    triangles,
                 };
                 item.parts.push(ThreeMfPart { name: named.to_string(), extruder: None, mesh });
             }
@@ -620,6 +640,33 @@ mod tests {
             }
         }
         (lo, hi)
+    }
+
+    #[test]
+    fn mirrored_build_item_flips_winding() {
+        // A build item with a mirror transform (negative determinant — here a
+        // flip across X) reverses the baked triangle winding, so a left/right
+        // pair built from one mesh stays outward-facing. Without this the
+        // mirrored copy shades dark in the viewer and slices to nothing.
+        let mirror = format!(
+            r#"<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+            <resources><object id="1" name="square" type="model">{SQUARE_MESH}</object></resources>
+            <build><item objectid="1" transform="-1 0 0 0 1 0 0 0 1 0 0 0"/></build></model>"#
+        );
+        let items = load_3mf_reader(make_3mf(&mirror, &[])).unwrap();
+        assert_eq!(
+            &items[0].parts[0].mesh.triangles,
+            &vec![[0, 2, 1], [0, 3, 2]],
+            "mirror reverses winding"
+        );
+        // A plain (non-mirror) placement leaves winding untouched.
+        let plain = format!(
+            r#"<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+            <resources><object id="1" name="square" type="model">{SQUARE_MESH}</object></resources>
+            <build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/></build></model>"#
+        );
+        let plain = load_3mf_reader(make_3mf(&plain, &[])).unwrap();
+        assert_eq!(&plain[0].parts[0].mesh.triangles, &vec![[0, 1, 2], [0, 2, 3]]);
     }
 
     #[test]
