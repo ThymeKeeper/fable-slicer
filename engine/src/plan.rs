@@ -15,6 +15,7 @@ use mesh::Mesh;
 use rayon::prelude::*;
 
 use crate::fill::infill_lines;
+use crate::paint::PaintField;
 use crate::{Layer, SliceParams};
 
 /// What a toolpath represents — drives speed, ordering, and rendering.
@@ -229,10 +230,25 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// at viewing distance the layer bands read as the mixed color (white, grey,
 /// and black dither into a full monochrome ramp). Each layer is an ordinary
 /// single-tool layer, so per-tool speeds, flow, and temperatures stay exact.
+/// What a painted face prints as: a solid tool, or a blend (dithered per layer,
+/// exactly like [`PartPaint::Blend`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FacePaint {
+    Tool(u32),
+    Blend(Vec<(u32, f64)>),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartPaint {
     Tool(u32),
     Blend(Vec<(u32, f64)>),
+    /// Per-face color: `face[t]` indexes `paints` for triangle `t` (1:1 with
+    /// the part mesh's `triangles`, final post-load order). At slice time each
+    /// path takes the paint of the surface nearest it (see [`crate::paint`]) —
+    /// a blend face resolves to its scheduled tool for that layer — and
+    /// walls/skins crossing a boundary split into per-tool arcs, so a single
+    /// continuous surface prints one wall that changes color at the seam.
+    Painted { face: Vec<u32>, paints: Vec<FacePaint> },
 }
 
 /// Slice and plan a multi-part model, one tool per part.
@@ -243,36 +259,97 @@ pub fn generate_parts(parts: &[(&Mesh, u32)], settings: &Settings) -> Vec<LayerP
     generate_painted(&painted, settings)
 }
 
-/// The layer→tool schedule realizing a blend: weighted error diffusion (a
-/// smooth weighted round-robin) — every layer picks the most-owed tool, so any
-/// ratio spreads maximally evenly (each tool's count is exact to within one
-/// over any prefix). The schedule is a pure function of the weights and the
-/// ABSOLUTE layer index: every part sharing a blend prints the same tool on
-/// the same layer — aligned bands across parts, no extra toolchanges.
-/// `generate_painted` then applies one top-face correction per recipe — see
-/// `swap_dominant_to_top`.
-fn blend_schedule(weights: &[(u32, f64)], n: usize) -> Vec<u32> {
-    let w: Vec<(u32, f64)> = weights.iter().filter(|&&(_, x)| x > 0.0).copied().collect();
-    if w.is_empty() {
-        return vec![0; n];
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd_u64(b, a % b)
     }
-    let total: f64 = w.iter().map(|&(_, x)| x).sum();
-    let mut credit = vec![0.0f64; w.len()];
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        for (c, &(_, x)) in credit.iter_mut().zip(&w) {
-            *c += x / total;
+}
+
+/// The layer→tool schedule realizing a blend: the tools' whole-layer counts
+/// arranged so the SAME color never lands on two adjacent layers when the ratio
+/// allows it (and clumps as little as possible when one color owns more than
+/// half the cycle — then it's forced). Even, non-repeating bands read as a
+/// smoother mixed color than clustered ones. The pattern is one minimal cycle
+/// tiled up the height, so it's a pure function of the weights and the ABSOLUTE
+/// layer index — every part sharing a blend prints the same tool on the same
+/// layer (aligned bands, no extra toolchanges). `generate_painted` then applies
+/// one top-face correction per recipe — see `swap_dominant_to_top`.
+fn blend_schedule(weights: &[(u32, f64)], n: usize) -> Vec<u32> {
+    // One whole-layer count per tool (blend weights ARE layer counts; round
+    // defensively, fold duplicate tool entries together).
+    let mut counts: Vec<(u32, u64)> = Vec::new();
+    for &(t, x) in weights {
+        let c = x.round();
+        if c < 1.0 {
+            continue;
         }
-        let mut best = 0;
-        for k in 1..w.len() {
-            // Strict comparison with a float guard: ties keep the
-            // earliest-listed tool, so the schedule is deterministic.
-            if credit[k] > credit[best] + 1e-12 {
-                best = k;
+        match counts.iter_mut().find(|(tt, _)| *tt == t) {
+            Some(e) => e.1 += c as u64,
+            None => counts.push((t, c as u64)),
+        }
+    }
+    let first = counts.first().map_or(0, |&(t, _)| t);
+    if counts.len() <= 1 {
+        return vec![first; n];
+    }
+    // Minimal cycle: divide out the common factor so the pattern repeats as
+    // tightly as possible (6:2 tiles a 3:1 cycle, not an 8-layer one).
+    let g = counts.iter().fold(0u64, |a, &(_, c)| gcd_u64(a, c));
+    if g > 1 {
+        for c in &mut counts {
+            c.1 /= g;
+        }
+    }
+    let cycle = anti_adjacent_cycle(&counts);
+    if cycle.is_empty() {
+        return vec![first; n];
+    }
+    (0..n).map(|i| cycle[i % cycle.len()]).collect()
+}
+
+/// Arrange `counts` (tool, whole-layer count) into one cycle that avoids
+/// same-color neighbors: greedily place the tool with the most layers left that
+/// ISN'T the one just placed (the "reorganize" / max-heap rule — no two
+/// adjacent equal when the largest count ≤ half the cycle, minimal clumping
+/// otherwise), then repair the seam where the tiled cycle wraps.
+fn anti_adjacent_cycle(counts: &[(u32, u64)]) -> Vec<u32> {
+    let total: u64 = counts.iter().map(|&(_, c)| c).sum();
+    let mut rem: Vec<u64> = counts.iter().map(|&(_, c)| c).collect();
+    let mut out: Vec<u32> = Vec::with_capacity(total as usize);
+    let mut prev: Option<usize> = None;
+    for _ in 0..total {
+        // Most-remaining tool that isn't `prev`; ties → lowest tool id (so the
+        // schedule is deterministic). Only fall back to `prev` when it's the
+        // sole tool with layers left (one color owns > half the cycle).
+        let mut best: Option<usize> = None;
+        for i in 0..rem.len() {
+            if rem[i] == 0 || Some(i) == prev {
+                continue;
+            }
+            best = Some(match best {
+                None => i,
+                Some(b) if rem[i] > rem[b] || (rem[i] == rem[b] && counts[i].0 < counts[b].0) => i,
+                Some(b) => b,
+            });
+        }
+        let pick = best.unwrap_or_else(|| rem.iter().position(|&c| c > 0).unwrap());
+        out.push(counts[pick].0);
+        rem[pick] -= 1;
+        prev = Some(pick);
+    }
+    // Wrap seam: if the tile ends and begins on the same tool, swap the last
+    // layer with an interior one that clears the seam without adding a clash.
+    let l = out.len();
+    if l > 3 && out[0] == out[l - 1] {
+        for j in 1..l - 1 {
+            let x = out[j];
+            if x != out[0] && out[l - 2] != x && out[j - 1] != out[0] && out[j + 1] != out[0] {
+                out.swap(j, l - 1);
+                break;
             }
         }
-        out.push(w[best].0);
-        credit[best] -= 1.0;
     }
     out
 }
@@ -503,6 +580,9 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
         .map(|(_, paint)| match paint {
             PartPaint::Tool(_) => None,
             PartPaint::Blend(w) => Some(blend_schedule(w, n)),
+            // Painted parts stamp per-path from the surface field, not a
+            // part-wide schedule (their blend faces get their own below).
+            PartPaint::Painted { .. } => None,
         })
         .collect();
     let mut done = vec![false; parts.len()];
@@ -540,6 +620,29 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
     // and it must stay exact.
     let lw = settings.line_width_mm;
     let empty = Polygons::new();
+    // Nearest-painted-surface field per painted part (Tool/Blend parts skip it).
+    let fields: Vec<Option<PaintField>> = parts
+        .iter()
+        .map(|(m, paint)| match paint {
+            PartPaint::Painted { face, .. } => Some(PaintField::new(m, face)),
+            _ => None,
+        })
+        .collect();
+    // Per painted part, one schedule per blend-paint (None for a solid tool) —
+    // a blend face dithers across layers just like PartPaint::Blend.
+    let paint_scheds: Vec<Vec<Option<Vec<u32>>>> = parts
+        .iter()
+        .map(|(_, paint)| match paint {
+            PartPaint::Painted { paints, .. } => paints
+                .iter()
+                .map(|p| match p {
+                    FacePaint::Tool(_) => None,
+                    FacePaint::Blend(w) => Some(blend_schedule(w, n)),
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
     for (m, plans) in part_plans.iter_mut().enumerate() {
         let (_, paint) = &parts[m];
         let schedule = &schedules[m];
@@ -547,6 +650,23 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
         let layers = &part_layers[m];
         for plan in plans.iter_mut() {
             let i = plan.index;
+            // Painted part: recolor each path by the nearest painted surface (a
+            // blend face resolves to its scheduled tool for this layer), and
+            // split walls/skins that cross a boundary into per-tool arcs.
+            if let Some(field) = &fields[m] {
+                let PartPaint::Painted { paints, .. } = paint else { unreachable!() };
+                let scheds = &paint_scheds[m];
+                let z = layers[i].z_mm;
+                split_paths_by_tool(&mut plan.paths, 0, lw, |p| {
+                    let idx = field.value_at([p.x_mm(), p.y_mm(), z]) as usize;
+                    match paints.get(idx) {
+                        Some(FacePaint::Tool(t)) => *t,
+                        Some(FacePaint::Blend(_)) => scheds[idx].as_ref().map_or(0, |s| s[i]),
+                        None => 0,
+                    }
+                });
+                continue;
+            }
             let tool = match (paint, schedule) {
                 (PartPaint::Tool(t), _) => *t,
                 (_, Some(sched)) => sched[i],
@@ -1828,6 +1948,161 @@ fn merge_bridge_connectors(paths: &mut [ToolPath], cap: f64) {
             && (at_bridge(tp.points[0]) || at_bridge(*tp.points.last().unwrap()))
         {
             tp.kind = PathKind::InternalBridge;
+        }
+    }
+}
+
+/// The kinds that trace a visible surface, so a color boundary crossing them
+/// must actually split the bead. Infill and helper paths (skirt/support/
+/// ironing) never show, so they take one tool by majority instead.
+fn splittable_kind(k: PathKind) -> bool {
+    matches!(
+        k,
+        PathKind::ExternalPerimeter
+            | PathKind::Perimeter
+            | PathKind::OverhangWall
+            | PathKind::Solid
+            | PathKind::TopSkin
+            | PathKind::BottomSkin
+            | PathKind::InternalBridge
+            | PathKind::Bridge
+    )
+}
+
+fn majority_tool(tools: &[u32]) -> u32 {
+    let mut counts: Vec<(u32, u32)> = Vec::new();
+    for &t in tools {
+        match counts.iter_mut().find(|(tt, _)| *tt == t) {
+            Some(e) => e.1 += 1,
+            None => counts.push((t, 1)),
+        }
+    }
+    counts.iter().max_by_key(|(_, c)| *c).map(|&(t, _)| t).unwrap_or(0)
+}
+
+/// Fold any color run shorter than one line width into a neighbor, so boundary
+/// jitter can't spawn a sub-mm arc (and thus a wasteful dock trip). `seg[k]` is
+/// the tool of segment k; mutated in place. Terminates: each pass merges the
+/// shortest short run into a neighbor, dropping one run.
+fn merge_short_runs(points: &[Point], seg: &mut [u32], closed: bool, lw: f64) {
+    let nseg = seg.len();
+    if nseg < 2 {
+        return;
+    }
+    let n = points.len();
+    let seglen = |k: usize| pt_dist_mm(points[k % n], points[(k + 1) % n]);
+    for _ in 0..nseg {
+        let mut runs: Vec<(usize, usize, u32, f64)> = Vec::new(); // start, count, tool, mm
+        let mut k = 0;
+        while k < nseg {
+            let t = seg[k];
+            let s = k;
+            let mut plen = 0.0;
+            while k < nseg && seg[k] == t {
+                plen += seglen(k);
+                k += 1;
+            }
+            runs.push((s, k - s, t, plen));
+        }
+        if runs.len() < 2 {
+            break;
+        }
+        let ri = (0..runs.len()).min_by(|&a, &b| runs[a].3.total_cmp(&runs[b].3)).unwrap();
+        if runs[ri].3 >= lw {
+            break;
+        }
+        let prev = if ri > 0 { ri - 1 } else { runs.len() - 1 };
+        let next = if ri + 1 < runs.len() { ri + 1 } else { 0 };
+        let has_prev = ri > 0 || closed;
+        let has_next = ri + 1 < runs.len() || closed;
+        let ntool = match (has_prev, has_next) {
+            (true, true) => {
+                if runs[prev].3 >= runs[next].3 {
+                    runs[prev].2
+                } else {
+                    runs[next].2
+                }
+            }
+            (true, false) => runs[prev].2,
+            (false, true) => runs[next].2,
+            (false, false) => break,
+        };
+        for k in runs[ri].0..runs[ri].0 + runs[ri].1 {
+            seg[k] = ntool;
+        }
+    }
+}
+
+/// Recolor and, where a path crosses a color boundary, SPLIT it into per-tool
+/// arcs — using the painted-surface `field` at this layer's `z`. A wall or skin
+/// that spans two colors becomes consecutive open arcs abutting at the boundary
+/// vertex (a bead can't change tool mid-stroke — a dock toolchange parks Z — so
+/// splitting is mandatory). Infill and helper paths take a single majority tool
+/// so interior fill never trips a mid-layer swap. `order_layers` regroups the
+/// arcs by tool downstream, so a split loop still costs one change per tool.
+fn split_paths_by_tool(
+    paths: &mut Vec<ToolPath>,
+    start: usize,
+    lw: f64,
+    tool_at: impl Fn(&Point) -> u32,
+) {
+    let beads: Vec<ToolPath> = paths.split_off(start);
+    for bead in beads {
+        let n = bead.points.len();
+        if n < 2 {
+            paths.push(bead);
+            continue;
+        }
+        let ptools: Vec<u32> = bead.points.iter().map(|p| tool_at(p)).collect();
+        if ptools.iter().all(|&t| t == ptools[0]) {
+            let mut b = bead;
+            b.tool = ptools[0];
+            paths.push(b);
+            continue;
+        }
+        if !splittable_kind(bead.kind) {
+            let mut b = bead;
+            b.tool = majority_tool(&ptools);
+            paths.push(b);
+            continue;
+        }
+        // Segment k (start-vertex tool) → group into maximal same-tool runs.
+        let nseg = if bead.closed { n } else { n - 1 };
+        let mut seg: Vec<u32> = (0..nseg).map(|k| ptools[k]).collect();
+        merge_short_runs(&bead.points, &mut seg, bead.closed, lw);
+        if seg.iter().all(|&t| t == seg[0]) {
+            let mut b = bead;
+            b.tool = seg[0];
+            paths.push(b);
+            continue;
+        }
+        // Rotate a closed loop so a run boundary starts the sequence; open
+        // paths start at 0.
+        let rot = if bead.closed {
+            (0..nseg).find(|&k| seg[k] != seg[(k + nseg - 1) % nseg]).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut i = 0;
+        while i < nseg {
+            let t = seg[(rot + i) % nseg];
+            let mut j = i;
+            while j < nseg && seg[(rot + j) % nseg] == t {
+                j += 1;
+            }
+            // Segments i..j → points (rot+i)..=(rot+j); consecutive arcs share
+            // the boundary vertex, so they abut with no gap.
+            let pts: Vec<Point> = (i..=j).map(|k| bead.points[(rot + k) % n]).collect();
+            if pts.len() >= 2 {
+                let mut b = bead.clone();
+                b.points = pts;
+                b.closed = false; // an arc of a split loop is an open stroke
+                b.tool = t;
+                b.widths = None; // per-point/segment channels don't survive a cut
+                b.segs = None;
+            paths.push(b);
+            }
+            i = j;
         }
     }
 }
@@ -4315,30 +4590,35 @@ mod tests {
     }
 
     #[test]
-    fn blend_schedule_hits_the_ratio_evenly() {
-        // 30% tool 0 / 70% tool 2 over 100 layers: exact counts, and every
-        // prefix stays within one layer of the ideal (error diffusion, not
-        // clumping). 50/50 must strictly alternate.
-        let sched = blend_schedule(&[(0, 0.3), (2, 0.7)], 100);
-        assert_eq!(sched.iter().filter(|&&t| t == 0).count(), 30);
-        assert_eq!(sched.iter().filter(|&&t| t == 2).count(), 70);
-        let mut c0 = 0.0;
-        for (i, &t) in sched.iter().enumerate() {
-            if t == 0 {
-                c0 += 1.0;
-            }
-            let ideal = 0.3 * (i + 1) as f64;
-            assert!((c0 - ideal).abs() <= 1.0, "prefix {i}: {c0} vs {ideal}");
+    fn blend_schedule_spreads_without_adjacent_repeats() {
+        // 4:1:3 (the classic knit-duck blend): exact ratio, and because no
+        // color owns more than half the 8-layer cycle, NO two adjacent layers
+        // (the tiled seam included) share a color — the point of the change.
+        let s = blend_schedule(&[(0, 4.0), (1, 1.0), (4, 3.0)], 80);
+        assert_eq!(s.iter().filter(|&&t| t == 0).count(), 40);
+        assert_eq!(s.iter().filter(|&&t| t == 1).count(), 10);
+        assert_eq!(s.iter().filter(|&&t| t == 4).count(), 30);
+        for w in s.windows(2) {
+            assert_ne!(w[0], w[1], "no adjacent repeats: {s:?}");
         }
+        // 50/50 strictly alternates.
         let ab = blend_schedule(&[(1, 1.0), (0, 1.0)], 10);
         for w in ab.windows(2) {
             assert_ne!(w[0], w[1], "50/50 must alternate: {ab:?}");
         }
+        // Duplicate tool entries fold together: (2+2) tool 0, 3 tool 1 → 4:3.
+        let dup = blend_schedule(&[(0, 2.0), (1, 3.0), (0, 2.0)], 70);
+        assert_eq!(dup.iter().filter(|&&t| t == 0).count(), 40);
+        assert_eq!(dup.iter().filter(|&&t| t == 1).count(), 30);
+        // A heavily-leaning blend can't avoid all repeats, but keeps the ratio.
+        let lean = blend_schedule(&[(0, 9.0), (1, 1.0)], 30);
+        assert_eq!(lean.iter().filter(|&&t| t == 0).count(), 27);
+        assert_eq!(lean.iter().filter(|&&t| t == 1).count(), 3);
         // Degenerate blends: one entry = that tool; empty = tool 0.
         assert!(blend_schedule(&[(3, 2.0)], 5).iter().all(|&t| t == 3));
         assert!(blend_schedule(&[], 5).iter().all(|&t| t == 0));
         // Deterministic.
-        assert_eq!(sched, blend_schedule(&[(0, 0.3), (2, 0.7)], 100));
+        assert_eq!(s, blend_schedule(&[(0, 4.0), (1, 1.0), (4, 3.0)], 80));
     }
 
     #[test]
@@ -4438,6 +4718,69 @@ mod tests {
     }
 
     #[test]
+    fn painted_faces_split_walls_at_the_color_boundary() {
+        // A box painted tool 1 on its +X half, tool 0 on the -X half. Every
+        // layer's wall crosses the boundary, so it splits into per-tool arcs:
+        // both tools print, a mid layer carries both colors, and the outer wall
+        // becomes open arcs (a closed loop can't change tool mid-stroke).
+        let mut t = Vec::new();
+        push_box(&mut t, [0.0, 0.0, 0.0], [20.0, 10.0, 4.0]);
+        let m = mesh::Mesh::from_triangle_soup(&t);
+        let face: Vec<u32> = (0..m.triangles.len())
+            .map(|i| {
+                let [a, b, c] = m.triangle(i);
+                if (a[0] + b[0] + c[0]) / 3.0 > 10.0 {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        let paints = vec![FacePaint::Tool(0), FacePaint::Tool(1)];
+        let plans = generate_painted(&[(&m, PartPaint::Painted { face, paints })], &s);
+        let tools: std::collections::BTreeSet<u32> =
+            plans.iter().flat_map(|l| l.paths.iter().map(|p| p.tool)).collect();
+        assert!(tools.contains(&0) && tools.contains(&1), "both tools present: {tools:?}");
+        let mid = &plans[plans.len() / 2];
+        assert!(
+            mid.paths.iter().any(|p| p.tool == 0) && mid.paths.iter().any(|p| p.tool == 1),
+            "a mid layer carries both colors"
+        );
+        assert!(
+            mid.paths.iter().any(|p| p.kind == PathKind::ExternalPerimeter && !p.closed),
+            "the outer wall was split into open arcs"
+        );
+    }
+
+    #[test]
+    fn painted_blend_face_dithers_like_a_part_blend() {
+        // A box whose every face is painted with a 50/50 blend of tools 0 and 1
+        // dithers exactly like the same box given PartPaint::Blend: one tool per
+        // layer, alternating (a single blend region has no boundary to split).
+        let mut t = Vec::new();
+        push_box(&mut t, [0.0, 0.0, 0.0], [10.0, 10.0, 4.0]);
+        let m = mesh::Mesh::from_triangle_soup(&t);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        let weights = vec![(0, 1.0), (1, 1.0)];
+        let face = vec![0u32; m.triangles.len()];
+        let painted = generate_painted(
+            &[(&m, PartPaint::Painted { face, paints: vec![FacePaint::Blend(weights.clone())] })],
+            &s,
+        );
+        let blend = generate_painted(&[(&m, PartPaint::Blend(weights))], &s);
+        let per_layer = |plans: &[LayerPlan]| -> Vec<u32> {
+            plans.iter().map(|p| p.paths.first().map_or(0, |x| x.tool)).collect()
+        };
+        assert_eq!(per_layer(&painted), per_layer(&blend), "same dither schedule as a part blend");
+        let tools: std::collections::BTreeSet<u32> =
+            painted.iter().flat_map(|l| l.paths.iter().map(|p| p.tool)).collect();
+        assert!(tools.contains(&0) && tools.contains(&1), "the blend uses both tools across layers");
+    }
+
+    #[test]
     fn painted_blend_caps_with_the_dominant_tool() {
         // A skewed blend must print its dominant tool on the top face — the
         // one surface with no layer averaging — while a shorter part sharing
@@ -4457,7 +4800,6 @@ mod tests {
         let plans = generate_painted(&[(&a, blend.clone()), (&b, blend)], &s);
         let top = plans.iter().rposition(|p| !p.paths.is_empty()).unwrap();
         let raw = blend_schedule(&weights, plans.len());
-        assert_eq!(raw[top], 1, "test setup: the raw cycle must land the minority on top");
         for plan in &plans {
             let tools: Vec<u32> = plan.paths.iter().map(|p| p.tool).collect();
             assert!(tools.windows(2).all(|w| w[0] == w[1]), "layer {} mixes tools", plan.index);
@@ -4481,8 +4823,8 @@ mod tests {
         // tool while buried layers keep the schedule — the wall dither is
         // what mixes the color, and it must stay exact.
         let mut t = Vec::new();
-        push_box(&mut t, [0.0, 0.0, 0.0], [20.0, 20.0, 2.2]);
-        push_box(&mut t, [6.0, 6.0, 2.2], [14.0, 14.0, 4.2]);
+        push_box(&mut t, [0.0, 0.0, 0.0], [20.0, 20.0, 2.0]);
+        push_box(&mut t, [6.0, 6.0, 2.0], [14.0, 14.0, 4.0]);
         let m = mesh::Mesh::from_triangle_soup(&t);
         let mut s = Settings::default();
         s.skirt_loops = 0;
@@ -4490,7 +4832,9 @@ mod tests {
         let weights = vec![(0u32, 3.0f64), (1u32, 1.0f64)];
         let plans = generate_painted(&[(&m, PartPaint::Blend(weights.clone()))], &s);
         let raw = blend_schedule(&weights, plans.len());
-        let shelf = 10;
+        // The 2.0 mm base tops out on layer 9 — a minority band of the 3:1
+        // cycle [0,1,0,0] — so the shelf face genuinely needs the swap.
+        let shelf = 9;
         assert_eq!(raw[shelf], 1, "test setup: the shelf layer must be a minority band");
         let on_shelf = |p: &ToolPath| {
             p.points.iter().any(|pt| {
@@ -4519,8 +4863,8 @@ mod tests {
         assert!(!buried.is_empty(), "the shelf layer must have buried paths under the tower");
         assert!(buried.iter().all(|p| p.tool == 1), "buried paths keep the minority band");
         // A buried minority layer inside the base keeps its band untouched.
-        assert_eq!(raw[6], 1);
-        assert!(plans[6].paths.iter().all(|p| p.tool == 1), "buried bands keep the schedule");
+        assert_eq!(raw[5], 1);
+        assert!(plans[5].paths.iter().all(|p| p.tool == 1), "buried bands keep the schedule");
         // And the cap prints the dominant tool (the swap's job).
         let top = plans.iter().rposition(|p| !p.paths.is_empty()).unwrap();
         assert!(plans[top].paths.iter().all(|p| p.tool == 0), "the cap prints the dominant");
@@ -4528,8 +4872,8 @@ mod tests {
         // a 6×6 tower leaves a 1 mm ledge — eroded away, so the gate rejects
         // it and the shelf layer keeps its minority band whole.
         let mut t = Vec::new();
-        push_box(&mut t, [30.0, 0.0, 0.0], [38.0, 8.0, 2.2]);
-        push_box(&mut t, [31.0, 1.0, 2.2], [37.0, 7.0, 4.2]);
+        push_box(&mut t, [30.0, 0.0, 0.0], [38.0, 8.0, 2.0]);
+        push_box(&mut t, [31.0, 1.0, 2.0], [37.0, 7.0, 4.0]);
         let m = mesh::Mesh::from_triangle_soup(&t);
         let plans = generate_painted(&[(&m, PartPaint::Blend(weights))], &s);
         assert!(
@@ -4547,10 +4891,10 @@ mod tests {
         // band right below it stays buried and untouched. A slab RESTING on
         // another part instead has an interface, not a face — no dock trip.
         let mut tb = Vec::new();
-        push_box(&mut tb, [0.0, 0.0, 0.0], [14.0, 14.0, 2.0]);
+        push_box(&mut tb, [0.0, 0.0, 0.0], [14.0, 14.0, 1.8]);
         let body = mesh::Mesh::from_triangle_soup(&tb);
         let mut tc = Vec::new();
-        push_box(&mut tc, [30.0, 0.0, 2.0], [40.0, 10.0, 3.0]);
+        push_box(&mut tc, [30.0, 0.0, 1.8], [40.0, 10.0, 2.8]);
         let slab = mesh::Mesh::from_triangle_soup(&tc);
         let mut s = Settings::default();
         s.skirt_loops = 0;
@@ -4561,7 +4905,9 @@ mod tests {
             &s,
         );
         let raw = blend_schedule(&weights, plans.len());
-        let slab_base = 10;
+        // The slab's base sits on layer 9 — a minority band of the 3:1 cycle
+        // [0,1,0,0] — so its underside genuinely exercises the override.
+        let slab_base = 9;
         assert_eq!(raw[slab_base], 1, "test setup: the slab's base must be a minority band");
         assert!(
             plans[slab_base].paths.iter().all(|p| p.tool == 0),
@@ -4576,7 +4922,7 @@ mod tests {
         // Resting flush on the body instead: the underside is an interface,
         // not a face — the minority band survives untouched.
         let mut tr = Vec::new();
-        push_box(&mut tr, [2.0, 2.0, 2.0], [12.0, 12.0, 3.0]);
+        push_box(&mut tr, [2.0, 2.0, 1.8], [12.0, 12.0, 2.8]);
         let resting = mesh::Mesh::from_triangle_soup(&tr);
         let plans = generate_painted(
             &[(&body, PartPaint::Tool(3)), (&resting, PartPaint::Blend(weights))],

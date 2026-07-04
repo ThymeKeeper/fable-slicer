@@ -120,6 +120,28 @@ struct Args {
     /// Fit circular arcs to curved toolpaths and emit G2/G3 (needs firmware arc support).
     #[arg(long)]
     arc_fitting: bool,
+    /// Dev: per-face paint test — paint every triangle on the +X half of each
+    /// part with this tool (the rest tool 0) and slice via the painter. Verifies
+    /// the per-face color path end to end (check the per-tool grams).
+    #[arg(long)]
+    paint_halfx: Option<u32>,
+}
+
+/// Per-triangle palette index for the `--paint-halfx` dev flag: 1 for every
+/// triangle whose centroid is on the +X half of the mesh, 0 otherwise.
+fn paint_half_x(m: &mesh::Mesh) -> Vec<u32> {
+    let (min_x, _, max_x, _) = m.xy_bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let mid = (min_x + max_x) / 2.0;
+    (0..m.triangles.len())
+        .map(|i| {
+            let [a, b, c] = m.triangle(i);
+            if (a[0] + b[0] + c[0]) / 3.0 > mid {
+                1
+            } else {
+                0
+            }
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -293,8 +315,25 @@ fn main() -> Result<()> {
     let tris: usize = parts.iter().map(|(m, _)| m.triangles.len()).sum();
     println!("Loaded {}: {tris} triangles", input.display());
 
-    let part_refs: Vec<(&mesh::Mesh, u32)> = parts.iter().map(|(m, t)| (m, *t)).collect();
-    let layers = engine::generate_parts(&part_refs, &settings);
+    let layers = if let Some(tool) = args.paint_halfx {
+        // Synthesize per-face paint: +X-half triangles get `tool`, the rest 0.
+        let painted: Vec<(&mesh::Mesh, engine::PartPaint)> = parts
+            .iter()
+            .map(|(m, _)| {
+                (
+                    m,
+                    engine::PartPaint::Painted {
+                        face: paint_half_x(m),
+                        paints: vec![engine::FacePaint::Tool(0), engine::FacePaint::Tool(tool)],
+                    },
+                )
+            })
+            .collect();
+        engine::generate_painted(&painted, &settings)
+    } else {
+        let part_refs: Vec<(&mesh::Mesh, u32)> = parts.iter().map(|(m, t)| (m, *t)).collect();
+        engine::generate_parts(&part_refs, &settings)
+    };
     let path_count: usize = layers.iter().map(|l| l.paths.len()).sum();
     println!("Planned {} layers, {} toolpaths", layers.len(), path_count);
     println!(

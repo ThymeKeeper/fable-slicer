@@ -92,6 +92,14 @@ pub fn run(a: &Args) -> Result<(), String> {
         let max_tool = |p: &engine::PartPaint| match p {
             engine::PartPaint::Tool(t) => *t,
             engine::PartPaint::Blend(w) => w.iter().map(|&(t, _)| t).max().unwrap_or(0),
+            engine::PartPaint::Painted { paints, .. } => paints
+                .iter()
+                .map(|p| match p {
+                    engine::FacePaint::Tool(t) => *t,
+                    engine::FacePaint::Blend(w) => w.iter().map(|&(t, _)| t).max().unwrap_or(0),
+                })
+                .max()
+                .unwrap_or(0),
         };
         settings.tool_count = parts.iter().map(|(_, p)| max_tool(p)).max().unwrap_or(0) as usize + 1;
         // Deterministic slot colors (no profiles load here): three greys the

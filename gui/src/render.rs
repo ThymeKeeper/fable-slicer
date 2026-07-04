@@ -545,11 +545,11 @@ impl Scene {
     pub fn set_mesh(
         &mut self,
         device: &wgpu::Device,
-        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)],
+        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool, Option<&[[f32; 3]]>)],
     ) -> Option<([f32; 3], [f32; 3])> {
         let mut verts: Vec<MeshVertex> = Vec::new();
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for (mesh, t, rgb, selected, invalid) in objects {
+        for (mesh, t, rgb, selected, invalid, face_rgb) in objects {
             let sel = if *selected { 1.0 } else { 0.0 };
             let invalid = if *invalid { 1.0 } else { 0.0 };
             for i in 0..mesh.triangles.len() {
@@ -557,12 +557,14 @@ impl Scene {
                 let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
                 let p: [[f32; 3]; 3] = [f3(t.apply(tri[0])), f3(t.apply(tri[1])), f3(t.apply(tri[2]))];
                 let n = flat_normal(p[0], p[1], p[2]);
+                // Per-face paint (when present) overrides the part's uniform tint.
+                let c = face_rgb.and_then(|fc| fc.get(i).copied()).unwrap_or(*rgb);
                 for pos in p {
                     for k in 0..3 {
                         lo[k] = lo[k].min(pos[k]);
                         hi[k] = hi[k].max(pos[k]);
                     }
-                    verts.push(MeshVertex { pos, normal: n, rgb: *rgb, sel, invalid });
+                    verts.push(MeshVertex { pos, normal: n, rgb: c, sel, invalid });
                 }
             }
         }

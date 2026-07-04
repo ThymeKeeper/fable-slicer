@@ -818,6 +818,13 @@ struct ScenePart {
     /// The tool or blend that prints this part. Clamped to the machine's
     /// tool count at bake time.
     paint: PartColor,
+    /// Per-face color: one paint (tool or blend) per `mesh` triangle. Empty
+    /// until the part is first brushed (`painted` flips true); then it drives
+    /// both the viewer's per-face color and the engine's `PartPaint::Painted`
+    /// at bake time. Kept aligned to `mesh` (not `display`), which is also what
+    /// `pick_face` hits.
+    paint_tri: Vec<PartColor>,
+    painted: bool,
 }
 
 /// One object placed on the bed: its parts (shared mesh geometry) plus an
@@ -843,6 +850,8 @@ impl SceneObject {
                 display: Arc::new(mesh.display_mesh()),
                 mesh: Arc::new(mesh),
                 paint: PartColor::Tool(0),
+                paint_tri: Vec::new(),
+                painted: false,
             }],
             rot_deg: [0.0; 3],
             scale: 1.0,
@@ -1314,6 +1323,15 @@ struct App {
     last_bed: (f64, f64),
     /// Object being dragged in the viewport (None = orbiting the camera).
     drag_obj: Option<usize>,
+    /// Paint mode: primary drag brushes colors onto faces (not moving).
+    paint_mode: bool,
+    /// The paint (tool or blend) the brush lays down.
+    brush_paint: PartColor,
+    /// Brush radius in mm — front-facing faces within this of the hit are painted.
+    brush_radius_mm: f64,
+    /// When set, a stroke flood-fills the contiguous surface up to sharp edges
+    /// instead of painting a disc.
+    fill_region: bool,
     /// Offset (bed XY) between the dragged object's pos and the cursor at grab time.
     drag_grab: [f64; 2],
     /// Screen rect of the transform overlay (so viewport input ignores clicks on it).
@@ -1506,6 +1524,10 @@ impl App {
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
+            paint_mode: false,
+            brush_paint: PartColor::Tool(1),
+            brush_radius_mm: 4.0,
+            fill_region: false,
             preview_layer: 1,
             show_walls: true,
             show_solid: true,
@@ -1556,6 +1578,150 @@ impl App {
             }
         }
         best.map(|(_, i)| i)
+    }
+
+    /// The object, part, and triangle index the ray first hits — the paint
+    /// brush's target. Tests the raw `mesh` (what `paint_tri` indexes), and
+    /// returns the world-space hit point so the caller can size a radius brush.
+    fn pick_face(&self, o: glam::Vec3, d: glam::Vec3) -> Option<(usize, usize, usize, glam::Vec3)> {
+        let mut best: Option<(f32, usize, usize, usize)> = None;
+        for (i, obj) in self.objects.iter().enumerate() {
+            let t = obj.transform();
+            let v = |p: [f64; 3]| {
+                let q = t.apply(p);
+                glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
+            };
+            for (pi, part) in obj.parts.iter().enumerate() {
+                for k in 0..part.mesh.triangles.len() {
+                    let tri = part.mesh.triangle(k);
+                    if let Some(dist) = ray_triangle(o, d, v(tri[0]), v(tri[1]), v(tri[2])) {
+                        if best.map_or(true, |(bd, ..)| dist < bd) {
+                            best = Some((dist, i, pi, k));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(dist, i, pi, k)| (i, pi, k, o + d * dist))
+    }
+
+    /// Brush the current tool onto part `pi` of object `oi` at ray hit `hit`
+    /// (ray origin `eye`). Promotes the part to painted on first touch, then
+    /// either paints a radius disc or flood-fills the surface region.
+    fn paint_at(&mut self, oi: usize, pi: usize, tri: usize, hit: glam::Vec3, eye: glam::Vec3) {
+        let paint = self.brush_paint;
+        {
+            let part = &mut self.objects[oi].parts[pi];
+            let ntri = part.mesh.triangles.len();
+            if !part.painted || part.paint_tri.len() != ntri {
+                part.paint_tri = vec![part.paint; ntri];
+                part.painted = true;
+            }
+        }
+        let changed = if self.fill_region {
+            self.fill_region_paint(oi, pi, tri, paint)
+        } else {
+            self.radius_paint(oi, pi, hit, eye, paint)
+        };
+        if changed {
+            self.needs_rebuild = true;
+            self.sliced = None;
+            self.slice_summary = None;
+            self.view_preview = false;
+        }
+    }
+
+    /// Paint every front-facing face whose world centroid is within the brush
+    /// radius of `hit`. Front-facing (normal toward `eye`) keeps the stroke from
+    /// bleeding through to the far wall.
+    fn radius_paint(&mut self, oi: usize, pi: usize, hit: glam::Vec3, eye: glam::Vec3, paint: PartColor) -> bool {
+        let t = self.objects[oi].transform();
+        let r2 = (self.brush_radius_mm as f32).powi(2);
+        let v = |p: [f64; 3]| {
+            let q = t.apply(p);
+            glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
+        };
+        let part = &mut self.objects[oi].parts[pi];
+        let mut changed = false;
+        for k in 0..part.mesh.triangles.len() {
+            let [a, b, c] = part.mesh.triangle(k);
+            let (a, b, c) = (v(a), v(b), v(c));
+            let cen = (a + b + c) / 3.0;
+            if (cen - hit).length_squared() > r2 {
+                continue;
+            }
+            if (b - a).cross(c - a).dot(eye - cen) <= 0.0 {
+                continue;
+            }
+            if part.paint_tri[k] != paint {
+                part.paint_tri[k] = paint;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Flood-fill the contiguous surface region from `start`, crossing an edge
+    /// only where the two faces meet at a shallow angle (no sharp crease).
+    fn fill_region_paint(&mut self, oi: usize, pi: usize, start: usize, paint: PartColor) -> bool {
+        use std::collections::HashMap;
+        let m = std::sync::Arc::clone(&self.objects[oi].parts[pi].mesh);
+        let ntri = m.triangles.len();
+        if start >= ntri {
+            return false;
+        }
+        let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
+        let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        for (k, t) in m.triangles.iter().enumerate() {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                edges.entry(key(a, b)).or_default().push(k as u32);
+            }
+        }
+        let fnorm = |k: usize| -> [f64; 3] {
+            let [a, b, c] = m.triangle(k);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if l > 0.0 {
+                [n[0] / l, n[1] / l, n[2] / l]
+            } else {
+                [0.0, 0.0, 0.0]
+            }
+        };
+        let cos_thresh = 40f64.to_radians().cos();
+        let mut seen = vec![false; ntri];
+        let mut stack = vec![start as u32];
+        seen[start] = true;
+        let mut region = vec![start];
+        while let Some(k) = stack.pop() {
+            let nk = fnorm(k as usize);
+            let t = m.triangles[k as usize];
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                if let Some(nbrs) = edges.get(&key(a, b)) {
+                    for &nb in nbrs {
+                        if !seen[nb as usize] {
+                            let nn = fnorm(nb as usize);
+                            let dot = nk[0] * nn[0] + nk[1] * nn[1] + nk[2] * nn[2];
+                            if dot >= cos_thresh {
+                                seen[nb as usize] = true;
+                                stack.push(nb);
+                                region.push(nb as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let part = &mut self.objects[oi].parts[pi];
+        let mut changed = false;
+        for k in region {
+            if part.paint_tri[k] != paint {
+                part.paint_tri[k] = paint;
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn category_mask(&self) -> u32 {
@@ -1976,6 +2142,8 @@ impl App {
                                 ),
                                 display: Arc::new(p.mesh.display_mesh()),
                                 mesh: Arc::new(p.mesh),
+                                paint_tri: Vec::new(),
+                                painted: false,
                             })
                             .collect();
                         let mut obj =
@@ -2062,6 +2230,8 @@ impl App {
                     mesh: Arc::clone(&p.mesh),
                     display: Arc::clone(&p.display),
                     paint: p.paint,
+                    paint_tri: p.paint_tri.clone(),
+                    painted: p.painted,
                 })
                 .collect(),
             rot_deg: src.rot_deg,
@@ -2296,6 +2466,45 @@ impl App {
     /// paint, in that bed's local coordinates (the engine plans in [0, bed]
     /// space). Tools and blend weights clamp to the machine's slot count
     /// here (see `paint_engine`).
+    /// Dedup a per-triangle `PartColor` list into a compact `(face, paints)`
+    /// palette for `PartPaint::Painted`: `face[t]` indexes `paints`.
+    fn face_paints(&self, paint_tri: &[PartColor]) -> (Vec<u32>, Vec<engine::FacePaint>) {
+        let mut order: Vec<PartColor> = Vec::new();
+        let face: Vec<u32> = paint_tri
+            .iter()
+            .map(|&pc| match order.iter().position(|&x| x == pc) {
+                Some(i) => i as u32,
+                None => {
+                    order.push(pc);
+                    (order.len() - 1) as u32
+                }
+            })
+            .collect();
+        let paints = order.iter().map(|&pc| self.face_paint_engine(pc)).collect();
+        (face, paints)
+    }
+
+    /// One face's paint in engine terms — the [`Self::paint_engine`] rule, but
+    /// yielding an [`engine::FacePaint`].
+    fn face_paint_engine(&self, paint: PartColor) -> engine::FacePaint {
+        let cap = self.settings.tool_count.saturating_sub(1) as u32;
+        match paint {
+            PartColor::Tool(t) => engine::FacePaint::Tool(t.min(cap)),
+            PartColor::Blend(b) => {
+                let weights: Vec<(u32, f64)> = self
+                    .blends
+                    .get(b)
+                    .map(|bl| self.valid_weights(bl).into_iter().map(|(t, w)| (t, w as f64)).collect())
+                    .unwrap_or_default();
+                if weights.is_empty() {
+                    engine::FacePaint::Tool(0)
+                } else {
+                    engine::FacePaint::Blend(weights)
+                }
+            }
+        }
+    }
+
     fn baked_parts(&self) -> Vec<(mesh::Mesh, engine::PartPaint)> {
         let ox = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
         let mut out: Vec<(mesh::Mesh, engine::PartPaint)> = Vec::new();
@@ -2303,6 +2512,16 @@ impl App {
             let mut t = obj.transform();
             t.translation[0] -= ox;
             for part in &obj.parts {
+                // A painted part bakes its placement via `transformed` (triangles
+                // stay 1:1, so `paint_tri` stays aligned) and slices per-face.
+                if part.painted && part.paint_tri.len() == part.mesh.triangles.len() {
+                    let baked = part.mesh.transformed(&t);
+                    if !baked.triangles.is_empty() {
+                        let (face, paints) = self.face_paints(&part.paint_tri);
+                        out.push((baked, engine::PartPaint::Painted { face, paints }));
+                    }
+                    continue;
+                }
                 let mut tris: Vec<[[f64; 3]; 3]> = Vec::with_capacity(part.mesh.triangles.len());
                 for i in 0..part.mesh.triangles.len() {
                     let tri = part.mesh.triangle(i);
@@ -2773,18 +2992,42 @@ impl App {
         let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
         let multi = self.settings.tool_count > 1;
         let (unsel_tint, _) = mesh_tints(self.accent);
-        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)> = Vec::new();
+        // Per-face colors for painted parts (owned, so `objs` can borrow them);
+        // one slot per part in iteration order, None for unpainted parts. Shown
+        // regardless of the single-vs-multi tool gate.
+        let palettes: Vec<Option<Vec<[f32; 3]>>> = self
+            .objects
+            .iter()
+            .flat_map(|o| &o.parts)
+            .map(|part| {
+                (part.painted && part.paint_tri.len() == part.mesh.triangles.len()).then(|| {
+                    part.paint_tri
+                        .iter()
+                        .map(|&pc| render::visible_against_backdrop(self.paint_display_rgb(pc)))
+                        .collect()
+                })
+            })
+            .collect();
+        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool, Option<&[[f32; 3]]>)> =
+            Vec::new();
+        let mut pi = 0;
         for (i, o) in self.objects.iter().enumerate() {
             let t = o.transform();
             for part in &o.parts {
-                let rgb = if multi {
-                    render::visible_against_backdrop(self.paint_display_rgb(part.paint))
+                let face = palettes[pi].as_deref();
+                pi += 1;
+                // A painted part draws its RAW mesh (aligned to paint_tri and
+                // pick_face); otherwise the ghost-stripped display with the
+                // part's uniform tint.
+                let (mesh_ref, rgb) = if face.is_some() {
+                    (part.mesh.as_ref(), unsel_tint)
+                } else if multi {
+                    let rgb = render::visible_against_backdrop(self.paint_display_rgb(part.paint));
+                    (part.display.as_ref(), rgb)
                 } else {
-                    unsel_tint
+                    (part.display.as_ref(), unsel_tint)
                 };
-                // part.display: the ghost-stripped copy cached at import —
-                // the raw mesh still goes to the slicer.
-                objs.push((part.display.as_ref(), t, rgb, self.selected == Some(i), blocked[i]));
+                objs.push((mesh_ref, t, rgb, self.selected == Some(i), blocked[i], face));
             }
         }
         let bounds = self.scene.set_mesh(&rs.device, &objs);
@@ -3413,6 +3656,77 @@ impl eframe::App for App {
                     self.view_preview = true;
                 }
             });
+            // Paint: brush per-face tool colors onto the model (Model view only).
+            if !self.view_preview {
+                ui.add_space(2.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 24.0],
+                        egui::Button::selectable(self.paint_mode, "🖌 Paint faces"),
+                    )
+                    .on_hover_text(
+                        "Brush tool colors onto the surface. Drag to paint a disc; turn on \
+                         Fill region to flood-fill up to sharp edges. Painted regions slice \
+                         on their tool — one continuous wall that changes color at the seam.",
+                    )
+                    .clicked()
+                {
+                    self.paint_mode = !self.paint_mode;
+                    if self.paint_mode {
+                        self.selected = None;
+                    }
+                }
+                if self.paint_mode {
+                    // Swatches: every tool, then every blend — brush any of them.
+                    let mut sel: Option<PartColor> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        let swatch = |ui: &mut egui::Ui, rgb: [f32; 3], selected: bool, tip: String| -> bool {
+                            let col = egui::Color32::from_rgb(
+                                (rgb[0] * 255.0) as u8,
+                                (rgb[1] * 255.0) as u8,
+                                (rgb[2] * 255.0) as u8,
+                            );
+                            let (r, resp) =
+                                ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                            ui.painter().rect_filled(r, 4.0, col);
+                            if selected {
+                                ui.painter().rect_stroke(
+                                    r.expand(1.0),
+                                    5.0,
+                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            resp.on_hover_text(tip).clicked()
+                        };
+                        for t in 0..self.settings.tool_count as u32 {
+                            let pc = PartColor::Tool(t);
+                            let rgb = self.paint_display_rgb(pc);
+                            if swatch(ui, rgb, self.brush_paint == pc, format!("Paint tool T{t}")) {
+                                sel = Some(pc);
+                            }
+                        }
+                        for b in 0..self.blends.len() {
+                            let pc = PartColor::Blend(b);
+                            let rgb = self.paint_display_rgb(pc);
+                            let tip = format!("Paint blend: {}", self.blends[b].name);
+                            if swatch(ui, rgb, self.brush_paint == pc, tip) {
+                                sel = Some(pc);
+                            }
+                        }
+                    });
+                    if let Some(pc) = sel {
+                        self.brush_paint = pc;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("size");
+                        ui.add(egui::Slider::new(&mut self.brush_radius_mm, 0.5..=20.0).suffix(" mm"));
+                    });
+                    ui.checkbox(&mut self.fill_region, "Fill region")
+                        .on_hover_text("Click fills the whole contiguous surface up to sharp edges.");
+                }
+            }
             // The accent picker: one hue drives the whole 3D view (model
             // tint, feature palette, heat ramps). The mesh tints ride shader
             // uniforms and follow the picker live; the baked preview colors
@@ -3939,34 +4253,47 @@ impl eframe::App for App {
                             };
                             // The palette: every color the chosen spools can
                             // dither to within the band, one chip per whole-layer
-                            // recipe — the same format at every spool count,
-                            // sorted neutral-ramp-first then by hue.
-                            let lat = config::blend_lattice(&sub_colors, dither_cycle, 168);
-                            if let Some(lat) = &lat {
-                                if let Some(w) =
-                                    lattice_chips(ui, lat, &participants, &blend.weights)
-                                {
-                                    blend.weights = w;
-                                    weights_edited = Some(k);
+                            // recipe. It opens in a popup off a swatch button —
+                            // like a tool's color picker — so the editor stays
+                            // compact even when the grid is large.
+                            let lat = config::blend_lattice(&sub_colors, dither_cycle, 2000);
+                            let cur = {
+                                let entries: Vec<([f32; 3], f32)> = blend
+                                    .weights
+                                    .iter()
+                                    .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
+                                    .map(|&(t, w)| (slot_colors[t as usize], w))
+                                    .collect();
+                                if entries.is_empty() {
+                                    config::NEUTRAL_FILAMENT_RGB
+                                } else {
+                                    config::mix_colors_linear(&entries)
                                 }
-                            } else {
-                                // Too many mixes to lay out (many spools × fine
-                                // layers): fall back to pick-and-snap — choose any
-                                // color, land on the nearest printable mix.
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
+                            };
+                            let palette_btn = ui
+                                .horizontal(|ui| {
                                     ui.add_space(16.0);
-                                    let entries: Vec<([f32; 3], f32)> = blend
-                                        .weights
-                                        .iter()
-                                        .filter(|&&(t, w)| (t as usize) < tool_count && w > 0.0)
-                                        .map(|&(t, w)| (slot_colors[t as usize], w))
-                                        .collect();
-                                    let cur = if entries.is_empty() {
-                                        config::NEUTRAL_FILAMENT_RGB
-                                    } else {
-                                        config::mix_colors_linear(&entries)
-                                    };
+                                    let (sw, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(sw, 3.0, rgb32(cur));
+                                    ui.button("colors…")
+                                        .on_hover_text("Pick this blend's color from the printable-mix palette.")
+                                })
+                                .inner;
+                            egui::Popup::menu(&palette_btn).show(|ui| {
+                                ui.set_max_width(260.0);
+                                if let Some(lat) = &lat {
+                                    if let Some(w) =
+                                        lattice_chips(ui, lat, &participants, &blend.weights)
+                                    {
+                                        blend.weights = w;
+                                        weights_edited = Some(k);
+                                    }
+                                } else {
+                                    // Too many mixes to lay out: pick-and-snap —
+                                    // choose any color, land on the nearest mix.
                                     let mut rgb8 = [
                                         (cur[0] * 255.0).round() as u8,
                                         (cur[1] * 255.0).round() as u8,
@@ -3976,8 +4303,8 @@ impl eframe::App for App {
                                         .color_edit_button_srgb(&mut rgb8)
                                         .on_hover_text(
                                             "Too many printable mixes to lay out as swatches — \
-                                             pick any color and the mix snaps to the closest one \
-                                             this blend's spools can dither to.",
+                                             pick any color; it snaps to the nearest mix this \
+                                             blend's spools can dither to.",
                                         )
                                         .changed()
                                     {
@@ -3992,9 +4319,8 @@ impl eframe::App for App {
                                         ));
                                         weights_edited = Some(k);
                                     }
-                                    ui.label("pick");
-                                });
-                            }
+                                }
+                            });
                             // One row per CHOSEN spool: parts (relative shares,
                             // not percentages). 0 keeps the spool, drops its share.
                             for &pt in &participants {
@@ -4582,8 +4908,24 @@ impl eframe::App for App {
                 || over(self.print_overlay_rect)
                 || over(self.msgs_overlay_rect);
 
+            // Paint mode intercepts the primary button to brush faces; object
+            // move / orbit / selection are suppressed while it is on. Secondary
+            // drag (pan) and scroll (zoom) still navigate.
+            if edit && self.paint_mode {
+                if !blocked
+                    && (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
+                {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let (o, d) = pointer_ray(vp, rect, p);
+                        if let Some((oi, part, tri, hit)) = self.pick_face(o, d) {
+                            self.paint_at(oi, part, tri, hit, o);
+                        }
+                    }
+                }
+            }
+
             // Left-press on an object grabs it for dragging; on empty space, orbits.
-            if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
+            if edit && !blocked && !self.paint_mode && response.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
@@ -4598,7 +4940,7 @@ impl eframe::App for App {
                     }
                 }
             }
-            if response.dragged_by(egui::PointerButton::Primary) {
+            if !self.paint_mode && response.dragged_by(egui::PointerButton::Primary) {
                 match self.drag_obj {
                     Some(i) => {
                         if let Some(p) = response.interact_pointer_pos() {
@@ -4630,7 +4972,7 @@ impl eframe::App for App {
             // A plain click selects the object under the cursor (its bed
             // becomes active), or — on empty space — deselects and activates
             // the bed nearest the click.
-            if edit && !blocked && response.clicked() {
+            if edit && !blocked && !self.paint_mode && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
                     self.selected = self.pick(o, d);
@@ -5589,6 +5931,14 @@ fn lattice_chips(
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.add_space(16.0);
+        // A big palette (many spools / fine layers) scrolls in place instead of
+        // shoving the panel down — the whole grid stays reachable. The height is
+        // capped; a small palette shrinks to fit.
+        egui::ScrollArea::vertical()
+            .id_salt("blend_chips")
+            .max_height(240.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
             for (comp, rgb) in lattice {
@@ -5623,6 +5973,7 @@ fn lattice_chips(
                 }
             }
         });
+            });
     });
     picked
 }
