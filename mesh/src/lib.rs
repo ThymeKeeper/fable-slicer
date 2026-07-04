@@ -103,6 +103,180 @@ impl Mesh {
         Mesh { vertices, triangles }
     }
 
+    /// A DISPLAY-ONLY copy without the faces that render as artifacts:
+    /// zero-area triangles and GHOST faces — surface with the same winding
+    /// number on both sides, bounding no material. That covers every
+    /// zero-thickness fin some generators emit for empty runs (a QR plate's
+    /// blank modules — doubled sheets in ANY triangulation, edge-adjacent or
+    /// not) and interior walls buried between abutting solids. The
+    /// classification is the generalized-winding-number test real mesh
+    /// repair tools use; meshes too large for its O(n²) fall back to the
+    /// cheap fold-back edge test.
+    ///
+    /// NEVER feed this to the slicer. Removing buried interior walls merges
+    /// regions the multi-material planner must keep distinct, and the
+    /// directed slicer already resolves ghosts correctly from the signed
+    /// winding of the raw mesh (verified: toolpaths identical either way).
+    /// In the viewer the dropped faces are invisible or artifacts, so
+    /// dropping them is safe there and only there.
+    pub fn display_mesh(&self) -> Mesh {
+        let mut m = self.clone();
+        m.drop_degenerate_faces();
+        m
+    }
+
+    /// Generalized winding number of the closed(ish) surface at `p` —
+    /// Van Oosterom–Strackee solid angles summed over every triangle, over
+    /// 4π. ≈1 inside, ≈0 outside; ghosts contribute canceling pairs.
+    fn winding_at(&self, p: Vec3) -> f64 {
+        let mut sum = 0.0f64;
+        for t in &self.triangles {
+            let s = |v: Vec3| [v[0] - p[0], v[1] - p[1], v[2] - p[2]];
+            let (a, b, c) = (
+                s(self.vertices[t[0] as usize]),
+                s(self.vertices[t[1] as usize]),
+                s(self.vertices[t[2] as usize]),
+            );
+            let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+            let cross = |x: [f64; 3], y: [f64; 3]| {
+                [
+                    x[1] * y[2] - x[2] * y[1],
+                    x[2] * y[0] - x[0] * y[2],
+                    x[0] * y[1] - x[1] * y[0],
+                ]
+            };
+            let (la, lb, lc) = (
+                dot(a, a).sqrt(),
+                dot(b, b).sqrt(),
+                dot(c, c).sqrt(),
+            );
+            let num = dot(a, cross(b, c));
+            let den = la * lb * lc + dot(a, b) * lc + dot(b, c) * la + dot(c, a) * lb;
+            sum += f64::atan2(num, den);
+        }
+        sum / (2.0 * std::f64::consts::PI)
+    }
+
+    /// Drop every face whose two sides see the same winding number — it
+    /// bounds no material. Catches doubled sheets regardless of how each
+    /// side is triangulated (the fold-back edge test needs the pair to share
+    /// an edge; a sheet split along the other diagonal escapes it).
+    fn drop_ghost_faces(&mut self) {
+        use rayon::prelude::*;
+        const EPS_MM: f64 = 5e-4;
+        let keep: Vec<bool> = self
+            .triangles
+            .par_iter()
+            .map(|t| {
+                let (a, b, c) = (
+                    self.vertices[t[0] as usize],
+                    self.vertices[t[1] as usize],
+                    self.vertices[t[2] as usize],
+                );
+                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let n = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                let m = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if m < 1e-12 {
+                    return false;
+                }
+                let cx = (a[0] + b[0] + c[0]) / 3.0;
+                let cy = (a[1] + b[1] + c[1]) / 3.0;
+                let cz = (a[2] + b[2] + c[2]) / 3.0;
+                let d = [n[0] / m * EPS_MM, n[1] / m * EPS_MM, n[2] / m * EPS_MM];
+                let wf = self.winding_at([cx + d[0], cy + d[1], cz + d[2]]).round();
+                let wb = self.winding_at([cx - d[0], cy - d[1], cz - d[2]]).round();
+                wf != wb
+            })
+            .collect();
+        let mut it = keep.iter();
+        self.triangles.retain(|_| *it.next().unwrap());
+    }
+
+    fn drop_degenerate_faces(&mut self) {
+        // Zero-area first — their normals are noise for the fold test.
+        let verts = &self.vertices;
+        let normal = |t: &[u32; 3]| -> Vec3 {
+            let (a, b, c) =
+                (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ]
+        };
+        let mag2 = |n: Vec3| n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+        self.triangles.retain(|t| mag2(normal(t)) > 1e-20);
+
+        // Ghost removal: the winding classification is complete but O(n²) —
+        // gate it; huge meshes keep the cheap edge-adjacent fold-back test.
+        if self.triangles.len() <= 20_000 {
+            self.drop_ghost_faces();
+            self.prune_unused_vertices();
+            return;
+        }
+
+        // Fold-backs: an edge shared by exactly two triangles whose normals
+        // point exactly opposite ways is a crease of angle zero — the
+        // surface doubles back on itself and encloses nothing there.
+        let normals: Vec<Vec3> = self.triangles.iter().map(|t| normal(t)).collect();
+        let mut edges: HashMap<(u32, u32), (u32, u32, u8)> = HashMap::new();
+        for (i, t) in self.triangles.iter().enumerate() {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let k = (a.min(b), a.max(b));
+                let e = edges.entry(k).or_insert((0, 0, 0));
+                match e.2 {
+                    0 => e.0 = i as u32,
+                    1 => e.1 = i as u32,
+                    _ => {}
+                }
+                e.2 = e.2.saturating_add(1);
+            }
+        }
+        let mut drop = vec![false; self.triangles.len()];
+        for &(i, j, n) in edges.values() {
+            if n != 2 {
+                continue;
+            }
+            let (a, b) = (normals[i as usize], normals[j as usize]);
+            let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            if dot < 0.0 && dot * dot > 0.999_998 * mag2(a) * mag2(b) {
+                drop[i as usize] = true;
+                drop[j as usize] = true;
+            }
+        }
+        if drop.iter().any(|&d| d) {
+            let mut it = drop.iter();
+            self.triangles.retain(|_| !it.next().unwrap());
+        }
+
+        self.prune_unused_vertices();
+    }
+
+    /// Prune vertices nothing references (ghost removal orphans the fin
+    /// crests) so z_bounds and friends read printable geometry only.
+    fn prune_unused_vertices(&mut self) {
+        let mut remap: Vec<u32> = vec![u32::MAX; self.vertices.len()];
+        let mut kept: Vec<Vec3> = Vec::new();
+        for t in &mut self.triangles {
+            for i in t.iter_mut() {
+                let m = &mut remap[*i as usize];
+                if *m == u32::MAX {
+                    *m = kept.len() as u32;
+                    kept.push(self.vertices[*i as usize]);
+                }
+                *i = *m;
+            }
+        }
+        self.vertices = kept;
+    }
+
     /// Append another mesh, re-basing its indices — merging build items into
     /// one plate (CLI) or components into one object.
     pub fn append(&mut self, other: &Mesh) {
@@ -317,5 +491,101 @@ mod tests {
         assert_eq!(loaded.vertices.len(), 8);
         assert_eq!(loaded.triangles.len(), 12);
         assert_eq!(loaded.z_bounds(), Some((0.0, 5.0)));
+    }
+
+    #[test]
+    fn degenerate_faces_are_dropped_at_load() {
+        // A unit cube (12 real triangles), plus the two degenerate classes
+        // some generators emit: a zero-thickness fold-back fin (a vertical
+        // quad doubled front-and-back, 4 triangles enclosing nothing) and a
+        // collinear sliver. Only the cube must survive, and the fin's
+        // orphaned crest vertices must not stretch the bounds.
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        let (lo, hi) = ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let v = [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
+        ];
+        for t in [
+            [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+            [3, 6, 2], [3, 7, 6], [0, 7, 3], [0, 4, 7], [1, 2, 6], [1, 6, 5],
+        ] {
+            tris.push([v[t[0]], v[t[1]], v[t[2]]]);
+        }
+        // The fin: a vertical quad on top of the cube, both windings — the
+        // crest at z=2 exists nowhere else, so pruning must remove it.
+        let (a, b) = ([0.2, 0.5, 1.0], [0.8, 0.5, 1.0]);
+        let (c, d) = ([0.2, 0.5, 2.0], [0.8, 0.5, 2.0]);
+        tris.push([a, b, d]);
+        tris.push([a, d, c]);
+        tris.push([a, d, b]);
+        tris.push([a, c, d]);
+        // Collinear sliver: three distinct points on one line.
+        tris.push([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        let m = Mesh::from_triangle_soup(&tris);
+        // The raw mesh keeps everything the slicer needs (the sliver dies to
+        // the soup's collapsed-corner weld only if its corners coincide —
+        // this one keeps 3 distinct vertices).
+        assert_eq!(m.triangles.len(), 17, "slicing input keeps the raw faces");
+        let d = m.display_mesh();
+        assert_eq!(d.triangles.len(), 12, "only the cube's faces are displayed");
+        assert_eq!(d.z_bounds(), Some((0.0, 1.0)), "the fin crest must not stretch display bounds");
+        assert_eq!(m.z_bounds(), Some((0.0, 2.0)), "the raw mesh is untouched");
+    }
+
+    #[test]
+    fn cross_diagonal_fins_and_buried_walls_are_ghosts() {
+        // The fin class the fold-back edge test CANNOT see: a doubled sheet
+        // whose two sides are triangulated along different diagonals — the
+        // anti-parallel faces never share an edge (the coin-holder QR's
+        // remaining fins). The winding classification must still drop it.
+        let cube = |lo: Vec3, hi: Vec3, tris: &mut Vec<[Vec3; 3]>| {
+            let v = [
+                [lo[0], lo[1], lo[2]],
+                [hi[0], lo[1], lo[2]],
+                [hi[0], hi[1], lo[2]],
+                [lo[0], hi[1], lo[2]],
+                [lo[0], lo[1], hi[2]],
+                [hi[0], lo[1], hi[2]],
+                [hi[0], hi[1], hi[2]],
+                [lo[0], hi[1], hi[2]],
+            ];
+            for t in [
+                [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+                [3, 6, 2], [3, 7, 6], [0, 7, 3], [0, 4, 7], [1, 2, 6], [1, 6, 5],
+            ] {
+                tris.push([v[t[0]], v[t[1]], v[t[2]]]);
+            }
+        };
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        cube([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], &mut tris);
+        // Fin quad corners above the cube; side A split a-d, side B split b-c.
+        let (a, b) = ([0.2, 0.5, 1.0], [0.8, 0.5, 1.0]);
+        let (c, d) = ([0.2, 0.5, 2.0], [0.8, 0.5, 2.0]);
+        tris.push([a, b, d]);
+        tris.push([a, d, c]);
+        tris.push([b, a, c]);
+        tris.push([b, c, d]);
+        let m = Mesh::from_triangle_soup(&tris);
+        assert_eq!(m.triangles.len(), 16);
+        let disp = m.display_mesh();
+        assert_eq!(disp.triangles.len(), 12, "cross-diagonal fin must be dropped");
+
+        // Two cubes sharing a full face: each keeps its own wall there —
+        // buried between solids, winding 1 on both sides, dropped from the
+        // display (they are invisible inside the union anyway).
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        cube([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], &mut tris);
+        cube([1.0, 0.0, 0.0], [2.0, 1.0, 1.0], &mut tris);
+        let m = Mesh::from_triangle_soup(&tris);
+        assert_eq!(m.triangles.len(), 24, "the raw pair keeps both interior walls");
+        let disp = m.display_mesh();
+        assert_eq!(disp.triangles.len(), 20, "buried walls drop from the display");
     }
 }

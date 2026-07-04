@@ -811,6 +811,10 @@ enum PartColor {
 struct ScenePart {
     name: String,
     mesh: Arc<mesh::Mesh>,
+    /// The mesh the viewer draws: `mesh` minus ghost faces (generator fins,
+    /// buried walls) — computed once at import, NEVER sliced (see
+    /// `Mesh::display_mesh`).
+    display: Arc<mesh::Mesh>,
     /// The tool or blend that prints this part. Clamped to the machine's
     /// tool count at bake time.
     paint: PartColor,
@@ -834,7 +838,12 @@ impl SceneObject {
     fn new(name: String, mesh: mesh::Mesh) -> Self {
         Self {
             name,
-            parts: vec![ScenePart { name: String::new(), mesh: Arc::new(mesh), paint: PartColor::Tool(0) }],
+            parts: vec![ScenePart {
+                name: String::new(),
+                display: Arc::new(mesh.display_mesh()),
+                mesh: Arc::new(mesh),
+                paint: PartColor::Tool(0),
+            }],
             rot_deg: [0.0; 3],
             scale: 1.0,
             pos: [0.0, 0.0],
@@ -1965,6 +1974,7 @@ impl App {
                                 paint: PartColor::Tool(
                                     p.extruder.map(|e| e.saturating_sub(1)).unwrap_or(0).min(tool_cap),
                                 ),
+                                display: Arc::new(p.mesh.display_mesh()),
                                 mesh: Arc::new(p.mesh),
                             })
                             .collect();
@@ -2047,7 +2057,12 @@ impl App {
             parts: src
                 .parts
                 .iter()
-                .map(|p| ScenePart { name: p.name.clone(), mesh: Arc::clone(&p.mesh), paint: p.paint })
+                .map(|p| ScenePart {
+                    name: p.name.clone(),
+                    mesh: Arc::clone(&p.mesh),
+                    display: Arc::clone(&p.display),
+                    paint: p.paint,
+                })
                 .collect(),
             rot_deg: src.rot_deg,
             scale: src.scale,
@@ -2767,7 +2782,9 @@ impl App {
                 } else {
                     unsel_tint
                 };
-                objs.push((part.mesh.as_ref(), t, rgb, self.selected == Some(i), blocked[i]));
+                // part.display: the ghost-stripped copy cached at import —
+                // the raw mesh still goes to the slicer.
+                objs.push((part.display.as_ref(), t, rgb, self.selected == Some(i), blocked[i]));
             }
         }
         let bounds = self.scene.set_mesh(&rs.device, &objs);
