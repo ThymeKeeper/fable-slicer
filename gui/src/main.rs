@@ -4324,35 +4324,48 @@ impl eframe::App for App {
                     // overflow, pushing the viewport right and opening an
                     // unpainted band (egui #4475; see the panel comment).
                     let before = s.tool_count;
-                    revert_row(ui, &mut s.tool_count, &self.baseline.tool_count, |ui, v| {
-                        ui.add(egui::DragValue::new(v).range(1..=8));
-                        ui.label("tools").on_hover_text(
-                            "Filament slots — 2+ = a multi-tool machine. Each slot loads \
-                             its filament on the Filament card's tabs; parts pick their \
-                             tool in the object list. How swaps happen is set below.",
+                    // Machine type: one dropdown = the machine's identity. "Single
+                    // nozzle" is simply one tool; the three multi-tool modes
+                    // describe how 2+ tools swap (heater model + whether a swap
+                    // purges). The slot count and swap facts appear below only when
+                    // it's a multi-tool machine.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        machine_type_combo(ui, &mut s.tool_count, &mut s.machine_kind).on_hover_text(
+                            "What kind of machine this is:\n\
+                             • Single nozzle — one hotend, one filament. The ordinary case.\n\
+                             • Independent hotends — a head per tool, docked and swapped. Each \
+                             keeps its own filament (nothing purged) and its own live temperature.\n\
+                             • Shared nozzle — one hotend fed by a selector. A swap unloads, loads, \
+                             and FLUSHES the old color through the shared melt zone; the single \
+                             heater ramps between materials.\n\
+                             • Separate nozzles + shared heater — a nozzle per filament (so no \
+                             flush) taking turns in ONE heater. A swap indexes the next nozzle in \
+                             and waits for it to reach temperature.\n\
+                             Set the swap macro under Custom g-code — placeholders {tool} / \
+                             {from_tool} / {to_temp} / {purge_mm3} / {purge_mm}.",
                         );
+                        // Revert the whole machine type (count + swap mode) at once.
+                        let cur_single = s.tool_count <= 1;
+                        let base_single = self.baseline.tool_count <= 1;
+                        let differs = cur_single != base_single
+                            || (!cur_single && s.machine_kind != self.baseline.machine_kind);
+                        if differs
+                            && ui
+                                .small_button("⟲")
+                                .on_hover_text("Edited — click to revert to the profile's value.")
+                                .clicked()
+                        {
+                            s.tool_count = self.baseline.tool_count;
+                            s.machine_kind = self.baseline.machine_kind;
+                        }
                     });
-                    if s.tool_count != before {
-                        tool_count_changed = true;
-                    }
-                    ui.add_enabled_ui(s.tool_count > 1, |ui| {
-                        // How the machine changes filament — the mechanism, which
-                        // drives temperature (one heater vs a heater per tool) and
-                        // whether a swap has to purge (shared melt zone or not).
-                        revert_row(ui, &mut s.machine_kind, &self.baseline.machine_kind, |ui, v| {
-                            machine_combo(ui, v).on_hover_text(
-                                "How swaps work — pick the mechanism:\n\
-                                 • Independent hotends — a head per tool, docked and swapped. \
-                                 Each keeps its own filament; nothing is purged. Every tool \
-                                 holds its own live temperature.\n\
-                                 • Shared nozzle — one hotend fed by a selector. A swap unloads, \
-                                 loads, and FLUSHES the old color through the shared melt zone; \
-                                 the single heater ramps between materials.\n\
-                                 • Separate nozzles + shared heater — a nozzle per filament (so \
-                                 no flush) taking turns in ONE heater. A swap indexes the next \
-                                 nozzle in and waits for it to reach temperature.\n\
-                                 Set the swap macro under Custom g-code — placeholders {tool} / \
-                                 {from_tool} / {to_temp} / {purge_mm3} / {purge_mm}.",
+                    if s.tool_count > 1 {
+                        revert_row(ui, &mut s.tool_count, &self.baseline.tool_count, |ui, v| {
+                            ui.add(egui::DragValue::new(v).range(2..=8));
+                            ui.label("tools").on_hover_text(
+                                "Filament slots on the machine. Each loads its filament on the \
+                                 Filament card's tabs; parts pick their tool in the object list.",
                             );
                         });
                         revert_row(ui, &mut s.toolchange_seconds, &self.baseline.toolchange_seconds, |ui, v| {
@@ -4402,7 +4415,10 @@ impl eframe::App for App {
                             // cool) — the reheat rides s/change. Nothing to add.
                             config::MachineKind::SharedHeater => {}
                         }
-                    });
+                    }
+                    if s.tool_count != before {
+                        tool_count_changed = true;
+                    }
                     revert_row(ui, &mut s.machine_speed_mm_s, &self.baseline.machine_speed_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 10.0..=700.0), "rated mm/s",
                             "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine.");
@@ -5830,17 +5846,65 @@ fn ray_triangle(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3, c: g
     (t > 1e-4).then_some(t)
 }
 
-fn machine_combo(ui: &mut egui::Ui, current: &mut config::MachineKind) -> egui::Response {
+/// The machine-type picker: a single-nozzle printer plus the three multi-tool
+/// swap mechanisms. "Single nozzle" is just `tool_count == 1`; picking a
+/// multi-tool mode from one tool bumps the count to 2. Drives both fields so the
+/// dropdown reads as the machine's identity.
+fn machine_type_combo(
+    ui: &mut egui::Ui,
+    tool_count: &mut usize,
+    machine_kind: &mut config::MachineKind,
+) -> egui::Response {
     use config::MachineKind::*;
-    egui::ComboBox::from_id_salt("machine_kind")
-        .selected_text(current.display())
+    #[derive(PartialEq, Clone, Copy)]
+    enum T {
+        Single,
+        Ind,
+        SharedNoz,
+        SharedHeat,
+    }
+    let single_text = "Single nozzle (one filament)";
+    let mut sel = if *tool_count <= 1 {
+        T::Single
+    } else {
+        match *machine_kind {
+            IndependentHotends => T::Ind,
+            SharedNozzle => T::SharedNoz,
+            SharedHeater => T::SharedHeat,
+        }
+    };
+    let text = match sel {
+        T::Single => single_text,
+        T::Ind => IndependentHotends.display(),
+        T::SharedNoz => SharedNozzle.display(),
+        T::SharedHeat => SharedHeater.display(),
+    };
+    let resp = egui::ComboBox::from_id_salt("machine_type")
+        .selected_text(text)
         .width(240.0)
         .show_ui(ui, |ui| {
-            for kind in [IndependentHotends, SharedNozzle, SharedHeater] {
-                ui.selectable_value(current, kind, kind.display());
-            }
+            ui.selectable_value(&mut sel, T::Single, single_text);
+            ui.selectable_value(&mut sel, T::Ind, IndependentHotends.display());
+            ui.selectable_value(&mut sel, T::SharedNoz, SharedNozzle.display());
+            ui.selectable_value(&mut sel, T::SharedHeat, SharedHeater.display());
         })
-        .response
+        .response;
+    match sel {
+        T::Single => *tool_count = 1,
+        T::Ind => {
+            *machine_kind = IndependentHotends;
+            *tool_count = (*tool_count).max(2);
+        }
+        T::SharedNoz => {
+            *machine_kind = SharedNozzle;
+            *tool_count = (*tool_count).max(2);
+        }
+        T::SharedHeat => {
+            *machine_kind = SharedHeater;
+            *tool_count = (*tool_count).max(2);
+        }
+    }
+    resp
 }
 
 fn seam_combo(ui: &mut egui::Ui, current: &mut config::SeamMode) -> egui::Response {
