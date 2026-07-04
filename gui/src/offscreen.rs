@@ -124,7 +124,14 @@ pub fn run(a: &Args) -> Result<(), String> {
             layers
                 .iter()
                 .map(|l| {
-                    l.paths.iter().map(|p| settings.tool(p.tool as usize).color_rgb).collect()
+                    l.paths
+                        .iter()
+                        .map(|p| {
+                            crate::render::visible_against_backdrop(
+                                settings.tool(p.tool as usize).color_rgb,
+                            )
+                        })
+                        .collect()
                 })
                 .collect(),
         ),

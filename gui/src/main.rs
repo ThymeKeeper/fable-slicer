@@ -2333,7 +2333,11 @@ impl App {
                         layer
                             .paths
                             .iter()
-                            .map(|p| self.settings.tool(p.tool as usize).color_rgb)
+                            .map(|p| {
+                                render::visible_against_backdrop(
+                                    self.settings.tool(p.tool as usize).color_rgb,
+                                )
+                            })
                             .collect()
                     })
                     .collect(),
@@ -2582,7 +2586,11 @@ impl App {
         for (i, o) in self.objects.iter().enumerate() {
             let t = o.transform();
             for part in &o.parts {
-                let rgb = if multi { self.paint_display_rgb(part.paint) } else { unsel_tint };
+                let rgb = if multi {
+                    render::visible_against_backdrop(self.paint_display_rgb(part.paint))
+                } else {
+                    unsel_tint
+                };
                 objs.push((part.mesh.as_ref(), t, rgb, self.selected == Some(i), blocked[i]));
             }
         }

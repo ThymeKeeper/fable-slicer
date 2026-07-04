@@ -21,6 +21,34 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// The viewport clear color, in the sRGB values the pipeline displays.
+/// Preview colors are contrast-checked against it (`visible_against_backdrop`),
+/// so it lives here beside the clear that uses it.
+pub const BACKDROP_RGB: [f32; 3] = [0.058, 0.048, 0.038];
+
+/// A displayed color the shade of the backdrop would vanish into it — a
+/// near-black spool on the near-black stage renders as a hole. Hold every
+/// preview color to a minimum luminance gap from the backdrop, nudged toward
+/// the pole the backdrop is far from (white, on this stage) just far enough
+/// to clear the floor. Hue survives the nudge; colors already clear of the
+/// floor pass through untouched. Display only — never the color that reaches
+/// profiles, blends, or g-code.
+pub fn visible_against_backdrop(c: [f32; 3]) -> [f32; 3] {
+    // 0.18 rather than a bare-minimum gap: the bead shader multiplies
+    // colors down to 0.40x on faces the light misses, and the layer
+    // slider dims lower layers further — the floor must survive both.
+    const FLOOR: f32 = 0.18;
+    let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let bl = luma(BACKDROP_RGB);
+    let cl = luma(c);
+    if (cl - bl).abs() >= FLOOR {
+        return c;
+    }
+    let (pole, target) = if bl < 0.5 { (1.0, bl + FLOOR) } else { (0.0, bl - FLOOR) };
+    let t = ((target - cl) / (pole - cl)).clamp(0.0, 1.0);
+    [c[0] + t * (pole - c[0]), c[1] + t * (pole - c[1]), c[2] + t * (pole - c[2])]
+}
+
 const SHADER: &str = r#"
 struct U {
     mvp: mat4x4<f32>,
@@ -706,7 +734,12 @@ impl Scene {
                     ops: wgpu::Operations {
                         // The viewport stage: ink a step deeper than the
                         // panels, so the chrome floats on it.
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.058, g: 0.048, b: 0.038, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: BACKDROP_RGB[0] as f64,
+                            g: BACKDROP_RGB[1] as f64,
+                            b: BACKDROP_RGB[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1041,4 +1074,32 @@ fn make_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_backdrop_colors_lift_to_the_luma_floor() {
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let bl = luma(BACKDROP_RGB);
+        // The backdrop's own color, pure black, and a #1A1A1A spool all
+        // clear the floor after the nudge.
+        for c in [BACKDROP_RGB, [0.0; 3], [0.102; 3]] {
+            let v = visible_against_backdrop(c);
+            assert!(
+                (luma(v) - bl).abs() >= 0.179,
+                "{c:?} -> {v:?} still hides against the backdrop"
+            );
+        }
+        // A dark red stays red-dominant — the nudge moves shade, not hue.
+        let v = visible_against_backdrop([0.13, 0.02, 0.02]);
+        assert!(v[0] > v[1] && v[0] > v[2], "hue must survive: {v:?}");
+        assert!((luma(v) - bl).abs() >= 0.179);
+        // Colors already clear of the floor pass through byte-identical.
+        for c in [[1.0, 1.0, 1.0], [0.82, 0.82, 0.82], [0.28, 0.28, 0.28], [0.9, 0.1, 0.1]] {
+            assert_eq!(visible_against_backdrop(c), c);
+        }
+    }
 }
