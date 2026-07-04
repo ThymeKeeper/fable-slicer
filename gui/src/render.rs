@@ -661,14 +661,18 @@ impl Scene {
             } else {
                 ([0.14, 0.125, 0.10], [0.34, 0.31, 0.26]) // receded
             };
-            let mut x = 0.0;
-            while x <= bed_x + 0.01 {
+            // INTERIOR grid lines only — the border below owns the four edges.
+            // Starting at 0 (or landing on bed_x/bed_y when they're a multiple of
+            // step) would double a grid line onto the border, so those edges read
+            // thicker than the others.
+            let mut x = step;
+            while x < bed_x - 0.01 {
                 v.push(LineVertex { pos: [ox + x, 0.0, 0.0], color: grid });
                 v.push(LineVertex { pos: [ox + x, bed_y, 0.0], color: grid });
                 x += step;
             }
-            let mut y = 0.0;
-            while y <= bed_y + 0.01 {
+            let mut y = step;
+            while y < bed_y - 0.01 {
                 v.push(LineVertex { pos: [ox, y, 0.0], color: grid });
                 v.push(LineVertex { pos: [ox + bed_x, y, 0.0], color: grid });
                 y += step;
