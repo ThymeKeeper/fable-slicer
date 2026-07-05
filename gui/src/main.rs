@@ -4880,6 +4880,12 @@ impl eframe::App for App {
             let aspect = rect.width() / rect.height().max(1.0);
             let vp = self.camera.view_proj(aspect);
 
+            // The camera is in motion this frame if a glide is running or the
+            // user orbits/pans/zooms below. While it moves, the scene renders at
+            // reduced resolution (dynamic resolution) — you can't see fine detail
+            // while spinning — and snaps back to full res the frame it settles.
+            let mut camera_moving = self.camera_glide.is_some();
+
             // Objects are only editable in Model view; Preview is read-only.
             let edit = !self.view_preview;
             // Ignore viewport input when the cursor is over a floating overlay.
@@ -4932,6 +4938,7 @@ impl eframe::App for App {
                         if !blocked {
                             let d = response.drag_delta();
                             self.camera.orbit(d.x, d.y);
+                            camera_moving = true;
                         }
                     }
                 }
@@ -4970,6 +4977,7 @@ impl eframe::App for App {
                 self.camera_glide = None;
                 let d = response.drag_delta();
                 self.camera.pan(d.x, d.y);
+                camera_moving = true;
             }
             if response.hovered() && !blocked {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -4977,13 +4985,31 @@ impl eframe::App for App {
                     // Manual zoom takes the camera back mid-glide.
                     self.camera_glide = None;
                     self.camera.zoom(scroll);
+                    camera_moving = true;
                 }
             }
 
+            // Dynamic resolution: render at half size while the camera moves
+            // (invisible while spinning — egui upsamples with Linear), full size
+            // when it settles. resize() no-ops when the size is unchanged, so a
+            // continuous drag reallocates the targets only at motion start/stop.
             let ppp = ui.ctx().pixels_per_point();
-            let w = (rect.width() * ppp).round().max(1.0) as u32;
-            let h = (rect.height() * ppp).round().max(1.0) as u32;
+            let full_w = (rect.width() * ppp).round().max(1.0) as u32;
+            let full_h = (rect.height() * ppp).round().max(1.0) as u32;
+            let scale = if camera_moving { 0.5 } else { 1.0 };
+            let w = ((full_w as f32 * scale).round() as u32).max(1);
+            let h = ((full_h as f32 * scale).round() as u32).max(1);
+            // Full dims drive the star-billboard sizing; the (maybe halved) w/h
+            // drive the render target AND RenderSig.size, so the settle frame
+            // (scale 1.0 → different size) forces a full-res re-render.
+            self.scene.set_display_size(full_w, full_h);
             self.scene.resize(&rs, w, h);
+            // Guarantee the frame after motion ends is drawn at full res (during
+            // an active drag egui repaints anyway; this covers the smooth-scroll
+            // tail). Self-terminating: the settle frame has camera_moving=false.
+            if camera_moving {
+                ui.ctx().request_repaint();
+            }
             let show_mesh = !(self.view_preview && self.sliced.is_some());
             let preview = if self.view_preview && self.sliced.is_some() {
                 let n = self.layer_ends.len();

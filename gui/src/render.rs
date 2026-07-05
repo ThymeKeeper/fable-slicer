@@ -355,7 +355,14 @@ pub struct Scene {
     bead_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// The render-target size — halved while the camera is moving (dynamic
+    /// resolution), so it can differ from the on-screen size below.
     size: (u32, u32),
+    /// The full on-screen size, fed to the star-billboard shader so the backdrop
+    /// stars keep a constant apparent size even when `size` is scaled down.
+    /// Tracks `size` by default (the headless oracle never scales), so the
+    /// offscreen render is unaffected.
+    display_size: (u32, u32),
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
@@ -499,6 +506,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            Some(wgpu::Face::Back),
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
@@ -511,6 +519,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            None,
         );
         let bead_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_bead", "fs_bead",
@@ -530,6 +539,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            Some(wgpu::Face::Back),
         );
         let joint_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_joint", "fs_bead",
@@ -549,6 +559,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            Some(wgpu::Face::Back),
         );
 
         // Bed-label pass: group(1) = its R8 font-atlas texture + sampler; alpha
@@ -611,6 +622,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Less,
+            None,
         );
 
         // Selection spotlight: alpha-blended like the label, but keyed off the
@@ -639,6 +651,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Always,
+            None,
         );
 
         // Night-sky stars: instanced billboards, alpha-over like the glow, depth
@@ -673,6 +686,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Always,
+            None,
         );
         let star_quad: [[f32; 2]; 6] =
             [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
@@ -714,6 +728,7 @@ impl Scene {
             uniform_buf,
             bind_group,
             size: (1, 1),
+            display_size: (1, 1),
             color_view,
             depth_view,
             resolve_view,
@@ -783,7 +798,17 @@ impl Scene {
         self.resolve_view = resolve_view;
         self.resolve_tex = resolve_tex;
         self.size = (w, h);
+        // Default the on-screen size to the target size; the GUI overrides it via
+        // `set_display_size` when it renders at a reduced (dynamic) resolution.
+        self.display_size = (w, h);
         true
+    }
+
+    /// Set the full on-screen size (for the star-billboard shader) independently
+    /// of the render-target `size`, so dynamic-resolution rendering doesn't
+    /// balloon the backdrop stars.
+    pub fn set_display_size(&mut self, w: u32, h: u32) {
+        self.display_size = (w.max(1), h.max(1));
     }
 
     /// How many parts the current geometry buffer holds — the caller uploads
@@ -1057,7 +1082,9 @@ impl Scene {
             mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
             label_color,
             cam_eye: [cam_eye.x, cam_eye.y, cam_eye.z, 0.0],
-            viewport: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0],
+            // Full on-screen size (not the possibly-scaled render target), so the
+            // star billboards keep a constant apparent size at reduced resolution.
+            viewport: [self.display_size.0 as f32, self.display_size.1 as f32, 0.0, 0.0],
             tool_palette,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -1444,6 +1471,10 @@ fn make_pipeline(
     blend: wgpu::BlendState,
     depth_write: bool,
     depth_compare: wgpu::CompareFunction,
+    // Back-face culling for the closed solids (beads/joints/mesh) whose inner
+    // faces are never visible; `None` for lines and the single-sided flat quads
+    // (spotlight/label/bed-fill/stars) that must draw from both sides.
+    cull: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("scene_pipeline"),
@@ -1468,7 +1499,7 @@ fn make_pipeline(
             topology,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            cull_mode: cull,
             unclipped_depth: false,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
