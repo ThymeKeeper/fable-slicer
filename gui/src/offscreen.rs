@@ -196,7 +196,8 @@ pub fn run(a: &Args) -> Result<(), String> {
         color_mode,
         tool_palette,
     };
-    scene.render_to(&device, &queue, view_proj, eye, false, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);
+    let (key, fill) = crate::render::camera_lights(eye, center);
+    scene.render_to(&device, &queue, view_proj, eye, false, false, Some(preview), key, fill, [0.0; 4]);
 
     let (w, h, rgba) = scene.read_rgba(&device, &queue);
     write_png(&a.out, w, h, &rgba).map_err(|e| format!("write png: {e}"))?;

@@ -5059,13 +5059,14 @@ impl eframe::App for App {
                 preview_color,
             };
             if self.last_render_sig.as_ref() != Some(&sig) {
-                let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
+                // Camera-relative key + fill so surface detail reads at any orbit.
+                let (key, fill) = render::camera_lights(self.camera.eye(), self.camera.target);
                 // The dim taupe the egui overlay used, in the scene's perceptual
                 // space (mesh/grid shaders don't linearize either).
                 let label_color = [104.0 / 255.0, 98.0 / 255.0, 86.0 / 255.0, 1.0];
                 self.scene.render(
-                    &rs, vp, self.camera.eye(), self.show_stars, show_mesh, preview, mesh_unsel,
-                    mesh_sel, label_color,
+                    &rs, vp, self.camera.eye(), self.show_stars, show_mesh, preview, key, fill,
+                    label_color,
                 );
                 self.last_render_sig = Some(sig);
             }

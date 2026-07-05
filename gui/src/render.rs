@@ -52,6 +52,7 @@ pub fn visible_against_backdrop(c: [f32; 3]) -> [f32; 3] {
 const SHADER: &str = r#"
 struct U {
     mvp: mat4x4<f32>,
+    // xyz = KEY light direction (camera-relative, over the shoulder).
     light: vec4<f32>,
     // x = current (top visible) layer, y = dim factor, z = category bitmask,
     // w = bead color mode (0 = use the baked per-instance rgb; 1 = Filament:
@@ -59,11 +60,10 @@ struct U {
     // their baked color). Lets a spool-color change be a uniform write instead
     // of a full instance rebuild.
     ctrl: vec4<f32>,
-    // Accent-derived model tints (rgb; w unused). The base (unselected) tint
-    // now rides each mesh vertex (per-part colors); mesh_unsel stays in the
-    // block only to keep the uniform layout, unread.
+    // xyz = FILL light direction (camera-relative, from the opposite side).
+    // (Was an accent tint slot; the base tint now rides each mesh vertex.)
     mesh_unsel: vec4<f32>,
-    mesh_sel: vec4<f32>,
+    mesh_sel: vec4<f32>, // unused
     label_color: vec4<f32>,
     // xyz = world-space camera eye (stars ride an infinite sphere around it).
     cam_eye: vec4<f32>,
@@ -100,8 +100,14 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     return o;
 }
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
-    let l = normalize(u.light.xyz);
-    let d = max(dot(normalize(i.normal), l), 0.0);
+    // Camera-relative two-light rig (key over the shoulder + a softer fill from
+    // the opposite side, both riding the camera — see the App). So whatever you
+    // orbit to is lit with form, and the shadow side stays readable instead of
+    // sinking to flat ambient. `u.light` = key dir, `u.mesh_unsel` = fill dir.
+    let n = normalize(i.normal);
+    let kd = max(dot(n, normalize(u.light.xyz)), 0.0);
+    let fd = max(dot(n, normalize(u.mesh_unsel.xyz)), 0.0);
+    let shade = 0.20 + 0.66 * kd + 0.30 * fd;
     // Base tint: the part's filament color on a toolchanger, or the accent sunk
     // into porcelain on a single tool. An invalid object (outside the build
     // volume, or overlapping another) overrides it with terracotta (the theme's
@@ -110,7 +116,7 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     var base = part.rgb.xyz;
     let warn = vec3<f32>(0.862, 0.420, 0.320);
     base = mix(base, warn, part.flags.x);
-    return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
+    return vec4<f32>(base * shade, 1.0);
 }
 
 // --- plain lines (bed grid) ---
@@ -186,9 +192,13 @@ struct BeadOut {
     if (u.ctrl.w > 0.5 && cat != 4u && cat != 5u) {
         col = u.tool_palette[u32(i.tool + 0.5)].rgb;
     }
-    let l = normalize(u.light.xyz);
-    let d = max(dot(normalize(i.normal), l), 0.0);
-    var shade = 0.40 + 0.60 * d;
+    // Camera-relative key + fill (u.light / u.mesh_unsel), so bead surfaces read
+    // from any orbit angle — a bit more ambient than the mesh so thin beads at a
+    // distance stay visible.
+    let n = normalize(i.normal);
+    let kd = max(dot(n, normalize(u.light.xyz)), 0.0);
+    let fd = max(dot(n, normalize(u.mesh_unsel.xyz)), 0.0);
+    var shade = 0.30 + 0.58 * kd + 0.26 * fd;
     if (i.layer < u.ctrl.x - 0.5) { shade = shade * u.ctrl.y; } // dim lower layers
     return vec4<f32>(col * shade, 1.0);
 }
@@ -1040,13 +1050,13 @@ impl Scene {
         show_stars: bool,
         show_mesh: bool,
         preview: Option<Preview>,
-        mesh_unsel: [f32; 3],
-        mesh_sel: [f32; 3],
+        key: [f32; 3],
+        fill: [f32; 3],
         label_color: [f32; 4],
     ) {
         self.render_to(
-            &rs.device, &rs.queue, view_proj, cam_eye, show_stars, show_mesh, preview, mesh_unsel,
-            mesh_sel, label_color,
+            &rs.device, &rs.queue, view_proj, cam_eye, show_stars, show_mesh, preview, key, fill,
+            label_color,
         );
     }
 
@@ -1062,8 +1072,8 @@ impl Scene {
         show_stars: bool,
         show_mesh: bool,
         preview: Option<Preview>,
-        mesh_unsel: [f32; 3],
-        mesh_sel: [f32; 3],
+        key: [f32; 3],
+        fill: [f32; 3],
         label_color: [f32; 4],
     ) {
         let ctrl = match &preview {
@@ -1076,10 +1086,10 @@ impl Scene {
         };
         let uniforms = Uniforms {
             mvp: view_proj.to_cols_array_2d(),
-            light: [0.4, 0.5, 0.85, 0.0],
+            light: [key[0], key[1], key[2], 0.0],
             ctrl,
-            mesh_unsel: [mesh_unsel[0], mesh_unsel[1], mesh_unsel[2], 0.0],
-            mesh_sel: [mesh_sel[0], mesh_sel[1], mesh_sel[2], 0.0],
+            mesh_unsel: [fill[0], fill[1], fill[2], 0.0],
+            mesh_sel: [0.0; 4],
             label_color,
             cam_eye: [cam_eye.x, cam_eye.y, cam_eye.z, 0.0],
             // Full on-screen size (not the possibly-scaled render target), so the
@@ -1457,6 +1467,24 @@ fn make_targets(
         resolve_view,
         resolve,
     )
+}
+
+/// The camera-relative KEY + FILL light directions for the mesh/bead shaders.
+/// The key rides over the camera's upper-right shoulder and the fill comes from
+/// the lower-left, both biased toward the viewer — so whatever you orbit to is
+/// lit with form, and the shadow side stays readable instead of sinking to flat
+/// ambient. Returns unit vectors (never zero) for the fixed camera too (offscreen).
+pub fn camera_lights(eye: glam::Vec3, target: glam::Vec3) -> ([f32; 3], [f32; 3]) {
+    let fwd = (target - eye).normalize_or_zero(); // into the screen
+    let mut right = fwd.cross(glam::Vec3::Z);
+    if right.length_squared() < 1.0e-6 {
+        right = glam::Vec3::X; // looking straight down — pick any horizontal
+    }
+    let right = right.normalize();
+    let up = right.cross(fwd).normalize();
+    let key = (-fwd * 0.55 + up * 0.62 + right * 0.5).normalize_or_zero();
+    let fill = (-fwd * 0.8 - up * 0.25 - right * 0.55).normalize_or_zero();
+    (key.to_array(), fill.to_array())
 }
 
 fn make_pipeline(
