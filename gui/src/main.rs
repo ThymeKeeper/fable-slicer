@@ -1396,6 +1396,9 @@ struct App {
     show_ironing: bool,
     /// Night-sky star field on the viewport backdrop (Model + Preview).
     show_stars: bool,
+    /// Experimental: draw preview beads as capsule impostors (set by IMPOSTOR
+    /// env at startup — for A/B'ing the renderer).
+    impostor: bool,
     /// Per-resource scene-invalidation flags. Split out of a single
     /// `needs_rebuild` bool so a cheap-intent action only redoes the resource it
     /// actually touched: a selection or bed-highlight refreshes the spotlight
@@ -1638,6 +1641,7 @@ impl App {
             show_travel: false,
             show_seams: false,
             show_stars: true,
+            impostor: std::env::var("IMPOSTOR").is_ok(),
             show_ironing: true,
             beds_dirty: true,
             spotlight_dirty: true,
@@ -5004,6 +5008,7 @@ impl eframe::App for App {
                     mask: self.category_mask(),
                     color_mode,
                     tool_palette: self.tool_palette(),
+                    impostor: self.impostor,
                 })
             } else {
                 None

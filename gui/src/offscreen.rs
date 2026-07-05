@@ -195,6 +195,8 @@ pub fn run(a: &Args) -> Result<(), String> {
         mask,
         color_mode,
         tool_palette,
+        // IMPOSTOR=1 draws beads as capsule impostors (rounded ends, no joints).
+        impostor: std::env::var("IMPOSTOR").is_ok(),
     };
     scene.render_to(&device, &queue, view_proj, eye, false, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);
 

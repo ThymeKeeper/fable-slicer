@@ -214,6 +214,139 @@ struct BeadOut {
     return o;
 }
 
+// --- capsule impostors (experimental bead renderer) ------------------------
+// One camera-facing quad per bead SEGMENT; the fragment shader analytically
+// ray-casts an elliptical capsule (cross-section w×h, rounded ends of radius
+// w/2). Rounded ends make it self-jointing — no separate joint blobs — and it
+// stays perfectly smooth at any zoom. It writes true surface depth so beads
+// occlude each other correctly. Costs 6 verts/bead vs the tube's 36 and drops
+// the joint pass entirely, trading vertex work for a little fragment math.
+// Ray↔capsule (Inigo Quilez): https://iquilezles.org/articles/intersectors/
+fn cap_intersect(ro: vec3<f32>, rd: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>, r: f32) -> f32 {
+    let ba = pb - pa;
+    let oa = ro - pa;
+    let baba = dot(ba, ba);
+    let bard = dot(ba, rd);
+    let baoa = dot(ba, oa);
+    let rdoa = dot(rd, oa);
+    let oaoa = dot(oa, oa);
+    let a = baba - bard * bard;
+    var b = baba * rdoa - baoa * bard;
+    var c = baba * oaoa - baoa * baoa - r * r * baba;
+    var h = b * b - a * c;
+    if (h >= 0.0) {
+        let t = (-b - sqrt(h)) / a;
+        let y = baoa + t * bard;
+        if (y > 0.0 && y < baba) { return t; } // cylinder body
+        let oc = select(ro - pb, oa, y <= 0.0); // nearer end cap
+        b = dot(rd, oc);
+        c = dot(oc, oc) - r * r;
+        h = b * b - c;
+        if (h > 0.0) { return -b - sqrt(h); }
+    }
+    return -1.0;
+}
+fn cap_normal(pos: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> vec3<f32> {
+    let ba = b - a;
+    let pa = pos - a;
+    let hh = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return (pa - hh * ba) / r;
+}
+struct CapOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) qpos: vec3<f32>,
+    @location(1) @interpolate(flat) a: vec3<f32>,
+    @location(2) @interpolate(flat) axis: vec3<f32>,
+    @location(3) @interpolate(flat) dims: vec3<f32>, // len, w, h
+    @location(4) @interpolate(flat) color: vec3<f32>,
+    @location(5) @interpolate(flat) lct: vec3<f32>,  // layer, cat, tool
+};
+@vertex fn vs_capsule(
+    @location(0) corner: vec3<f32>, // unit box corner in [-1,1]^3
+    @location(2) p0: vec3<f32>,
+    @location(3) dir_len: vec3<f32>,
+    @location(4) wh: vec2<f32>,
+    @location(5) color: vec3<f32>,
+    @location(6) lc: vec2<f32>,
+    @location(7) tool: f32,
+) -> CapOut {
+    let axis = vec3<f32>(dir_len.x, dir_len.y, 0.0);
+    let len = dir_len.z;
+    let w = wh.x;
+    let h = wh.y;
+    let a = p0;
+    let mid = a + axis * (len * 0.5);
+    // The capsule's own frame (matches fs_capsule and the tube beads).
+    let up = vec3<f32>(0.0, 0.0, 1.0);
+    var across = cross(up, axis);
+    let al = length(across);
+    if (al < 1.0e-5) { across = vec3<f32>(1.0, 0.0, 0.0); } else { across = across / al; }
+    // Stretch the unit box to the capsule's oriented bounding box: half len+cap
+    // along the axis, cross radii across/up (a hair of margin for the silhouette).
+    let hx = len * 0.5 + w * 0.5;
+    let hy = w * 0.5 * 1.02;
+    let hz = h * 0.5 * 1.02;
+    let world = mid + axis * (corner.x * hx) + across * (corner.y * hy) + up * (corner.z * hz);
+    var o: CapOut;
+    o.clip = u.mvp * vec4<f32>(world, 1.0);
+    o.qpos = world;
+    o.a = a;
+    o.axis = axis;
+    o.dims = vec3<f32>(len, w, h);
+    o.color = color;
+    o.lct = vec3<f32>(lc.x, lc.y, tool);
+    return o;
+}
+struct CapFrag { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
+@fragment fn fs_capsule(i: CapOut) -> CapFrag {
+    let cat = u32(i.lct.y + 0.5);
+    let mask = u32(u.ctrl.z + 0.5);
+    if ((mask & (1u << cat)) == 0u) { discard; }
+    let axis = i.axis;
+    let len = i.dims.x;
+    let w = i.dims.y;
+    let h = i.dims.z;
+    // Capsule frame: axis (along), across (bed plane), up (height) — the same
+    // basis the tube beads use, so the cross-section matches exactly.
+    let up = vec3<f32>(0.0, 0.0, 1.0);
+    var across = cross(up, axis);
+    let al = length(across);
+    if (al < 1.0e-5) { across = vec3<f32>(1.0, 0.0, 0.0); } else { across = across / al; }
+    // The pixel's world ray, taken into the capsule's local frame.
+    let ro = u.cam_eye.xyz;
+    let rd = normalize(i.qpos - ro);
+    let oa = ro - i.a;
+    let ro_l = vec3<f32>(dot(oa, axis), dot(oa, across), dot(oa, up));
+    let rd_l = vec3<f32>(dot(rd, axis), dot(rd, across), dot(rd, up));
+    // Scale to a UNIT capsule (across w/2, up h/2; caps round in the bed plane
+    // at radius w/2 — matching the old joint blobs).
+    let s = vec3<f32>(w * 0.5, w * 0.5, h * 0.5);
+    let ro_u = ro_l / s;
+    let rd_u = rd_l / s;
+    let pb = vec3<f32>(len / (w * 0.5), 0.0, 0.0);
+    let t = cap_intersect(ro_u, rd_u, vec3<f32>(0.0), pb, 1.0);
+    if (t < 0.0) { discard; }
+    let p_u = ro_u + t * rd_u;
+    let p_l = p_u * s;
+    let p_w = i.a + axis * p_l.x + across * p_l.y + up * p_l.z;
+    let n_u = cap_normal(p_u, vec3<f32>(0.0), pb, 1.0);
+    let n_l = normalize(n_u / s); // inverse-transpose of a diagonal scale
+    let n_w = normalize(axis * n_l.x + across * n_l.y + up * n_l.z);
+    let clip = u.mvp * vec4<f32>(p_w, 1.0);
+    // Color/dim exactly as fs_bead (palette in Filament mode; travels/seams baked).
+    var col = i.color;
+    let tool = u32(i.lct.z + 0.5);
+    if (u.ctrl.w > 0.5 && cat != 4u && cat != 5u) { col = u.tool_palette[tool].rgb; }
+    let l = normalize(u.light.xyz);
+    let d = max(dot(n_w, l), 0.0);
+    var shade = 0.40 + 0.60 * d;
+    if (i.lct.x < u.ctrl.x - 0.5) { shade = shade * u.ctrl.y; }
+    var o: CapFrag;
+    o.color = vec4<f32>(col * shade, 1.0);
+    o.depth = clip.z / clip.w;
+    return o;
+}
+
 // --- bed label ("Front"): textured glyph quads laid on z=0, depth-tested so
 // the model occludes them per-pixel; the atlas is egui's font coverage (R8). ---
 @group(1) @binding(0) var lbl_tex: texture_2d<f32>;
@@ -346,6 +479,9 @@ pub struct Preview {
     /// Per-tool spool colors (rgb; index by tool id). Only read when
     /// `color_mode == 1`. Extra slots are zero.
     pub tool_palette: [[f32; 4]; TOOL_PALETTE_LEN],
+    /// Experimental: draw beads as capsule impostors (one ray-cast quad per
+    /// segment, rounded ends → no joint pass) instead of tube instances.
+    pub impostor: bool,
 }
 
 pub struct Scene {
@@ -353,6 +489,9 @@ pub struct Scene {
     mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     bead_pipeline: wgpu::RenderPipeline,
+    capsule_pipeline: wgpu::RenderPipeline,
+    impostor_box_vbuf: wgpu::Buffer,
+    impostor_box_ibuf: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     size: (u32, u32),
@@ -499,6 +638,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            None,
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
@@ -511,6 +651,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            None,
         );
         let bead_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_bead", "fs_bead",
@@ -530,7 +671,57 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            None,
         );
+        // Capsule impostors: a 2D corner quad + the SAME bead instance buffer.
+        // The fragment shader ray-casts the capsule and writes true depth.
+        // Box impostor: draw the capsule's oriented bounding box (its BACK faces
+        // — cull front — so it stays covered from ANY angle, even end-on, with no
+        // billboard degeneracy). The fragment shader ray-casts the capsule.
+        let capsule_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_capsule", "fs_capsule",
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: (3 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (14 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32],
+                },
+            ],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
+            wgpu::CompareFunction::Less,
+            Some(wgpu::Face::Front),
+        );
+        // Unit box [-1,1]^3 (8 corners) + outward-CCW indices (12 tris). vs_capsule
+        // stretches it to the capsule's oriented bounding box.
+        let box_corners: [[f32; 3]; 8] = [
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+        ];
+        let box_idx: [u16; 36] = [
+            4, 5, 6, 4, 6, 7, // +z
+            0, 2, 1, 0, 3, 2, // -z
+            1, 2, 6, 1, 6, 5, // +x
+            0, 4, 7, 0, 7, 3, // -x
+            3, 7, 6, 3, 6, 2, // +y
+            0, 1, 5, 0, 5, 4, // -y
+        ];
+        let impostor_box_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("impostor_box"),
+            contents: bytemuck::cast_slice(&box_corners[..]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let impostor_box_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("impostor_box_idx"),
+            contents: bytemuck::cast_slice(&box_idx[..]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
         let joint_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_joint", "fs_bead",
             &[
@@ -549,6 +740,7 @@ impl Scene {
             wgpu::BlendState::REPLACE,
             true,
             wgpu::CompareFunction::Less,
+            None,
         );
 
         // Bed-label pass: group(1) = its R8 font-atlas texture + sampler; alpha
@@ -611,6 +803,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Less,
+            None,
         );
 
         // Selection spotlight: alpha-blended like the label, but keyed off the
@@ -639,6 +832,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Always,
+            None,
         );
 
         // Night-sky stars: instanced billboards, alpha-over like the glow, depth
@@ -673,6 +867,7 @@ impl Scene {
             },
             false,
             wgpu::CompareFunction::Always,
+            None,
         );
         let star_quad: [[f32; 2]; 6] =
             [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
@@ -711,6 +906,9 @@ impl Scene {
             mesh_pipeline,
             line_pipeline,
             bead_pipeline,
+            capsule_pipeline,
+            impostor_box_vbuf,
+            impostor_box_ibuf,
             uniform_buf,
             bind_group,
             size: (1, 1),
@@ -1135,21 +1333,35 @@ impl Scene {
 
             if let Some(p) = &preview {
                 let n = p.count.min(self.inst_count);
-                if n > 0 {
-                    if let Some(inst) = self.inst_vbuf.as_ref() {
-                        pass.set_pipeline(&self.bead_pipeline);
-                        pass.set_vertex_buffer(0, self.box_vbuf.slice(..));
-                        pass.set_vertex_buffer(1, inst.slice(..));
-                        pass.draw(0..self.box_count, 0..n);
+                if p.impostor {
+                    // One ray-cast box per bead; rounded caps stand in for the
+                    // joint pass (skipped here).
+                    if n > 0 {
+                        if let Some(inst) = self.inst_vbuf.as_ref() {
+                            pass.set_pipeline(&self.capsule_pipeline);
+                            pass.set_vertex_buffer(0, self.impostor_box_vbuf.slice(..));
+                            pass.set_vertex_buffer(1, inst.slice(..));
+                            pass.set_index_buffer(self.impostor_box_ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                            pass.draw_indexed(0..36, 0, 0..n);
+                        }
                     }
-                }
-                let jn = p.joint_count.min(self.joint_count);
-                if jn > 0 {
-                    if let Some(jinst) = self.joint_vbuf.as_ref() {
-                        pass.set_pipeline(&self.joint_pipeline);
-                        pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
-                        pass.set_vertex_buffer(1, jinst.slice(..));
-                        pass.draw(0..self.blob_count, 0..jn);
+                } else {
+                    if n > 0 {
+                        if let Some(inst) = self.inst_vbuf.as_ref() {
+                            pass.set_pipeline(&self.bead_pipeline);
+                            pass.set_vertex_buffer(0, self.box_vbuf.slice(..));
+                            pass.set_vertex_buffer(1, inst.slice(..));
+                            pass.draw(0..self.box_count, 0..n);
+                        }
+                    }
+                    let jn = p.joint_count.min(self.joint_count);
+                    if jn > 0 {
+                        if let Some(jinst) = self.joint_vbuf.as_ref() {
+                            pass.set_pipeline(&self.joint_pipeline);
+                            pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
+                            pass.set_vertex_buffer(1, jinst.slice(..));
+                            pass.draw(0..self.blob_count, 0..jn);
+                        }
                     }
                 }
             }
@@ -1444,6 +1656,7 @@ fn make_pipeline(
     blend: wgpu::BlendState,
     depth_write: bool,
     depth_compare: wgpu::CompareFunction,
+    cull: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("scene_pipeline"),
@@ -1468,7 +1681,7 @@ fn make_pipeline(
             topology,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            cull_mode: cull,
             unclipped_depth: false,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
