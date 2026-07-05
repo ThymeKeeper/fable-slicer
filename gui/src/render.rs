@@ -53,7 +53,11 @@ const SHADER: &str = r#"
 struct U {
     mvp: mat4x4<f32>,
     light: vec4<f32>,
-    // x = current (top visible) layer, y = dim factor, z = category bitmask, w = unused
+    // x = current (top visible) layer, y = dim factor, z = category bitmask,
+    // w = bead color mode (0 = use the baked per-instance rgb; 1 = Filament:
+    // recolor extrusion beads from tool_palette[tool], leaving travel/seam on
+    // their baked color). Lets a spool-color change be a uniform write instead
+    // of a full instance rebuild.
     ctrl: vec4<f32>,
     // Accent-derived model tints (rgb; w unused). The base (unselected) tint
     // now rides each mesh vertex (per-part colors); mesh_unsel stays in the
@@ -65,34 +69,47 @@ struct U {
     cam_eye: vec4<f32>,
     // x,y = viewport pixels (round, aspect-correct star billboards).
     viewport: vec4<f32>,
+    // Per-tool spool colors (rgb) indexed by a bead's tool id, used only when
+    // ctrl.w == 1. Fixed 16 slots (the machine tool-count ceiling).
+    tool_palette: array<vec4<f32>, 16>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
 // --- mesh (shaded) ---
-struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) rgb: vec3<f32>, @location(2) @interpolate(flat) sel: f32, @location(3) @interpolate(flat) invalid: f32 };
-@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) rgb: vec3<f32>, @location(3) sel: f32, @location(4) invalid: f32) -> MeshOut {
+// Per-part placement + tint, bound with a dynamic offset per draw call. The
+// mesh geometry is uploaded ONCE in object-local space; this is the only thing
+// a drag or a color change rewrites (a ~96-byte record), so neither re-walks or
+// re-uploads a single vertex. `flags.x` = invalid (build-volume / overlap).
+struct PartData {
+    model: mat4x4<f32>,
+    rgb: vec4<f32>,
+    flags: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> part: PartData;
+
+struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
+@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> MeshOut {
     var o: MeshOut;
-    o.clip = u.mvp * vec4<f32>(p, 1.0);
-    o.normal = n;
-    o.rgb = rgb;
-    o.sel = sel;
-    o.invalid = invalid;
+    let world = part.model * vec4<f32>(p, 1.0);
+    o.clip = u.mvp * world;
+    // The local flat normal rotated into world space. `model` is rotation ×
+    // uniform-scale + translation, so its 3×3 preserves the normal's direction
+    // (scale cancels on normalize) — this reproduces the old CPU flat_normal(of
+    // the transformed triangle) exactly, without storing world normals.
+    o.normal = (part.model * vec4<f32>(n, 0.0)).xyz;
     return o;
 }
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
     let l = normalize(u.light.xyz);
     let d = max(dot(normalize(i.normal), l), 0.0);
-    // Per-vertex base tint: the part's filament color on a toolchanger, or
-    // the accent sunk into porcelain on a single tool (main.rs bakes either
-    // into the buffer). Selected mixes toward the accent proper exactly as
-    // before. An invalid object (outside the build volume, or overlapping
-    // another) overrides both with terracotta (the theme's error color) —
-    // and when that invalid object is also the selection it gets a brighter
-    // coral, so you can tell which of two colliding parts is selected — so
-    // the warning reads over any filament color. It can't print until fixed.
-    var base = mix(i.rgb, u.mesh_sel.rgb, i.sel);
-    let warn = mix(vec3<f32>(0.862, 0.420, 0.320), vec3<f32>(0.980, 0.670, 0.520), i.sel);
-    base = mix(base, warn, i.invalid);
+    // Base tint: the part's filament color on a toolchanger, or the accent sunk
+    // into porcelain on a single tool. An invalid object (outside the build
+    // volume, or overlapping another) overrides it with terracotta (the theme's
+    // error color) — the warning reads over any filament color; it can't print
+    // until fixed. (Selection is shown by the bed spotlight, not a mesh tint.)
+    var base = part.rgb.xyz;
+    let warn = vec3<f32>(0.862, 0.420, 0.320);
+    base = mix(base, warn, part.flags.x);
     return vec4<f32>(base * (0.35 + 0.65 * d), 1.0);
 }
 
@@ -131,6 +148,7 @@ struct BeadOut {
     @location(1) color: vec3<f32>,
     @location(2) @interpolate(flat) layer: f32,
     @location(3) @interpolate(flat) cat: f32,
+    @location(4) @interpolate(flat) tool: f32,
 };
 @vertex fn vs_bead(
     @location(0) lpos: vec3<f32>,
@@ -140,6 +158,7 @@ struct BeadOut {
     @location(4) dims: vec2<f32>,
     @location(5) color: vec3<f32>,
     @location(6) lc: vec2<f32>,
+    @location(7) tool: f32,
 ) -> BeadOut {
     let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
     let zaxis = vec3<f32>(0.0, 0.0, 1.0);
@@ -154,17 +173,24 @@ struct BeadOut {
     o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
+    o.tool = tool;
     return o;
 }
 @fragment fn fs_bead(i: BeadOut) -> @location(0) vec4<f32> {
     let mask = u32(u.ctrl.z + 0.5);
     let cat = u32(i.cat + 0.5);
     if ((mask & (1u << cat)) == 0u) { discard; }
+    // Filament mode (ctrl.w == 1) recolors extrusion from the tool palette;
+    // travels (cat 4) and seams (cat 5) keep their baked accent color.
+    var col = i.color;
+    if (u.ctrl.w > 0.5 && cat != 4u && cat != 5u) {
+        col = u.tool_palette[u32(i.tool + 0.5)].rgb;
+    }
     let l = normalize(u.light.xyz);
     let d = max(dot(normalize(i.normal), l), 0.0);
     var shade = 0.40 + 0.60 * d;
     if (i.layer < u.ctrl.x - 0.5) { shade = shade * u.ctrl.y; } // dim lower layers
-    return vec4<f32>(i.color * shade, 1.0);
+    return vec4<f32>(col * shade, 1.0);
 }
 
 // --- joint blobs (instanced; round path ends and fill corners) ---
@@ -175,6 +201,7 @@ struct BeadOut {
     @location(3) dims: vec2<f32>,
     @location(4) color: vec3<f32>,
     @location(5) lc: vec2<f32>,
+    @location(6) tool: f32,
 ) -> BeadOut {
     let r = vec3<f32>(dims.x * 0.5, dims.x * 0.5, dims.y * 0.5);
     var o: BeadOut;
@@ -183,6 +210,7 @@ struct BeadOut {
     o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
+    o.tool = tool;
     return o;
 }
 
@@ -242,20 +270,6 @@ struct Vertex {
     normal: [f32; 3],
 }
 
-/// Mesh vertex with its base tint and state flags: `rgb` = the part's color
-/// (filament on a toolchanger, accent porcelain otherwise); `sel` 1 = selected
-/// highlight; `invalid` 1 = can't be printed (outside the build volume or
-/// overlapping another object) — drawn with the warning tint.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct MeshVertex {
-    pos: [f32; 3],
-    normal: [f32; 3],
-    rgb: [f32; 3],
-    sel: f32,
-    invalid: f32,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LineVertex {
@@ -284,7 +298,34 @@ struct Uniforms {
     label_color: [f32; 4],
     cam_eye: [f32; 4],
     viewport: [f32; 4],
+    /// Per-tool spool colors (rgb in xyz), indexed by a bead's tool id; read
+    /// only when `ctrl.w == 1` (Filament mode). 16 = the tool-count ceiling.
+    tool_palette: [[f32; 4]; 16],
 }
+
+/// Number of tool-palette slots (the machine tool-count ceiling); must match the
+/// `array<vec4<f32>, 16>` in the shader.
+pub const TOOL_PALETTE_LEN: usize = 16;
+
+/// Per-part placement + tint, one per drawn part, addressed by a dynamic uniform
+/// offset. Geometry stays static in object-local space; a drag rewrites only
+/// `model`, a recolor only `rgb`/`flags` — 96 bytes, no vertex touched.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PartData {
+    /// Column-major model matrix (object-local → bed/world), same convention as
+    /// `Uniforms::mvp`.
+    model: [[f32; 4]; 4],
+    /// xyz = base tint (filament/accent); w unused.
+    rgb: [f32; 4],
+    /// x = invalid (1 → warning tint); yzw unused.
+    flags: [f32; 4],
+}
+
+/// Dynamic-uniform stride for `PartData` — must be a multiple of the device's
+/// `min_uniform_buffer_offset_alignment` (256 on desktop backends). `PartData`
+/// is 96 bytes, so it pads out to one 256-byte slot per part.
+const PART_STRIDE: u64 = 256;
 
 /// How to draw the toolpaths this frame.
 pub struct Preview {
@@ -298,6 +339,13 @@ pub struct Preview {
     pub dim: f32,
     /// Category visibility bitmask (bit per category id).
     pub mask: u32,
+    /// Bead color mode: 0 = draw each bead's baked rgb (Feature / LayerTime, and
+    /// the headless oracle); 1 = Filament: recolor extrusion from `tool_palette`
+    /// by tool id so a spool-color change is a uniform write, not a rebuild.
+    pub color_mode: u32,
+    /// Per-tool spool colors (rgb; index by tool id). Only read when
+    /// `color_mode == 1`. Extra slots are zero.
+    pub tool_palette: [[f32; 4]; TOOL_PALETTE_LEN],
 }
 
 pub struct Scene {
@@ -315,12 +363,21 @@ pub struct Scene {
     resolve_tex: wgpu::Texture,
     /// egui texture handle — `None` in the headless (offscreen) path.
     tex_id: Option<TextureId>,
-    mesh_vbuf: Option<wgpu::Buffer>,
-    mesh_count: u32,
-    line_vbuf: Option<wgpu::Buffer>,
+    /// Concatenated object-LOCAL mesh geometry (pos+normal), uploaded once per
+    /// structure change (import/delete). Placement + tint live in `part_ubuf`,
+    /// so a drag/recolor never touches this.
+    mesh_geo: GrowBuf,
+    /// Per-part draw ranges `(vertex_offset, vertex_count)` into `mesh_geo`.
+    mesh_parts: Vec<(u32, u32)>,
+    /// Dynamic uniform buffer of `PartData`, one 256-byte slot per part.
+    part_ubuf: Option<wgpu::Buffer>,
+    part_ubuf_cap: u64,
+    part_bgl: wgpu::BindGroupLayout,
+    part_bind_group: Option<wgpu::BindGroup>,
+    line_vbuf: GrowBuf,
     line_count: u32,
     glow_pipeline: wgpu::RenderPipeline,
-    glow_vbuf: Option<wgpu::Buffer>,
+    glow_vbuf: GrowBuf,
     glow_count: u32,
     // Night-sky backdrop: a fixed catalog of star billboards (base quad +
     // per-star instance = direction + magnitude), drawn first with depth off.
@@ -330,22 +387,22 @@ pub struct Scene {
     star_count: u32,
     /// Opaque backdrop-colored bed fill (glow pipeline), so stars don't show
     /// through the grid. Built by `set_beds`.
-    bed_fill_vbuf: Option<wgpu::Buffer>,
+    bed_fill_vbuf: GrowBuf,
     bed_fill_count: u32,
     box_vbuf: wgpu::Buffer,
     box_count: u32,
-    inst_vbuf: Option<wgpu::Buffer>,
+    inst_vbuf: GrowBuf,
     inst_count: u32,
     joint_pipeline: wgpu::RenderPipeline,
     blob_vbuf: wgpu::Buffer,
     blob_count: u32,
-    joint_vbuf: Option<wgpu::Buffer>,
+    joint_vbuf: GrowBuf,
     joint_count: u32,
     label_pipeline: wgpu::RenderPipeline,
     label_bgl: wgpu::BindGroupLayout,
     label_sampler: wgpu::Sampler,
     label_bind_group: Option<wgpu::BindGroup>,
-    label_vbuf: Option<wgpu::Buffer>,
+    label_vbuf: GrowBuf,
     label_count: u32,
 }
 
@@ -385,6 +442,22 @@ impl Scene {
             }],
         });
 
+        // Per-part placement + tint (mesh pipeline, group 1), addressed by a
+        // dynamic offset so one draw per part carries its own `PartData`.
+        let part_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("part_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<PartData>() as u64),
+                },
+                count: None,
+            }],
+        });
+
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene_uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -407,12 +480,20 @@ impl Scene {
             immediate_size: 0,
         });
 
+        // The mesh pipeline also binds the per-part uniform (group 1).
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh_layout"),
+            bind_group_layouts: &[Some(&bgl), Some(&part_bgl)],
+            immediate_size: 0,
+        });
+
         let mesh_pipeline = make_pipeline(
-            device, &layout, &shader, format, "vs_mesh", "fs_mesh",
+            device, &mesh_layout, &shader, format, "vs_mesh", "fs_mesh",
             &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                // Object-local geometry: pos + local flat normal.
+                array_stride: std::mem::size_of::<Vertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32, 4 => Float32],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
             }],
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
@@ -440,9 +521,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (13 * 4) as u64,
+                    array_stride: (14 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -459,9 +540,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (10 * 4) as u64,
+                    array_stride: (11 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Float32x3, 5 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Float32x3, 5 => Float32x2, 6 => Float32],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -638,33 +719,37 @@ impl Scene {
             resolve_view,
             resolve_tex,
             tex_id: None,
-            mesh_vbuf: None,
-            mesh_count: 0,
-            line_vbuf: None,
+            mesh_geo: GrowBuf::default(),
+            mesh_parts: Vec::new(),
+            part_ubuf: None,
+            part_ubuf_cap: 0,
+            part_bgl,
+            part_bind_group: None,
+            line_vbuf: GrowBuf::default(),
             line_count: 0,
             glow_pipeline,
-            glow_vbuf: None,
+            glow_vbuf: GrowBuf::default(),
             glow_count: 0,
             star_pipeline,
             star_quad_vbuf,
             star_inst_vbuf,
             star_count,
-            bed_fill_vbuf: None,
+            bed_fill_vbuf: GrowBuf::default(),
             bed_fill_count: 0,
             box_vbuf,
             box_count: box_verts.len() as u32,
-            inst_vbuf: None,
+            inst_vbuf: GrowBuf::default(),
             inst_count: 0,
             joint_pipeline,
             blob_vbuf,
             blob_count: blob_verts.len() as u32,
-            joint_vbuf: None,
+            joint_vbuf: GrowBuf::default(),
             joint_count: 0,
             label_pipeline,
             label_bgl,
             label_sampler,
             label_bind_group: None,
-            label_vbuf: None,
+            label_vbuf: GrowBuf::default(),
             label_count: 0,
         }
     }
@@ -701,47 +786,87 @@ impl Scene {
         true
     }
 
-    pub fn clear_mesh(&mut self) {
-        self.mesh_vbuf = None;
-        self.mesh_count = 0;
+    /// How many parts the current geometry buffer holds — the caller uploads
+    /// fresh geometry whenever its part list length no longer matches this.
+    pub fn mesh_part_count(&self) -> usize {
+        self.mesh_parts.len()
     }
 
-    /// Upload all scene parts (each: mesh, placement, base tint, selected?,
-    /// invalid?) as one buffer, baking the transform into bed coordinates and
-    /// the tint/flags into each vertex. Returns the combined bounding box
-    /// (min, max), or None if empty.
-    pub fn set_mesh(
-        &mut self,
-        device: &wgpu::Device,
-        objects: &[(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)],
-    ) -> Option<([f32; 3], [f32; 3])> {
-        let mut verts: Vec<MeshVertex> = Vec::new();
-        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for (mesh, t, rgb, selected, invalid) in objects {
-            let sel = if *selected { 1.0 } else { 0.0 };
-            let invalid = if *invalid { 1.0 } else { 0.0 };
+    /// Upload each part's mesh in OBJECT-LOCAL space (pos + local flat normal),
+    /// concatenated into one buffer with a `(offset, count)` draw range per part.
+    /// Called only when the part SET changes (import/delete) — a drag or recolor
+    /// leaves this untouched and rewrites just the per-part uniforms. `meshes`
+    /// must be in the same order as the `parts` handed to `upload_mesh_parts`.
+    pub fn upload_mesh_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, meshes: &[&mesh::Mesh]) {
+        let mut verts: Vec<Vertex> = Vec::new();
+        self.mesh_parts.clear();
+        for mesh in meshes {
+            let start = verts.len() as u32;
             for i in 0..mesh.triangles.len() {
                 let tri = mesh.triangle(i);
                 let f3 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
-                let p: [[f32; 3]; 3] = [f3(t.apply(tri[0])), f3(t.apply(tri[1])), f3(t.apply(tri[2]))];
+                let p: [[f32; 3]; 3] = [f3(tri[0]), f3(tri[1]), f3(tri[2])];
+                // Flat normal in LOCAL space; the shader rotates it by the part
+                // matrix, reproducing the old transformed flat_normal exactly.
                 let n = flat_normal(p[0], p[1], p[2]);
-                let c = *rgb;
                 for pos in p {
-                    for k in 0..3 {
-                        lo[k] = lo[k].min(pos[k]);
-                        hi[k] = hi[k].max(pos[k]);
-                    }
-                    verts.push(MeshVertex { pos, normal: n, rgb: c, sel, invalid });
+                    verts.push(Vertex { pos, normal: n });
                 }
             }
+            self.mesh_parts.push((start, verts.len() as u32 - start));
         }
-        if verts.is_empty() {
-            self.clear_mesh();
-            return None;
+        self.mesh_geo.write(device, queue, "mesh_geo", bytemuck::cast_slice(&verts));
+    }
+
+    /// Rewrite the per-part placement + tint uniforms — the ONLY thing a drag
+    /// (new `model`) or a recolor (new `rgb`/`invalid`) touches. `parts` must
+    /// match the `meshes` order/count from `upload_mesh_geometry`.
+    pub fn upload_mesh_parts(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        parts: &[([[f32; 4]; 4], [f32; 3], bool)],
+    ) {
+        let needed = (parts.len() as u64).max(1) * PART_STRIDE;
+        if self.part_ubuf.is_none() || needed > self.part_ubuf_cap {
+            let cap = needed.max(self.part_ubuf_cap * 2).max(PART_STRIDE * 16);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("part_uniforms"),
+                size: cap,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.part_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("part_bg"),
+                layout: &self.part_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(std::mem::size_of::<PartData>() as u64),
+                    }),
+                }],
+            }));
+            self.part_ubuf = Some(buf);
+            self.part_ubuf_cap = cap;
         }
-        self.mesh_count = verts.len() as u32;
-        self.mesh_vbuf = make_vbuf(device, "mesh_vbuf", bytemuck::cast_slice(&verts));
-        Some((lo, hi))
+        // One 256-byte slot per part (the rest of each slot is padding).
+        let mut bytes = vec![0u8; parts.len() * PART_STRIDE as usize];
+        for (i, (model, rgb, invalid)) in parts.iter().enumerate() {
+            let pd = PartData {
+                model: *model,
+                rgb: [rgb[0], rgb[1], rgb[2], 0.0],
+                flags: [if *invalid { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            };
+            let off = i * PART_STRIDE as usize;
+            bytes[off..off + std::mem::size_of::<PartData>()].copy_from_slice(bytemuck::bytes_of(&pd));
+        }
+        if let Some(buf) = &self.part_ubuf {
+            if !bytes.is_empty() {
+                queue.write_buffer(buf, 0, &bytes);
+            }
+        }
     }
 
     /// Build the bed grids: `n` beds in a row along +X, `gap` apart. The
@@ -750,6 +875,7 @@ impl Scene {
     pub fn set_beds(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         bed_x: f32,
         bed_y: f32,
         n: usize,
@@ -799,16 +925,15 @@ impl Scene {
             }
         }
         self.line_count = v.len() as u32;
-        self.line_vbuf = make_vbuf(device, "bed_vbuf", bytemuck::cast_slice(&v));
+        self.line_vbuf.write(device, queue, "bed_vbuf", bytemuck::cast_slice(&v));
         self.bed_fill_count = fill.len() as u32;
-        self.bed_fill_vbuf = make_vbuf(device, "bed_fill", bytemuck::cast_slice(&fill));
+        self.bed_fill_vbuf.write(device, queue, "bed_fill", bytemuck::cast_slice(&fill));
     }
 
     /// Upload the selection spotlight: a triangle soup on the bed plane where
     /// each vertex is `[x, y, z, r, g, b, a]`. An empty slice clears it.
-    pub fn set_spotlight(&mut self, device: &wgpu::Device, verts: &[[f32; 7]]) {
+    pub fn set_spotlight(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[[f32; 7]]) {
         if verts.is_empty() {
-            self.glow_vbuf = None;
             self.glow_count = 0;
             return;
         }
@@ -817,19 +942,19 @@ impl Scene {
             .map(|v| GlowVertex { pos: [v[0], v[1], v[2]], rgba: [v[3], v[4], v[5], v[6]] })
             .collect();
         self.glow_count = gv.len() as u32;
-        self.glow_vbuf = make_vbuf(device, "glow_vbuf", bytemuck::cast_slice(&gv));
+        self.glow_vbuf.write(device, queue, "glow_vbuf", bytemuck::cast_slice(&gv));
     }
 
-    /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat]`.
-    pub fn set_toolpaths(&mut self, device: &wgpu::Device, instances: &[[f32; 13]]) {
+    /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat, tool]`.
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[[f32; 14]]) {
         self.inst_count = instances.len() as u32;
-        self.inst_vbuf = make_vbuf(device, "bead_instances", bytemuck::cast_slice(instances));
+        self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
 
-    /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat]`.
-    pub fn set_joints(&mut self, device: &wgpu::Device, joints: &[[f32; 10]]) {
+    /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat, tool]`.
+    pub fn set_joints(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, joints: &[[f32; 11]]) {
         self.joint_count = joints.len() as u32;
-        self.joint_vbuf = make_vbuf(device, "joint_instances", bytemuck::cast_slice(joints));
+        self.joint_vbuf.write(device, queue, "joint_instances", bytemuck::cast_slice(joints));
     }
 
     /// Upload the font-atlas coverage (R8) the bed label samples, and (re)build
@@ -875,9 +1000,9 @@ impl Scene {
     }
 
     /// Upload the label's world-space glyph triangles (rebuilt when the bed changes).
-    pub fn set_label_geom(&mut self, device: &wgpu::Device, verts: &[[f32; 5]]) {
+    pub fn set_label_geom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[[f32; 5]]) {
         self.label_count = verts.len() as u32;
-        self.label_vbuf = make_vbuf(device, "label", bytemuck::cast_slice(verts));
+        self.label_vbuf.write(device, queue, "label", bytemuck::cast_slice(verts));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -917,8 +1042,12 @@ impl Scene {
         label_color: [f32; 4],
     ) {
         let ctrl = match &preview {
-            Some(p) => [p.current_layer, p.dim, p.mask as f32, 0.0],
+            Some(p) => [p.current_layer, p.dim, p.mask as f32, p.color_mode as f32],
             None => [0.0, 1.0, 0.0, 0.0],
+        };
+        let tool_palette = match &preview {
+            Some(p) => p.tool_palette,
+            None => [[0.0; 4]; TOOL_PALETTE_LEN],
         };
         let uniforms = Uniforms {
             mvp: view_proj.to_cols_array_2d(),
@@ -929,6 +1058,7 @@ impl Scene {
             label_color,
             cam_eye: [cam_eye.x, cam_eye.y, cam_eye.z, 0.0],
             viewport: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0],
+            tool_palette,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -977,7 +1107,7 @@ impl Scene {
                 // Then paint the plate's footprint back to backdrop (opaque, over
                 // the stars via the glow pipeline) so the sky shows only AROUND
                 // the plate — never through the grid cells.
-                if let Some(buf) = &self.bed_fill_vbuf {
+                if let Some(buf) = self.bed_fill_vbuf.as_ref() {
                     if self.bed_fill_count > 0 {
                         pass.set_pipeline(&self.glow_pipeline);
                         pass.set_vertex_buffer(0, buf.slice(..));
@@ -986,7 +1116,7 @@ impl Scene {
                 }
             }
 
-            if let Some(buf) = &self.line_vbuf {
+            if let Some(buf) = self.line_vbuf.as_ref() {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.line_count, 0..1);
@@ -996,7 +1126,7 @@ impl Scene {
             // (drawn below) overdraws its core and the glow spills out around
             // the footprint. Model view only.
             if show_mesh && self.glow_count > 0 {
-                if let Some(buf) = &self.glow_vbuf {
+                if let Some(buf) = self.glow_vbuf.as_ref() {
                     pass.set_pipeline(&self.glow_pipeline);
                     pass.set_vertex_buffer(0, buf.slice(..));
                     pass.draw(0..self.glow_count, 0..1);
@@ -1006,7 +1136,7 @@ impl Scene {
             if let Some(p) = &preview {
                 let n = p.count.min(self.inst_count);
                 if n > 0 {
-                    if let Some(inst) = &self.inst_vbuf {
+                    if let Some(inst) = self.inst_vbuf.as_ref() {
                         pass.set_pipeline(&self.bead_pipeline);
                         pass.set_vertex_buffer(0, self.box_vbuf.slice(..));
                         pass.set_vertex_buffer(1, inst.slice(..));
@@ -1015,7 +1145,7 @@ impl Scene {
                 }
                 let jn = p.joint_count.min(self.joint_count);
                 if jn > 0 {
-                    if let Some(jinst) = &self.joint_vbuf {
+                    if let Some(jinst) = self.joint_vbuf.as_ref() {
                         pass.set_pipeline(&self.joint_pipeline);
                         pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
                         pass.set_vertex_buffer(1, jinst.slice(..));
@@ -1025,17 +1155,27 @@ impl Scene {
             }
 
             if show_mesh {
-                if let Some(buf) = &self.mesh_vbuf {
-                    pass.set_pipeline(&self.mesh_pipeline);
-                    pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..self.mesh_count, 0..1);
+                // One draw per part: static local geometry (bound once) + the
+                // part's placement/tint via a dynamic uniform offset.
+                if let (Some(geo), Some(pbg)) = (self.mesh_geo.as_ref(), &self.part_bind_group) {
+                    if !self.mesh_parts.is_empty() {
+                        pass.set_pipeline(&self.mesh_pipeline);
+                        pass.set_vertex_buffer(0, geo.slice(..));
+                        for (i, &(off, count)) in self.mesh_parts.iter().enumerate() {
+                            if count == 0 {
+                                continue;
+                            }
+                            pass.set_bind_group(1, pbg, &[(i as u64 * PART_STRIDE) as u32]);
+                            pass.draw(off..off + count, 0..1);
+                        }
+                    }
                 }
             }
 
             // The bed label LAST, so it depth-tests against the model/beads and
             // is hidden per-pixel where they stand in front of it.
             if self.label_count > 0 {
-                if let (Some(bg), Some(vbuf)) = (&self.label_bind_group, &self.label_vbuf) {
+                if let (Some(bg), Some(vbuf)) = (&self.label_bind_group, self.label_vbuf.as_ref()) {
                     pass.set_pipeline(&self.label_pipeline);
                     pass.set_bind_group(0, &self.bind_group, &[]);
                     pass.set_bind_group(1, bg, &[]);
@@ -1153,15 +1293,51 @@ fn blob_vertices() -> Vec<Vertex> {
     v
 }
 
-fn make_vbuf(device: &wgpu::Device, label: &str, data: &[u8]) -> Option<wgpu::Buffer> {
-    if data.is_empty() {
-        return None;
+/// A persistent GPU vertex buffer that grows on demand. It reuses its
+/// allocation via `queue.write_buffer` whenever the new upload fits the current
+/// capacity, and only reallocates (with 1.5× headroom) when it must grow — so a
+/// recolor, a drag, or a re-slice that produces the same-or-smaller byte count
+/// never frees+reallocs a fresh buffer the way the old `create_buffer_init` path
+/// did. Modeled on the already-correct `uniform_buf` (COPY_DST + write_buffer).
+#[derive(Default)]
+struct GrowBuf {
+    buf: Option<wgpu::Buffer>,
+    cap: u64,
+}
+
+impl GrowBuf {
+    /// Upload `bytes` into the retained buffer, growing the allocation only when
+    /// it no longer fits. Empty uploads keep the allocation untouched (callers
+    /// zero their own count so nothing is drawn). Requires `bytes.len()` to be a
+    /// multiple of 4 (all callers pass `f32` arrays).
+    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let need = bytes.len() as u64;
+        if let Some(buf) = &self.buf {
+            if need <= self.cap {
+                queue.write_buffer(buf, 0, bytes);
+                return;
+            }
+        }
+        // Grow past the immediate need so a steadily-growing buffer doesn't
+        // realloc every step; round to COPY_BUFFER_ALIGNMENT (4).
+        let cap = (need.max(self.cap * 3 / 2) + 3) & !3;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: cap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, bytes);
+        self.buf = Some(buf);
+        self.cap = cap;
     }
-    Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: data,
-        usage: wgpu::BufferUsages::VERTEX,
-    }))
+
+    fn as_ref(&self) -> Option<&wgpu::Buffer> {
+        self.buf.as_ref()
+    }
 }
 
 fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
@@ -1178,33 +1354,25 @@ fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 
 /// MSAA sample count for the offscreen scene — smooths the dense thin beads,
 /// which otherwise alias into a moiré / screen-door pattern. Resolved once at
-/// startup (`pick_samples`) to the most the device supports, capped at 8×:
-/// counts above the WebGPU-guaranteed 4× aren't universal (software backends
-/// cap at 4), so requesting 8× unconditionally panics on those.
+/// startup (`pick_samples`) to the most the device supports, capped at 4× (the
+/// WebGPU-guaranteed baseline — universal, and cheap enough for the dense bead
+/// preview).
 static SAMPLES: AtomicU32 = AtomicU32::new(4);
 
-/// Highest MSAA count in {8, 4, 2, 1} the device supports for both the color
-/// and depth attachments.
-fn pick_samples(rs: &RenderState, color: wgpu::TextureFormat) -> u32 {
-    // A device only accepts sample counts above the WebGPU-guaranteed 4× when it
-    // was created with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES (requested in
-    // main.rs). The adapter's format flags describe the *hardware*, not what this
-    // device will allow — so cap at 4× unless the device actually has the
-    // feature, otherwise an 8× target panics even on a GPU that can do it.
-    let cap = if rs
-        .device
-        .features()
-        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-    {
-        8
-    } else {
-        4
-    };
-    let cf = rs.adapter.get_texture_format_features(color).flags;
-    let df = rs.adapter.get_texture_format_features(DEPTH_FORMAT).flags;
-    [8, 4, 2, 1]
+/// Highest MSAA count in {4, 2, 1} the device supports for both the color and
+/// depth attachments.
+///
+/// Capped at 4× (the WebGPU-guaranteed baseline, and what the offscreen oracle
+/// already runs at). On a dense, high-overdraw bead preview, 8× doubled the
+/// depth + coverage + resolve bandwidth of every orbit/scrub redraw for
+/// near-invisible quality gain over 4× on opaque beads — so we no longer ask
+/// for it. This also drops the need for TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+/// to avoid an 8×-target panic.
+fn pick_samples(_rs: &RenderState, color: wgpu::TextureFormat) -> u32 {
+    let cf = _rs.adapter.get_texture_format_features(color).flags;
+    let df = _rs.adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    [4, 2, 1]
         .into_iter()
-        .filter(|&s| s <= cap)
         .find(|&s| cf.sample_count_supported(s) && df.sample_count_supported(s))
         .unwrap_or(1)
 }

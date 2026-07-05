@@ -868,6 +868,45 @@ struct SceneObject {
     scale: f64,
     /// Bed XY of the rotated/scaled footprint's center.
     pos: [f64; 2],
+    /// Memoized rotated/scaled bounds — `footprint()`/`height()`/`transform()`
+    /// all read it. It depends ONLY on `rot_deg`+`scale`, so a move (pos) or a
+    /// recolor never invalidates it; the full per-vertex walk these once did on
+    /// every rebuild (drag/select/color) now runs only when rotation or scale
+    /// actually changes. Interior-mutable so the `&self` accessors can fill it
+    /// lazily (GUI is single-threaded).
+    bounds_cache: std::cell::Cell<Option<BoundsCache>>,
+}
+
+/// Signature of the inputs that determine slice GEOMETRY (not paint): the
+/// active-bed parts' source meshes + their baked placements, and the full
+/// settings. Two signatures match iff a re-slice would produce byte-identical
+/// geometry, so the only thing that could have changed is the parts' paint —
+/// making [`engine::restamp_paint`] valid. Meshes are compared by `Arc` pointer
+/// (and held alive here, so an address can't be reused for a different mesh).
+struct GeomSig {
+    parts: Vec<(std::sync::Arc<mesh::Mesh>, mesh::Transform)>,
+    settings: config::Settings,
+}
+
+impl GeomSig {
+    fn matches(&self, other: &GeomSig) -> bool {
+        self.settings == other.settings
+            && self.parts.len() == other.parts.len()
+            && self
+                .parts
+                .iter()
+                .zip(&other.parts)
+                .all(|(a, b)| std::sync::Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1)
+    }
+}
+
+/// Cached rotated/scaled extents: `(minx, miny, maxx, maxy, minz, maxz)` under
+/// `(rot_deg, scale)`.
+#[derive(Clone, Copy)]
+struct BoundsCache {
+    rot_deg: [f64; 3],
+    scale: f64,
+    b: (f64, f64, f64, f64, f64, f64),
 }
 
 impl SceneObject {
@@ -883,13 +922,20 @@ impl SceneObject {
             rot_deg: [0.0; 3],
             scale: 1.0,
             pos: [0.0, 0.0],
+            bounds_cache: std::cell::Cell::new(None),
         }
     }
 
-    /// Footprint of the rotated+scaled parts (no placement): (minx,miny,maxx,maxy,minz).
-    fn footprint(&self) -> (f64, f64, f64, f64, f64) {
+    /// Rotated/scaled extents `(minx,miny,maxx,maxy,minz,maxz)`, memoized on
+    /// `(rot_deg, scale)`. The one place that walks the parts' vertices.
+    fn bounds6(&self) -> (f64, f64, f64, f64, f64, f64) {
+        if let Some(c) = self.bounds_cache.get() {
+            if c.rot_deg == self.rot_deg && c.scale == self.scale {
+                return c.b;
+            }
+        }
         let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
-        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX);
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MAX, f64::MIN);
         for &v in self.parts.iter().flat_map(|p| &p.mesh.vertices) {
             let p = lin.apply_linear(v);
             b.0 = b.0.min(p[0]);
@@ -897,21 +943,23 @@ impl SceneObject {
             b.2 = b.2.max(p[0]);
             b.3 = b.3.max(p[1]);
             b.4 = b.4.min(p[2]);
+            b.5 = b.5.max(p[2]);
         }
+        self.bounds_cache.set(Some(BoundsCache { rot_deg: self.rot_deg, scale: self.scale, b }));
         b
+    }
+
+    /// Footprint of the rotated+scaled parts (no placement): (minx,miny,maxx,maxy,minz).
+    fn footprint(&self) -> (f64, f64, f64, f64, f64) {
+        let b = self.bounds6();
+        (b.0, b.1, b.2, b.3, b.4)
     }
 
     /// Printed height (mm): the z-span of the rotated/scaled parts. The object
     /// rests on z=0 (its transform drops it there), so it occupies [0, h].
     fn height(&self) -> f64 {
-        let lin = mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
-        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-        for &v in self.parts.iter().flat_map(|p| &p.mesh.vertices) {
-            let z = lin.apply_linear(v)[2];
-            lo = lo.min(z);
-            hi = hi.max(z);
-        }
-        (hi - lo).max(0.0)
+        let b = self.bounds6();
+        (b.5 - b.4).max(0.0)
     }
 
     /// Bake the placement into an affine transform: footprint centered on `pos`,
@@ -1040,6 +1088,25 @@ fn euler_matrix(deg: [f64; 3]) -> [[f64; 3]; 3] {
         [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
         [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
         [-sy, cy * sx, cy * cx],
+    ]
+}
+
+/// A `mesh::Transform` (`p ↦ R·(s·p) + T`, row-major R) as a COLUMN-MAJOR 4×4
+/// for the GPU — same convention as `Uniforms::mvp`. The shader does
+/// `mvp * model * vec4(p,1)`, reproducing the old CPU `Transform::apply` bake.
+fn transform_to_mat4(t: &mesh::Transform) -> [[f32; 4]; 4] {
+    let r = &t.rotation;
+    let s = t.scale as f32;
+    let (r00, r01, r02) = (r[0][0] as f32, r[0][1] as f32, r[0][2] as f32);
+    let (r10, r11, r12) = (r[1][0] as f32, r[1][1] as f32, r[1][2] as f32);
+    let (r20, r21, r22) = (r[2][0] as f32, r[2][1] as f32, r[2][2] as f32);
+    let tr = &t.translation;
+    // Columns: the linear part is R·s (column j = (R[0][j], R[1][j], R[2][j])·s).
+    [
+        [r00 * s, r10 * s, r20 * s, 0.0],
+        [r01 * s, r11 * s, r21 * s, 0.0],
+        [r02 * s, r12 * s, r22 * s, 0.0],
+        [tr[0] as f32, tr[1] as f32, tr[2] as f32, 1.0],
     ]
 }
 
@@ -1280,6 +1347,11 @@ struct App {
     camera: Camera,
     status: String,
     sliced: Option<Vec<engine::LayerPlan>>,
+    /// Paint-independent slice geometry from the last full slice, plus the
+    /// signature of the inputs that made it. A re-slice whose signature still
+    /// matches (only the parts' paint changed — a tool reassignment or a blend
+    /// edit) re-stamps this instead of re-slicing the geometry.
+    geom_cache: Option<(GeomSig, engine::GeometryPlan)>,
     /// Readable result block for the last slice; cleared with `sliced`.
     slice_summary: Option<SliceSummary>,
     /// Per-layer time/heat numbers behind the preview color modes.
@@ -1324,7 +1396,22 @@ struct App {
     show_ironing: bool,
     /// Night-sky star field on the viewport backdrop (Model + Preview).
     show_stars: bool,
-    needs_rebuild: bool,
+    /// Per-resource scene-invalidation flags. Split out of a single
+    /// `needs_rebuild` bool so a cheap-intent action only redoes the resource it
+    /// actually touched: a selection or bed-highlight refreshes the spotlight
+    /// (and beds) without re-walking + re-uploading the whole mesh vertex
+    /// buffer, and a color change stays off the beds/spotlight/bounds work.
+    /// The mesh is geometry (local, uploaded once) + a per-part uniform (model
+    /// matrix + tint). `mesh_struct_dirty` = the part SET changed (import/delete)
+    /// → re-upload geometry; `mesh_xform_dirty` = an object moved/rotated/scaled
+    /// → rewrite only the model matrices (+refresh bounds); `mesh_color_dirty` =
+    /// only a tint changed → rewrite only the colors. A drag or recolor is now a
+    /// ~96-byte-per-part uniform write, never a vertex re-walk.
+    beds_dirty: bool,
+    spotlight_dirty: bool,
+    mesh_struct_dirty: bool,
+    mesh_xform_dirty: bool,
+    mesh_color_dirty: bool,
     /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
     /// render-skip below can tell a content change from a static frame.
     content_version: u64,
@@ -1525,6 +1612,7 @@ impl App {
             camera: Camera::new(),
             status,
             sliced: None,
+            geom_cache: None,
             slice_summary: None,
             layer_stats: Vec::new(),
             // Filament colors are the point of a toolchanger preview; the
@@ -1551,7 +1639,11 @@ impl App {
             show_seams: false,
             show_stars: true,
             show_ironing: true,
-            needs_rebuild: true,
+            beds_dirty: true,
+            spotlight_dirty: true,
+            mesh_struct_dirty: true,
+            mesh_xform_dirty: false,
+            mesh_color_dirty: false,
             content_version: 0,
             last_render_sig: None,
             front_label: None,
@@ -1644,7 +1736,7 @@ impl App {
             self.sliced = None;
             self.slice_summary = None;
             self.view_preview = false;
-            self.needs_rebuild = true;
+            self.mark_scene_dirty();
             self.refit_camera = true;
         }
         self.refresh_pins();
@@ -2021,8 +2113,14 @@ impl App {
                                 mesh: Arc::new(p.mesh),
                             })
                             .collect();
-                        let mut obj =
-                            SceneObject { name, parts, rot_deg: [0.0; 3], scale: 1.0, pos: [0.0, 0.0] };
+                        let mut obj = SceneObject {
+                            name,
+                            parts,
+                            rot_deg: [0.0; 3],
+                            scale: 1.0,
+                            pos: [0.0, 0.0],
+                            bounds_cache: std::cell::Cell::new(None),
+                        };
                         // pos = the baked footprint center reproduces the
                         // file's build placement (SceneObject::transform
                         // recenters the footprint on pos).
@@ -2110,6 +2208,7 @@ impl App {
             rot_deg: src.rot_deg,
             scale: src.scale,
             pos,
+            bounds_cache: std::cell::Cell::new(None),
         };
         self.objects.push(copy);
         self.selected = Some(self.objects.len() - 1);
@@ -2199,7 +2298,10 @@ impl App {
         if self.active_bed != k {
             self.active_bed = k;
             self.recenter_camera = true;
-            self.needs_rebuild = true; // bed highlight
+            // Bed highlight: only the bed grid's active index and the selection
+            // spotlight change — the mesh is untouched.
+            self.beds_dirty = true;
+            self.spotlight_dirty = true;
         }
     }
 
@@ -2272,7 +2374,40 @@ impl App {
         self.sliced = None;
         self.slice_summary = None;
         self.view_preview = false;
-        self.needs_rebuild = true;
+        self.mark_scene_dirty();
+    }
+
+    /// Full scene rebuild next frame: mesh geometry (part set may have changed),
+    /// beds, and the selection spotlight (import / delete / arrange / profile /
+    /// bed). Re-uploads geometry — use `mark_geom_dirty` for a mere move.
+    fn mark_scene_dirty(&mut self) {
+        self.mesh_struct_dirty = true;
+        self.beds_dirty = true;
+        self.spotlight_dirty = true;
+    }
+
+    /// An object moved/rotated/scaled: rewrite only the per-part model matrices
+    /// (+refresh the bounds cache) and move the selection spotlight to follow.
+    /// The mesh geometry buffer and beds are untouched.
+    fn mark_geom_dirty(&mut self) {
+        self.mesh_xform_dirty = true;
+        self.spotlight_dirty = true;
+    }
+
+    /// Only per-part tints changed (spool color / blend / accent): rewrite just
+    /// the per-part color uniforms. Geometry, matrices, beds, spotlight, and the
+    /// bounds cache all stay put.
+    fn mark_mesh_color_dirty(&mut self) {
+        self.mesh_color_dirty = true;
+    }
+
+    /// True while any scene resource is awaiting an upload.
+    fn scene_dirty_any(&self) -> bool {
+        self.beds_dirty
+            || self.spotlight_dirty
+            || self.mesh_struct_dirty
+            || self.mesh_xform_dirty
+            || self.mesh_color_dirty
     }
 
     /// Re-layout every object, flowing across beds (shelf packing — see
@@ -2371,6 +2506,26 @@ impl App {
         }
     }
 
+    /// The geometry signature of the active bed's parts — the same parts, in the
+    /// same order and with the same empty-skip, that `baked_parts` produces, but
+    /// carrying the source-mesh `Arc` + baked transform instead of the placed
+    /// geometry (so it's cheap and the paint is excluded). Paired with the full
+    /// settings, it captures everything a slice's GEOMETRY depends on.
+    fn geom_signature(&self) -> GeomSig {
+        let ox = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
+        let mut parts = Vec::new();
+        for obj in self.objects.iter().filter(|o| self.bed_of(o) == self.active_bed) {
+            let mut t = obj.transform();
+            t.translation[0] -= ox;
+            for part in &obj.parts {
+                if !part.mesh.triangles.is_empty() {
+                    parts.push((std::sync::Arc::clone(&part.mesh), t));
+                }
+            }
+        }
+        GeomSig { parts, settings: self.settings.clone() }
+    }
+
     /// Bake the ACTIVE bed's parts into placed meshes, each paired with its
     /// paint, in that bed's local coordinates (the engine plans in [0, bed]
     /// space). Tools and blend weights clamp to the machine's slot count
@@ -2382,13 +2537,15 @@ impl App {
             let mut t = obj.transform();
             t.translation[0] -= ox;
             for part in &obj.parts {
-                let mut tris: Vec<[[f64; 3]; 3]> = Vec::with_capacity(part.mesh.triangles.len());
-                for i in 0..part.mesh.triangles.len() {
-                    let tri = part.mesh.triangle(i);
-                    tris.push([t.apply(tri[0]), t.apply(tri[1]), t.apply(tri[2])]);
-                }
-                if !tris.is_empty() {
-                    out.push((mesh::Mesh::from_triangle_soup(&tris), self.paint_engine(part.paint)));
+                // `part.mesh` is already welded/indexed (STL import + 3MF load
+                // both go through `from_triangle_soup`), and an affine placement
+                // is injective — so baking is just a per-vertex map that reuses
+                // the existing triangle indices. Re-welding through a HashMap
+                // (the old soup + `from_triangle_soup` round-trip) recomputed
+                // topology that can't have changed; `transformed()` is O(V) with
+                // no hashing and yields byte-identical geometry.
+                if !part.mesh.triangles.is_empty() {
+                    out.push((part.mesh.transformed(&t), self.paint_engine(part.paint)));
                 }
             }
         }
@@ -2461,7 +2618,7 @@ impl App {
         self.sliced = None;
         self.slice_summary = None;
         self.view_preview = false;
-        self.needs_rebuild = true;
+        self.mark_mesh_color_dirty();
     }
 
     /// Save slot `slot`'s per-tool diff as the user filament profile `name` —
@@ -2526,10 +2683,29 @@ impl App {
         let resliced = self.sliced.is_some();
         let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
             parts.iter().map(|(m, paint)| (m, paint.clone())).collect();
-        let layers = engine::generate_painted(&refs, &self.settings);
+        // If nothing but the parts' paint changed since the last full slice
+        // (a tool reassignment or a blend edit — same meshes, same settings),
+        // re-stamp the cached geometry instead of re-slicing it; otherwise slice
+        // fresh and refresh the cache. `restamp_paint` is proven byte-identical
+        // to a full slice (engine test `restamp_matches_full_slice`).
+        let sig = self.geom_signature();
+        let layers = if self.geom_cache.as_ref().is_some_and(|(cs, _)| cs.matches(&sig)) {
+            engine::restamp_paint(&self.geom_cache.as_ref().unwrap().1, &refs)
+        } else {
+            let geo = engine::plan_geometry(&refs, &self.settings);
+            let layers = engine::restamp_paint(&geo, &refs);
+            self.geom_cache = Some((sig, geo));
+            layers
+        };
         let n = layers.len();
         let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
-        let secs = engine::estimate_seconds(&layers, &self.settings);
+        // `per_layer_stats` (needed below for the layer-time map) already sums
+        // each layer's Z-move + extrusion + travel — the exact terms
+        // `estimate_seconds` recomputes — so derive the total from it instead of
+        // walking every path (and re-running the priciest per-path trapezoid
+        // time math) a second time.
+        let layer_stats = engine::per_layer_stats(&layers, &self.settings);
+        let secs: f64 = layer_stats.iter().map(|s| s.secs).sum();
         let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
         let per_tool = engine::estimate_filament_per_tool(&layers, &self.settings);
         // Tool switches: transitions between consecutive printable paths,
@@ -2553,7 +2729,7 @@ impl App {
         });
         self.status.clear();
         self.slice_gen += 1;
-        self.layer_stats = engine::per_layer_stats(&layers, &self.settings);
+        self.layer_stats = layer_stats;
         self.sliced = Some(layers);
         // The preview belongs to the bed that was active at slice time —
         // instances bake its world offset, so it stays put if the user
@@ -2581,8 +2757,8 @@ impl App {
             accent_hsl(self.accent),
             self.sliced_origin_x as f32,
         );
-        self.scene.set_toolpaths(&rs.device, &verts);
-        self.scene.set_joints(&rs.device, &joints);
+        self.scene.set_toolpaths(&rs.device, &rs.queue, &verts);
+        self.scene.set_joints(&rs.device, &rs.queue, &joints);
         self.content_version += 1;
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
@@ -2635,6 +2811,22 @@ impl App {
                 )
             }
         }
+    }
+
+    /// The per-tool spool colors as a fixed 16-slot palette for the bead
+    /// shader's Filament mode, indexed by a bead's tool id. Matches exactly what
+    /// `layer_color_table`'s Filament branch bakes (`visible_against_backdrop`
+    /// of the slot color), so driving color from this uniform instead of the
+    /// baked instance rgb is visually identical — and lets a spool-color change
+    /// be a per-frame uniform write with no instance rebuild.
+    fn tool_palette(&self) -> [[f32; 4]; render::TOOL_PALETTE_LEN] {
+        let mut pal = [[0.0f32; 4]; render::TOOL_PALETTE_LEN];
+        let n = self.settings.tool_count.min(render::TOOL_PALETTE_LEN);
+        for (i, slot) in pal.iter_mut().enumerate().take(n) {
+            let c = render::visible_against_backdrop(self.settings.tool(i).color_rgb);
+            *slot = [c[0], c[1], c[2], 1.0];
+        }
+        pal
     }
 
     /// The one-line status plus the last slice's summary — the body of the
@@ -2915,75 +3107,118 @@ impl App {
     }
 
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        self.content_version += 1;
+        let mut changed = false;
         let bx = self.settings.bed_size_x_mm as f32;
         let by = self.settings.bed_size_y_mm as f32;
-        self.scene.set_beds(&rs.device, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
-        // Selection cue: a warm spotlight pool tracing the selected object's
-        // footprint on the bed (in place of a color tint on the model).
-        let spotlight = self.selection_spotlight();
-        self.scene.set_spotlight(&rs.device, &spotlight);
 
-        // Refresh the world-bounds cache from the meshes (the one place that
-        // walks vertices), then derive per-object state from it.
-        let bx_cache = self.settings.bed_size_x_mm;
-        self.obj_bounds = self
-            .objects
-            .iter()
-            .map(|o| {
-                let (minx, miny, maxx, maxy, _) = o.footprint();
-                let (hw, hh) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
-                ObjBounds {
-                    aabb: [o.pos[0] - hw, o.pos[1] - hh, o.pos[0] + hw, o.pos[1] + hh],
-                    height: o.height(),
-                    bed: bed_of_pos(o.pos[0], bx_cache),
-                }
-            })
-            .collect();
-
-        // The selected object is flagged for highlight; unprintable objects
-        // (off the bed or overlapping, any bed) get the warning tint. One
-        // upload entry PER PART: on a toolchanger each part wears its paint's
-        // display color (slot color, or a blend's MIX — the preview shows the
-        // dithered truth); single-tool keeps the accent-porcelain tint exactly
-        // as before.
-        let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
-        let multi = self.settings.tool_count > 1;
-        let (unsel_tint, _) = mesh_tints(self.accent);
-        let mut objs: Vec<(&mesh::Mesh, mesh::Transform, [f32; 3], bool, bool)> = Vec::new();
-        for (i, o) in self.objects.iter().enumerate() {
-            let t = o.transform();
-            for part in &o.parts {
-                let (mesh_ref, rgb) = if multi {
-                    let rgb = render::visible_against_backdrop(self.paint_display_rgb(part.paint));
-                    (part.display.as_ref(), rgb)
-                } else {
-                    (part.display.as_ref(), unsel_tint)
-                };
-                // Selection no longer recolors the model — it's shown by the
-                // spotlight pool on the bed (set_spotlight, below). Only the
-                // print-blocking warning still tints a part.
-                objs.push((mesh_ref, t, rgb, false, blocked[i]));
-            }
+        if self.beds_dirty {
+            self.scene.set_beds(&rs.device, &rs.queue, bx, by, self.n_beds(), BED_GAP_MM as f32, self.active_bed);
+            self.beds_dirty = false;
+            changed = true;
         }
-        let bounds = self.scene.set_mesh(&rs.device, &objs);
-        // Only re-frame on scene changes (import/duplicate/delete/arrange/profile),
-        // not when the user merely selects an object.
-        if self.refit_camera {
-            match bounds {
-                Some((lo, hi)) => {
-                    let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]);
+
+        if self.spotlight_dirty {
+            // Selection cue: a warm spotlight pool tracing the selected object's
+            // footprint on the bed (in place of a color tint on the model).
+            let spotlight = self.selection_spotlight();
+            self.scene.set_spotlight(&rs.device, &rs.queue, &spotlight);
+            self.spotlight_dirty = false;
+            changed = true;
+        }
+
+        // The mesh (and its bounds) only matter when the model view is showing
+        // them. In Preview the model is hidden, so a color/geometry change is
+        // DEFERRED — the flags stay set and the expensive vertex re-bake waits
+        // until the user returns to model view. This is what makes a spool-color
+        // change while judging the sliced preview free: the beads recolor from
+        // the tool palette (a uniform, tracked by RenderSig) and the hidden mesh
+        // isn't touched at all.
+        let show_mesh = !(self.view_preview && self.sliced.is_some());
+        if (self.mesh_struct_dirty || self.mesh_xform_dirty || self.mesh_color_dirty) && show_mesh {
+            // A structure or placement change refreshes the world-bounds cache
+            // (positions feed both the invalid check and the model matrices); a
+            // color-only change reuses it.
+            if self.mesh_struct_dirty || self.mesh_xform_dirty {
+                let bx_cache = self.settings.bed_size_x_mm;
+                self.obj_bounds = self
+                    .objects
+                    .iter()
+                    .map(|o| {
+                        let (minx, miny, maxx, maxy, _) = o.footprint();
+                        let (hw, hh) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+                        ObjBounds {
+                            aabb: [o.pos[0] - hw, o.pos[1] - hh, o.pos[0] + hw, o.pos[1] + hh],
+                            height: o.height(),
+                            bed: bed_of_pos(o.pos[0], bx_cache),
+                        }
+                    })
+                    .collect();
+            }
+            // Build the per-part lists (same object→part order for geometry and
+            // uniforms). Unprintable objects (off the bed or overlapping, any
+            // bed) get the warning tint via the `invalid` flag; on a toolchanger
+            // each part wears its paint's display color, single-tool keeps the
+            // accent porcelain. Selection is shown by the bed spotlight, not a
+            // mesh tint.
+            let blocked: Vec<bool> = (0..self.objects.len()).map(|i| self.obj_problem(i).is_some()).collect();
+            let multi = self.settings.tool_count > 1;
+            let (unsel_tint, _) = mesh_tints(self.accent);
+            let mut meshes: Vec<&mesh::Mesh> = Vec::new();
+            let mut part_data: Vec<([[f32; 4]; 4], [f32; 3], bool)> = Vec::new();
+            for (i, o) in self.objects.iter().enumerate() {
+                let model = transform_to_mat4(&o.transform());
+                for part in &o.parts {
+                    let rgb = if multi {
+                        render::visible_against_backdrop(self.paint_display_rgb(part.paint))
+                    } else {
+                        unsel_tint
+                    };
+                    meshes.push(part.display.as_ref());
+                    part_data.push((model, rgb, blocked[i]));
+                }
+            }
+            // Re-upload geometry only when the part SET changed. The count guard
+            // is a safety net: a missed struct flag would otherwise desync the
+            // draw ranges from the uniforms.
+            if self.mesh_struct_dirty || part_data.len() != self.scene.mesh_part_count() {
+                self.scene.upload_mesh_geometry(&rs.device, &rs.queue, &meshes);
+            }
+            // Placement + tint: the only thing a drag or recolor rewrites.
+            self.scene.upload_mesh_parts(&rs.device, &rs.queue, &part_data);
+
+            // Only re-frame on scene changes (import/duplicate/delete/arrange/
+            // profile), not when the user merely selects an object. Objects rest
+            // on z=0, so the world box is the footprints' XY span × [0, height].
+            if self.refit_camera {
+                if self.obj_bounds.is_empty() {
+                    let c = self.bed_center(self.active_bed);
+                    self.camera.frame(glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0), bx.max(by) * 0.5);
+                } else {
+                    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                    let mut top = 0.0f32;
+                    for b in &self.obj_bounds {
+                        lo[0] = lo[0].min(b.aabb[0] as f32);
+                        lo[1] = lo[1].min(b.aabb[1] as f32);
+                        hi[0] = hi[0].max(b.aabb[2] as f32);
+                        hi[1] = hi[1].max(b.aabb[3] as f32);
+                        top = top.max(b.height as f32);
+                    }
+                    let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(top);
                     self.camera.frame(
-                        glam::Vec3::new((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0),
+                        glam::Vec3::new((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top / 2.0),
                         span * 0.5 + 1.0,
                     );
                 }
-                None => {
-                    let c = self.bed_center(self.active_bed);
-                    self.camera.frame(glam::Vec3::new(c[0] as f32, c[1] as f32, 0.0), bx.max(by) * 0.5)
-                }
+                self.refit_camera = false;
             }
-            self.refit_camera = false;
+            self.mesh_struct_dirty = false;
+            self.mesh_xform_dirty = false;
+            self.mesh_color_dirty = false;
+            changed = true;
+        }
+
+        if changed {
+            self.content_version += 1;
         }
     }
 }
@@ -3001,6 +3236,23 @@ struct RenderSig {
     accent: egui::Color32,
     size: (u32, u32),
     content: u64,
+    /// Bead color mode + a hash of the tool palette, so a Filament-mode
+    /// spool-color change re-renders (it updates only a uniform, bumping no
+    /// content_version — the mesh re-bake it would otherwise trigger is deferred
+    /// while the model is hidden).
+    preview_color: (u32, u64),
+}
+
+/// A cheap order-sensitive hash of the tool palette's bit patterns — only used
+/// to detect a spool-color change for the render gate.
+fn palette_hash(pal: &[[f32; 4]; render::TOOL_PALETTE_LEN]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
+    for slot in pal {
+        for &c in slot {
+            h = (h ^ c.to_bits() as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    h
 }
 
 impl eframe::App for App {
@@ -3014,7 +3266,7 @@ impl eframe::App for App {
         if bed != self.last_bed {
             let old_bx = self.last_bed.0;
             self.last_bed = bed;
-            self.needs_rebuild = true;
+            self.mark_scene_dirty();
             self.recenter_camera = true;
             // The bed pitch changed: re-pin every object to the same bed
             // index + relative offset under the new layout, so membership
@@ -3038,9 +3290,8 @@ impl eframe::App for App {
                 self.refit_camera = true;
             }
         }
-        if self.needs_rebuild {
+        if self.scene_dirty_any() {
             self.rebuild_scene(&rs);
-            self.needs_rebuild = false;
         }
         // After any refit so the plate-center pivot wins; distance and angles
         // are untouched (it's a pivot move, not a re-frame).
@@ -3546,7 +3797,7 @@ impl eframe::App for App {
                 self.set_preview_instances(&rs);
                 // The model tint bakes into the mesh vertices now (per-part
                 // colors) — re-upload them on the same release.
-                self.needs_rebuild = true;
+                self.mark_mesh_color_dirty();
                 ui.ctx().request_repaint();
             }
             if self.view_preview && n_layers > 0 {
@@ -4121,7 +4372,7 @@ impl eframe::App for App {
                             self.slice_summary = None;
                             self.view_preview = false;
                         }
-                        self.needs_rebuild = true; // swatch rows changed; tints may have
+                        self.mesh_color_dirty = true; // swatch rows changed; tints may have
                     }
                     if let Some(k) = weights_edited {
                         // The swatch is already live (recomputed above per frame);
@@ -4137,7 +4388,7 @@ impl eframe::App for App {
                             self.sliced = None;
                             self.slice_summary = None;
                             self.view_preview = false;
-                            self.needs_rebuild = true;
+                            self.mesh_color_dirty = true;
                         }
                         ui.ctx().request_repaint();
                     }
@@ -4607,16 +4858,17 @@ impl eframe::App for App {
             self.sliced = None;
             self.slice_summary = None;
             self.view_preview = false;
-            self.needs_rebuild = true;
+            // single↔multi flips the model tint (accent vs per-part spool
+            // colors) and reclamps part paints — a color change, not geometry.
+            self.mark_mesh_color_dirty();
             ui.ctx().request_repaint();
         }
-        // A spool-color edit re-tints tool-0 parts (and the filament preview
-        // mode); single-tool models keep the accent tint, nothing to do.
+        // A spool-color edit re-tints tool-0 parts; single-tool models keep the
+        // accent tint, nothing to do. The Filament preview recolors itself from
+        // the tool palette in-shader (no instance rebuild) — the mesh re-tint
+        // below bumps content_version, so the fresh palette lands on the beads.
         if filament_color_changed && self.settings.tool_count > 1 {
-            self.needs_rebuild = true;
-            if self.color_by == ColorBy::Filament && self.sliced.is_some() {
-                self.set_preview_instances(&rs);
-            }
+            self.mark_mesh_color_dirty();
             ui.ctx().request_repaint();
         }
 
@@ -4650,7 +4902,8 @@ impl eframe::App for App {
                             let pos = self.objects[i].pos;
                             self.drag_grab = [pos[0] - xy.x as f64, pos[1] - xy.y as f64];
                         }
-                        self.needs_rebuild = true;
+                        // Grabbing an object selects it — only the spotlight moves.
+                        self.spotlight_dirty = true;
                     }
                 }
             }
@@ -4665,7 +4918,10 @@ impl eframe::App for App {
                                 // Dragging a part rightward past the last bed
                                 // creates the bed under it (and it persists).
                                 self.grow_beds_to_fit();
-                                self.needs_rebuild = true;
+                                // The object's placement moved (and a bed may
+                                // have been added) — re-bake geometry + beds.
+                                self.mark_geom_dirty();
+                                self.beds_dirty = true;
                                 self.sliced = None;
                                 self.slice_summary = None;
                                 self.view_preview = false;
@@ -4703,7 +4959,9 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    self.needs_rebuild = true;
+                    // A click only changes the selection (and maybe the active
+                    // bed, handled by set_active_bed) — the mesh is untouched.
+                    self.spotlight_dirty = true;
                 }
             }
             if response.dragged_by(egui::PointerButton::Secondary) {
@@ -4734,12 +4992,18 @@ impl eframe::App for App {
                 let joint_count = self.joint_layer_ends.get(idx).copied().unwrap_or(0);
                 // Dim lower layers only when the slider is below the top.
                 let dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
+                // Filament mode recolors extrusion beads from the tool palette
+                // in-shader, so a spool-color change is a uniform update, not an
+                // instance rebuild. Other modes use each bead's baked rgb.
+                let color_mode = if self.color_by == ColorBy::Filament { 1 } else { 0 };
                 Some(render::Preview {
                     count,
                     joint_count,
                     current_layer: self.preview_layer as f32,
                     dim,
                     mask: self.category_mask(),
+                    color_mode,
+                    tool_palette: self.tool_palette(),
                 })
             } else {
                 None
@@ -4751,6 +5015,13 @@ impl eframe::App for App {
             let preview_sig = preview.as_ref().map(|p| {
                 (p.count, p.joint_count, p.current_layer.to_bits(), p.dim.to_bits(), p.mask)
             });
+            // Only the palette actually feeds a pixel (via ctrl.w) in Filament
+            // mode, so hash it just then — a spool-color change re-renders the
+            // beads without any content_version bump.
+            let preview_color = match preview.as_ref() {
+                Some(p) if p.color_mode == 1 => (1u32, palette_hash(&p.tool_palette)),
+                _ => (0, 0),
+            };
             let sig = RenderSig {
                 vp,
                 show_mesh,
@@ -4759,6 +5030,7 @@ impl eframe::App for App {
                 accent: self.accent,
                 size: (w, h),
                 content: self.content_version,
+                preview_color,
             };
             if self.last_render_sig.as_ref() != Some(&sig) {
                 let (mesh_unsel, mesh_sel) = mesh_tints(self.accent);
@@ -4818,7 +5090,7 @@ impl eframe::App for App {
                         .iter()
                         .map(|&([gx, gy], [u, v])| [x0 + gx * scale, -pad - gy * scale, 0.0, u, v])
                         .collect();
-                    self.scene.set_label_geom(&rs.device, &verts);
+                    self.scene.set_label_geom(&rs.device, &rs.queue, &verts);
                     self.last_label_bed = Some(key);
                     self.content_version += 1;
                     // Geometry uploaded after this frame's render — make sure the
@@ -5094,7 +5366,8 @@ impl eframe::App for App {
                     });
                 self.overlay_rect = Some(area.response.rect);
                 if changed {
-                    self.needs_rebuild = true;
+                    // Rotation / scale / position edit — geometry+placement moved.
+                    self.mark_geom_dirty();
                     self.sliced = None;
                     self.slice_summary = None;
                     self.view_preview = false;
@@ -5965,7 +6238,7 @@ const CAT_SURFACE: f32 = 9.0;
 /// each with a cumulative per-layer count for the layer slider.
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
-type Instances = (Vec<[f32; 13]>, Vec<u32>, Vec<[f32; 10]>, Vec<u32>);
+type Instances = (Vec<[f32; 14]>, Vec<u32>, Vec<[f32; 11]>, Vec<u32>);
 fn build_instances(
     layers: &[engine::LayerPlan],
     z_hop_mm: f32,
@@ -5973,9 +6246,9 @@ fn build_instances(
     accent: (f32, f32, f32),
     origin_x: f32,
 ) -> Instances {
-    let mut inst: Vec<[f32; 13]> = Vec::new();
+    let mut inst: Vec<[f32; 14]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
-    let mut joints: Vec<[f32; 10]> = Vec::new();
+    let mut joints: Vec<[f32; 11]> = Vec::new();
     let mut joint_ends: Vec<u32> = Vec::with_capacity(layers.len());
     let (ah, as_, _) = accent;
     // Travels whisper on the complement (hairline, usually toggled off);
@@ -6000,13 +6273,18 @@ fn build_instances(
                 let zc = if tr.hop { z_top + z_hop_mm } else { z_top } - travel_dim * 0.5;
                 let mut from = pe;
                 for &pt in &tr.points {
-                    push_inst(&mut inst, origin_x, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL);
+                    // Travels keep their baked accent color in all modes (tool id
+                    // unused for CAT_TRAVEL).
+                    push_inst(&mut inst, origin_x, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL, 0.0);
                     from = pt;
                 }
             }
             // Heat-map modes override the feature palette per path (per layer).
             let c = path_colors.map_or_else(|| color_for(path.kind, accent), |t| t[li][pi]);
             let cat = category_of(path.kind);
+            // The printing tool — the palette index the Filament-mode shader path
+            // uses to recolor this bead without a rebuild.
+            let tool = path.tool as f32;
             // Trickle-flow paths (ironing) render as a thin film at the layer top:
             // full width, height scaled by flow.
             let base_h = h * path.height_scale as f32; // height_scale is 1.0 today
@@ -6042,11 +6320,11 @@ fn build_instances(
             for k in 0..n_pts - 1 {
                 let sw = (vert_w(k) + vert_w(k + 1)) * 0.5;
                 let (sc, scat) = seg_cc(k);
-                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat);
+                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat, tool);
             }
             if path.closed {
                 let (sc, scat) = seg_cc(n_pts - 1);
-                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat);
+                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat, tool);
             }
             // Joint blob at every vertex (extrusion paths only — travels stay bare).
             for (vi, p) in path.points.iter().enumerate() {
@@ -6055,7 +6333,7 @@ fn build_instances(
                     p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
                     vert_w(vi), bh,
                     sc[0], sc[1], sc[2],
-                    layer_id, scat,
+                    layer_id, scat, tool,
                 ]);
             }
             // Highlight the external-perimeter seam (loop start) with a larger
@@ -6070,7 +6348,7 @@ fn build_instances(
                     s.x_mm() as f32 + origin_x, s.y_mm() as f32, zc,
                     w * 2.5, h * 2.5,
                     seam_color[0], seam_color[1], seam_color[2],
-                    layer_id, CAT_SEAM,
+                    layer_id, CAT_SEAM, 0.0,
                 ]);
             }
             prev_end = Some(if path.closed {
@@ -6087,7 +6365,7 @@ fn build_instances(
 
 #[allow(clippy::too_many_arguments)]
 fn push_inst(
-    v: &mut Vec<[f32; 13]>,
+    v: &mut Vec<[f32; 14]>,
     origin_x: f32,
     a: geo2d::Point,
     b: geo2d::Point,
@@ -6097,6 +6375,7 @@ fn push_inst(
     color: [f32; 3],
     layer: f32,
     cat: f32,
+    tool: f32,
 ) {
     let (ax, ay) = (a.x_mm() as f32 + origin_x, a.y_mm() as f32);
     let (bx, by) = (b.x_mm() as f32 + origin_x, b.y_mm() as f32);
@@ -6110,7 +6389,7 @@ fn push_inst(
         dx / len, dy / len, len,
         width, height,
         color[0], color[1], color[2],
-        layer, cat,
+        layer, cat, tool,
     ]);
 }
 

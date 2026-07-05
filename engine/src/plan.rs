@@ -432,7 +432,44 @@ fn path_touches(points: &[geo2d::Point], region: &Polygons) -> bool {
 /// the union of ALL parts below, so a part resting on another is supported,
 /// not floating. Overlapping volumes resolve by order: the earlier part owns
 /// the overlap and later parts are trimmed around it.
-pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Vec<LayerPlan> {
+/// The paint-independent result of slicing: geometry, per-layer physics, and
+/// each part's planned toolpaths BEFORE any tool is stamped. Produced by
+/// [`plan_geometry`] (the heavy half of the pipeline: slicing, offsets, the
+/// physical union, `plan_part`, supports). Hand it to [`restamp_paint`] to
+/// change which tool prints each path — a part→tool reassignment or a
+/// blend-weight edit — without re-slicing, whenever the meshes and settings are
+/// unchanged. Opaque to callers; only the engine reads its innards.
+pub struct GeometryPlan {
+    norm_settings: Settings,
+    grid: Vec<Layer>,
+    part_layers: Vec<Vec<Layer>>,
+    phys: Vec<Polygons>,
+    /// Pre-stamp: geometry planned, `path.tool` not yet assigned.
+    part_plans: Vec<Vec<LayerPlan>>,
+    occupied: Vec<Vec<bool>>,
+    n: usize,
+}
+
+impl GeometryPlan {
+    /// An empty plan (no printable geometry) — `stamp_and_finish` yields no
+    /// layers from it.
+    fn empty(norm_settings: Settings) -> Self {
+        Self {
+            norm_settings,
+            grid: Vec::new(),
+            part_layers: Vec::new(),
+            phys: Vec::new(),
+            part_plans: Vec::new(),
+            occupied: Vec::new(),
+            n: 0,
+        }
+    }
+}
+
+/// Slice and plan geometry, independent of paint — the expensive half of
+/// [`generate_painted`]. Cache the result and re-stamp paint cheaply with
+/// [`restamp_paint`].
+pub fn plan_geometry(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> GeometryPlan {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
     // above the solid bottom, nothing that would interrupt the continuous loop.
     // It is meaningless across parts, so a multi-part job ignores it.
@@ -462,7 +499,7 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
         }
     }
     let Some((zmin, zmax)) = z_range else {
-        return Vec::new();
+        return GeometryPlan::empty(norm_settings);
     };
     let grid = crate::slice::layer_grid(
         zmin,
@@ -473,7 +510,7 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
         },
     );
     if grid.is_empty() {
-        return Vec::new();
+        return GeometryPlan::empty(norm_settings);
     }
     let n = grid.len();
 
@@ -550,6 +587,26 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
             (0..n).map(|i| !plans[i].paths.is_empty() && !layers[i].polygons.is_empty()).collect()
         })
         .collect();
+
+    GeometryPlan { norm_settings, grid, part_layers, phys, part_plans, occupied, n }
+}
+
+/// The paint half of the plan: stamp each path's tool (uniform or blend
+/// schedule + face override), merge parts, add brim/skirt, order, and plan
+/// travels. Split out of [`generate_painted`] so a paint-only change can re-run
+/// just this stage over a cached [`GeometryPlan`]. `part_plans` is moved in
+/// (generate_painted hands over its owned plans; restamp clones the cache's).
+fn stamp_and_finish(
+    geo: &GeometryPlan,
+    mut part_plans: Vec<Vec<LayerPlan>>,
+    parts: &[(&Mesh, PartPaint)],
+) -> Vec<LayerPlan> {
+    let settings = &geo.norm_settings;
+    let n = geo.n;
+    let phys = &geo.phys;
+    let part_layers = &geo.part_layers;
+    let occupied = &geo.occupied;
+    let grid = &geo.grid;
 
     // Blend schedules. Equal recipes yield byte-equal schedules (the schedule
     // is a pure function of the weights), so grouping by schedule equality
@@ -715,6 +772,26 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
+}
+
+/// Slice a set of painted parts into the final per-layer toolpaths. Equivalent
+/// to `plan_geometry` followed by `stamp_and_finish` — kept as one call for the
+/// common path (it hands its owned pre-stamp plans straight through, no clone).
+pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Vec<LayerPlan> {
+    let mut geo = plan_geometry(parts, settings);
+    let part_plans = std::mem::take(&mut geo.part_plans);
+    stamp_and_finish(&geo, part_plans, parts)
+}
+
+/// Re-stamp paint onto a cached [`GeometryPlan`] without re-slicing: only the
+/// tool each path carries (and everything downstream — face override, layer
+/// ordering by tool, travels) is recomputed. Valid ONLY when the meshes and
+/// settings that produced `geo` are unchanged and just the parts' `PartPaint`
+/// differs (a part→tool reassignment or a blend-weight edit); the caller owns
+/// that invariant. Output is byte-identical to `generate_painted` with the new
+/// paint (verified by `restamp_matches_full_slice`).
+pub fn restamp_paint(geo: &GeometryPlan, parts: &[(&Mesh, PartPaint)]) -> Vec<LayerPlan> {
+    stamp_and_finish(geo, geo.part_plans.clone(), parts)
 }
 
 /// Plan one part's layers into per-layer toolpaths — everything that reads only
@@ -3403,6 +3480,82 @@ mod tests {
 
     fn count(layer: &LayerPlan, kind: PathKind) -> usize {
         layer.paths.iter().filter(|p| p.kind == kind).count()
+    }
+
+    /// A structural fingerprint of a plan: per layer, its z and the ordered
+    /// per-path (tool, kind, closed, quantized points). Captures tool
+    /// assignment, path geometry, AND the by-tool ordering — everything a
+    /// paint change can touch.
+    #[allow(clippy::type_complexity)]
+    fn fp(plans: &[LayerPlan]) -> Vec<(usize, i64, Vec<(u32, PathKind, bool, Vec<(i64, i64)>)>)> {
+        plans
+            .iter()
+            .map(|l| {
+                (
+                    l.index,
+                    (l.print_z_mm * 1e6).round() as i64,
+                    l.paths
+                        .iter()
+                        .map(|p| {
+                            let pts = p
+                                .points
+                                .iter()
+                                .map(|pt| ((pt.x_mm() * 1e5).round() as i64, (pt.y_mm() * 1e5).round() as i64))
+                                .collect();
+                            (p.tool, p.kind, p.closed, pts)
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restamp_matches_full_slice() {
+        // Stepped part (its shelf exercises the blend face-override, the
+        // trickiest paint stage) + a second part on another tool.
+        let mut t = Vec::new();
+        push_box(&mut t, [0.0, 0.0, 0.0], [20.0, 20.0, 2.0]);
+        push_box(&mut t, [6.0, 6.0, 2.0], [14.0, 14.0, 4.0]);
+        let stepped = mesh::Mesh::from_triangle_soup(&t);
+        let mut sl = Vec::new();
+        push_box(&mut sl, [22.0, 0.0, 0.0], [32.0, 10.0, 3.0]);
+        let slab = mesh::Mesh::from_triangle_soup(&sl);
+
+        let mut s = Settings::default();
+        s.tool_count = 3;
+        s.tools = (0..3).map(|i| s.flat_tool(format!("t{i}"))).collect();
+        s.auto_center_on_bed = false;
+
+        // Geometry is paint-independent, so one cache serves any paint.
+        let parts_a: Vec<(&Mesh, PartPaint)> =
+            vec![(&stepped, PartPaint::Blend(vec![(0, 3.0), (1, 1.0)])), (&slab, PartPaint::Tool(2))];
+        let geo = plan_geometry(&parts_a, &s);
+
+        // Restamping the SAME paint must reproduce a full slice exactly.
+        assert_eq!(
+            fp(&restamp_paint(&geo, &parts_a)),
+            fp(&generate_painted(&parts_a, &s)),
+            "restamp with the same paint must equal a full slice",
+        );
+
+        // Restamping a DIFFERENT paint (moved tools + weights) must equal a full
+        // slice with that paint — the whole point of the cache.
+        let parts_b: Vec<(&Mesh, PartPaint)> =
+            vec![(&stepped, PartPaint::Blend(vec![(0, 1.0), (2, 1.0)])), (&slab, PartPaint::Tool(0))];
+        let full_b = generate_painted(&parts_b, &s);
+        assert_eq!(
+            fp(&restamp_paint(&geo, &parts_b)),
+            fp(&full_b),
+            "restamp with new paint must equal a full slice with that paint",
+        );
+
+        // Guard against a vacuous test: the two paints really do differ.
+        assert_ne!(
+            fp(&generate_painted(&parts_a, &s)),
+            fp(&full_b),
+            "test setup: paints A and B must produce different plans",
+        );
     }
 
     /// Axis-aligned box as a triangle soup (outward winding, same pattern as

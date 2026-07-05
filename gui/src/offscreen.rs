@@ -146,10 +146,10 @@ pub fn run(a: &Args) -> Result<(), String> {
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut scene = Scene::new_core(&device, format, 4);
     scene.resize_core(&device, a.width, a.height);
-    scene.set_toolpaths(&device, &inst);
+    scene.set_toolpaths(&device, &queue, &inst);
     let joint_count = if std::env::var("NO_JOINTS").is_ok() { 0 } else { joint_count };
     if joint_count > 0 {
-        scene.set_joints(&device, &joints);
+        scene.set_joints(&device, &queue, &joints);
     }
 
     // Camera: frame the geometry visible through this layer, from a high front
@@ -171,12 +171,29 @@ pub fn run(a: &Args) -> Result<(), String> {
     // DIM (0.0–1.0) fades layers below the current one — set DIM=0 to isolate just
     // the top layer's beads (everything below renders black).
     let dim = std::env::var("DIM").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+    // The oracle bakes tool colors into each bead's rgb (COLOR=filament
+    // path_colors), so it defaults to the baked-color path — faithful to the
+    // GUI. CMODE=1 forces the Filament palette path (recolor extrusion from
+    // tool_palette by tool id) — a diagnostic to confirm it matches the baked
+    // path when the palette equals the baked colors.
+    let mut tool_palette = [[0.0f32; 4]; crate::render::TOOL_PALETTE_LEN];
+    for (i, slot) in tool_palette
+        .iter_mut()
+        .enumerate()
+        .take(settings.tool_count.min(crate::render::TOOL_PALETTE_LEN))
+    {
+        let c = crate::render::visible_against_backdrop(settings.tool(i).color_rgb);
+        *slot = [c[0], c[1], c[2], 1.0];
+    }
+    let color_mode = std::env::var("CMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let preview = crate::render::Preview {
         count,
         joint_count,
         current_layer: layer as f32,
         dim,
         mask,
+        color_mode,
+        tool_palette,
     };
     scene.render_to(&device, &queue, view_proj, eye, false, false, Some(preview), [0.0; 3], [0.0; 3], [0.0; 4]);
 

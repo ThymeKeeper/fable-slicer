@@ -24,7 +24,7 @@ pub use emit::{
     LayerStats,
 };
 pub use plan::{
-    debug_uncovered, generate, generate_painted, generate_parts, LayerPlan, PartPaint, PathKind,
-    ToolPath, Travel,
+    debug_uncovered, generate, generate_painted, generate_parts, plan_geometry, restamp_paint,
+    GeometryPlan, LayerPlan, PartPaint, PathKind, ToolPath, Travel,
 };
 pub use slice::{slice_mesh, Layer, SliceParams};
