@@ -6326,8 +6326,25 @@ fn build_instances(
                 let (sc, scat) = seg_cc(n_pts - 1);
                 push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat, tool);
             }
-            // Joint blob at every vertex (extrusion paths only — travels stay bare).
+            // Joint blobs round path ends and fill the outer wedge at CORNERS
+            // (extrusion paths only — travels stay bare). A shallow bend's two
+            // tube-ends already abut — the gap is a sliver of the bead width, so
+            // the blob there is fully hidden under the beads. Emit one only at an
+            // open-path cap or a turn sharper than JOINT_MIN_TURN; this cuts the
+            // joint count several-fold, the biggest per-frame cost of a dense
+            // preview, with no visible change.
+            let closed = path.closed;
             for (vi, p) in path.points.iter().enumerate() {
+                let keep = if !closed && (vi == 0 || vi == n_pts - 1) {
+                    true // open-path cap
+                } else {
+                    let prev = path.points[(vi + n_pts - 1) % n_pts];
+                    let next = path.points[(vi + 1) % n_pts];
+                    joint_needed(prev, *p, next)
+                };
+                if !keep {
+                    continue;
+                }
                 let (sc, scat) = seg_cc(vi);
                 joints.push([
                     p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
@@ -6361,6 +6378,25 @@ fn build_instances(
         joint_ends.push(joints.len() as u32);
     }
     (inst, ends, joints, joint_ends)
+}
+
+/// A path vertex needs a joint blob only where the tube turns enough that the
+/// two segment-ends leave a visible outer wedge. Below `JOINT_MIN_TURN` the
+/// ends abut (the gap is a sub-bead-width sliver hidden under the beads), so no
+/// blob is needed. `a→b→c` are consecutive path points.
+fn joint_needed(a: geo2d::Point, b: geo2d::Point, c: geo2d::Point) -> bool {
+    /// Emit a joint above this turn angle. ~22° leaves worst-case gaps under
+    /// ~0.1·bead-width — invisible — while culling the many shallow vertices of
+    /// a curved wall.
+    const JOINT_MIN_COS: f64 = 0.927; // cos(22°)
+    let (ix, iy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+    let (ox, oy) = (c.x_mm() - b.x_mm(), c.y_mm() - b.y_mm());
+    let li = (ix * ix + iy * iy).sqrt();
+    let lo = (ox * ox + oy * oy).sqrt();
+    if li < 1.0e-9 || lo < 1.0e-9 {
+        return true; // a degenerate/zero-length neighbor — keep the blob
+    }
+    (ix * ox + iy * oy) / (li * lo) < JOINT_MIN_COS
 }
 
 #[allow(clippy::too_many_arguments)]

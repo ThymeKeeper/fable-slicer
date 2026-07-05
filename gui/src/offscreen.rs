@@ -141,6 +141,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0);
     let count = ends.get(layer - 1).copied().unwrap_or(0);
     let joint_count = joint_ends.get(layer - 1).copied().unwrap_or(0);
+    eprintln!("offscreen: instances beads={} joints={} (through layer {layer})", count, joint_count);
 
     // Scene (4× MSAA — within the WebGPU baseline, so no device feature needed).
     let format = wgpu::TextureFormat::Rgba8Unorm;

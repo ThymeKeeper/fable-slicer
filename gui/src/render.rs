@@ -1242,7 +1242,10 @@ impl Scene {
 /// cross-section to (line width, layer height). Ends are left open; a joint blob
 /// at every vertex rounds the ends and fills corners between segments.
 fn bead_vertices() -> Vec<Vertex> {
-    const N: usize = 8;
+    // A hexagonal tube: at bead scale (a fraction of a mm) the extra facets of
+    // an octagon aren't visible, and dropping 8→6 sides is 25% fewer verts per
+    // bead across the whole preview.
+    const N: usize = 6;
     let ring: Vec<[f32; 2]> = (0..N)
         .map(|k| {
             let t = std::f32::consts::TAU * (k as f32) / (N as f32);
@@ -1271,7 +1274,9 @@ fn bead_vertices() -> Vec<Vertex> {
 /// path vertex, rounding ends and filling corners. Vertex positions are unit
 /// vectors, so they double as normals.
 fn blob_vertices() -> Vec<Vertex> {
-    const S: usize = 8;
+    // A tiny corner/end filler — a pentagonal bipyramid is plenty round at this
+    // scale (and joints are now culled to only sharp corners anyway).
+    const S: usize = 5;
     let eq: Vec<[f32; 3]> = (0..S)
         .map(|k| {
             let t = std::f32::consts::TAU * (k as f32) / (S as f32);
