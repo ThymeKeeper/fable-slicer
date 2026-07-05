@@ -469,7 +469,57 @@ impl GeometryPlan {
 /// Slice and plan geometry, independent of paint — the expensive half of
 /// [`generate_painted`]. Cache the result and re-stamp paint cheaply with
 /// [`restamp_paint`].
+/// Live progress of a slice: `done`/`total` per-layer wall-planning units,
+/// bumped as the heavy per-layer wall pass finishes each layer. Shared (via an
+/// `Arc`) between the worker running [`plan_geometry_tracked`] and a UI that
+/// polls [`SliceProgress::fraction`] to drive a progress bar.
+#[derive(Default)]
+pub struct SliceProgress {
+    done: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+}
+
+impl SliceProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn add_total(&self, n: usize) {
+        self.total.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn tick(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Completed fraction in `0.0..=1.0` — `0.0` until the total is known (the
+    /// wall pass, where nearly all of a high-wall-count slice's time goes).
+    pub fn fraction(&self) -> f32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = self.total.load(Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        (self.done.load(Relaxed) as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Like [`plan_geometry`], but ticks `progress` as the heavy per-layer wall pass
+/// advances, so a background slice can drive a progress bar.
+pub fn plan_geometry_tracked(
+    parts: &[(&Mesh, PartPaint)],
+    settings: &Settings,
+    progress: &SliceProgress,
+) -> GeometryPlan {
+    plan_geometry_inner(parts, settings, Some(progress))
+}
+
 pub fn plan_geometry(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> GeometryPlan {
+    plan_geometry_inner(parts, settings, None)
+}
+
+fn plan_geometry_inner(
+    parts: &[(&Mesh, PartPaint)],
+    settings: &Settings,
+    progress: Option<&SliceProgress>,
+) -> GeometryPlan {
     // Spiral vase rewrites the recipe: one wall, no sparse infill, no shells
     // above the solid bottom, nothing that would interrupt the continuous loop.
     // It is meaningless across parts, so a multi-part job ignores it.
@@ -568,10 +618,14 @@ pub fn plan_geometry(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Geome
             .collect()
     };
 
-    // Plan each part independently.
+    // Plan each part independently. The wall pass ticks progress once per
+    // layer, so the total work is one unit per layer per part.
+    if let Some(p) = progress {
+        p.add_total(n * parts.len());
+    }
     let mut part_plans: Vec<Vec<LayerPlan>> = Vec::with_capacity(parts.len());
     for layers in &part_layers {
-        let mut plans = plan_part(layers, &phys, settings);
+        let mut plans = plan_part(layers, &phys, settings, progress);
         add_supports(&mut plans, layers, &phys, settings);
         part_plans.push(plans);
     }
@@ -799,7 +853,12 @@ pub fn restamp_paint(geo: &GeometryPlan, parts: &[(&Mesh, PartPaint)]) -> Vec<La
 /// "is there something below me" physical tests (overhang walls, bridges,
 /// enclosed ceilings) run against it, while top/bottom skin placement
 /// deliberately stays per part so interfaces between parts get full shells.
-fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<LayerPlan> {
+fn plan_part(
+    layers: &[Layer],
+    phys: &[Polygons],
+    settings: &Settings,
+    progress: Option<&SliceProgress>,
+) -> Vec<LayerPlan> {
     let lw = settings.line_width_mm;
     let n = layers.len();
 
@@ -867,6 +926,7 @@ fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<La
             let wall_region = difference(interior, &ceiling);
             let interior: &Polygons = &wall_region;
             let mut walls = Vec::new();
+            let mut consumed = false;
             for w in 0..settings.wall_count {
                 let inset = -(lw * 0.5 + w as f64 * sp);
                 let kind = if w == 0 {
@@ -879,6 +939,17 @@ fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<La
                 // the outer at stadium spacing all the way around — the surface is
                 // no longer carved out of this region, so they no longer detour.
                 let centers = offset(if w == 0 { &layer.polygons } else { interior }, inset);
+                // The cross-section can't hold this many walls: once an inward
+                // offset comes back empty, every deeper one will too (erosion is
+                // monotonic in the inset), so stop instead of grinding through
+                // the remaining offsets — up to 90-odd full Clipper passes per
+                // layer at wall_count=99, all returning empty. Pure speed:
+                // `emit_loops` on an empty set already emitted nothing, so the
+                // planned paths are byte-identical.
+                if centers.is_empty() {
+                    consumed = true;
+                    break;
+                }
                 let emit_loops = |src: &Polygons, walls: &mut Vec<ToolPath>| {
                     for c in &src.contours {
                         if c.points.len() >= 3 {
@@ -936,7 +1007,14 @@ fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<La
             // Inside the innermost wall — the skin/solid fills this whole region now
             // (the surface is no longer carved out into a separate band), so the
             // interior the wandering walls used to occupy is reclaimed as fill.
-            let inset = offset(interior, -wall_depth);
+            // If the walls already consumed the cross-section (the loop broke
+            // early), the region inside the innermost wall is empty — offsetting
+            // by the full wall depth would just be another expensive empty
+            // Clipper pass, so skip it. Byte-identical: that offset returns empty
+            // here anyway (wall_depth is at least as deep as the inset that came
+            // back empty).
+            let inset =
+                if consumed { Polygons::new() } else { offset(interior, -wall_depth) };
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
             // Wall stretches hanging past the layer below print slow with full
             // cooling (the spiral loop must stay whole, so vase mode skips).
@@ -960,6 +1038,13 @@ fn plan_part(layers: &[Layer], phys: &[Polygons], settings: &Settings) -> Vec<La
             // (spiralize_shells), together with the concentric fill they ring, so the
             // wall stack and cavity fill become one continuous stroke.
             (walls, opened)
+        })
+        // Tick once per layer as its walls finish — this pass is ~all of a
+        // high-wall-count slice's time, so it drives the progress bar.
+        .inspect(|_| {
+            if let Some(p) = progress {
+                p.tick();
+            }
         })
         .collect();
     let mut walls_per_layer: Vec<Vec<ToolPath>> = Vec::with_capacity(n);

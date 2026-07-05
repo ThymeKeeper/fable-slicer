@@ -1258,6 +1258,40 @@ struct SliceSummary {
     toolchanges: usize,
 }
 
+/// One in-flight background slice. The heavy geometry pass (`plan_geometry` —
+/// seconds of wall offsets on a 99-wall model) runs off the UI thread so the
+/// app never freezes; `ui()` polls `rx` each frame and commits the result. Only
+/// paint-only re-stamps (fast) stay on the UI thread; a fresh geometry slice
+/// takes this path.
+struct SliceJob {
+    rx: std::sync::mpsc::Receiver<SliceOutput>,
+    /// The geometry signature the parts had at spawn — cached with the result
+    /// so a later paint-only change can re-stamp instead of re-slicing.
+    sig: GeomSig,
+    /// A re-slice keeps the viewed layer; a first slice jumps to the top.
+    resliced: bool,
+    /// Bed world offset baked into the preview instances at slice time.
+    origin_x: f64,
+    /// Live wall-pass progress, ticked by the worker; the Slice button reads
+    /// `fraction()` each frame to fill as a progress bar.
+    progress: std::sync::Arc<engine::SliceProgress>,
+}
+
+/// The product of a slice — computed on the UI thread (paint-only re-stamp) or
+/// a worker (full re-slice), ready to commit and upload to the GPU.
+struct SliceOutput {
+    layers: Vec<engine::LayerPlan>,
+    /// `Some` when the geometry was freshly planned (cache it); `None` on a
+    /// paint-only re-stamp of already-cached geometry.
+    geo: Option<engine::GeometryPlan>,
+    summary: SliceSummary,
+    layer_stats: Vec<engine::LayerStats>,
+    verts: Vec<[f32; 14]>,
+    ends: Vec<u32>,
+    joints: Vec<[f32; 11]>,
+    joint_ends: Vec<u32>,
+}
+
 /// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
 /// the bounds/collision checks (run for tinting, the transform card, and the
 /// Send gate) don't re-walk mesh vertices every frame.
@@ -1352,6 +1386,10 @@ struct App {
     /// matches (only the parts' paint changed — a tool reassignment or a blend
     /// edit) re-stamps this instead of re-slicing the geometry.
     geom_cache: Option<(GeomSig, engine::GeometryPlan)>,
+    /// An in-flight background slice, if any. Set when a geometry change kicks
+    /// off `plan_geometry` on a worker thread; polled + committed in `ui()`.
+    /// The Slice button disables while this is `Some`.
+    slice_job: Option<SliceJob>,
     /// Readable result block for the last slice; cleared with `sliced`.
     slice_summary: Option<SliceSummary>,
     /// Per-layer time/heat numbers behind the preview color modes.
@@ -1613,6 +1651,7 @@ impl App {
             status,
             sliced: None,
             geom_cache: None,
+            slice_job: None,
             slice_summary: None,
             layer_stats: Vec::new(),
             // Filament colors are the point of a toolchanger preview; the
@@ -2673,69 +2712,93 @@ impl App {
     }
 
     fn slice(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        if self.slice_job.is_some() {
+            return; // a background slice is already running
+        }
         self.refresh_tool0();
         let parts = self.baked_parts();
         if parts.is_empty() {
             return;
         }
-        // A re-slice keeps the layer the user was viewing (clamped below); only the
-        // first slice of a fresh model jumps the slider to the top.
+        // A re-slice keeps the layer the user was viewing (clamped in
+        // `apply_slice_output`); only the first slice of a fresh model jumps to
+        // the top.
         let resliced = self.sliced.is_some();
-        let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
-            parts.iter().map(|(m, paint)| (m, paint.clone())).collect();
-        // If nothing but the parts' paint changed since the last full slice
-        // (a tool reassignment or a blend edit — same meshes, same settings),
-        // re-stamp the cached geometry instead of re-slicing it; otherwise slice
-        // fresh and refresh the cache. `restamp_paint` is proven byte-identical
-        // to a full slice (engine test `restamp_matches_full_slice`).
+        // The preview belongs to the bed that was active at slice time —
+        // instances bake its world offset, so it stays put if the user switches
+        // beds afterward.
+        let origin_x = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
+        let color_by = self.color_by;
+        let accent = accent_hsl(self.accent);
+        let z_hop = self.settings.z_hop_mm as f32;
         let sig = self.geom_signature();
-        let layers = if self.geom_cache.as_ref().is_some_and(|(cs, _)| cs.matches(&sig)) {
-            engine::restamp_paint(&self.geom_cache.as_ref().unwrap().1, &refs)
+        // If nothing but the parts' paint changed since the last full slice (a
+        // tool reassignment or a blend edit — same meshes, same settings),
+        // re-stamp the cached geometry: that's ~100 ms, so do it inline and land
+        // the result this frame. `restamp_paint` is proven byte-identical to a
+        // full slice (engine test `restamp_matches_full_slice`).
+        if self.geom_cache.as_ref().is_some_and(|(cs, _)| cs.matches(&sig)) {
+            let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
+                parts.iter().map(|(m, paint)| (m, paint.clone())).collect();
+            let layers = engine::restamp_paint(&self.geom_cache.as_ref().unwrap().1, &refs);
+            let out =
+                finish_slice(layers, None, &self.settings, color_by, accent, origin_x as f32, z_hop);
+            self.apply_slice_output(out, sig, rs, resliced, origin_x);
         } else {
-            let geo = engine::plan_geometry(&refs, &self.settings);
-            let layers = engine::restamp_paint(&geo, &refs);
-            self.geom_cache = Some((sig, geo));
-            layers
-        };
-        let n = layers.len();
-        let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
-        // `per_layer_stats` (needed below for the layer-time map) already sums
-        // each layer's Z-move + extrusion + travel — the exact terms
-        // `estimate_seconds` recomputes — so derive the total from it instead of
-        // walking every path (and re-running the priciest per-path trapezoid
-        // time math) a second time.
-        let layer_stats = engine::per_layer_stats(&layers, &self.settings);
-        let secs: f64 = layer_stats.iter().map(|s| s.secs).sum();
-        let (fil_mm, grams) = engine::estimate_filament(&layers, &self.settings);
-        let per_tool = engine::estimate_filament_per_tool(&layers, &self.settings);
-        // Tool switches: transitions between consecutive printable paths,
-        // across layer boundaries too (where the g-code swaps tools).
-        let mut toolchanges = 0usize;
-        let mut last_tool: Option<u32> = None;
-        for path in layers.iter().flat_map(|l| &l.paths).filter(|p| p.points.len() >= 2) {
-            if last_tool.is_some_and(|t| t != path.tool) {
-                toolchanges += 1;
-            }
-            last_tool = Some(path.tool);
+            // A geometry change: the heavy `plan_geometry` (seconds at high wall
+            // counts) runs on a worker so the UI thread never blocks. `ui()`
+            // polls the channel and commits + uploads when it lands.
+            let settings = self.settings.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let progress = std::sync::Arc::new(engine::SliceProgress::new());
+            let worker_progress = std::sync::Arc::clone(&progress);
+            std::thread::spawn(move || {
+                let refs: Vec<(&mesh::Mesh, engine::PartPaint)> =
+                    parts.iter().map(|(m, paint)| (m, paint.clone())).collect();
+                let geo = engine::plan_geometry_tracked(&refs, &settings, &worker_progress);
+                let layers = engine::restamp_paint(&geo, &refs);
+                let out = finish_slice(
+                    layers,
+                    Some(geo),
+                    &settings,
+                    color_by,
+                    accent,
+                    origin_x as f32,
+                    z_hop,
+                );
+                let _ = tx.send(out);
+            });
+            self.slice_job = Some(SliceJob { rx, sig, resliced, origin_x, progress });
+            self.status.clear();
         }
-        self.slice_summary = Some(SliceSummary {
-            layers: n,
-            toolpaths: paths,
-            secs,
-            filament_m: fil_mm / 1000.0,
-            grams,
-            per_tool,
-            toolchanges,
-        });
+    }
+
+    /// Commit a finished slice on the UI thread: publish the layers + summary,
+    /// cache freshly-planned geometry, and upload the preview instances to the
+    /// GPU (which must happen on the main thread that owns the wgpu queue).
+    fn apply_slice_output(
+        &mut self,
+        out: SliceOutput,
+        sig: GeomSig,
+        rs: &eframe::egui_wgpu::RenderState,
+        resliced: bool,
+        origin_x: f64,
+    ) {
+        let n = out.layers.len();
+        if let Some(geo) = out.geo {
+            self.geom_cache = Some((sig, geo));
+        }
+        self.slice_summary = Some(out.summary);
         self.status.clear();
         self.slice_gen += 1;
-        self.layer_stats = layer_stats;
-        self.sliced = Some(layers);
-        // The preview belongs to the bed that was active at slice time —
-        // instances bake its world offset, so it stays put if the user
-        // switches beds afterward.
-        self.sliced_origin_x = bed_origin_x(self.active_bed, self.settings.bed_size_x_mm);
-        self.set_preview_instances(rs);
+        self.layer_stats = out.layer_stats;
+        self.sliced = Some(out.layers);
+        self.sliced_origin_x = origin_x;
+        self.scene.set_toolpaths(&rs.device, &rs.queue, &out.verts);
+        self.scene.set_joints(&rs.device, &rs.queue, &out.joints);
+        self.content_version += 1;
+        self.layer_ends = out.ends;
+        self.joint_layer_ends = out.joint_ends;
         self.preview_layer = if resliced {
             self.preview_layer.clamp(1, n.max(1))
         } else {
@@ -2770,47 +2833,13 @@ impl App {
     /// printing tool wearing its slot's color.
     fn layer_color_table(&self) -> Option<Vec<Vec<[f32; 3]>>> {
         let layers = self.sliced.as_ref()?;
-        match self.color_by {
-            ColorBy::Feature => None,
-            ColorBy::Filament => Some(
-                layers
-                    .iter()
-                    .map(|layer| {
-                        layer
-                            .paths
-                            .iter()
-                            .map(|p| {
-                                render::visible_against_backdrop(
-                                    self.settings.tool(p.tool as usize).color_rgb,
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            ),
-            ColorBy::LayerTime => {
-                if self.layer_stats.is_empty() {
-                    return None;
-                }
-                let acc = accent_hsl(self.accent);
-                let logs: Vec<f64> =
-                    self.layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
-                let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
-                let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let span = (hi - lo).max(1e-12);
-                Some(
-                    layers
-                        .iter()
-                        .zip(&logs)
-                        .map(|(layer, &l)| {
-                            // Inverted: short layers = least cooling = the hot end.
-                            let u = 1.0 - ((l - lo) / span) as f32;
-                            vec![heat_ramp(u, acc); layer.paths.len()]
-                        })
-                        .collect(),
-                )
-            }
-        }
+        build_color_table(
+            layers,
+            self.color_by,
+            &self.settings,
+            accent_hsl(self.accent),
+            &self.layer_stats,
+        )
     }
 
     /// The per-tool spool colors as a fixed 16-slot palette for the bead
@@ -3259,6 +3288,27 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let rs = frame.wgpu_render_state().expect("wgpu render state").clone();
 
+        // A background slice finished? Commit + upload it. While one is in
+        // flight, keep repainting so we notice the frame it lands (the worker
+        // can't wake egui itself). A worker that died mid-slice (a panic in the
+        // engine) just drops the job — the app stays alive, unlike the old
+        // synchronous slice.
+        if let Some(job) = self.slice_job.take() {
+            match job.rx.try_recv() {
+                Ok(out) => {
+                    let (sig, resliced, origin_x) = (job.sig, job.resliced, job.origin_x);
+                    self.apply_slice_output(out, sig, &rs, resliced, origin_x);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.slice_job = Some(job);
+                    ui.ctx().request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.status = "Slice failed — see the console for details.".into();
+                }
+            }
+        }
+
         // A bed-size change — slider edit, printer switch, profile delete
         // fallback — refreshes the bed mesh and re-pivots the view on the new
         // plate, whatever path it arrived by.
@@ -3659,22 +3709,48 @@ impl eframe::App for App {
                 // Slice is the hero action: printed in reverse — cream plate,
                 // ink text — the one inverted block in the panel. It slices
                 // the ACTIVE bed.
-                let can_slice = self.objects.iter().any(|o| self.bed_of(o) == self.active_bed);
-                let mut label = egui::RichText::new("Slice").size(15.0).strong();
-                if can_slice {
-                    label = label.color(palette::INK);
-                }
-                let mut slice_btn = egui::Button::new(label).min_size(big);
-                if can_slice {
-                    slice_btn = slice_btn.fill(palette::CREAM);
-                }
-                if ui
-                    .add_enabled(can_slice, slice_btn)
-                    .on_hover_text("Slice the active bed's objects into toolpaths using the current settings.")
-                    .on_disabled_hover_text("Nothing on the active bed — import a model, or step beds with ◀ ▶.")
-                    .clicked()
-                {
-                    self.slice(&rs);
+                if let Some(job) = self.slice_job.as_ref() {
+                    // While a background slice runs, the Slice button doubles as
+                    // a progress bar: a cream fill sweeps left→right as the wall
+                    // pass advances, "Slicing… NN%" in ink over it. Held just shy
+                    // of full (there's a brief stamp/upload tail after the wall
+                    // pass) so it never sticks at 100% — it flips to the finished
+                    // button the frame the result lands.
+                    let frac = job.progress.fraction();
+                    let shown = frac.min(0.99);
+                    let (rect, _) = ui.allocate_exact_size(big, egui::Sense::hover());
+                    let radius = egui::CornerRadius::same(3);
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, radius, palette::CREAM_DIM);
+                    let mut fill = rect;
+                    fill.set_width(rect.width() * shown);
+                    painter.rect_filled(fill, radius, palette::CREAM);
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("Slicing… {:.0}%", (frac * 100.0).min(99.0)),
+                        egui::FontId::proportional(15.0),
+                        palette::INK,
+                    );
+                    ui.ctx().request_repaint();
+                } else {
+                    let can_slice = self.objects.iter().any(|o| self.bed_of(o) == self.active_bed);
+                    let mut label = egui::RichText::new("Slice").size(15.0).strong();
+                    if can_slice {
+                        label = label.color(palette::INK);
+                    }
+                    let mut slice_btn = egui::Button::new(label).min_size(big);
+                    if can_slice {
+                        slice_btn = slice_btn.fill(palette::CREAM);
+                    }
+                    if ui
+                        .add_enabled(can_slice, slice_btn)
+                        .on_hover_text("Slice the active bed's objects into toolpaths using the current settings.")
+                        .on_disabled_hover_text("Nothing on the active bed — import a model, or step beds with ◀ ▶.")
+                        .clicked()
+                    {
+                        self.slice(&rs);
+                    }
                 }
                 let export_btn = egui::Button::new(egui::RichText::new("Export…").size(15.0)).min_size(big);
                 if ui
@@ -5048,6 +5124,16 @@ impl eframe::App for App {
                 Some(p) if p.color_mode == 1 => (1u32, palette_hash(&p.tool_palette)),
                 _ => (0, 0),
             };
+            // Re-derive the view-projection from the camera AFTER this frame's
+            // orbit/pan/zoom. The `vp` above is the PRE-interaction one, kept for
+            // unprojecting clicks against the frame the user is actually looking
+            // at; but the render must use the POST-interaction camera so its view
+            // matrix agrees with the `cam_eye` the star backdrop is centered on.
+            // If they disagree by a frame of motion, `view * cam_eye != 0` and the
+            // infinite-distance stars pick up parallax — negligible under orbit (a
+            // tangential shift ÷1000) but a visible radial drift under zoom (the
+            // eye delta is along the view axis), which read as lag/vertigo.
+            let vp = self.camera.view_proj(aspect);
             let sig = RenderSig {
                 vp,
                 show_mesh,
@@ -6266,6 +6352,106 @@ const CAT_SURFACE: f32 = 9.0;
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
 type Instances = (Vec<[f32; 14]>, Vec<u32>, Vec<[f32; 11]>, Vec<u32>);
+
+/// The active metric mapped to per-path colors — or `None` in feature mode
+/// (`build_instances` then colors by path kind). Filament = each path's tool
+/// wearing its slot color; layer-time = one ramp color per layer. A free
+/// function (no `&self`) so a worker thread can build it during a background
+/// slice; `App::layer_color_table` delegates here.
+fn build_color_table(
+    layers: &[engine::LayerPlan],
+    color_by: ColorBy,
+    settings: &config::Settings,
+    accent: (f32, f32, f32),
+    layer_stats: &[engine::LayerStats],
+) -> Option<Vec<Vec<[f32; 3]>>> {
+    match color_by {
+        ColorBy::Feature => None,
+        ColorBy::Filament => Some(
+            layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .paths
+                        .iter()
+                        .map(|p| {
+                            render::visible_against_backdrop(settings.tool(p.tool as usize).color_rgb)
+                        })
+                        .collect()
+                })
+                .collect(),
+        ),
+        ColorBy::LayerTime => {
+            if layer_stats.is_empty() {
+                return None;
+            }
+            let logs: Vec<f64> = layer_stats.iter().map(|st| st.secs.max(1e-12).ln()).collect();
+            let lo = logs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let span = (hi - lo).max(1e-12);
+            Some(
+                layers
+                    .iter()
+                    .zip(&logs)
+                    .map(|(layer, &l)| {
+                        // Inverted: short layers = least cooling = the hot end.
+                        let u = 1.0 - ((l - lo) / span) as f32;
+                        vec![heat_ramp(u, accent); layer.paths.len()]
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Turn a freshly sliced `layers` into a committable [`SliceOutput`]: the
+/// estimate block, the layer-time stats, and the built preview instances. Runs
+/// on the UI thread (paint-only re-stamp) or a worker (full re-slice) — no
+/// `&self`, no GPU — so it can live entirely off the UI thread.
+fn finish_slice(
+    layers: Vec<engine::LayerPlan>,
+    geo: Option<engine::GeometryPlan>,
+    settings: &config::Settings,
+    color_by: ColorBy,
+    accent: (f32, f32, f32),
+    origin_x: f32,
+    z_hop: f32,
+) -> SliceOutput {
+    let n = layers.len();
+    let paths: usize = layers.iter().map(|l| l.paths.len()).sum();
+    // `per_layer_stats` already sums each layer's Z-move + extrusion + travel —
+    // the exact terms `estimate_seconds` recomputes — so derive the total from
+    // it instead of re-running the priciest per-path trapezoid math a second
+    // time.
+    let layer_stats = engine::per_layer_stats(&layers, settings);
+    let secs: f64 = layer_stats.iter().map(|s| s.secs).sum();
+    let (fil_mm, grams) = engine::estimate_filament(&layers, settings);
+    let per_tool = engine::estimate_filament_per_tool(&layers, settings);
+    // Tool switches: transitions between consecutive printable paths, across
+    // layer boundaries too (where the g-code swaps tools).
+    let mut toolchanges = 0usize;
+    let mut last_tool: Option<u32> = None;
+    for path in layers.iter().flat_map(|l| &l.paths).filter(|p| p.points.len() >= 2) {
+        if last_tool.is_some_and(|t| t != path.tool) {
+            toolchanges += 1;
+        }
+        last_tool = Some(path.tool);
+    }
+    let summary = SliceSummary {
+        layers: n,
+        toolpaths: paths,
+        secs,
+        filament_m: fil_mm / 1000.0,
+        grams,
+        per_tool,
+        toolchanges,
+    };
+    let color_table = build_color_table(&layers, color_by, settings, accent, &layer_stats);
+    let (verts, ends, joints, joint_ends) =
+        build_instances(&layers, z_hop, color_table.as_deref(), accent, origin_x);
+    SliceOutput { layers, geo, summary, layer_stats, verts, ends, joints, joint_ends }
+}
+
 fn build_instances(
     layers: &[engine::LayerPlan],
     z_hop_mm: f32,
