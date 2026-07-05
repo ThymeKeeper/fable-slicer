@@ -1,4 +1,5 @@
-<img width="2882" height="1716" alt="1" src="https://github.com/user-attachments/assets/a3775225-031f-4931-be1d-b098091815ce" />
+<img width="2880" height="1716" alt="1" src="https://github.com/user-attachments/assets/46d686c2-2e2a-4b34-9bb2-520415dc07af" />
+
 
 
 # Fable Slicer
