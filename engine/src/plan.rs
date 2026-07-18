@@ -15,6 +15,7 @@ use mesh::Mesh;
 use rayon::prelude::*;
 
 use crate::fill::infill_lines;
+use crate::paint::PaintField;
 use crate::{Layer, SliceParams};
 
 /// What a toolpath represents — drives speed, ordering, and rendering.
@@ -229,10 +230,16 @@ pub fn generate(mesh: &Mesh, settings: &Settings) -> Vec<LayerPlan> {
 /// at viewing distance the layer bands read as the mixed color (white, grey,
 /// and black dither into a full monochrome ramp). Each layer is an ordinary
 /// single-tool layer, so per-tool speeds, flow, and temperatures stay exact.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum PartPaint {
     Tool(u32),
     Blend(Vec<(u32, f64)>),
+    /// Per-surface paint: a tool per triangle of `field` — a mesh in the SAME
+    /// frame as the sliced part (the GUI's visible/display mesh, transformed to
+    /// the bed). Each bead takes the tool of the nearest painted surface, and a
+    /// wall/skin crossing a color boundary is split into per-tool arcs.
+    /// `face_tool[i]` is triangle i's tool; unpainted areas carry the base tool.
+    Surface { field: std::sync::Arc<Mesh>, face_tool: Vec<u32> },
 }
 
 /// Slice and plan a multi-part model, one tool per part.
@@ -675,6 +682,7 @@ fn stamp_and_finish(
         .map(|(_, paint)| match paint {
             PartPaint::Tool(_) => None,
             PartPaint::Blend(w) => Some(blend_schedule(w, n)),
+            PartPaint::Surface { .. } => None,
         })
         .collect();
     let mut done = vec![false; parts.len()];
@@ -712,6 +720,14 @@ fn stamp_and_finish(
     // and it must stay exact.
     let lw = settings.line_width_mm;
     let empty = Polygons::new();
+    // Nearest-painted-surface field per surface-painted part (Tool/Blend skip it).
+    let fields: Vec<Option<PaintField>> = parts
+        .iter()
+        .map(|(_, paint)| match paint {
+            PartPaint::Surface { field, face_tool } => Some(PaintField::new(field, face_tool)),
+            _ => None,
+        })
+        .collect();
     for (m, plans) in part_plans.iter_mut().enumerate() {
         let (_, paint) = &parts[m];
         let schedule = &schedules[m];
@@ -719,6 +735,16 @@ fn stamp_and_finish(
         let layers = &part_layers[m];
         for plan in plans.iter_mut() {
             let i = plan.index;
+            // Surface paint: recolor each path by the nearest painted surface at
+            // this layer's z, splitting a wall/skin that crosses a color
+            // boundary into per-tool arcs. Interior fill takes a majority tool.
+            if let Some(field) = &fields[m] {
+                let z = layers[i].z_mm;
+                split_paths_by_tool(&mut plan.paths, 0, lw, |p| {
+                    field.value_at([p.x_mm(), p.y_mm(), z])
+                });
+                continue;
+            }
             let tool = match (paint, schedule) {
                 (PartPaint::Tool(t), _) => *t,
                 (_, Some(sched)) => sched[i],
@@ -837,6 +863,387 @@ pub fn generate_painted(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Ve
     stamp_and_finish(&geo, part_plans, parts)
 }
 
+fn splittable_kind(k: PathKind) -> bool {
+    matches!(
+        k,
+        PathKind::ExternalPerimeter
+            | PathKind::Perimeter
+            | PathKind::OverhangWall
+            | PathKind::Solid
+            | PathKind::TopSkin
+            | PathKind::BottomSkin
+            | PathKind::Bridge
+    )
+}
+
+fn majority_tool(tools: &[u32]) -> u32 {
+    let mut counts: Vec<(u32, u32)> = Vec::new();
+    for &t in tools {
+        match counts.iter_mut().find(|(tt, _)| *tt == t) {
+            Some(e) => e.1 += 1,
+            None => counts.push((t, 1)),
+        }
+    }
+    counts.iter().max_by_key(|(_, c)| *c).map(|&(t, _)| t).unwrap_or(0)
+}
+
+/// Fold any color run shorter than one line width into a neighbor, so boundary
+/// jitter can't spawn a sub-mm arc (and thus a wasteful dock trip). `seg[k]` is
+/// the tool of segment k; mutated in place. Terminates: each pass merges the
+/// shortest short run into a neighbor, dropping one run.
+fn merge_short_runs(points: &[Point], seg: &mut [u32], closed: bool, lw: f64) {
+    let nseg = seg.len();
+    if nseg < 2 {
+        return;
+    }
+    let n = points.len();
+    let seglen = |k: usize| pt_dist_mm(points[k % n], points[(k + 1) % n]);
+    for _ in 0..nseg {
+        let mut runs: Vec<(usize, usize, u32, f64)> = Vec::new(); // start, count, tool, mm
+        let mut k = 0;
+        while k < nseg {
+            let t = seg[k];
+            let s = k;
+            let mut plen = 0.0;
+            while k < nseg && seg[k] == t {
+                plen += seglen(k);
+                k += 1;
+            }
+            runs.push((s, k - s, t, plen));
+        }
+        if runs.len() < 2 {
+            break;
+        }
+        let ri = (0..runs.len()).min_by(|&a, &b| runs[a].3.total_cmp(&runs[b].3)).unwrap();
+        if runs[ri].3 >= lw {
+            break;
+        }
+        let prev = if ri > 0 { ri - 1 } else { runs.len() - 1 };
+        let next = if ri + 1 < runs.len() { ri + 1 } else { 0 };
+        let has_prev = ri > 0 || closed;
+        let has_next = ri + 1 < runs.len() || closed;
+        let ntool = match (has_prev, has_next) {
+            (true, true) => {
+                if runs[prev].3 >= runs[next].3 {
+                    runs[prev].2
+                } else {
+                    runs[next].2
+                }
+            }
+            (true, false) => runs[prev].2,
+            (false, true) => runs[next].2,
+            (false, false) => break,
+        };
+        for k in runs[ri].0..runs[ri].0 + runs[ri].1 {
+            seg[k] = ntool;
+        }
+    }
+}
+
+/// Recolor and, where a path crosses a color boundary, SPLIT it into per-tool
+/// arcs — by the surface `tool_at` query. A wall or skin that spans two colors
+/// becomes consecutive open arcs abutting at the boundary vertex (a bead can't
+/// change tool mid-stroke — a dock toolchange parks Z — so splitting is
+/// mandatory). Infill and helper paths take a single majority tool so interior
+/// fill never trips a mid-layer swap. `order_layers` regroups the arcs by tool
+/// downstream, so a split loop still costs one change per tool.
+fn split_paths_by_tool(
+    paths: &mut Vec<ToolPath>,
+    start: usize,
+    lw: f64,
+    tool_at: impl Fn(&Point) -> u32,
+) {
+    let beads: Vec<ToolPath> = paths.split_off(start);
+    for bead in beads {
+        split_one_bead(paths, bead, lw, &tool_at);
+    }
+}
+
+/// Recolor one bead by `tool_at` and, if it crosses a color boundary, split it
+/// into per-tool arcs — pushing the result(s) onto `out`.
+fn split_one_bead(out: &mut Vec<ToolPath>, bead: ToolPath, lw: f64, tool_at: impl Fn(&Point) -> u32) {
+    let n = bead.points.len();
+    if n < 2 {
+        out.push(bead);
+        return;
+    }
+    let ptools: Vec<u32> = bead.points.iter().map(|p| tool_at(p)).collect();
+    if ptools.iter().all(|&t| t == ptools[0]) {
+        let mut b = bead;
+        b.tool = ptools[0];
+        out.push(b);
+        return;
+    }
+    if !splittable_kind(bead.kind) {
+        let mut b = bead;
+        b.tool = majority_tool(&ptools);
+        out.push(b);
+        return;
+    }
+    // Segment k (start-vertex tool) → group into maximal same-tool runs.
+    let nseg = if bead.closed { n } else { n - 1 };
+    let mut seg: Vec<u32> = (0..nseg).map(|k| ptools[k]).collect();
+    merge_short_runs(&bead.points, &mut seg, bead.closed, lw);
+    if seg.iter().all(|&t| t == seg[0]) {
+        let mut b = bead;
+        b.tool = seg[0];
+        out.push(b);
+        return;
+    }
+    // Rotate a closed loop so a run boundary starts the sequence; open
+    // paths start at 0.
+    let rot = if bead.closed {
+        (0..nseg).find(|&k| seg[k] != seg[(k + nseg - 1) % nseg]).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut i = 0;
+    while i < nseg {
+        let t = seg[(rot + i) % nseg];
+        let mut j = i;
+        while j < nseg && seg[(rot + j) % nseg] == t {
+            j += 1;
+        }
+        // Segments i..j → points (rot+i)..=(rot+j); consecutive arcs share
+        // the boundary vertex, so they abut with no gap.
+        let pts: Vec<Point> = (i..=j).map(|k| bead.points[(rot + k) % n]).collect();
+        if pts.len() >= 2 {
+            let mut b = bead.clone();
+            b.points = pts;
+            b.closed = false; // an arc of a split loop is an open stroke
+            b.tool = t;
+            b.widths = None; // per-point/segment channels don't survive a cut
+            b.segs = None;
+            out.push(b);
+        }
+        i = j;
+    }
+}
+
+/// How far past the flooded patch (laterally, mm) a bead may sit and still count
+/// as hugging it — bridges the mesh-triangle sampling and a small mesh↔bead gap.
+const PAINT_LAT_TOL: f64 = 0.35;
+/// How far OUTSIDE the mesh surface (mm) a bead may sit and still be painted.
+const PAINT_SURF_OUT: f64 = 0.30;
+/// How far INSIDE the mesh surface (mm) the paint reaches — deep enough to catch
+/// the visible outer wall(s), shallow enough to leave the deep interior (infill,
+/// inner walls, the back side) alone, so no color bleeds in from inside.
+const PAINT_SURF_IN: f64 = 0.80;
+
+/// A freehand paint stroke on the sliced beads: the CONNECTED front-surface patch
+/// (`tris`, flooded from where the brush clicked) it covers, plus a `center` +
+/// `radius` bounding sphere for cheap culling. A bead is painted only if it hugs
+/// the outer shell of THAT patch (see [`dab_covers`]) — surface connectivity that
+/// keeps the brush off disconnected/back-side/deep-interior beads. `None` tool
+/// clears (keeps base). All coords are in the sliced LayerPlan frame (the GUI
+/// shifts by the bed origin).
+#[derive(Clone, Debug)]
+pub struct BeadDab {
+    pub center: [f64; 3],
+    pub radius: f64,
+    pub tool: Option<u32>,
+    pub tris: Vec<[[f64; 3]; 3]>,
+}
+
+/// Closest point on triangle `abc` to `p` (Ericson, Real-Time Collision
+/// Detection §5.1.5) — Voronoi-region tests over the 3 vertices, 3 edges, face.
+fn closest_on_tri(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let sub = |u: [f64; 3], v: [f64; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f64; 3], v: [f64; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = sub(p, b);
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return [a[0] + ab[0] * v, a[1] + ab[1] * v, a[2] + ab[2] * v];
+    }
+    let cp = sub(p, c);
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return [a[0] + ac[0] * w, a[1] + ac[1] * w, a[2] + ac[2] * w];
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return [b[0] + (c[0] - b[0]) * w, b[1] + (c[1] - b[1]) * w, b[2] + (c[2] - b[2]) * w];
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    [a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w]
+}
+
+/// Whether point `p` hugs the outer shell of a flooded surface patch `tris`:
+/// within `PAINT_LAT_TOL` laterally of the nearest triangle AND inside the
+/// `[-PAINT_SURF_IN, +PAINT_SURF_OUT]` depth window along that triangle's outward
+/// normal. The flood only ever contains FRONT faces of the CONNECTED surface, so
+/// this paints the visible surface the brush is over and nothing else. Same test
+/// runs in the GUI preview and this export, so they match.
+pub fn dab_covers(tris: &[[[f64; 3]; 3]], p: [f64; 3]) -> bool {
+    let mut best = f64::MAX;
+    let mut covered = false;
+    for t in tris {
+        let cp = closest_on_tri(p, t[0], t[1], t[2]);
+        let d = [p[0] - cp[0], p[1] - cp[1], p[2] - cp[2]];
+        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if d2 >= best {
+            continue;
+        }
+        best = d2;
+        // Outward normal: the flooded faces are front-facing, so the winding
+        // cross product points out of the model.
+        let ab = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
+        let ac = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
+        let n = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+        let perp = (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]) / nl;
+        let lat2 = (d2 - perp * perp).max(0.0);
+        covered = lat2 <= PAINT_LAT_TOL * PAINT_LAT_TOL
+            && perp >= -PAINT_SURF_IN
+            && perp <= PAINT_SURF_OUT;
+    }
+    covered
+}
+
+/// Max bead-segment length (mm) after subdividing near a dab — the paint
+/// resolution for the export split. Matches the GUI's preview subdivision.
+const PAINT_SUBDIV_MM: f64 = 0.5;
+
+/// Whether any dab's sphere reaches this bead at layer `z` (a cheap circle-vs-
+/// bbox test so we only subdivide painted beads).
+fn bead_near_dab(bead: &ToolPath, z: f64, dabs: &[BeadDab]) -> bool {
+    let (mut lox, mut loy, mut hix, mut hiy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in &bead.points {
+        lox = lox.min(p.x_mm());
+        loy = loy.min(p.y_mm());
+        hix = hix.max(p.x_mm());
+        hiy = hiy.max(p.y_mm());
+    }
+    for d in dabs {
+        let dz = z - d.center[2];
+        if dz.abs() > d.radius {
+            continue;
+        }
+        // The sphere's radius at this layer's z, plus a segment of margin.
+        let rxy = (d.radius * d.radius - dz * dz).sqrt() + PAINT_SUBDIV_MM;
+        let cx = d.center[0].clamp(lox, hix);
+        let cy = d.center[1].clamp(loy, hiy);
+        let (ex, ey) = (d.center[0] - cx, d.center[1] - cy);
+        if ex * ex + ey * ey <= rxy * rxy {
+            return true;
+        }
+    }
+    false
+}
+
+/// Subdivide a bead's segments to ≤ `max_seg` mm so a paint boundary can fall
+/// mid-segment. Drops per-point width/segment channels (a cut invalidates them).
+fn subdivide_bead(bead: &mut ToolPath, max_seg: f64) {
+    let pts = &bead.points;
+    let n = pts.len();
+    if n < 2 {
+        return;
+    }
+    let segs = if bead.closed { n } else { n - 1 };
+    let mut out: Vec<Point> = Vec::with_capacity(n);
+    for k in 0..segs {
+        let a = pts[k];
+        let b = pts[(k + 1) % n];
+        out.push(a);
+        let len = ((b.x_mm() - a.x_mm()).powi(2) + (b.y_mm() - a.y_mm()).powi(2)).sqrt();
+        let nsub = (len / max_seg).ceil().max(1.0) as usize;
+        for i in 1..nsub {
+            let t = i as f64 / nsub as f64;
+            out.push(Point::from_mm(
+                a.x_mm() + (b.x_mm() - a.x_mm()) * t,
+                a.y_mm() + (b.y_mm() - a.y_mm()) * t,
+            ));
+        }
+    }
+    if !bead.closed {
+        out.push(pts[n - 1]);
+    }
+    bead.points = out;
+    bead.widths = None;
+    bead.segs = None;
+}
+
+/// The tool a dab list assigns at point `(p, z)`: the LAST dab whose flooded
+/// surface patch this point hugs wins (`Some` = paint, `None` = erase); `None`
+/// overall = no dab → keep base.
+fn dab_tool_at(p: &Point, z: f64, dabs: &[BeadDab]) -> Option<u32> {
+    let (px, py) = (p.x_mm(), p.y_mm());
+    let mut result = None;
+    for d in dabs {
+        // Cheap bounding-sphere cull: the patch lives within radius+reach of the
+        // center, so skip the per-triangle test for far dabs.
+        let (dx, dy, dz) = (px - d.center[0], py - d.center[1], z - d.center[2]);
+        let r = d.radius + PAINT_SURF_IN + PAINT_LAT_TOL;
+        if dx * dx + dy * dy + dz * dz > r * r {
+            continue;
+        }
+        if dab_covers(&d.tris, [px, py, z]) {
+            result = d.tool;
+        }
+    }
+    result
+}
+
+/// Apply bead-paint dabs to already-sliced layers: recolor each bead (and split
+/// a wall/skin that crosses a dab boundary into per-tool arcs) by the dab field
+/// at that layer's z, falling back to the bead's existing tool where no dab
+/// applies. In-place; a no-op when `dabs` is empty (so an unpainted export is
+/// byte-identical). NOTE: does not re-order by tool — good enough for a
+/// post-slice recolor, at the cost of a few extra dock trips per layer.
+pub fn apply_bead_dabs(layers: &mut [LayerPlan], dabs: &[BeadDab], settings: &Settings) {
+    if dabs.is_empty() {
+        return;
+    }
+    let lw = settings.line_width_mm;
+    for layer in layers.iter_mut() {
+        let z = layer.print_z_mm;
+        let beads = std::mem::take(&mut layer.paths);
+        for mut bead in beads {
+            // Subdivide only beads a dab reaches, so the split falls per-portion
+            // (a long straight run painted at its middle splits mid-run, not
+            // whole) without bloating untouched paths.
+            if bead_near_dab(&bead, z, dabs) {
+                subdivide_bead(&mut bead, PAINT_SUBDIV_MM);
+            }
+            let base = bead.tool;
+            split_one_bead(&mut layer.paths, bead, lw, |p| {
+                dab_tool_at(p, z, dabs).unwrap_or(base)
+            });
+        }
+    }
+    // Re-group each layer's paths by tool so the print does everything one tool
+    // owns before docking — otherwise the freshly-split arcs interleave with the
+    // base tool and every crossing is a dock trip (hundreds per small region).
+    order_layers(layers, settings.outer_wall_first);
+}
+
 /// Re-stamp paint onto a cached [`GeometryPlan`] without re-slicing: only the
 /// tool each path carries (and everything downstream — face override, layer
 /// ordering by tool, travels) is recomputed. Valid ONLY when the meshes and
@@ -923,7 +1330,50 @@ fn plan_part(
             // used to wander through. Only the enclosed ceiling is carved out, so the
             // walls don't box in its bridged hollow. (Top surfaces get their edge
             // perimeters + skin inside, like every other slicer — no more wandering.)
-            let wall_region = difference(interior, &ceiling);
+            // Surface-overrides-wall: an exposed top/bottom face a tall wall stack
+            // would otherwise bury in concentric rings is reserved for skin. Kept
+            // strictly inside the outer wall (offset -lw) and clear of the enclosed
+            // ceiling (its own bridge path), it is carved out of the INNER walls here
+            // and folded back into the infill region below (see `opened`), so the skin
+            // machinery claims it at any wall count with no Pass-2 changes. Scoped per
+            // exposed island to fire ONLY where the normal infill region no longer
+            // reaches the face (the stack consumed it) AND the face is wide enough to
+            // skin — so normal wall counts and thin lips stay byte-identical (walls
+            // run through, skin fills inside the innermost wall, exactly as today).
+            let base_region = difference(interior, &ceiling);
+            let surf_reserved = if surface_per_layer[layer.index].is_empty() {
+                Polygons::new()
+            } else {
+                let wall_depth = match settings.wall_count {
+                    0 => 0.0,
+                    wc => lw + (wc - 1) as f64 * sp,
+                };
+                // The exposed face, pulled inside the outer-wall bead and clear of the
+                // enclosed ceiling (so that dedicated bridge path stays byte-identical).
+                let surf_inside = difference(
+                    &intersection(&surface_per_layer[layer.index], &offset(&layer.polygons, -lw)),
+                    &ceiling,
+                );
+                // Today's uncarved infill region — where sparse/solid would land.
+                let inner_bare = offset(&base_region, -wall_depth);
+                let mut acc = Polygons::new();
+                for isl in islands(&surf_inside) {
+                    // Reserve iff the wall stack buries this face whole (no infill
+                    // reaches it) YET it is wide enough to hold skin. Both hold only
+                    // once wall_depth outgrows ~a line width (high wall count), so low
+                    // counts reserve nothing and stay byte-identical; thin lips/lintels
+                    // fail the width test and keep their walls, exactly as today.
+                    if intersection(&isl, &inner_bare).is_empty() && !offset(&isl, -lw).is_empty() {
+                        acc = union(&acc, &isl);
+                    }
+                }
+                acc
+            };
+            let wall_region = if surf_reserved.is_empty() {
+                base_region
+            } else {
+                difference(&base_region, &surf_reserved)
+            };
             let interior: &Polygons = &wall_region;
             let mut walls = Vec::new();
             let mut consumed = false;
@@ -1016,6 +1466,14 @@ fn plan_part(
             let inset =
                 if consumed { Polygons::new() } else { offset(interior, -wall_depth) };
             let opened = offset(&offset(&inset, -lw * 0.5), lw * 0.5);
+            // Fold the reserved exposed face back into the infill region so it skins
+            // even when the wall stack consumed the section (inset empty). Empty on
+            // every normal-count / no-surface layer → `opened` byte-identical there.
+            let opened = if surf_reserved.is_empty() {
+                opened
+            } else {
+                union(&opened, &surf_reserved)
+            };
             // Wall stretches hanging past the layer below print slow with full
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
@@ -1214,20 +1672,57 @@ fn plan_part(
             let mut bridged = Polygons::new();
             let bridge_start = paths.len();
             for island in islands(&overhang_region) {
-                let segs = match try_bridge(&island, &supported_below, lw, settings.max_bridge_span_mm) {
-                    Some(segs) => segs
-                        .into_iter()
-                        .map(|seg| (PathKind::Bridge, seg))
-                        .collect::<Vec<_>>(),
-                    None => continue,
+                // Decide on the TRUE unsupported span (so the reach below can't inflate
+                // it past max_span), then fill a region grown to reach the walls.
+                let Some(angle) = bridge_angle(&island, &supported_below, lw, settings.max_bridge_span_mm)
+                else {
+                    continue;
                 };
-                for (kind, seg) in segs {
+                // Grow the span through the void up to the perimeters that ring it, so
+                // the strands land ON their anchor (bond, no gap). The grown ring is void
+                // that is within reach of BOTH the span and a wall bead, and CLEAR of any
+                // other solid/skin — so it fires only where bare perimeters ring the span
+                // (a tall wall stack) with nothing but void between them and the span. It
+                // is clipped to `ftw` (never OVER a wall) and held a wide margin off other
+                // solid, whose own beads grow into this same void (`ftw − inner`) — so the
+                // two never fill the same space (no double extrusion). Where the span is
+                // ringed by solid instead of bare walls (low wall counts), that margin
+                // erases the ring and the fill is byte-identical to `island`.
+                let wall_beads = difference(&layers[i].polygons, &ftw);
+                // Solid/skin that will actually lay BEADS near this span (its own region
+                // minus the span, opened to drop sub-bead slivers — e.g. the thin
+                // supported lip a tall-wall reserved face leaves, which prints nothing).
+                // The grow keeps a wide margin off it, since those beads grow into this
+                // same void; where the span is ringed by real solid (low wall counts) this
+                // erases the ring, and where it is ringed by bare perimeters (tall stacks,
+                // no solid beads) it leaves the wedge voids free to fill.
+                let other_solid = difference(solid_all, &island);
+                let solid_beads = offset(&offset(&other_solid, -lw * 0.5), lw * 0.5);
+                let ring = difference(
+                    &intersection(
+                        &intersection(&offset(&island, lw * 5.0), &ftw),
+                        &offset(&wall_beads, lw * 5.0),
+                    ),
+                    &offset(&solid_beads, lw * 3.0),
+                );
+                let fill_region = union(&island, &ring);
+                for seg in infill_lines(&fill_region, angle, lw, true, 0.5, false) {
                     if seg.len() >= 2 {
-                        paths.push(ToolPath::new(kind, false, lw, seg));
+                        paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
                     }
                 }
-                bridged.contours.extend(island.contours);
+                bridged.contours.extend(fill_region.contours);
             }
+            // Per-bead flush: walk each strand's end the last fraction onto the wall it
+            // reaches (the same finish every solid/skin line gets). Target the room inside
+            // the walls MINUS the solid/skin fill (`solid_all`): a strand end abutting
+            // solid is already at that region's edge, so the guard leaves it — it never
+            // reaches THROUGH the solid ring to a wall beyond it (which would lay the
+            // strand over the solid beads). Where the span is ringed by bare perimeters
+            // (tall stacks, solid_all is the span's own region), the ends still reach out
+            // across the void to those perimeters.
+            let bridge_reach_to = difference(&ftw, solid_all);
+            extend_ends_to_wall(&mut paths[bridge_start..], lw * 4.0, &bridge_reach_to);
             // A fully-bridged region (a cabin roof) is all one kind, so its boustrophedon
             // beads stitch into continuous runs exactly like solid — and a bridge wants
             // unbroken flow most of all, since a stop on an unsupported span sags. Same
@@ -1367,6 +1862,13 @@ fn plan_part(
                     (internal, PathKind::Solid, settings.monotonic_solid),
                     (skin_top, PathKind::TopSkin, true),
                 ];
+                // The room a solid/skin bead may grow or reach into: inside the walls
+                // (`ftw`) but NEVER the bridged span. A bridge already fills that span
+                // (and grows onto the walls that ring it), so a solid line-end reaching
+                // for the same wall, or a skin sheet grown into the same void, would lay
+                // a second bead over the bridge. Holding both the void-grow and the
+                // wall-reach out of `bridged` keeps the two fills from colliding.
+                let ftw_ex = if bridged.is_empty() { ftw.clone() } else { difference(&ftw, &bridged) };
                 // A wide solid region gets NO concentric perimeter loop: alongside a
                 // wall the loop just doubles the perimeter bead (walls + solid in the
                 // same band, the user's complaint). Its fill pattern extends out to
@@ -1449,7 +1951,7 @@ fn plan_part(
                     // the wall and the sparse boundary. Buried line-fill solid keeps the
                     // plain half-bead inset for a clean kiss against the sparse it borders.
                     let fill = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
-                        let void = difference(&ftw, inner);
+                        let void = difference(&ftw_ex, inner);
                         union(&region, &intersection(&offset(&region, lw * 1.5), &void))
                     } else if pattern == InfillPattern::Concentric {
                         region.clone()
@@ -1475,7 +1977,9 @@ fn plan_part(
                         // PER-BEAD reach: lengthen each line-end along its OWN direction
                         // until it meets the wall edge (`ftw`) — the few tenths it needs.
                         // Ends that border a wall extend; ends facing other infill don't
-                        // move. Applies to every solid kind, not just skins.
+                        // move. Applies to every solid kind, not just skins. (Targets full
+                        // `ftw`, NOT ftw−bridged: a bridge hole in the target would give a
+                        // solid end a near boundary to reach TO, pulling it onto the span.)
                         extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
                         // Cut each bead at the support boundary: the stretch over open
                         // sparse becomes an internal bridge (bridge flow/speed), the rest
@@ -2295,11 +2799,13 @@ fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance
     band
 }
 
-/// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
-/// with straight lines — return those lines (oriented across the shortest gap,
-/// solid spacing). Returns None for cantilevers or spans wider than `max_span`,
-/// which the caller arc-fills instead.
-fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -> Option<Vec<Vec<Point>>> {
+/// The direction to run bridge lines across `region` — the angle whose spans are
+/// shortest and (almost) all anchored on both ends. `None` for a cantilever or a
+/// span wider than `max_span`. Split out from `try_bridge` so the caller can DECIDE
+/// on the true unsupported span here, then FILL a slightly grown region (reaching
+/// onto the surrounding walls) at the same angle — without the extension inflating
+/// the span check.
+fn bridge_angle(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -> Option<f64> {
     if max_span <= 0.0 {
         return None;
     }
@@ -2326,11 +2832,21 @@ fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -
             best = Some((max_len, angle));
         }
     }
-    let (_, angle) = best?;
+    best.map(|(_, angle)| angle)
+}
+
+/// If `region` is a true bridge — supported on ≥2 sides and narrow enough to span
+/// with straight lines — return those lines (oriented across the shortest gap,
+/// solid spacing). Returns None for cantilevers or spans wider than `max_span`.
+/// The planner splits this into `bridge_angle` (decide) + a grown fill; this whole-
+/// region form is kept as the unit-test entry point for the bridge decision.
+#[cfg(test)]
+fn try_bridge(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -> Option<Vec<Vec<Point>>> {
     // Boustrophedon order (alternating direction) so consecutive bridge lines meet at
     // the same end — short turnarounds that `connect_fill_runs` can stitch into one
     // continuous bridge, instead of every line being a span apart.
-    Some(infill_lines(region, angle, lw, true, 0.5, false))
+    bridge_angle(region, supported, lw, max_span)
+        .map(|angle| infill_lines(region, angle, lw, true, 0.5, false))
 }
 
 /// A bridge line is anchored if both ends, extended outward by a line width, land
@@ -3563,6 +4079,44 @@ mod tests {
     use super::*;
     use geo2d::Contour;
 
+    // A flat square patch in the z=10 plane, split into 2 triangles, wound so the
+    // outward normal points +z (toward a viewer above). Models a flooded front
+    // surface facet the brush painted.
+    fn flat_patch() -> Vec<[[f64; 3]; 3]> {
+        let a = [0.0, 0.0, 10.0];
+        let b = [4.0, 0.0, 10.0];
+        let c = [4.0, 4.0, 10.0];
+        let d = [0.0, 4.0, 10.0];
+        vec![[a, b, c], [a, c, d]] // CCW from +z ⇒ normal +z
+    }
+
+    #[test]
+    fn dab_covers_outer_shell_not_interior_or_backside() {
+        let tris = flat_patch();
+        let inside = [2.0, 2.0, 10.0]; // over the patch, laterally centered
+        // Outer wall: ~0.2 mm below the surface → painted.
+        assert!(dab_covers(&tris, [inside[0], inside[1], 9.8]));
+        // Right at the surface → painted.
+        assert!(dab_covers(&tris, [inside[0], inside[1], 10.0]));
+        // Deep interior / inner walls (1 mm in, past PAINT_SURF_IN) → NOT painted:
+        // this is the "color from the inside" the brush must stop reaching.
+        assert!(!dab_covers(&tris, [inside[0], inside[1], 9.0]));
+        // Well above the surface (0.6 mm out, past PAINT_SURF_OUT) → NOT painted.
+        assert!(!dab_covers(&tris, [inside[0], inside[1], 10.6]));
+    }
+
+    #[test]
+    fn dab_covers_stops_at_the_patch_edge_and_disconnected_surfaces() {
+        let tris = flat_patch(); // covers x,y in [0,4]
+        // A bead laterally well outside the patch (even at the right depth) is not
+        // covered — the brush can't jump to a nearby disconnected surface.
+        assert!(!dab_covers(&tris, [9.0, 2.0, 9.9]));
+        // A bead just past the edge, within the lateral tolerance, still counts
+        // (bridges mesh sampling); far past it does not.
+        assert!(dab_covers(&tris, [4.0 + PAINT_LAT_TOL * 0.5, 2.0, 9.9]));
+        assert!(!dab_covers(&tris, [4.0 + PAINT_LAT_TOL * 3.0, 2.0, 9.9]));
+    }
+
     fn count(layer: &LayerPlan, kind: PathKind) -> usize {
         layer.paths.iter().filter(|p| p.kind == kind).count()
     }
@@ -4227,6 +4781,32 @@ mod tests {
         let mid = &layers[50];
         assert!(count(mid, PathKind::Infill) > 0, "middle has sparse infill");
         assert_eq!(count(mid, PathKind::Solid), 0, "middle has no solid fill");
+    }
+
+    #[test]
+    fn surface_skins_the_faces_even_when_walls_bury_the_section() {
+        // walls=99 buries a small cube in concentric perimeters. The exposed top
+        // and bottom faces must still print as skin (a surface overrides a wall),
+        // with the outer edge perimeter kept — while buried middle layers, which
+        // have no exposed face, stay walls-only exactly as before.
+        let m = Mesh::cube(20.0);
+        let s = Settings { wall_count: 99, ..Settings::default() };
+        let layers = generate(&m, &s);
+
+        // Exposed faces skin, and the outer wall still rings them.
+        assert!(count(&layers[0], PathKind::BottomSkin) > 0, "bed face skins at walls=99");
+        assert!(count(&layers[99], PathKind::TopSkin) > 0, "roof skins at walls=99");
+        assert!(count(&layers[99], PathKind::ExternalPerimeter) > 0, "outer wall kept on the roof");
+        // The concentric inner-ring stack the face used to be is replaced by skin.
+        assert_eq!(count(&layers[99], PathKind::Perimeter), 0, "inner rings gone from the face");
+
+        // A buried middle layer has no exposed face: walls fill it solid, no skin.
+        let mid = &layers[50];
+        assert!(
+            count(mid, PathKind::Perimeter) + count(mid, PathKind::ExternalPerimeter) > 0,
+            "middle stays walls"
+        );
+        assert_eq!(count(mid, PathKind::TopSkin) + count(mid, PathKind::BottomSkin), 0, "middle has no skin");
     }
 
     #[test]

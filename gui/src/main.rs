@@ -4,6 +4,7 @@
 
 mod camera;
 mod offscreen;
+mod paint;
 mod render;
 
 use camera::Camera;
@@ -854,6 +855,11 @@ struct ScenePart {
     /// The tool or blend that prints this part. Clamped to the machine's
     /// tool count at bake time.
     paint: PartColor,
+    /// Surface paint: a tool per `display` triangle (`None` = unpainted → the
+    /// part's base `paint` shows). Empty until first brushed. Indexed by
+    /// `display` triangle (what's shown + picked); the smart-fill brush writes
+    /// it. (Stage A: preview/selection only — not yet fed to the slicer.)
+    paint_tri: Vec<Option<u32>>,
 }
 
 /// One object placed on the bed: its parts (shared mesh geometry) plus an
@@ -918,6 +924,7 @@ impl SceneObject {
                 display: Arc::new(mesh.display_mesh()),
                 mesh: Arc::new(mesh),
                 paint: PartColor::Tool(0),
+                paint_tri: Vec::new(),
             }],
             rot_deg: [0.0; 3],
             scale: 1.0,
@@ -1003,6 +1010,19 @@ const FLY_ZOOM_MAX: f32 = 2.5;
 /// along +X; an object's world position decides which bed it belongs to, so
 /// dragging a part across the gap moves it between beds.
 const BED_GAP_MM: f64 = 25.0;
+
+/// Smart-fill connectivity gate: the flood won't cross an edge whose smoothed
+/// face normals differ by more than this (a crease). The GLOBAL drift budget
+/// (`brush_drift_deg`) is the live anti-bleed knob on top of it.
+const PAINT_THETA_LOCAL_DEG: f64 = 35.0;
+
+/// Cell size (mm) of the spatial index over sliced beads for the bead brush.
+const BEAD_GRID_CELL_MM: f32 = 2.0;
+
+/// In paint mode the preview beads are subdivided to this max length so the
+/// bead brush paints only the piece under it, not a whole (possibly long) path
+/// segment. Off outside paint mode (avoids bloating the normal preview).
+const PAINT_BEAD_MAX_MM: f32 = 0.5;
 
 /// World X origin of bed `k`.
 fn bed_origin_x(k: usize, bed_x: f64) -> f64 {
@@ -1292,6 +1312,78 @@ struct SliceOutput {
     joint_ends: Vec<u32>,
 }
 
+/// A freehand paint stroke on the SLICED beads: a shallow disc on the surface at
+/// A freehand paint stroke on the sliced beads. `tris` is the CONNECTED
+/// front-surface patch flooded from where the brush clicked (world space); a bead
+/// is painted only if it hugs the outer shell of that patch (`engine::dab_covers`)
+/// — surface connectivity that keeps the brush off disconnected/back-side/interior
+/// beads. `center` + `radius` bound it for cheap culling. Assigns a tool (`None`
+/// clears → the bead reverts to base). World space so it re-applies across
+/// re-slices; composes in order (later wins).
+#[derive(Clone)]
+struct BeadDab {
+    center: glam::Vec3,
+    radius: f32,
+    tool: Option<u32>,
+    tris: Vec<[[f64; 3]; 3]>,
+}
+
+/// Uniform spatial hash over bead midpoints so "which beads are in this sphere"
+/// is O(beads near the brush), not O(all beads) — the difference between a
+/// smooth stroke and a stutter on an 800k-bead slice. Rebuilt whenever the
+/// instance set changes.
+#[derive(Default)]
+struct BeadGrid {
+    cell: f32,
+    map: std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+/// A bead instance's midpoint (start + ½·dir·len) in world/render coords.
+fn bead_mid(b: &[f32; 14]) -> glam::Vec3 {
+    glam::Vec3::new(b[0] + b[3] * b[5] * 0.5, b[1] + b[4] * b[5] * 0.5, b[2])
+}
+
+impl BeadGrid {
+    fn build(inst: &[[f32; 14]], cell: f32) -> Self {
+        let inv = 1.0 / cell.max(1e-3);
+        let mut map: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, b) in inst.iter().enumerate() {
+            // Only extrusion carries a printing tool — skip travels/seams.
+            if b[12] >= CAT_TRAVEL {
+                continue;
+            }
+            let m = bead_mid(b);
+            let key = ((m.x * inv).floor() as i32, (m.y * inv).floor() as i32, (m.z * inv).floor() as i32);
+            map.entry(key).or_default().push(i as u32);
+        }
+        Self { cell, map }
+    }
+
+    /// Indices of beads whose midpoint is within `radius` of `center`.
+    fn query(&self, inst: &[[f32; 14]], center: glam::Vec3, radius: f32) -> Vec<u32> {
+        let inv = 1.0 / self.cell.max(1e-3);
+        let r2 = radius * radius;
+        let lo = (center - glam::Vec3::splat(radius)) * inv;
+        let hi = (center + glam::Vec3::splat(radius)) * inv;
+        let mut out = Vec::new();
+        for gx in lo.x.floor() as i32..=hi.x.floor() as i32 {
+            for gy in lo.y.floor() as i32..=hi.y.floor() as i32 {
+                for gz in lo.z.floor() as i32..=hi.z.floor() as i32 {
+                    if let Some(v) = self.map.get(&(gx, gy, gz)) {
+                        for &i in v {
+                            if (bead_mid(&inst[i as usize]) - center).length_squared() <= r2 {
+                                out.push(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
 /// the bounds/collision checks (run for tinting, the transform card, and the
 /// Send gate) don't re-walk mesh vertices every frame.
@@ -1450,6 +1542,40 @@ struct App {
     mesh_struct_dirty: bool,
     mesh_xform_dirty: bool,
     mesh_color_dirty: bool,
+    /// The per-vertex paint tint buffer needs re-upload (a brush stroke changed
+    /// `paint_tri`). Distinct from `mesh_color_dirty` (per-part base tint).
+    mesh_paint_dirty: bool,
+    // --- surface paint brush (Stage A) ---
+    /// Paint mode: viewport clicks flood-fill surface regions instead of
+    /// selecting/orbiting.
+    paint_mode: bool,
+    /// Tool the brush lays down; `brush_erase` clears instead.
+    brush_tool: u32,
+    brush_erase: bool,
+    /// Live smart-fill tolerances: global normal drift from the seed (degrees)
+    /// and geodesic reach (mm).
+    brush_drift_deg: f32,
+    brush_radius_mm: f32,
+    /// Cached flood topology for the part under the brush (`(obj, part, topo)`),
+    /// rebuilt when the target part changes.
+    paint_topo: Option<(usize, usize, paint::PaintTopology)>,
+    /// A freehand brush stroke is underway (drag started on the model in paint
+    /// mode) — drag events paint instead of orbiting.
+    painting: bool,
+    /// Freehand brush radius (world mm) for the drag-stroke add/erase that
+    /// corrects what the flood over/under-grabbed.
+    brush_dab_mm: f32,
+    // --- bead painting (paint the sliced preview directly, bead resolution) ---
+    /// Paint strokes on the sliced beads, in world space — resolution-
+    /// independent, re-applied after every (re)slice and mode change.
+    bead_dabs: Vec<BeadDab>,
+    /// Working copy of the bead instances (== what's on the GPU); dabs recolor it.
+    bead_inst: Vec<[f32; 14]>,
+    /// The pristine (mesh-paint) instances, so an erase reverts a bead and the
+    /// dabs can be re-applied onto a fresh slice.
+    bead_pristine: Vec<[f32; 14]>,
+    /// Spatial index over `bead_inst` midpoints for brush queries.
+    bead_grid: BeadGrid,
     /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
     /// render-skip below can tell a content change from a static frame.
     content_version: u64,
@@ -1683,6 +1809,19 @@ impl App {
             mesh_struct_dirty: true,
             mesh_xform_dirty: false,
             mesh_color_dirty: false,
+            mesh_paint_dirty: false,
+            paint_mode: false,
+            brush_tool: 1,
+            brush_erase: false,
+            brush_drift_deg: 60.0,
+            brush_radius_mm: 25.0,
+            paint_topo: None,
+            painting: false,
+            brush_dab_mm: 6.0,
+            bead_dabs: Vec::new(),
+            bead_inst: Vec::new(),
+            bead_pristine: Vec::new(),
+            bead_grid: BeadGrid::default(),
             content_version: 0,
             last_render_sig: None,
             front_label: None,
@@ -1722,6 +1861,304 @@ impl App {
             }
         }
         best.map(|(_, i)| i)
+    }
+
+    /// Nearest FRONT-facing `display` triangle the ray hits: `(obj, part, tri,
+    /// world hit)`. Front-face only so a click paints the visible surface, never
+    /// punches through to a hidden back wall. Rays/triangles are in world space.
+    fn pick_paint_face(
+        &self,
+        o: glam::Vec3,
+        d: glam::Vec3,
+    ) -> Option<(usize, usize, usize, glam::Vec3)> {
+        let mut best: Option<(f32, usize, usize, usize)> = None;
+        for (i, obj) in self.objects.iter().enumerate() {
+            let t = obj.transform();
+            let v = |p: [f64; 3]| {
+                let q = t.apply(p);
+                glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)
+            };
+            for (pi, part) in obj.parts.iter().enumerate() {
+                for k in 0..part.display.triangles.len() {
+                    let tri = part.display.triangle(k);
+                    let (a, b, c) = (v(tri[0]), v(tri[1]), v(tri[2]));
+                    // Front-face: geometric normal points toward the ray origin.
+                    if (b - a).cross(c - a).dot(o - a) <= 0.0 {
+                        continue;
+                    }
+                    if let Some(dist) = ray_triangle(o, d, a, b, c) {
+                        if best.map_or(true, |(bd, ..)| dist < bd) {
+                            best = Some((dist, i, pi, k));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(dist, i, pi, k)| (i, pi, k, o + d * dist))
+    }
+
+    /// Camera eye in part `oi`'s LOCAL mesh frame. Topology (normals, centroids)
+    /// lives in local space, so the front-face mask needs the eye there:
+    /// world = R·(s·local) + T  ⇒  local = Rᵀ·(world − T)/s.
+    fn eye_in_local(&self, oi: usize) -> glam::Vec3 {
+        let t = self.objects[oi].transform();
+        let e = self.camera.eye();
+        let dw = [
+            e.x as f64 - t.translation[0],
+            e.y as f64 - t.translation[1],
+            e.z as f64 - t.translation[2],
+        ];
+        let mut loc = [0.0f64; 3];
+        for j in 0..3 {
+            for i in 0..3 {
+                loc[j] += t.rotation[i][j] * dw[i];
+            }
+            loc[j] /= t.scale;
+        }
+        glam::Vec3::new(loc[0] as f32, loc[1] as f32, loc[2] as f32)
+    }
+
+    /// Build (or reuse) the cached flood topology for part `(oi, pi)` — the one
+    /// expensive step; strokes/re-clicks on the same part reuse it.
+    fn ensure_topo(&mut self, oi: usize, pi: usize) {
+        if self.paint_topo.as_ref().map_or(true, |(a, b, _)| *a != oi || *b != pi) {
+            let topo = paint::PaintTopology::build(&self.objects[oi].parts[pi].display);
+            self.paint_topo = Some((oi, pi, topo));
+        }
+    }
+
+    /// Stamp a flooded face set into `paint_tri` (the brush tool, or clear when
+    /// erasing). `drift_max` drops faces past that normal drift from the seed
+    /// (the smart-fill gate); `None` takes every face (the freehand brush).
+    fn apply_region(&mut self, oi: usize, pi: usize, region: &[paint::FloodFace], drift_max: Option<f32>) {
+        let val = if self.brush_erase { None } else { Some(self.brush_tool) };
+        let part = &mut self.objects[oi].parts[pi];
+        let ntri = part.display.triangles.len();
+        if part.paint_tri.len() != ntri {
+            part.paint_tri = vec![None; ntri];
+        }
+        let mut changed = false;
+        for f in region {
+            if drift_max.is_some_and(|dm| f.drift > dm) {
+                continue;
+            }
+            if part.paint_tri[f.face as usize] != val {
+                part.paint_tri[f.face as usize] = val;
+                changed = true;
+            }
+        }
+        if changed {
+            self.mesh_paint_dirty = true;
+        }
+        // The mesh tint above is just the live model-view feedback; the SLICE
+        // truth is a sub-bead dab of the same flooded patch (applied by
+        // `dab_covers` when sliced/exported — bead-resolution, not per-triangle).
+        self.record_dab(oi, pi, region, drift_max);
+    }
+
+    /// Record a sub-bead paint dab from a flooded region — the drift-gated faces
+    /// in world space, bounded by a sphere for cheap culling — so a Model-view
+    /// stroke resolves to bead-resolution paint (`engine::dab_covers`) at slice
+    /// time, matching the mesh tint shown live. Empty region ⇒ no dab.
+    fn record_dab(&mut self, oi: usize, pi: usize, region: &[paint::FloodFace], drift_max: Option<f32>) {
+        let t = self.objects[oi].transform();
+        let disp = &self.objects[oi].parts[pi].display;
+        let tris: Vec<[[f64; 3]; 3]> = region
+            .iter()
+            .filter(|f| drift_max.map_or(true, |dm| f.drift <= dm))
+            .map(|f| {
+                let tr = disp.triangle(f.face as usize);
+                [t.apply(tr[0]), t.apply(tr[1]), t.apply(tr[2])]
+            })
+            .collect();
+        if tris.is_empty() {
+            return;
+        }
+        // Bounding sphere (centroid + max radius) of the patch — used only to
+        // cull far beads; works for a small freehand dab or a big smart-fill.
+        let mut c = [0.0f64; 3];
+        for tr in &tris {
+            for v in tr {
+                c[0] += v[0];
+                c[1] += v[1];
+                c[2] += v[2];
+            }
+        }
+        let inv = 1.0 / (tris.len() * 3) as f64;
+        c = [c[0] * inv, c[1] * inv, c[2] * inv];
+        let mut r2 = 0.0f64;
+        for tr in &tris {
+            for v in tr {
+                let d = [v[0] - c[0], v[1] - c[1], v[2] - c[2]];
+                r2 = r2.max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            }
+        }
+        let dab = BeadDab {
+            center: glam::Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32),
+            radius: r2.sqrt() as f32,
+            tool: if self.brush_erase { None } else { Some(self.brush_tool) },
+            tris,
+        };
+        // If already sliced, stamp this dab onto the beads NOW (incremental — no
+        // GPU upload; that lands on stroke end). Otherwise it applies at the next
+        // slice. Keeps a live stroke cheap: no full replay per frame.
+        if self.sliced.is_some() && !self.bead_pristine.is_empty() {
+            self.recolor_beads(&dab);
+        }
+        self.bead_dabs.push(dab);
+    }
+
+    /// Smart-fill the surface region under a paint-mode click: flood from the
+    /// front face bounded by the live drift + reach, and stamp the brush tool.
+    fn paint_click(&mut self, o: glam::Vec3, d: glam::Vec3) {
+        let Some((oi, pi, tri, _)) = self.pick_paint_face(o, d) else {
+            return;
+        };
+        self.ensure_topo(oi, pi);
+        let s = (self.objects[oi].transform().scale as f32).max(1e-6);
+        let params = paint::FloodParams {
+            theta_local: (PAINT_THETA_LOCAL_DEG as f32).to_radians(),
+            max_dist: self.brush_radius_mm / s,
+            // "Paint what you can see": don't wrap onto faces turned away from
+            // the camera (the dress interior, the far side).
+            front_faces_only: true,
+            eye_local: self.eye_in_local(oi),
+        };
+        let region = self.paint_topo.as_ref().unwrap().2.flood(tri, &params);
+        self.apply_region(oi, pi, &region, Some(self.brush_drift_deg.to_radians()));
+    }
+
+    /// The brush's on-surface RADIUS in mm. The `brush_dab_mm` slider value is
+    /// the spot DIAMETER — what the user reads as the brush size, so a "6" paints
+    /// a ~6 mm-wide spot — hence the radius the paint/cursor tests use is half it.
+    fn dab_radius(&self) -> f32 {
+        self.brush_dab_mm * 0.5
+    }
+
+    /// Freehand brush: flood the CONNECTED front-facing surface within
+    /// `dab_radius()` GEODESIC (along-the-surface) distance of the hit — a disc
+    /// that hugs the surface, NOT a Euclidean sphere, so it never jumps onto a
+    /// disconnected surface that merely happens to be nearby in space. No crease
+    /// gate (a manual brush paints across corners); front-face keeps it off the
+    /// hidden side. Called per drag frame for a stroke — the correction for what
+    /// the flood over/under-grabbed.
+    fn paint_dab(&mut self, o: glam::Vec3, d: glam::Vec3) {
+        let Some((oi, pi, tri, _)) = self.pick_paint_face(o, d) else {
+            return;
+        };
+        self.ensure_topo(oi, pi);
+        let s = (self.objects[oi].transform().scale as f32).max(1e-6);
+        let params = paint::FloodParams {
+            theta_local: std::f32::consts::PI, // cross any edge — it's a manual brush
+            max_dist: self.dab_radius() / s,
+            front_faces_only: true,
+            eye_local: self.eye_in_local(oi),
+        };
+        let region = self.paint_topo.as_ref().unwrap().2.flood(tri, &params);
+        self.apply_region(oi, pi, &region, None);
+    }
+
+    /// Screen-space boundary of the region the freehand brush would paint at the
+    /// cursor — the SAME geodesic disc the brush floods, traced as its boundary
+    /// edges and projected to screen, so the cursor drapes over the real surface
+    /// instead of being a flat tangent circle. `None` if the cursor isn't over a
+    /// paintable front face.
+    fn paint_cursor_outline(
+        &mut self,
+        vp: glam::Mat4,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+    ) -> Option<Vec<[egui::Pos2; 2]>> {
+        let (o, d) = pointer_ray(vp, rect, pointer);
+        let (oi, pi, tri, _) = self.pick_paint_face(o, d)?;
+        self.ensure_topo(oi, pi);
+        let s = (self.objects[oi].transform().scale as f32).max(1e-6);
+        // The brush floods the CONNECTED front-surface patch within `dab_radius`
+        // of the click and paints the beads hugging it — so the cursor is that
+        // same flooded patch's boundary, draped over the real surface. Identical
+        // for the mesh brush (Model) and bead brush (Preview): both paint this
+        // patch.
+        let params = paint::FloodParams {
+            theta_local: std::f32::consts::PI,
+            max_dist: self.dab_radius() / s,
+            front_faces_only: true,
+            eye_local: self.eye_in_local(oi),
+        };
+        let region = self.paint_topo.as_ref().unwrap().2.flood(tri, &params);
+        if region.is_empty() {
+            return None;
+        }
+        let t = self.objects[oi].transform();
+        let disp = &self.objects[oi].parts[pi].display;
+        let face_set: std::collections::HashSet<u32> = region.iter().map(|f| f.face).collect();
+        // Boundary edge = shared by exactly ONE face in the kept set (the outer
+        // rim of the disc); interior edges are shared by two.
+        let mut edge_count: std::collections::HashMap<(u32, u32), u32> =
+            std::collections::HashMap::new();
+        for &f in &face_set {
+            let t3 = disp.triangles[f as usize];
+            for (a, b) in [(t3[0], t3[1]), (t3[1], t3[2]), (t3[2], t3[0])] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edge_count.entry(key).or_insert(0) += 1;
+            }
+        }
+        let project = |vi: u32| -> Option<egui::Pos2> {
+            let p = disp.vertices[vi as usize];
+            let q = t.apply(p);
+            let clip = vp * glam::Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32).extend(1.0);
+            if clip.w <= 1e-4 {
+                return None;
+            }
+            let sx = rect.min.x + (clip.x / clip.w * 0.5 + 0.5) * rect.width();
+            let sy = rect.min.y + (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * rect.height();
+            Some(egui::pos2(sx, sy))
+        };
+        let mut segs = Vec::new();
+        for (&(a, b), &count) in &edge_count {
+            if count == 1 {
+                if let (Some(sa), Some(sb)) = (project(a), project(b)) {
+                    segs.push([sa, sb]);
+                }
+            }
+        }
+        Some(segs)
+    }
+
+    /// Clear all surface paint on every part.
+    fn clear_paint(&mut self) {
+        for o in &mut self.objects {
+            for p in &mut o.parts {
+                p.paint_tri.clear();
+            }
+        }
+        self.mesh_paint_dirty = true;
+    }
+
+    /// Per-vertex paint tint for the whole scene, in the SAME object→part→
+    /// display-triangle order (3 verts/triangle) that `upload_mesh_geometry`
+    /// lays down — so it lines up with the geometry buffer. Painted triangles
+    /// carry their tool's display color at full coverage; unpainted are zero.
+    fn build_mesh_paint(&self) -> Vec<[f32; 4]> {
+        let mut out = Vec::new();
+        for o in &self.objects {
+            for part in &o.parts {
+                for k in 0..part.display.triangles.len() {
+                    let entry = match part.paint_tri.get(k).copied().flatten() {
+                        Some(t) => {
+                            let c = render::visible_against_backdrop(
+                                self.settings.tool(t as usize).color_rgb,
+                            );
+                            [c[0], c[1], c[2], 1.0]
+                        }
+                        None => [0.0; 4],
+                    };
+                    out.push(entry);
+                    out.push(entry);
+                    out.push(entry);
+                }
+            }
+        }
+        out
     }
 
     fn category_mask(&self) -> u32 {
@@ -2148,6 +2585,7 @@ impl App {
                                 paint: PartColor::Tool(
                                     p.extruder.map(|e| e.saturating_sub(1)).unwrap_or(0).min(tool_cap),
                                 ),
+                                paint_tri: Vec::new(),
                                 display: Arc::new(p.mesh.display_mesh()),
                                 mesh: Arc::new(p.mesh),
                             })
@@ -2242,6 +2680,7 @@ impl App {
                     mesh: Arc::clone(&p.mesh),
                     display: Arc::clone(&p.display),
                     paint: p.paint,
+                    paint_tri: Vec::new(),
                 })
                 .collect(),
             rot_deg: src.rot_deg,
@@ -2277,6 +2716,7 @@ impl App {
                     display: Arc::new(body.display_mesh()),
                     mesh: Arc::new(body),
                     paint: part.paint,
+                    paint_tri: Vec::new(),
                 });
             }
         }
@@ -2447,6 +2887,7 @@ impl App {
             || self.mesh_struct_dirty
             || self.mesh_xform_dirty
             || self.mesh_color_dirty
+            || self.mesh_paint_dirty
     }
 
     /// Re-layout every object, flowing across beds (shelf packing — see
@@ -2584,7 +3025,13 @@ impl App {
                 // topology that can't have changed; `transformed()` is O(V) with
                 // no hashing and yields byte-identical geometry.
                 if !part.mesh.triangles.is_empty() {
-                    out.push((part.mesh.transformed(&t), self.paint_engine(part.paint)));
+                    // Surface paint is no longer baked into the slice — the
+                    // freehand/smart-fill brush records sub-bead DABS
+                    // (`bead_dabs`) that `apply_bead_dabs` stamps onto the sliced
+                    // beads at bead resolution (see `apply_slice_output`). The
+                    // slice itself carries only the part's base tool / blend.
+                    let paint = self.paint_engine(part.paint);
+                    out.push((part.mesh.transformed(&t), paint));
                 }
             }
         }
@@ -2794,7 +3241,7 @@ impl App {
         self.layer_stats = out.layer_stats;
         self.sliced = Some(out.layers);
         self.sliced_origin_x = origin_x;
-        self.scene.set_toolpaths(&rs.device, &rs.queue, &out.verts);
+        self.commit_bead_instances(out.verts, rs);
         self.scene.set_joints(&rs.device, &rs.queue, &out.joints);
         self.content_version += 1;
         self.layer_ends = out.ends;
@@ -2805,6 +3252,16 @@ impl App {
             n.max(1)
         };
         self.view_preview = true;
+        // The worker built the beads UNsubdivided + unpainted (it can't see paint
+        // state). If there's surface paint (dabs) — or we're actively painting —
+        // rebuild the beads subdivided and stamp the dabs, and refresh the readout
+        // so the preview + summary reflect the paint immediately after a (re)slice.
+        if self.paint_mode || !self.bead_dabs.is_empty() {
+            self.set_preview_instances(rs);
+        }
+        if !self.bead_dabs.is_empty() {
+            self.refresh_bead_summary();
+        }
     }
 
     /// (Re)build the preview bead instances from the sliced layers, colored
@@ -2819,12 +3276,141 @@ impl App {
             layer_colors.as_deref(),
             accent_hsl(self.accent),
             self.sliced_origin_x as f32,
+            // Subdivide beads when there's surface paint (or we're painting), so a
+            // dab boundary can fall mid-bead (sub-bead resolution).
+            if self.paint_mode || !self.bead_dabs.is_empty() {
+                Some(PAINT_BEAD_MAX_MM)
+            } else {
+                None
+            },
         );
-        self.scene.set_toolpaths(&rs.device, &rs.queue, &verts);
+        self.commit_bead_instances(verts, rs);
         self.scene.set_joints(&rs.device, &rs.queue, &joints);
         self.content_version += 1;
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
+    }
+
+    /// Take a fresh bead instance buffer (from `build_instances` — pristine
+    /// mesh-paint colors), keep it as the pristine base, build the spatial
+    /// index, re-apply the accumulated bead dabs on top, and upload to the GPU.
+    fn commit_bead_instances(
+        &mut self,
+        verts: Vec<[f32; 14]>,
+        rs: &eframe::egui_wgpu::RenderState,
+    ) {
+        self.bead_grid = BeadGrid::build(&verts, BEAD_GRID_CELL_MM);
+        self.bead_pristine = verts;
+        self.replay_bead_dabs();
+        self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+    }
+
+    /// Rebuild the working bead buffer from pristine and re-apply every dab in
+    /// order. `mem::take` lets each `recolor_beads` borrow `&mut self` without
+    /// fighting the dab list it's iterating.
+    fn replay_bead_dabs(&mut self) {
+        self.bead_inst = self.bead_pristine.clone();
+        let dabs = std::mem::take(&mut self.bead_dabs);
+        for dab in &dabs {
+            self.recolor_beads(dab);
+        }
+        self.bead_dabs = dabs;
+    }
+
+    /// Recolor the beads a dab covers in the working buffer: paint → the dab's
+    /// tool + display color; erase → revert to the pristine bead. A bead is
+    /// covered only if it hugs the dab's flooded surface patch (connected, front,
+    /// outer shell) — never a disconnected/back-side/interior bead nearby.
+    fn recolor_beads(&mut self, dab: &BeadDab) {
+        // Bounding-sphere query for candidates (padded for the patch's reach past
+        // its center), then the exact patch-hugging test.
+        let reach = dab.radius + 1.0;
+        let beads = self.bead_grid.query(&self.bead_inst, dab.center, reach);
+        for i in beads {
+            let i = i as usize;
+            let m = bead_mid(&self.bead_inst[i]);
+            if !engine::dab_covers(&dab.tris, [m.x as f64, m.y as f64, m.z as f64]) {
+                continue;
+            }
+            match dab.tool {
+                Some(t) => {
+                    let c = render::visible_against_backdrop(self.settings.tool(t as usize).color_rgb);
+                    self.bead_inst[i][8] = c[0];
+                    self.bead_inst[i][9] = c[1];
+                    self.bead_inst[i][10] = c[2];
+                    self.bead_inst[i][13] = t as f32;
+                }
+                None => self.bead_inst[i] = self.bead_pristine[i],
+            }
+        }
+    }
+
+    /// End of a Model-view paint stroke: the dabs were already stamped onto the
+    /// beads incrementally in `record_dab`, so just upload the fresh bead buffer
+    /// and refresh the readout, so a switch to Preview + the export reflect it.
+    /// No-op when unsliced — the dabs apply at the next slice.
+    fn commit_paint_stroke(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        if self.sliced.is_some() && !self.bead_pristine.is_empty() {
+            self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+            self.content_version += 1;
+            self.refresh_bead_summary();
+        }
+    }
+
+    /// The bead dabs in the sliced LayerPlan frame (the render frame minus the
+    /// bed origin that `build_instances` bakes into the bead x), ready for the
+    /// engine's `apply_bead_dabs`.
+    fn engine_dabs(&self) -> Vec<engine::BeadDab> {
+        let ox = self.sliced_origin_x;
+        self.bead_dabs
+            .iter()
+            .map(|d| engine::BeadDab {
+                center: [d.center.x as f64 - ox, d.center.y as f64, d.center.z as f64],
+                radius: d.radius as f64,
+                tool: d.tool,
+                tris: d
+                    .tris
+                    .iter()
+                    .map(|t| [[t[0][0] - ox, t[0][1], t[0][2]], [t[1][0] - ox, t[1][1], t[1][2]], [t[2][0] - ox, t[2][1], t[2][2]]])
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Recompute the paint-affected summary fields (toolchanges, per-tool
+    /// filament, path count) from the bead-dab-applied layers — so the readout
+    /// matches what will export. Called on stroke end, not per frame.
+    fn refresh_bead_summary(&mut self) {
+        let dabs = self.engine_dabs();
+        let Some(base) = self.sliced.as_ref() else { return };
+        let mut layers = base.clone();
+        engine::apply_bead_dabs(&mut layers, &dabs, &self.settings);
+        let mut toolchanges = 0usize;
+        let mut last: Option<u32> = None;
+        for path in layers.iter().flat_map(|l| &l.paths).filter(|p| p.points.len() >= 2) {
+            if last.is_some_and(|t| t != path.tool) {
+                toolchanges += 1;
+            }
+            last = Some(path.tool);
+        }
+        let per_tool = engine::estimate_filament_per_tool(&layers, &self.settings);
+        let toolpaths = layers.iter().map(|l| l.paths.len()).sum();
+        if let Some(s) = &mut self.slice_summary {
+            s.toolchanges = toolchanges;
+            s.per_tool = per_tool;
+            s.toolpaths = toolpaths;
+        }
+    }
+
+    /// Rebuild the working bead buffer from pristine + the current dab list and
+    /// re-upload — after clearing/undoing dabs (reuses the cached pristine+grid).
+    fn reapply_bead_dabs(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        if self.bead_pristine.is_empty() {
+            return;
+        }
+        self.replay_bead_dabs();
+        self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+        self.content_version += 1;
     }
 
     /// The active metric mapped to per-path colors — or None in feature mode
@@ -2943,7 +3529,7 @@ impl App {
 
     fn export(&mut self) {
         self.refresh_tool0();
-        let Some(layers) = self.sliced.as_ref() else { return };
+        let Some(mut layers) = self.sliced.clone() else { return };
         let mut dialog = rfd::FileDialog::new()
             .add_filter("g-code", &["gcode"])
             .set_file_name("out.gcode");
@@ -2954,7 +3540,9 @@ impl App {
             return;
         };
         self.last_export_dir = path.parent().map(|d| d.to_path_buf());
-        let gcode = engine::to_gcode(layers, &self.settings);
+        // Bake the bead-paint strokes into the toolpaths (no-op when unpainted).
+        engine::apply_bead_dabs(&mut layers, &self.engine_dabs(), &self.settings);
+        let gcode = engine::to_gcode(&layers, &self.settings);
         self.status = match std::fs::write(&path, gcode) {
             Ok(()) => format!("Wrote {}", path.display()),
             Err(e) => format!("Write failed: {e}"),
@@ -3163,7 +3751,12 @@ impl App {
         // the tool palette (a uniform, tracked by RenderSig) and the hidden mesh
         // isn't touched at all.
         let show_mesh = !(self.view_preview && self.sliced.is_some());
-        if (self.mesh_struct_dirty || self.mesh_xform_dirty || self.mesh_color_dirty) && show_mesh {
+        if (self.mesh_struct_dirty
+            || self.mesh_xform_dirty
+            || self.mesh_color_dirty
+            || self.mesh_paint_dirty)
+            && show_mesh
+        {
             // A structure or placement change refreshes the world-bounds cache
             // (positions feed both the invalid check and the model matrices); a
             // color-only change reuses it.
@@ -3215,6 +3808,14 @@ impl App {
             // Placement + tint: the only thing a drag or recolor rewrites.
             self.scene.upload_mesh_parts(&rs.device, &rs.queue, &part_data);
 
+            // Per-vertex surface paint. A geometry re-upload zeroed the paint
+            // buffer, so restore it whenever the struct changed, or when a brush
+            // stroke marked it dirty.
+            if self.mesh_struct_dirty || self.mesh_paint_dirty {
+                let paint = self.build_mesh_paint();
+                self.scene.upload_mesh_paint(&rs.device, &rs.queue, &paint);
+            }
+
             // Only re-frame on scene changes (import/duplicate/delete/arrange/
             // profile), not when the user merely selects an object. Objects rest
             // on z=0, so the world box is the footprints' XY span × [0, height].
@@ -3243,6 +3844,7 @@ impl App {
             self.mesh_struct_dirty = false;
             self.mesh_xform_dirty = false;
             self.mesh_color_dirty = false;
+            self.mesh_paint_dirty = false;
             changed = true;
         }
 
@@ -3875,6 +4477,61 @@ impl eframe::App for App {
                 // colors) — re-upload them on the same release.
                 self.mark_mesh_color_dirty();
                 ui.ctx().request_repaint();
+            }
+
+            // Surface paint brush: paint tool-color regions on the MODEL (mesh);
+            // the strokes are recorded as sub-bead dabs that resolve at bead
+            // resolution when sliced (Preview shows the result, read-only). Only
+            // meaningful on a multi-tool machine, in Model view.
+            if self.settings.tool_count > 1 && !self.view_preview {
+                ui.horizontal(|ui| {
+                    let tip = "Paint tool-color regions on the model. Click a spot to smart-fill \
+                         (crease-bounded); drag to freehand brush; drag empty space orbits. \
+                         Boundaries resolve at bead resolution when you slice.";
+                    if ui.add(egui::Button::selectable(self.paint_mode, "🖌 paint")).on_hover_text(tip).clicked() {
+                        self.paint_mode = !self.paint_mode;
+                        // Entering/leaving paint mode toggles bead subdivision, so
+                        // rebuild the sliced beads (kept ready for a Preview switch).
+                        if self.sliced.is_some() {
+                            self.set_preview_instances(&rs);
+                        }
+                    }
+                    if self.paint_mode {
+                        for t in 0..self.settings.tool_count as u32 {
+                            if ui
+                                .selectable_label(!self.brush_erase && self.brush_tool == t, format!("T{t}"))
+                                .clicked()
+                            {
+                                self.brush_tool = t;
+                                self.brush_erase = false;
+                            }
+                        }
+                        if ui.selectable_label(self.brush_erase, "erase").clicked() {
+                            self.brush_erase = true;
+                        }
+                        if ui.button("clear").on_hover_text("Remove all paint.").clicked() {
+                            self.clear_paint();
+                            self.bead_dabs.clear();
+                            self.reapply_bead_dabs(&rs);
+                        }
+                    }
+                });
+                if self.paint_mode {
+                    // drift/reach tune the smart-fill CLICK; brush = freehand drag width.
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut self.brush_drift_deg, 5.0..=120.0).text("drift°"))
+                            .on_hover_text(
+                                "How far a smart-fill may drift from the clicked surface's angle \
+                                 before stopping. Lower = tighter; higher = grabs more curve.",
+                            );
+                        ui.add(egui::Slider::new(&mut self.brush_radius_mm, 2.0..=120.0).text("reach"))
+                            .on_hover_text("Max distance a smart-fill spreads from the click (mm).");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut self.brush_dab_mm, 1.0..=30.0).text("brush"))
+                            .on_hover_text("Brush size — the WIDTH (mm) of the painted spot, for the freehand drag.");
+                    });
+                }
             }
             if self.view_preview && n_layers > 0 {
                 // The layer slider itself lives on the right edge of the 3D pane
@@ -4963,6 +5620,8 @@ impl eframe::App for App {
             let mut camera_moving = self.camera_glide.is_some();
 
             // Objects are only editable in Model view; Preview is read-only.
+            // Painting also happens in Model view now (it records sub-bead dabs
+            // that resolve at slice time); Preview just shows the result.
             let edit = !self.view_preview;
             // Ignore viewport input when the cursor is over a floating overlay.
             let pointer = ui.ctx().pointer_interact_pos();
@@ -4973,7 +5632,20 @@ impl eframe::App for App {
                 || over(self.msgs_overlay_rect);
 
             // Left-press on an object grabs it for dragging; on empty space, orbits.
-            if edit && !blocked && response.drag_started_by(egui::PointerButton::Primary) {
+            // In paint mode nothing is grabbed — a drag still orbits (so you can
+            // rotate to the back), and a click paints (handled below).
+            // In paint mode, a drag that starts on the model is a brush stroke
+            // (painted below); starting on empty space still orbits.
+            if edit && !blocked && self.paint_mode && response.drag_started_by(egui::PointerButton::Primary) {
+                self.painting = response
+                    .interact_pointer_pos()
+                    .map(|p| {
+                        let (o, d) = pointer_ray(vp, rect, p);
+                        self.pick_paint_face(o, d).is_some()
+                    })
+                    .unwrap_or(false);
+            }
+            if edit && !blocked && !self.paint_mode && response.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
@@ -5011,7 +5683,16 @@ impl eframe::App for App {
                         }
                     }
                     None => {
-                        if !blocked {
+                        if self.paint_mode && self.painting {
+                            // A brush stroke on the MODEL: flood the surface patch
+                            // under the ray each frame → tint the mesh (live) +
+                            // record a sub-bead dab (applied when sliced). Skips
+                            // orbit; a drag off the model still orbits.
+                            if let Some(p) = response.interact_pointer_pos() {
+                                let (o, d) = pointer_ray(vp, rect, p);
+                                self.paint_dab(o, d);
+                            }
+                        } else if !blocked {
                             let d = response.drag_delta();
                             self.camera.orbit(d.x, d.y);
                             camera_moving = true;
@@ -5021,6 +5702,12 @@ impl eframe::App for App {
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 self.drag_obj = None;
+                // A finished paint stroke: push the new dabs onto the sliced beads
+                // + refresh the readout (no-op if not yet sliced).
+                if self.painting {
+                    self.commit_paint_stroke(&rs);
+                }
+                self.painting = false;
             }
             // A plain click selects the object under the cursor (its bed
             // becomes active), or — on empty space — deselects and activates
@@ -5028,23 +5715,30 @@ impl eframe::App for App {
             if edit && !blocked && response.clicked() {
                 if let Some(p) = response.interact_pointer_pos() {
                     let (o, d) = pointer_ray(vp, rect, p);
-                    self.selected = self.pick(o, d);
-                    match self.selected {
-                        Some(i) => {
-                            let k = self.bed_of(&self.objects[i]);
-                            self.set_active_bed(k);
-                        }
-                        None => {
-                            if let Some(xy) = ray_plane_z0(o, d) {
-                                let k = bed_of_pos(xy.x as f64, self.settings.bed_size_x_mm)
-                                    .min(self.n_beds() - 1);
+                    if self.paint_mode {
+                        // Smart-fill the surface region under the cursor, then
+                        // push the dab onto the sliced beads + readout.
+                        self.paint_click(o, d);
+                        self.commit_paint_stroke(&rs);
+                    } else {
+                        self.selected = self.pick(o, d);
+                        match self.selected {
+                            Some(i) => {
+                                let k = self.bed_of(&self.objects[i]);
                                 self.set_active_bed(k);
                             }
+                            None => {
+                                if let Some(xy) = ray_plane_z0(o, d) {
+                                    let k = bed_of_pos(xy.x as f64, self.settings.bed_size_x_mm)
+                                        .min(self.n_beds() - 1);
+                                    self.set_active_bed(k);
+                                }
+                            }
                         }
+                        // A click only changes the selection (and maybe the active
+                        // bed, handled by set_active_bed) — the mesh is untouched.
+                        self.spotlight_dirty = true;
                     }
-                    // A click only changes the selection (and maybe the active
-                    // bed, handled by set_active_bed) — the mesh is untouched.
-                    self.spotlight_dirty = true;
                 }
             }
             if response.dragged_by(egui::PointerButton::Secondary) {
@@ -5163,6 +5857,39 @@ impl eframe::App for App {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+
+            // Live brush cursor: a ring on the surface at the pointer, sized to
+            // the freehand brush — drawn AFTER the scene image so it sits on top.
+            if edit && !blocked && self.paint_mode {
+                if let Some(p) = ui.ctx().pointer_hover_pos() {
+                    if rect.contains(p) {
+                        // Keep repainting so the cursor tracks smoothly.
+                        ui.ctx().request_repaint();
+                        let col = if self.brush_erase {
+                            egui::Color32::from_rgb(230, 120, 100)
+                        } else {
+                            let c = render::visible_against_backdrop(
+                                self.settings.tool(self.brush_tool as usize).color_rgb,
+                            );
+                            egui::Color32::from_rgb(
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                            )
+                        };
+                        let stroke = egui::Stroke::new(1.5, col);
+                        // The brush footprint draped on the actual surface (a
+                        // geodesic disc of the brush radius, traced as its
+                        // boundary) — projected onto the model in both views, so
+                        // it hugs the geometry instead of floating as a flat ring.
+                        if let Some(segs) = self.paint_cursor_outline(vp, rect, p) {
+                            for [a, b] in &segs {
+                                ui.painter().line_segment([*a, *b], stroke);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Front-edge marker: which edge is the printer's front (the origin
             // edge, y=0) is otherwise ambiguous. The "Front" wordmark (Playfair,
@@ -5748,8 +6475,9 @@ impl eframe::App for App {
                 }),
                 HostOp::Send { start } => {
                     self.refresh_tool0();
-                    if let Some(layers) = self.sliced.as_ref() {
-                        let gcode = engine::to_gcode(layers, &self.settings);
+                    if let Some(mut layers) = self.sliced.clone() {
+                        engine::apply_bead_dabs(&mut layers, &self.engine_dabs(), &self.settings);
+                        let gcode = engine::to_gcode(&layers, &self.settings);
                         let filename = self.upload_filename();
                         // A chamber soak waits on the printer's chamber sensor —
                         // confirm it's there before sending, so a missing/misnamed
@@ -5759,7 +6487,7 @@ impl eframe::App for App {
                         let chamber_sensor = self.settings.chamber_sensor.clone();
                         // Tools this job actually prints with, for the
                         // does-the-machine-have-them preflight below.
-                        let used = engine::used_tools(layers);
+                        let used = engine::used_tools(&layers);
                         let needs_t_macros = self.settings.toolchange_gcode.contains("T{tool}");
                         self.spawn_host_op(&ctx, false, move |c| {
                             if chamber_temp > 0 {
@@ -6448,8 +7176,47 @@ fn finish_slice(
     };
     let color_table = build_color_table(&layers, color_by, settings, accent, &layer_stats);
     let (verts, ends, joints, joint_ends) =
-        build_instances(&layers, z_hop, color_table.as_deref(), accent, origin_x);
+        build_instances(&layers, z_hop, color_table.as_deref(), accent, origin_x, None);
     SliceOutput { layers, geo, summary, layer_stats, verts, ends, joints, joint_ends }
+}
+
+/// Emit one bead segment `a→b`, subdivided into ≤ `max_seg` mm pieces when set
+/// (paint mode) so a brush can target a sub-portion of a long straight run.
+#[allow(clippy::too_many_arguments)]
+fn push_bead(
+    v: &mut Vec<[f32; 14]>,
+    origin_x: f32,
+    a: geo2d::Point,
+    b: geo2d::Point,
+    zc: f32,
+    w: f32,
+    h: f32,
+    color: [f32; 3],
+    layer: f32,
+    cat: f32,
+    tool: f32,
+    max_seg: Option<f32>,
+) {
+    let Some(ms) = max_seg else {
+        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool);
+        return;
+    };
+    let len = ((b.x_mm() - a.x_mm()).powi(2) + (b.y_mm() - a.y_mm()).powi(2)).sqrt();
+    let nsub = (len / ms.max(0.05) as f64).ceil().max(1.0) as usize;
+    if nsub <= 1 {
+        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool);
+        return;
+    }
+    let mut prev = a;
+    for si in 1..=nsub {
+        let t = si as f64 / nsub as f64;
+        let p = geo2d::Point::from_mm(
+            a.x_mm() + (b.x_mm() - a.x_mm()) * t,
+            a.y_mm() + (b.y_mm() - a.y_mm()) * t,
+        );
+        push_inst(v, origin_x, prev, p, zc, w, h, color, layer, cat, tool);
+        prev = p;
+    }
 }
 
 fn build_instances(
@@ -6458,6 +7225,7 @@ fn build_instances(
     path_colors: Option<&[Vec<[f32; 3]>]>,
     accent: (f32, f32, f32),
     origin_x: f32,
+    max_seg: Option<f32>,
 ) -> Instances {
     let mut inst: Vec<[f32; 14]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
@@ -6533,11 +7301,11 @@ fn build_instances(
             for k in 0..n_pts - 1 {
                 let sw = (vert_w(k) + vert_w(k + 1)) * 0.5;
                 let (sc, scat) = seg_cc(k);
-                push_inst(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat, tool);
+                push_bead(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat, tool, max_seg);
             }
             if path.closed {
                 let (sc, scat) = seg_cc(n_pts - 1);
-                push_inst(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat, tool);
+                push_bead(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat, tool, max_seg);
             }
             // Joint blobs round path ends and fill the outer wedge at CORNERS
             // (extrusion paths only — travels stay bare). A shallow bend's two

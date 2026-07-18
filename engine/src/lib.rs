@@ -13,6 +13,7 @@ mod calibrate;
 mod coverage;
 mod emit;
 mod fill;
+mod paint;
 mod plan;
 mod slice;
 
@@ -24,8 +25,8 @@ pub use emit::{
     LayerStats,
 };
 pub use plan::{
-    debug_uncovered, generate, generate_painted, generate_parts, plan_geometry,
-    plan_geometry_tracked, restamp_paint, GeometryPlan, LayerPlan, PartPaint, PathKind,
-    SliceProgress, ToolPath, Travel,
+    apply_bead_dabs, dab_covers, debug_uncovered, generate, generate_painted, generate_parts,
+    plan_geometry, plan_geometry_tracked, restamp_paint, BeadDab, GeometryPlan, LayerPlan,
+    PartPaint, PathKind, SliceProgress, ToolPath, Travel,
 };
 pub use slice::{slice_mesh, Layer, SliceParams};

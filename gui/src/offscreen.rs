@@ -92,6 +92,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         let max_tool = |p: &engine::PartPaint| match p {
             engine::PartPaint::Tool(t) => *t,
             engine::PartPaint::Blend(w) => w.iter().map(|&(t, _)| t).max().unwrap_or(0),
+            engine::PartPaint::Surface { face_tool, .. } => face_tool.iter().copied().max().unwrap_or(0),
         };
         settings.tool_count = parts.iter().map(|(_, p)| max_tool(p)).max().unwrap_or(0) as usize + 1;
         // Deterministic slot colors (no profiles load here): three greys the
@@ -138,7 +139,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         _ => None,
     };
     let (inst, ends, joints, joint_ends) =
-        build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0);
+        build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0, None);
     let count = ends.get(layer - 1).copied().unwrap_or(0);
     let joint_count = joint_ends.get(layer - 1).copied().unwrap_or(0);
     eprintln!("offscreen: instances beads={} joints={} (through layer {layer})", count, joint_count);

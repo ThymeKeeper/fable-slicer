@@ -87,8 +87,8 @@ struct PartData {
 };
 @group(1) @binding(0) var<uniform> part: PartData;
 
-struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
-@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>) -> MeshOut {
+struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) paint: vec4<f32> };
+@vertex fn vs_mesh(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) paint: vec4<f32>) -> MeshOut {
     var o: MeshOut;
     let world = part.model * vec4<f32>(p, 1.0);
     o.clip = u.mvp * world;
@@ -97,6 +97,9 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     // (scale cancels on normalize) — this reproduces the old CPU flat_normal(of
     // the transformed triangle) exactly, without storing world normals.
     o.normal = (part.model * vec4<f32>(n, 0.0)).xyz;
+    // Per-vertex paint tint (rgb + coverage in w), flat across a painted
+    // triangle. Zero w = unpainted → the part's base tint shows through.
+    o.paint = paint;
     return o;
 }
 @fragment fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
@@ -116,6 +119,9 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     var base = part.rgb.xyz;
     let warn = vec3<f32>(0.862, 0.420, 0.320);
     base = mix(base, warn, part.flags.x);
+    // Painted regions tint over the base (and over the warning) so the brush is
+    // visible while editing; the tint is still lit by the same rig.
+    base = mix(base, i.paint.xyz, i.paint.w);
     return vec4<f32>(base * shade, 1.0);
 }
 
@@ -384,6 +390,10 @@ pub struct Scene {
     /// structure change (import/delete). Placement + tint live in `part_ubuf`,
     /// so a drag/recolor never touches this.
     mesh_geo: GrowBuf,
+    /// Per-vertex paint tint (rgb + coverage), parallel to `mesh_geo`. Kept the
+    /// same length as `mesh_geo` (zeroed by `upload_mesh_geometry`, overwritten
+    /// by `upload_mesh_paint`).
+    mesh_paint: GrowBuf,
     /// Per-part draw ranges `(vertex_offset, vertex_count)` into `mesh_geo`.
     mesh_parts: Vec<(u32, u32)>,
     /// Dynamic uniform buffer of `PartData`, one 256-byte slot per part.
@@ -506,12 +516,22 @@ impl Scene {
 
         let mesh_pipeline = make_pipeline(
             device, &mesh_layout, &shader, format, "vs_mesh", "fs_mesh",
-            &[wgpu::VertexBufferLayout {
-                // Object-local geometry: pos + local flat normal.
-                array_stride: std::mem::size_of::<Vertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-            }],
+            &[
+                wgpu::VertexBufferLayout {
+                    // Object-local geometry: pos + local flat normal.
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    // Parallel per-vertex paint tint (rgb + coverage), same order
+                    // and count as the geometry buffer. A recolor rewrites only
+                    // this; geometry stays put.
+                    array_stride: std::mem::size_of::<[f32; 4]>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x4],
+                },
+            ],
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
             true,
@@ -745,6 +765,7 @@ impl Scene {
             resolve_tex,
             tex_id: None,
             mesh_geo: GrowBuf::default(),
+            mesh_paint: GrowBuf::default(),
             mesh_parts: Vec::new(),
             part_ubuf: None,
             part_ubuf_cap: 0,
@@ -851,6 +872,17 @@ impl Scene {
             self.mesh_parts.push((start, verts.len() as u32 - start));
         }
         self.mesh_geo.write(device, queue, "mesh_geo", bytemuck::cast_slice(&verts));
+        // Keep the paint buffer valid and the same length (all-unpainted) so the
+        // draw can always bind it; painting overwrites it via `upload_mesh_paint`.
+        let zero = vec![[0.0f32; 4]; verts.len()];
+        self.mesh_paint.write(device, queue, "mesh_paint", bytemuck::cast_slice(&zero));
+    }
+
+    /// Overwrite the per-vertex paint tint (rgb + coverage in w), one entry per
+    /// vertex in the SAME order/count as `upload_mesh_geometry` produced (3 per
+    /// triangle, parts concatenated). Painting rewrites only this buffer.
+    pub fn upload_mesh_paint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, paint: &[[f32; 4]]) {
+        self.mesh_paint.write(device, queue, "mesh_paint", bytemuck::cast_slice(paint));
     }
 
     /// Rewrite the per-part placement + tint uniforms — the ONLY thing a drag
@@ -1194,10 +1226,13 @@ impl Scene {
             if show_mesh {
                 // One draw per part: static local geometry (bound once) + the
                 // part's placement/tint via a dynamic uniform offset.
-                if let (Some(geo), Some(pbg)) = (self.mesh_geo.as_ref(), &self.part_bind_group) {
+                if let (Some(geo), Some(paint), Some(pbg)) =
+                    (self.mesh_geo.as_ref(), self.mesh_paint.as_ref(), &self.part_bind_group)
+                {
                     if !self.mesh_parts.is_empty() {
                         pass.set_pipeline(&self.mesh_pipeline);
                         pass.set_vertex_buffer(0, geo.slice(..));
+                        pass.set_vertex_buffer(1, paint.slice(..));
                         for (i, &(off, count)) in self.mesh_parts.iter().enumerate() {
                             if count == 0 {
                                 continue;
