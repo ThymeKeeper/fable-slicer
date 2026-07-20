@@ -137,10 +137,15 @@ struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f3
     return vec4<f32>(i.color, 1.0);
 }
 
-// --- selection spotlight: a translucent gradient pool laid on z=0 that traces
-// the selected object's footprint. Straight (non-premultiplied) RGBA per vertex;
-// alpha fades from the silhouette outward. Depth is ignored (it paints over the
-// grid) but it is drawn before the opaque mesh, so the object overdraws its core. ---
+// --- flat z=0 quads, two consumers: the bed's backdrop fill (opaque, plain
+// alpha-over via fs_glow) and the selection spotlight (fs_glow_max + MAX
+// blending). The spotlight is a splat soup — one gradient quad per silhouette
+// edge plus corner fans — whose overlaps MUST NOT stack: with premultiplied
+// output and max blending, overlapping splats resolve to the brightest
+// (nearest-edge) value, so the pool reads as the outline's distance field
+// instead of a pile of translucent wedges. Depth is ignored (it paints over
+// the grid) but it is drawn before the opaque mesh, so the object overdraws
+// its core. ---
 struct GlowOut { @builtin(position) clip: vec4<f32>, @location(0) rgba: vec4<f32> };
 @vertex fn vs_glow(@location(0) p: vec3<f32>, @location(1) rgba: vec4<f32>) -> GlowOut {
     var o: GlowOut;
@@ -150,6 +155,9 @@ struct GlowOut { @builtin(position) clip: vec4<f32>, @location(0) rgba: vec4<f32
 }
 @fragment fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
     return i.rgba;
+}
+@fragment fn fs_glow_max(i: GlowOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(i.rgba.rgb * i.rgba.a, i.rgba.a);
 }
 
 // --- toolpath beads (instanced boxes) ---
@@ -404,6 +412,10 @@ pub struct Scene {
     line_vbuf: GrowBuf,
     line_count: u32,
     glow_pipeline: wgpu::RenderPipeline,
+    /// The selection spotlight's own pipeline: premultiplied + MAX blending,
+    /// so the splat soup's overlaps take the nearest-edge value instead of
+    /// stacking into bright wedges.
+    spot_pipeline: wgpu::RenderPipeline,
     glow_vbuf: GrowBuf,
     glow_count: u32,
     // Night-sky backdrop: a fixed catalog of star billboards (base quad +
@@ -655,10 +667,9 @@ impl Scene {
             None,
         );
 
-        // Selection spotlight: alpha-blended like the label, but keyed off the
-        // group(0) uniforms only (no texture), with depth reads OFF so the pool
-        // paints over the bed grid. Drawn before the opaque mesh, which
-        // overdraws the object's own footprint.
+        // Flat z=0 quads (bed backdrop fill): alpha-blended like the label, but
+        // keyed off the group(0) uniforms only (no texture), with depth reads
+        // OFF so it paints over the stars.
         let glow_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_glow", "fs_glow",
             &[wgpu::VertexBufferLayout {
@@ -677,6 +688,37 @@ impl Scene {
                     src_factor: wgpu::BlendFactor::One,
                     dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                     operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+            wgpu::CompareFunction::Always,
+            None,
+        );
+
+        // Selection spotlight: same flat quads, but premultiplied + MAX
+        // compositing — overlapping splats take the brighter (nearest-edge)
+        // fragment instead of stacking, so the gradient pool reads as one
+        // distance field however much its edge quads and corner fans overlap.
+        // (Max also means the grid stays visible under the pool rather than
+        // being dimmed — a lighting cue, not a coat of paint.)
+        let spot_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_glow", "fs_glow_max",
+            &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GlowVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+            }],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Max,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Max,
                 },
             },
             false,
@@ -774,6 +816,7 @@ impl Scene {
             line_vbuf: GrowBuf::default(),
             line_count: 0,
             glow_pipeline,
+            spot_pipeline,
             glow_vbuf: GrowBuf::default(),
             glow_count: 0,
             star_pipeline,
@@ -1196,7 +1239,7 @@ impl Scene {
             // the footprint. Model view only.
             if show_mesh && self.glow_count > 0 {
                 if let Some(buf) = self.glow_vbuf.as_ref() {
-                    pass.set_pipeline(&self.glow_pipeline);
+                    pass.set_pipeline(&self.spot_pipeline);
                     pass.set_vertex_buffer(0, buf.slice(..));
                     pass.draw(0..self.glow_count, 0..1);
                 }

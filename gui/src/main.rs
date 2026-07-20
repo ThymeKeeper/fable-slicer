@@ -433,6 +433,15 @@ struct FlowCalUi<'a> {
     status: &'a mut String,
 }
 
+/// Same shape for the guided pressure-advance tower: arm the print, take the
+/// measured best-corner height, report to the status line.
+struct PaCalUi<'a> {
+    host_ready: bool,
+    start: &'a mut bool,
+    height_mm: &'a mut f64,
+    status: &'a mut String,
+}
+
 /// The Filament packaging-card rows, written once for both surfaces (see
 /// [`FilamentFields`]). `show_standby` = toolchanger (docked tools carry a
 /// standby setpoint); line width and layer height are read-only context for
@@ -445,6 +454,7 @@ fn filament_card_rows(
     line_width_mm: f64,
     layer_height_mm: f64,
     cal: FlowCalUi<'_>,
+    pa_cal: PaCalUi<'_>,
 ) {
     revert_row(ui, f.nozzle_temp_c, &base.nozzle_temp_c, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, config::NOZZLE_TEMP_MIN_C..=config::NOZZLE_TEMP_MAX_C), "nozzle °C",
@@ -528,9 +538,56 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.0..=80.0), "max flow mm³/s",
             mf_hint);
     });
-    revert_row(ui, f.pressure_advance, &base.pressure_advance, |ui, v| {
+    let pa = f.pressure_advance;
+    revert_row(ui, &mut *pa, &base.pressure_advance, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+    });
+    // Guided PA calibration: print a single-wall tower whose PA ramps with
+    // height, find the crispest corners, enter that height → pin PA.
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
+            .on_hover_text(format!(
+                "Print a single-wall {:.0} mm square tower whose pressure advance ramps \
+                 0 → {:.2} with height (the sweep is baked into the g-code — nothing to \
+                 run on the printer). Seams stack on one corner; judge the other three \
+                 under raking light: bulged corners = PA too low, gaps right after a \
+                 corner = too high. Measure the height of the crispest band and enter \
+                 it below. Clear the bed first.",
+                engine::PA_TOWER_MM,
+                engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::PA_TOWER_H_MM,
+            ))
+            .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
+            .clicked()
+        {
+            *pa_cal.start = true;
+        }
+        ui.add(
+            egui::DragValue::new(pa_cal.height_mm)
+                .speed(0.1)
+                .range(0.0..=engine::PA_TOWER_H_MM)
+                .fixed_decimals(1)
+                .suffix(" mm"),
+        )
+        .on_hover_text("Height up the tower where the corners look crispest — neither bulged nor starved.");
+        if ui
+            .button("apply")
+            .on_hover_text(format!(
+                "Pin pressure advance = {} + {} × height.",
+                engine::PA_TOWER_START,
+                engine::PA_TOWER_FACTOR
+            ))
+            .clicked()
+            && *pa_cal.height_mm > 0.0
+        {
+            let before = *pa;
+            *pa = engine::pa_from_height(before, *pa_cal.height_mm);
+            *pa_cal.status = format!(
+                "pressure advance {before:.4} → {:.4} (best corners at {:.1} mm)",
+                *pa, *pa_cal.height_mm
+            );
+        }
     });
     revert_row(ui, f.bridge_flow, &base.bridge_flow, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.3..=2.0), "bridge flow",
@@ -881,6 +938,34 @@ struct SceneObject {
     /// actually changes. Interior-mutable so the `&self` accessors can fill it
     /// lazily (GUI is single-threaded).
     bounds_cache: std::cell::Cell<Option<BoundsCache>>,
+    /// Memoized rotated/scaled XY convex hull (no placement) — the true footprint
+    /// the overlap check tests, so two interlocking L-shapes whose bounding boxes
+    /// overlap but whose actual footprints don't aren't flagged as colliding. Same
+    /// `(rot_deg, scale)` keying as `bounds_cache`; placement is a pure XY shift the
+    /// caller adds. `RefCell` (not `Cell`) because the hull is a `Vec`, not `Copy`.
+    hull_cache: std::cell::RefCell<Option<HullCache>>,
+    /// Memoized rotated/scaled XY silhouette (true footprint, no placement) — the
+    /// EXACT footprint, used only when the cheap AABB+hull checks are ambiguous
+    /// (two concave footprints nested so their hulls overlap but shapes don't).
+    /// Same `(rot_deg, scale)` keying; computed by a coarse slice, so it's only
+    /// paid when a hull-overlap actually needs disambiguating.
+    sil_cache: std::cell::RefCell<Option<SilCache>>,
+}
+
+/// Cached rotated/scaled XY convex hull under `(rot_deg, scale)` — see
+/// `SceneObject::footprint_hull`.
+struct HullCache {
+    rot_deg: [f64; 3],
+    scale: f64,
+    hull: Vec<[f64; 2]>,
+}
+
+/// Cached rotated/scaled XY silhouette under `(rot_deg, scale)` — see
+/// `SceneObject::footprint_silhouette`.
+struct SilCache {
+    rot_deg: [f64; 3],
+    scale: f64,
+    poly: geo2d::Polygons,
 }
 
 /// Signature of the inputs that determine slice GEOMETRY (not paint): the
@@ -930,6 +1015,8 @@ impl SceneObject {
             scale: 1.0,
             pos: [0.0, 0.0],
             bounds_cache: std::cell::Cell::new(None),
+            hull_cache: std::cell::RefCell::new(None),
+            sil_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -960,6 +1047,75 @@ impl SceneObject {
     fn footprint(&self) -> (f64, f64, f64, f64, f64) {
         let b = self.bounds6();
         (b.0, b.1, b.2, b.3, b.4)
+    }
+
+    /// The rotated/scaled XY convex hull (no placement translation), memoized on
+    /// `(rot_deg, scale)`. This is the footprint the overlap check uses — an
+    /// L-bracket hulls to ~half its bbox, so two of them whose boxes overlap but
+    /// whose real footprints don't no longer read as colliding. The convex hull is
+    /// affine-invariant, so the caller just adds the placement XY shift.
+    fn footprint_hull(&self) -> Vec<[f64; 2]> {
+        if let Some(c) = self.hull_cache.borrow().as_ref() {
+            if c.rot_deg == self.rot_deg && c.scale == self.scale {
+                return c.hull.clone();
+            }
+        }
+        let lin =
+            mesh::Transform { rotation: euler_matrix(self.rot_deg), scale: self.scale, ..Default::default() };
+        let pts: Vec<[f64; 2]> = self
+            .parts
+            .iter()
+            .flat_map(|p| &p.mesh.vertices)
+            .map(|&v| {
+                let p = lin.apply_linear(v);
+                [p[0], p[1]]
+            })
+            .collect();
+        let hull = convex_hull_2d(pts);
+        *self.hull_cache.borrow_mut() =
+            Some(HullCache { rot_deg: self.rot_deg, scale: self.scale, hull: hull.clone() });
+        hull
+    }
+
+    /// The rotated/scaled XY silhouette — the object's EXACT footprint (a possibly
+    /// concave, multi-contour shadow), no placement translation, memoized on
+    /// `(rot_deg, scale)`. Where the convex hull over-fills a concavity (two L's
+    /// nested so their hulls touch but their shapes don't), this is correct.
+    /// Computed by a COARSE slice of the placed mesh and unioning every layer
+    /// (the shadow needs no fine resolution), so it stays a few ms even on big
+    /// meshes; the caller only reaches for it when a hull-overlap is ambiguous.
+    fn footprint_silhouette(&self) -> geo2d::Polygons {
+        if let Some(c) = self.sil_cache.borrow().as_ref() {
+            if c.rot_deg == self.rot_deg && c.scale == self.scale {
+                return c.poly.clone();
+            }
+        }
+        // Rotated+scaled, bottom dropped to z=0 (so the slicer sees it), NO xy
+        // shift — same frame as `footprint_hull`, placement is added by the caller.
+        let (_, _, _, _, minz) = self.footprint();
+        let drop = mesh::Transform {
+            rotation: euler_matrix(self.rot_deg),
+            scale: self.scale,
+            translation: [0.0, 0.0, -minz],
+        };
+        let lh = (self.height().max(0.2) / 16.0).clamp(0.5, 5.0);
+        let mut shadow = geo2d::Polygons::new();
+        for part in &self.parts {
+            let tm = mesh::Mesh {
+                vertices: part.mesh.vertices.iter().map(|&v| drop.apply(v)).collect(),
+                triangles: part.mesh.triangles.clone(),
+            };
+            let layers = engine::slice_mesh(
+                &tm,
+                engine::SliceParams { layer_height_mm: lh, first_layer_height_mm: lh },
+            );
+            for l in &layers {
+                shadow = geo2d::union(&shadow, &l.polygons);
+            }
+        }
+        *self.sil_cache.borrow_mut() =
+            Some(SilCache { rot_deg: self.rot_deg, scale: self.scale, poly: shadow.clone() });
+        shadow
     }
 
     /// Printed height (mm): the z-span of the rotated/scaled parts. The object
@@ -1040,6 +1196,159 @@ fn bed_of_pos(x: f64, bed_x: f64) -> usize {
 fn aabb_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
     const EPS: f64 = 0.05;
     a[0] < b[2] - EPS && a[2] > b[0] + EPS && a[1] < b[3] - EPS && a[3] > b[1] + EPS
+}
+
+/// Do two convex polygons (CCW loops of world-XY points, mm) overlap by more than
+/// a hair? Separating Axis Theorem: they're disjoint iff some edge normal of
+/// either separates their projections. Used on the objects' footprint hulls so an
+/// L-bracket beside its interlocking copy — boxes overlapping, footprints not —
+/// isn't flagged as a collision. Degenerate (<3 pt) hulls fall back to no overlap.
+fn convex_polys_overlap(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
+    if a.len() < 3 || b.len() < 3 {
+        return false;
+    }
+    // Same "more than a hair" slack as `aabb_overlap`, so exactly-touching
+    // footprints (what auto-arrange leaves) don't read as collisions.
+    const EPS: f64 = 0.05;
+    let project = |poly: &[[f64; 2]], ax: f64, ay: f64| {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &p in poly {
+            let d = p[0] * ax + p[1] * ay;
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+        (lo, hi)
+    };
+    for poly in [a, b] {
+        let n = poly.len();
+        for k in 0..n {
+            let p = poly[k];
+            let q = poly[(k + 1) % n];
+            // Edge normal (not normalized — only its sign/ordering matters). The
+            // EPS gap is scaled by the axis length so it stays ~0.05 mm.
+            let (ax, ay) = (q[1] - p[1], -(q[0] - p[0]));
+            let len = (ax * ax + ay * ay).sqrt();
+            if len < 1.0e-9 {
+                continue;
+            }
+            let (alo, ahi) = project(a, ax, ay);
+            let (blo, bhi) = project(b, ax, ay);
+            let slack = EPS * len;
+            if ahi <= blo + slack || bhi <= alo + slack {
+                return false; // a separating axis → disjoint
+            }
+        }
+    }
+    true
+}
+
+/// Shift every point of `p` by `(dx, dy)` mm — places a local footprint (hull or
+/// silhouette, both in the object's rotated/scaled frame) into world coordinates.
+fn translate_polys(p: &geo2d::Polygons, dx: f64, dy: f64) -> geo2d::Polygons {
+    let mut out = geo2d::Polygons::new();
+    for c in &p.contours {
+        out.contours.push(geo2d::Contour::new(
+            c.points
+                .iter()
+                .map(|pt| geo2d::Point::from_mm(pt.x_mm() + dx, pt.y_mm() + dy))
+                .collect(),
+        ));
+    }
+    out
+}
+
+/// Triangle soup for the selection pool: a gradient quad per silhouette edge
+/// plus arc fans at convex corners, each splat carrying alpha = falloff of the
+/// distance to the outline. Composited with MAX blending (the scene's spot
+/// pipeline), so wherever splats overlap the brighter — nearer-edge — value
+/// wins and the pool reads as the outline's plain distance field. The old
+/// miter-ring stitch folded onto itself wherever the pool was wider than a
+/// concave feature, and alpha-over stacked every fold — rounded regions read
+/// as a fan of separate spotlights.
+fn spotlight_band(sil: &geo2d::Polygons, width: f64, col: [f32; 3]) -> Vec<[f32; 7]> {
+    // (fraction of width, alpha): brightest at the wall, feathering to zero.
+    const STOPS: [(f64, f32); 3] = [(0.0, 0.55), (0.4, 0.20), (1.0, 0.0)];
+    // Convex corners fan at ~20° steps — the chord error at full pool width
+    // is far below the gradient's visible resolution.
+    const FAN_STEP_RAD: f64 = 0.35;
+    let vert = |x: f64, y: f64, a: f32| -> [f32; 7] {
+        [x as f32, y as f32, 0.0, col[0], col[1], col[2], a]
+    };
+    let mut out: Vec<[f32; 7]> = Vec::new();
+    // Holes (CW) cast no glow — the pool rings the outline, not its cutouts.
+    for c in &sil.contours {
+        if c.points.len() < 3 || !c.is_ccw() {
+            continue;
+        }
+        // Drop coincident consecutive points — a zero-length edge has no normal.
+        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(c.points.len());
+        for p in &c.points {
+            let q = [p.x_mm(), p.y_mm()];
+            if pts.last().is_none_or(|l| (l[0] - q[0]).hypot(l[1] - q[1]) > 1e-6) {
+                pts.push(q);
+            }
+        }
+        while pts.len() > 1 {
+            let (f, l) = (pts[0], *pts.last().unwrap());
+            if (f[0] - l[0]).hypot(f[1] - l[1]) > 1e-6 {
+                break;
+            }
+            pts.pop();
+        }
+        let n = pts.len();
+        if n < 3 {
+            continue;
+        }
+        // Outward edge normals (CCW loop: edge a→b faces (dy, −dx)).
+        let en: Vec<[f64; 2]> = (0..n)
+            .map(|k| {
+                let (a, b) = (pts[k], pts[(k + 1) % n]);
+                let d = [b[0] - a[0], b[1] - a[1]];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+                [d[1] / l, -d[0] / l]
+            })
+            .collect();
+        for k in 0..n {
+            let (a, b, nk) = (pts[k], pts[(k + 1) % n], en[k]);
+            for w in STOPS.windows(2) {
+                let ((f0, a0), (f1, a1)) = (w[0], w[1]);
+                let (r0, r1) = (width * f0, width * f1);
+                let i0 = vert(a[0] + nk[0] * r0, a[1] + nk[1] * r0, a0);
+                let i1 = vert(b[0] + nk[0] * r0, b[1] + nk[1] * r0, a0);
+                let o0 = vert(a[0] + nk[0] * r1, a[1] + nk[1] * r1, a1);
+                let o1 = vert(b[0] + nk[0] * r1, b[1] + nk[1] * r1, a1);
+                out.extend_from_slice(&[i0, i1, o1, i0, o1, o0]);
+            }
+            // Fan the pie slice the two edge quads leave open at a convex
+            // vertex, sweeping this edge's normal to the next one's. Concave
+            // vertices need nothing: there the quads overlap, and max-blending
+            // resolves the overlap to the nearer edge.
+            let nn = en[(k + 1) % n];
+            if nk[0] * nn[1] - nk[1] * nn[0] <= 1e-9 {
+                continue;
+            }
+            let v = pts[(k + 1) % n];
+            let th0 = nk[1].atan2(nk[0]);
+            let dth = (nn[1].atan2(nn[0]) - th0).rem_euclid(std::f64::consts::TAU);
+            let steps = (dth / FAN_STEP_RAD).ceil().max(1.0) as usize;
+            for s in 0..steps {
+                let t0 = th0 + dth * s as f64 / steps as f64;
+                let t1 = th0 + dth * (s + 1) as f64 / steps as f64;
+                let (d0, d1) = ([t0.cos(), t0.sin()], [t1.cos(), t1.sin()]);
+                for w in STOPS.windows(2) {
+                    let ((f0, a0), (f1, a1)) = (w[0], w[1]);
+                    let (r0, r1) = (width * f0, width * f1);
+                    let i0 = vert(v[0] + d0[0] * r0, v[1] + d0[1] * r0, a0);
+                    let i1 = vert(v[0] + d1[0] * r0, v[1] + d1[1] * r0, a0);
+                    let o0 = vert(v[0] + d0[0] * r1, v[1] + d0[1] * r1, a1);
+                    let o1 = vert(v[0] + d1[0] * r1, v[1] + d1[1] * r1, a1);
+                    out.extend_from_slice(&[i0, i1, o1, i0, o1, o0]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Shelf-pack footprint rectangles onto beds: tallest-first fills shelves
@@ -1387,10 +1696,14 @@ impl BeadGrid {
 /// Cached world bounds of one scene object, refreshed by `rebuild_scene` so
 /// the bounds/collision checks (run for tinting, the transform card, and the
 /// Send gate) don't re-walk mesh vertices every frame.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ObjBounds {
     /// World XY axis-aligned bounds: `[minx, miny, maxx, maxy]`.
     aabb: [f64; 4],
+    /// World XY convex hull (CCW), the object's true footprint — a cheap
+    /// AABB test rejects far-apart pairs, then this catches interlocking
+    /// concave shapes (two L-brackets) whose boxes overlap but footprints don't.
+    hull: Vec<[f64; 2]>,
     /// Printed height (mm); the object rests on z=0, occupying `[0, height]`.
     height: f64,
     /// Bed index (by world X), so collisions only pair same-bed objects.
@@ -1440,6 +1753,12 @@ struct App {
     /// Measured wall thickness (mm) entered after the flow-cal print; "apply"
     /// turns it into the filament's `extrusion_multiplier`.
     flow_cal_mm: f64,
+    /// Pressure-advance calibration: the Filament-panel button arms this; the
+    /// dispatch generates the PA tower and sends it to the printer.
+    start_pa_cal: bool,
+    /// Best-corner height (mm) entered after the PA tower print; "apply"
+    /// turns it into the filament's `pressure_advance`.
+    pa_cal_mm: f64,
     /// A profile switch requested while settings carry unsaved (*) edits —
     /// held here until the user confirms discarding them.
     pending_switch: Option<(String, String, String)>,
@@ -1766,6 +2085,8 @@ impl App {
             profile_dialog: None,
             start_flow_cal: false,
             flow_cal_mm: 0.0,
+            start_pa_cal: false,
+            pa_cal_mm: 0.0,
             pending_switch: None,
             pending_slot: None,
             active_tool_tab: 0,
@@ -2597,6 +2918,8 @@ impl App {
                             scale: 1.0,
                             pos: [0.0, 0.0],
                             bounds_cache: std::cell::Cell::new(None),
+            hull_cache: std::cell::RefCell::new(None),
+            sil_cache: std::cell::RefCell::new(None),
                         };
                         // pos = the baked footprint center reproduces the
                         // file's build placement (SceneObject::transform
@@ -2687,6 +3010,8 @@ impl App {
             scale: src.scale,
             pos,
             bounds_cache: std::cell::Cell::new(None),
+            hull_cache: std::cell::RefCell::new(None),
+            sil_cache: std::cell::RefCell::new(None),
         };
         self.objects.push(copy);
         self.selected = Some(self.objects.len() - 1);
@@ -2826,16 +3151,36 @@ impl App {
         if !axes.is_empty() {
             parts.push(format!("outside build volume ({})", axes.join("/")));
         }
-        // Footprint (AABB) overlap with any other object sharing this bed.
-        let collides = self
-            .obj_bounds
-            .iter()
-            .enumerate()
-            .any(|(j, bj)| j != i && bj.bed == b.bed && aabb_overlap(b.aabb, bj.aabb));
+        // Footprint overlap with any other object sharing this bed, cheapest test
+        // first: AABB (box ⊇ hull) rejects far pairs, the convex hull rejects most
+        // near-but-clear pairs, and only a genuinely ambiguous hull-overlap pays
+        // for the exact silhouette — so two interlocking L-brackets nested so their
+        // hulls touch but their real footprints don't aren't flagged as colliding.
+        let collides = self.obj_bounds.iter().enumerate().any(|(j, bj)| {
+            j != i
+                && bj.bed == b.bed
+                && aabb_overlap(b.aabb, bj.aabb)
+                && convex_polys_overlap(&b.hull, &bj.hull)
+                && self.footprints_overlap(i, j)
+        });
         if collides {
             parts.push("overlapping another object".to_string());
         }
         (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// Do objects `i` and `j` truly overlap on the bed? Their exact silhouettes,
+    /// placed in world coordinates (the memoized local footprint + the pure XY
+    /// placement shift), intersected. Only called once the cheap AABB+hull checks
+    /// are ambiguous, so the silhouette (a coarse slice) is rarely computed.
+    fn footprints_overlap(&self, i: usize, j: usize) -> bool {
+        let world = |k: usize| -> geo2d::Polygons {
+            let o = &self.objects[k];
+            let (minx, miny, maxx, maxy, _) = o.footprint();
+            let (tx, ty) = (o.pos[0] - (minx + maxx) / 2.0, o.pos[1] - (miny + maxy) / 2.0);
+            translate_polys(&o.footprint_silhouette(), tx, ty)
+        };
+        !geo2d::intersection(&world(i), &world(j)).is_empty()
     }
 
     /// Names of active-bed objects that can't be printed (off the bed or
@@ -3646,81 +3991,39 @@ impl App {
     }
 
     /// Geometry for the selection spotlight: a translucent gradient band on the
-    /// bed (z=0) that hugs the selected object's footprint — brightest at the
-    /// silhouette, fading out into the bed. Returned as `[x,y,z,r,g,b,a]` verts
-    /// (a triangle soup). Empty when nothing is selected. Uses the convex hull
-    /// of the object's world-projected vertices: a clean single loop, cheap
-    /// enough to rebuild on every drag/rotate frame (same order as the mesh
-    /// upload that already walks these vertices).
+    /// bed (z=0) that hugs the selected object's TRUE footprint — brightest at the
+    /// silhouette, fading out into the bed. Returned as `[x,y,z,r,g,b,a]` verts (a
+    /// triangle soup). Empty when nothing is selected. Uses the same silhouette the
+    /// overlap check does (the real shape, e.g. an L, not its convex hull), placed
+    /// by the cached local footprint + the placement shift.
     fn selection_spotlight(&self) -> Vec<[f32; 7]> {
         let Some(i) = self.selected else { return Vec::new() };
         let Some(obj) = self.objects.get(i) else { return Vec::new() };
-        let t = obj.transform();
-        let mut pts: Vec<[f64; 2]> = Vec::new();
-        for v in obj.parts.iter().flat_map(|p| &p.mesh.vertices) {
-            let w = t.apply(*v);
-            pts.push([w[0], w[1]]);
-        }
-        let hull = convex_hull_2d(pts);
-        let n = hull.len();
-        if n < 3 {
-            return Vec::new();
-        }
+        let (minx, miny, maxx, maxy, _) = obj.footprint();
+        let (tx, ty) = (obj.pos[0] - (minx + maxx) / 2.0, obj.pos[1] - (miny + maxy) / 2.0);
+        let sil = translate_polys(&obj.footprint_silhouette(), tx, ty);
 
-        // Outward vertex normals: the average of the two adjacent edges'
-        // outward normals. In a CCW loop an edge a→b's outward normal is
-        // (dy, -dx). Averaging gives a miter direction with no corner spikes.
-        let edge_n = |a: [f64; 2], b: [f64; 2]| {
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
-            [d[1] / l, -d[0] / l]
-        };
-        let mut nrm = vec![[0.0f64; 2]; n];
-        for k in 0..n {
-            let n0 = edge_n(hull[(k + n - 1) % n], hull[k]);
-            let n1 = edge_n(hull[k], hull[(k + 1) % n]);
-            let s = [n0[0] + n1[0], n0[1] + n1[1]];
-            let l = (s[0] * s[0] + s[1] * s[1]).sqrt();
-            nrm[k] = if l < 1e-6 { n1 } else { [s[0] / l, s[1] / l] };
-        }
-
-        // Pool width scales with the footprint, clamped to a sane range.
+        // Pool width scales with the footprint's overall span, clamped to a sane range.
         let (mut mnx, mut mny, mut mxx, mut mxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for p in &hull {
-            mnx = mnx.min(p[0]);
-            mny = mny.min(p[1]);
-            mxx = mxx.max(p[0]);
-            mxy = mxy.max(p[1]);
+        for c in &sil.contours {
+            for p in &c.points {
+                mnx = mnx.min(p.x_mm());
+                mny = mny.min(p.y_mm());
+                mxx = mxx.max(p.x_mm());
+                mxy = mxy.max(p.y_mm());
+            }
+        }
+        if mnx > mxx {
+            return Vec::new();
         }
         let diag = ((mxx - mnx).powi(2) + (mxy - mny).powi(2)).sqrt();
         let width = (diag * 0.18).clamp(12.0, 45.0);
 
         // Warm accent glow (the same "accent proper" the old highlight used).
         let (_, col) = mesh_tints(self.accent);
-        // Concentric rings offset outward from the silhouette; alpha → 0.
-        let rings: [(f64, f32); 3] = [(0.0, 0.55), (width * 0.4, 0.20), (width, 0.0)];
-        let ring_at = |r: f64| -> Vec<[f64; 2]> {
-            (0..n).map(|k| [hull[k][0] + nrm[k][0] * r, hull[k][1] + nrm[k][1] * r]).collect()
-        };
-        let ring_pts: Vec<Vec<[f64; 2]>> = rings.iter().map(|&(r, _)| ring_at(r)).collect();
-
-        let vert = |p: [f64; 2], a: f32| -> [f32; 7] {
-            [p[0] as f32, p[1] as f32, 0.0, col[0], col[1], col[2], a]
-        };
-        let mut out: Vec<[f32; 7]> = Vec::new();
-        for b in 0..rings.len() - 1 {
-            let (inner, ai) = (&ring_pts[b], rings[b].1);
-            let (outer, ao) = (&ring_pts[b + 1], rings[b + 1].1);
-            for k in 0..n {
-                let k2 = (k + 1) % n;
-                let i0 = vert(inner[k], ai);
-                let i1 = vert(inner[k2], ai);
-                let o0 = vert(outer[k], ao);
-                let o1 = vert(outer[k2], ao);
-                out.extend_from_slice(&[i0, i1, o1, i0, o1, o0]);
-            }
-        }
-        out
+        // The pool is a soft cue — a light simplify keeps the splat count sane
+        // on dense scanned/CAD outlines without moving the visible gradient.
+        spotlight_band(&geo2d::simplify(&sil, 0.3), width, col)
     }
 
     fn rebuild_scene(&mut self, rs: &eframe::egui_wgpu::RenderState) {
@@ -3768,8 +4071,13 @@ impl App {
                     .map(|o| {
                         let (minx, miny, maxx, maxy, _) = o.footprint();
                         let (hw, hh) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+                        // Placement is a pure XY shift of the footprint's center onto
+                        // `pos` — apply it to the memoized local hull for the world hull.
+                        let (tx, ty) = (o.pos[0] - (minx + maxx) / 2.0, o.pos[1] - (miny + maxy) / 2.0);
+                        let hull = o.footprint_hull().iter().map(|p| [p[0] + tx, p[1] + ty]).collect();
                         ObjBounds {
                             aabb: [o.pos[0] - hw, o.pos[1] - hh, o.pos[0] + hw, o.pos[1] + hh],
+                            hull,
                             height: o.height(),
                             bed: bed_of_pos(o.pos[0], bx_cache),
                         }
@@ -4635,177 +4943,6 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let s = &mut self.settings;
                 let pins = &mut self.pins;
-                tier_section(ui, "Quality", TierKind::Process, true, |ui| {
-                    let lh_hint = format!(
-                        "Height of each printed layer. Smaller = finer detail but slower.\n\n\
-                         One corner of the flow triangle: every mm/s of print speed extrudes a bead of \
-                         line width × layer height, and the hotend can only melt `max flow` mm³ per second. \
-                         The speed ceiling is therefore {}. \
-                         Thicker layers lower that ceiling — unpinned feature speeds follow it live.",
-                        flow_ceiling_text(s)
-                    );
-                    revert_row(ui, &mut s.layer_height_mm, &self.baseline.layer_height_mm, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0.05..=0.4), "layer mm",
-                            lh_hint);
-                    });
-                    revert_row(ui, &mut s.first_layer_height_mm, &self.baseline.first_layer_height_mm, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0.1..=0.4), "first layer mm",
-                            "Thickness of the first layer — often thicker for bed adhesion.");
-                    });
-                    auto_slider(ui, &mut s.line_width_mm, 0.1..=1.5, "line width mm",
-                        &mut pins.line_width, config::derived_line_width_mm(s.nozzle_diameter_mm),
-                        profile_pins.line_width, self.baseline.line_width_mm,
-                        "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
-                    revert_row(ui, &mut s.seam_mode, &self.baseline.seam_mode, |ui, v| {
-                        seam_combo(ui, v)
-                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
-                    });
-                    revert_row(ui, &mut s.elephant_foot_mm, &self.baseline.elephant_foot_mm, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "elephant foot mm",
-                            "Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
-                    });
-                    if s.tool_count > 1 {
-                        revert_row(ui, &mut s.blend_band_mm, &self.baseline.blend_band_mm, |ui, v| {
-                            hslider(ui, true, egui::Slider::new(v, 0.2..=3.0), "blend band mm",
-                                "Tallest dither repeat a blend may have and still read as one color \
-                                 at viewing distance. Sets the blend picker's palette: mixes quantize \
-                                 to whole layers of a band ÷ layer-height cycle, so a ratio that \
-                                 would stripe visibly (one layer in ten = a 2 mm band) simply isn't \
-                                 offered. Tighten it for saturated colors; close greys fuse at \
-                                 longer repeats.");
-                        });
-                    }
-                    revert_row(ui, &mut s.xy_compensation_mm, &self.baseline.xy_compensation_mm, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, -0.5..=0.5), "XY comp mm",
-                            "Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
-                    });
-                    let vase = s.spiral_vase;
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.ironing, "ironing"))
-                        .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.")
-                        .on_disabled_hover_text("Forced off in spiral vase mode.");
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.fuzzy_skin, "fuzzy skin"))
-                        .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).")
-                        .on_disabled_hover_text("Forced off in spiral vase mode.");
-                    revert_row(ui, &mut s.fuzzy_skin_thickness_mm, &self.baseline.fuzzy_skin_thickness_mm, |ui, v| {
-                        hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(v, 0.05..=1.0), "fuzzy thickness mm",
-                            "Total jitter band, centered on the wall line.");
-                    });
-                    revert_row(ui, &mut s.fuzzy_skin_point_dist_mm, &self.baseline.fuzzy_skin_point_dist_mm, |ui, v| {
-                        hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(v, 0.2..=2.0), "fuzzy point dist mm",
-                            "Spacing between jittered points — smaller is noisier.");
-                    });
-                    // The engine ignores vase for multi-part plates — mirror it.
-                    ui.add_enabled(active_bed_parts <= 1, egui::Checkbox::new(&mut s.spiral_vase, "spiral vase"))
-                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).")
-                        .on_disabled_hover_text("The active bed holds multiple parts — spiral vase is one continuous wall, so the engine ignores it on multi-part plates.");
-                });
-                tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
-                    let vase = s.spiral_vase;
-                    revert_row(ui, &mut s.wall_count, &self.baseline.wall_count, |ui, v| {
-                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0..=99), "walls",
-                            "Number of perimeter loops (shell wall thickness). 0 = infill only, no perimeters.",
-                            "Spiral vase forces a single wall.");
-                    });
-                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.outer_wall_first, "outer wall first"))
-                        .on_hover_text("Print each island's outer wall before its inner walls — crisper overhang edges. Off (default): inner walls first, outer wall last, for the best flat-surface finish.")
-                        .on_disabled_hover_text("Spiral vase prints a single wall.");
-                    revert_row(ui, &mut s.top_layers, &self.baseline.top_layers, |ui, v| {
-                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0..=10), "top layers",
-                            "Number of solid layers on top surfaces.",
-                            "Spiral vase prints no top shells.");
-                    });
-                    revert_row(ui, &mut s.bottom_layers, &self.baseline.bottom_layers, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0..=10), "bottom layers",
-                            "Number of solid layers on bottom surfaces.");
-                    });
-                    revert_row(ui, &mut s.monotonic_solid, &self.baseline.monotonic_solid, |ui, v| {
-                        ui.checkbox(v, "monotonic top/bottom")
-                            .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
-                    });
-                });
-                tier_section(ui, "Infill", TierKind::Process, false, |ui| {
-                    let vase = s.spiral_vase;
-                    revert_row(ui, &mut s.infill_density, &self.baseline.infill_density, |ui, v| {
-                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0.0..=1.0), "density",
-                            "Sparse interior fill density (0 = hollow, 1 = solid).",
-                            "Spiral vase prints no infill.");
-                    });
-                    ui.add_enabled_ui(s.infill_density > 0.0 && !vase, |ui| {
-                        revert_row(ui, &mut s.sparse_pattern, &self.baseline.sparse_pattern, |ui, v| {
-                            pattern_combo(ui, "sparse fill", v)
-                                .on_hover_text("Pattern for the sparse interior infill.");
-                        });
-                    });
-                    revert_row(ui, &mut s.top_pattern, &self.baseline.top_pattern, |ui, v| {
-                        pattern_combo(ui, "top", v)
-                            .on_hover_text("Pattern for the top skin (the visible top surface) layers.");
-                    });
-                    revert_row(ui, &mut s.bottom_pattern, &self.baseline.bottom_pattern, |ui, v| {
-                        pattern_combo(ui, "bottom", v)
-                            .on_hover_text("Pattern for the bottom skin (the visible bottom surface) layers.");
-                    });
-                    revert_row(ui, &mut s.solid_pattern, &self.baseline.solid_pattern, |ui, v| {
-                        pattern_combo(ui, "solid fill", v)
-                            .on_hover_text("Pattern for buried solid fill, between the sparse infill and the skins.");
-                    });
-                    revert_row(ui, &mut s.infill_overlap, &self.baseline.infill_overlap, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "wall overlap",
-                            "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
-                    });
-                });
-                tier_section(ui, "Support", TierKind::Process, true, |ui| {
-                    let vase = s.spiral_vase;
-                    ui.add_enabled_ui(!vase, |ui| {
-                        revert_row(ui, &mut s.support_mode, &self.baseline.support_mode, |ui, v| {
-                            support_combo(ui, v)
-                                .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.")
-                                .on_disabled_hover_text("Forced off in spiral vase mode.");
-                        });
-                    });
-                    let has_support = s.support_mode != config::SupportMode::None && !vase;
-                    revert_row(ui, &mut s.support_overhang_angle_deg, &self.baseline.support_overhang_angle_deg, |ui, v| {
-                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=80.0), "overhang °",
-                            "Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
-                    });
-                    revert_row(ui, &mut s.support_density, &self.baseline.support_density, |ui, v| {
-                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=1.0), "density",
-                            "Infill density of grid supports.");
-                    });
-                    revert_row(ui, &mut s.support_xy_clearance_mm, &self.baseline.support_xy_clearance_mm, |ui, v| {
-                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=2.0), "xy gap mm",
-                            "Horizontal gap between support and the model (for easy removal).");
-                    });
-                    revert_row(ui, &mut s.support_z_gap_layers, &self.baseline.support_z_gap_layers, |ui, v| {
-                        hslider(ui, has_support, egui::Slider::new(v, 0..=5), "z-gap layers",
-                            "Empty layers between a support top and the part it holds up.");
-                    });
-                    revert_row(ui, &mut s.support_interface_layers, &self.baseline.support_interface_layers, |ui, v| {
-                        hslider(ui, has_support, egui::Slider::new(v, 0..=5), "interface",
-                            "Dense solid layers at the support top for a smoother overhang underside.");
-                    });
-                    revert_row(ui, &mut s.max_bridge_span_mm, &self.baseline.max_bridge_span_mm, |ui, v| {
-                        hslider(ui, !vase, egui::Slider::new(v, 0.0..=30.0), "bridge span mm",
-                            "Widest gap (supported on \u{2265}2 sides) filled with straight anchored bridge lines; wider gaps fall back to the bottom shell.");
-                    });
-                    revert_row(ui, &mut s.bridge_foothold_mm, &self.baseline.bridge_foothold_mm, |ui, v| {
-                        hslider(ui, !vase, egui::Slider::new(v, 0.0..=3.0), "bridge foothold mm",
-                            "How far an enclosed-ceiling bridge sheet lands onto the supported rim. Bigger = more solid under the sheet's ends, but inner perimeters start further from the hollow. 0 = no foothold band. Applies in every support mode.");
-                    });
-                });
-                tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
-                    revert_row(ui, &mut s.skirt_loops, &self.baseline.skirt_loops, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0..=5), "skirt loops",
-                            "Loops printed around the first layer to prime the nozzle. 0 = off.");
-                    });
-                    revert_row(ui, &mut s.skirt_gap_mm, &self.baseline.skirt_gap_mm, |ui, v| {
-                        hslider(ui, s.skirt_loops > 0, egui::Slider::new(v, 0.0..=10.0), "skirt gap mm",
-                            "Distance from the skirt to the model.");
-                    });
-                    revert_row(ui, &mut s.brim_loops, &self.baseline.brim_loops, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0..=20), "brim loops",
-                            "Loops attached around the first layer for adhesion. 0 = off.");
-                    });
-                });
                 tier_section(ui, "Filament", TierKind::Filament, false, |ui| {
                     // The packaging card: what the box says. The material
                     // class itself is profile data — switching filament
@@ -4820,6 +4957,16 @@ impl eframe::App for App {
                         start: &mut self.start_flow_cal,
                         measured_mm: &mut self.flow_cal_mm,
                         status: &mut self.status,
+                    };
+                    // The PA row reports through a local: `cal` above already
+                    // holds the status line mutably (one report per frame is
+                    // plenty — copied back after the card renders).
+                    let mut pa_cal_status = String::new();
+                    let pa_cal = PaCalUi {
+                        host_ready: host_set && !host_busy,
+                        start: &mut self.start_pa_cal,
+                        height_mm: &mut self.pa_cal_mm,
+                        status: &mut pa_cal_status,
                     };
                     // The blend palette lives at the top of the Filament
                     // card — blends are filament-tier facts (mixes of the
@@ -5266,15 +5413,189 @@ impl eframe::App for App {
                         // a shared heater ramps its one heater, so hide the row.
                         let show_standby = !s.single_heater();
                         if s.tool_count > 1 {
-                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, show_standby, line_w, layer_h, cal);
+                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, show_standby, line_w, layer_h, cal, pa_cal);
                             ui.separator();
                             cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, aux, exhaust);
                         } else {
-                            filament_card_rows(ui, FilamentFields::flat(s), &fb, false, line_w, layer_h, cal);
+                            filament_card_rows(ui, FilamentFields::flat(s), &fb, false, line_w, layer_h, cal, pa_cal);
                             ui.separator();
                             cooling_rows(ui, FilamentFields::flat(s), &fb, aux, exhaust);
                         }
+                        if !pa_cal_status.is_empty() {
+                            self.status = pa_cal_status;
+                        }
                     }
+                });
+                tier_section(ui, "Quality", TierKind::Process, false, |ui| {
+                    let lh_hint = format!(
+                        "Height of each printed layer. Smaller = finer detail but slower.\n\n\
+                         One corner of the flow triangle: every mm/s of print speed extrudes a bead of \
+                         line width × layer height, and the hotend can only melt `max flow` mm³ per second. \
+                         The speed ceiling is therefore {}. \
+                         Thicker layers lower that ceiling — unpinned feature speeds follow it live.",
+                        flow_ceiling_text(s)
+                    );
+                    revert_row(ui, &mut s.layer_height_mm, &self.baseline.layer_height_mm, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0.05..=0.4), "layer mm",
+                            lh_hint);
+                    });
+                    revert_row(ui, &mut s.first_layer_height_mm, &self.baseline.first_layer_height_mm, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0.1..=0.4), "first layer mm",
+                            "Thickness of the first layer — often thicker for bed adhesion.");
+                    });
+                    auto_slider(ui, &mut s.line_width_mm, 0.1..=1.5, "line width mm",
+                        &mut pins.line_width, config::derived_line_width_mm(s.nozzle_diameter_mm),
+                        profile_pins.line_width, self.baseline.line_width_mm,
+                        "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
+                    revert_row(ui, &mut s.seam_mode, &self.baseline.seam_mode, |ui, v| {
+                        seam_combo(ui, v)
+                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
+                    });
+                    revert_row(ui, &mut s.elephant_foot_mm, &self.baseline.elephant_foot_mm, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "elephant foot mm",
+                            "Shrink the first layer's outline inward to counter first-layer squish. 0 = off.");
+                    });
+                    if s.tool_count > 1 {
+                        revert_row(ui, &mut s.blend_band_mm, &self.baseline.blend_band_mm, |ui, v| {
+                            hslider(ui, true, egui::Slider::new(v, 0.2..=3.0), "blend band mm",
+                                "Tallest dither repeat a blend may have and still read as one color \
+                                 at viewing distance. Sets the blend picker's palette: mixes quantize \
+                                 to whole layers of a band ÷ layer-height cycle, so a ratio that \
+                                 would stripe visibly (one layer in ten = a 2 mm band) simply isn't \
+                                 offered. Tighten it for saturated colors; close greys fuse at \
+                                 longer repeats.");
+                        });
+                    }
+                    revert_row(ui, &mut s.xy_compensation_mm, &self.baseline.xy_compensation_mm, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, -0.5..=0.5), "XY comp mm",
+                            "Grow (+) or shrink (−) every layer's outline for dimensional accuracy. 0 = off.");
+                    });
+                    let vase = s.spiral_vase;
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.ironing, "ironing"))
+                        .on_hover_text("Re-traverse top surfaces with a hot nozzle and a trickle of flow to melt them smooth.")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.fuzzy_skin, "fuzzy skin"))
+                        .on_hover_text("Jitter the outer wall into a rough, textured surface (hides layer lines).")
+                        .on_disabled_hover_text("Forced off in spiral vase mode.");
+                    revert_row(ui, &mut s.fuzzy_skin_thickness_mm, &self.baseline.fuzzy_skin_thickness_mm, |ui, v| {
+                        hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(v, 0.05..=1.0), "fuzzy thickness mm",
+                            "Total jitter band, centered on the wall line.");
+                    });
+                    revert_row(ui, &mut s.fuzzy_skin_point_dist_mm, &self.baseline.fuzzy_skin_point_dist_mm, |ui, v| {
+                        hslider(ui, s.fuzzy_skin && !vase, egui::Slider::new(v, 0.2..=2.0), "fuzzy point dist mm",
+                            "Spacing between jittered points — smaller is noisier.");
+                    });
+                    // The engine ignores vase for multi-part plates — mirror it.
+                    ui.add_enabled(active_bed_parts <= 1, egui::Checkbox::new(&mut s.spiral_vase, "spiral vase"))
+                        .on_hover_text("One continuously rising outer wall above a solid bottom — no infill, no seams. Forces 1 wall / 0% infill / no supports (those controls gray out).")
+                        .on_disabled_hover_text("The active bed holds multiple parts — spiral vase is one continuous wall, so the engine ignores it on multi-part plates.");
+                });
+                tier_section(ui, "Walls & top/bottom", TierKind::Process, false, |ui| {
+                    let vase = s.spiral_vase;
+                    revert_row(ui, &mut s.wall_count, &self.baseline.wall_count, |ui, v| {
+                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0..=99), "walls",
+                            "Number of perimeter loops (shell wall thickness). 0 = infill only, no perimeters.",
+                            "Spiral vase forces a single wall.");
+                    });
+                    ui.add_enabled(!vase, egui::Checkbox::new(&mut s.outer_wall_first, "outer wall first"))
+                        .on_hover_text("Print each island's outer wall before its inner walls — crisper overhang edges. Off (default): inner walls first, outer wall last, for the best flat-surface finish.")
+                        .on_disabled_hover_text("Spiral vase prints a single wall.");
+                    revert_row(ui, &mut s.top_layers, &self.baseline.top_layers, |ui, v| {
+                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0..=10), "top layers",
+                            "Number of solid layers on top surfaces.",
+                            "Spiral vase prints no top shells.");
+                    });
+                    revert_row(ui, &mut s.bottom_layers, &self.baseline.bottom_layers, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0..=10), "bottom layers",
+                            "Number of solid layers on bottom surfaces.");
+                    });
+                    revert_row(ui, &mut s.monotonic_solid, &self.baseline.monotonic_solid, |ui, v| {
+                        ui.checkbox(v, "monotonic top/bottom")
+                            .on_hover_text("Print solid-fill lines in one strict sweep per surface for an even sheen.");
+                    });
+                });
+                tier_section(ui, "Infill", TierKind::Process, false, |ui| {
+                    let vase = s.spiral_vase;
+                    revert_row(ui, &mut s.infill_density, &self.baseline.infill_density, |ui, v| {
+                        hslider_lockout(ui, !vase, egui::Slider::new(v, 0.0..=1.0), "density",
+                            "Sparse interior fill density (0 = hollow, 1 = solid).",
+                            "Spiral vase prints no infill.");
+                    });
+                    ui.add_enabled_ui(s.infill_density > 0.0 && !vase, |ui| {
+                        revert_row(ui, &mut s.sparse_pattern, &self.baseline.sparse_pattern, |ui, v| {
+                            pattern_combo(ui, "sparse fill", v)
+                                .on_hover_text("Pattern for the sparse interior infill.");
+                        });
+                    });
+                    revert_row(ui, &mut s.top_pattern, &self.baseline.top_pattern, |ui, v| {
+                        pattern_combo(ui, "top", v)
+                            .on_hover_text("Pattern for the top skin (the visible top surface) layers.");
+                    });
+                    revert_row(ui, &mut s.bottom_pattern, &self.baseline.bottom_pattern, |ui, v| {
+                        pattern_combo(ui, "bottom", v)
+                            .on_hover_text("Pattern for the bottom skin (the visible bottom surface) layers.");
+                    });
+                    revert_row(ui, &mut s.solid_pattern, &self.baseline.solid_pattern, |ui, v| {
+                        pattern_combo(ui, "solid fill", v)
+                            .on_hover_text("Pattern for buried solid fill, between the sparse infill and the skins.");
+                    });
+                    revert_row(ui, &mut s.infill_overlap, &self.baseline.infill_overlap, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "wall overlap",
+                            "How far infill pushes into the innermost wall (fraction of a line width) so they bond.");
+                    });
+                });
+                tier_section(ui, "Support", TierKind::Process, false, |ui| {
+                    let vase = s.spiral_vase;
+                    ui.add_enabled_ui(!vase, |ui| {
+                        revert_row(ui, &mut s.support_mode, &self.baseline.support_mode, |ui, v| {
+                            support_combo(ui, v)
+                                .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.")
+                                .on_disabled_hover_text("Forced off in spiral vase mode.");
+                        });
+                    });
+                    let has_support = s.support_mode != config::SupportMode::None && !vase;
+                    revert_row(ui, &mut s.support_overhang_angle_deg, &self.baseline.support_overhang_angle_deg, |ui, v| {
+                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=80.0), "overhang °",
+                            "Steepest overhang (from vertical) printable without support. 45° ≈ one layer-width.");
+                    });
+                    revert_row(ui, &mut s.support_density, &self.baseline.support_density, |ui, v| {
+                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=1.0), "density",
+                            "Infill density of grid supports.");
+                    });
+                    revert_row(ui, &mut s.support_xy_clearance_mm, &self.baseline.support_xy_clearance_mm, |ui, v| {
+                        hslider(ui, has_support, egui::Slider::new(v, 0.0..=2.0), "xy gap mm",
+                            "Horizontal gap between support and the model (for easy removal).");
+                    });
+                    revert_row(ui, &mut s.support_z_gap_layers, &self.baseline.support_z_gap_layers, |ui, v| {
+                        hslider(ui, has_support, egui::Slider::new(v, 0..=5), "z-gap layers",
+                            "Empty layers between a support top and the part it holds up.");
+                    });
+                    revert_row(ui, &mut s.support_interface_layers, &self.baseline.support_interface_layers, |ui, v| {
+                        hslider(ui, has_support, egui::Slider::new(v, 0..=5), "interface",
+                            "Dense solid layers at the support top for a smoother overhang underside.");
+                    });
+                    revert_row(ui, &mut s.max_bridge_span_mm, &self.baseline.max_bridge_span_mm, |ui, v| {
+                        hslider(ui, !vase, egui::Slider::new(v, 0.0..=30.0), "bridge span mm",
+                            "Widest gap (supported on \u{2265}2 sides) filled with straight anchored bridge lines; wider gaps fall back to the bottom shell.");
+                    });
+                    revert_row(ui, &mut s.bridge_foothold_mm, &self.baseline.bridge_foothold_mm, |ui, v| {
+                        hslider(ui, !vase, egui::Slider::new(v, 0.0..=3.0), "bridge foothold mm",
+                            "How far an enclosed-ceiling bridge sheet lands onto the supported rim. Bigger = more solid under the sheet's ends, but inner perimeters start further from the hollow. 0 = no foothold band. Applies in every support mode.");
+                    });
+                });
+                tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
+                    revert_row(ui, &mut s.skirt_loops, &self.baseline.skirt_loops, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0..=5), "skirt loops",
+                            "Loops printed around the first layer to prime the nozzle. 0 = off.");
+                    });
+                    revert_row(ui, &mut s.skirt_gap_mm, &self.baseline.skirt_gap_mm, |ui, v| {
+                        hslider(ui, s.skirt_loops > 0, egui::Slider::new(v, 0.0..=10.0), "skirt gap mm",
+                            "Distance from the skirt to the model.");
+                    });
+                    revert_row(ui, &mut s.brim_loops, &self.baseline.brim_loops, |ui, v| {
+                        hslider(ui, true, egui::Slider::new(v, 0..=20), "brim loops",
+                            "Loops attached around the first layer for adhesion. 0 = off.");
+                    });
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
                     revert_row(ui, &mut s.retract_len_mm, &self.baseline.retract_len_mm, |ui, v| {
@@ -6549,6 +6870,23 @@ impl eframe::App for App {
             });
         }
 
+        // PA calibration: the Filament-panel button armed `start_pa_cal`.
+        // Generate the ramped tower from the current settings and send it; the
+        // user reads off the best-corner height and applies it in the panel.
+        if std::mem::take(&mut self.start_pa_cal) {
+            let gcode = engine::pa_tower_gcode(&self.settings);
+            let ctx = ui.ctx().clone();
+            self.spawn_host_op(&ctx, false, move |c| {
+                match c.upload("pa-tower.gcode", gcode.as_bytes(), true) {
+                    Ok(()) => HostReply::SendDone {
+                        ok: true,
+                        msg: "Printing the PA tower — when it's done, find the height band with the crispest corners (bulges = PA too low, post-corner gaps = too high; skip the seam corner) and enter that height in the Filament panel.".to_string(),
+                    },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("PA-tower upload failed: {e}") },
+                }
+            });
+        }
+
         // Save / delete profile dialog (floats over the viewport).
         if let Some(mut dlg) = self.profile_dialog.take() {
             let mut keep = true;
@@ -7472,6 +7810,210 @@ mod tests {
         let (a, b) = (per[0].1, per[1].1);
         let share = a / (a + b);
         assert!((share - 0.5).abs() < 0.05, "T0 share {share:.3} (T0 {a:.0} mm, T1 {b:.0} mm)");
+    }
+
+    #[test]
+    fn spotlight_pool_is_a_distance_field() {
+        // A plus-shaped outline — four concave corners, the folding case: the
+        // old miter-ring stitch folded there and alpha-over stacked the folds
+        // into bright wedges. Rasterize the splat soup with the MAX semantics
+        // the spot pipeline uses: every exterior sample must read the plain
+        // distance falloff, nothing brighter, nothing banded.
+        let plus: Vec<(f64, f64)> = vec![
+            (10.0, 0.0), (20.0, 0.0), (20.0, 10.0), (30.0, 10.0), (30.0, 20.0), (20.0, 20.0),
+            (20.0, 30.0), (10.0, 30.0), (10.0, 20.0), (0.0, 20.0), (0.0, 10.0), (10.0, 10.0),
+        ];
+        let mut c = geo2d::Contour::new(
+            plus.iter().map(|&(x, y)| geo2d::Point::from_mm(x, y)).collect(),
+        );
+        c.make_ccw();
+        let mut sil = geo2d::Polygons::new();
+        sil.contours.push(c);
+        let width = 12.0;
+        let soup = spotlight_band(&sil, width, [1.0, 1.0, 1.0]);
+        assert!(!soup.is_empty());
+
+        let m = plus.len();
+        let edges: Vec<([f64; 2], [f64; 2])> = (0..m)
+            .map(|k| {
+                let (a, b) = (plus[k], plus[(k + 1) % m]);
+                ([a.0, a.1], [b.0, b.1])
+            })
+            .collect();
+        let seg_d = |p: [f64; 2], a: [f64; 2], b: [f64; 2]| -> f64 {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = (dx * dx + dy * dy).max(1e-12);
+            let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0);
+            (p[0] - a[0] - dx * t).hypot(p[1] - a[1] - dy * t)
+        };
+        let inside = |p: [f64; 2]| -> bool {
+            let mut odd = false;
+            for (a, b) in &edges {
+                if (a[1] > p[1]) != (b[1] > p[1]) {
+                    let t = (p[1] - a[1]) / (b[1] - a[1]);
+                    if p[0] < a[0] + t * (b[0] - a[0]) {
+                        odd = !odd;
+                    }
+                }
+            }
+            odd
+        };
+        let expected = |d: f64| -> f64 {
+            if d <= width * 0.4 {
+                0.55 + (0.20 - 0.55) * d / (width * 0.4)
+            } else if d <= width {
+                0.20 * (1.0 - (d - width * 0.4) / (width * 0.6))
+            } else {
+                0.0
+            }
+        };
+        // Max-composite the soup at p, barycentric alpha per covering triangle.
+        let alpha_at = |p: [f64; 2]| -> f64 {
+            let mut best = 0.0f64;
+            for t in soup.chunks(3) {
+                let (v0, v1, v2) = (
+                    [t[0][0] as f64, t[0][1] as f64],
+                    [t[1][0] as f64, t[1][1] as f64],
+                    [t[2][0] as f64, t[2][1] as f64],
+                );
+                let det = (v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1]);
+                if det.abs() < 1e-12 {
+                    continue;
+                }
+                let l1 = ((p[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (p[1] - v0[1])) / det;
+                let l2 = ((v1[0] - v0[0]) * (p[1] - v0[1]) - (p[0] - v0[0]) * (v1[1] - v0[1])) / det;
+                let l0 = 1.0 - l1 - l2;
+                if l0 >= -1e-9 && l1 >= -1e-9 && l2 >= -1e-9 {
+                    let a = t[0][6] as f64 * l0 + t[1][6] as f64 * l1 + t[2][6] as f64 * l2;
+                    best = best.max(a);
+                }
+            }
+            best
+        };
+        let mut checked = 0usize;
+        let mut y = -14.0;
+        while y <= 44.0 {
+            let mut x = -14.0;
+            while x <= 44.0 {
+                let p = [x, y];
+                if !inside(p) {
+                    let d = edges.iter().map(|&(a, b)| seg_d(p, a, b)).fold(f64::MAX, f64::min);
+                    // Skip the knife edge where the band ends (pure sampling noise).
+                    if (d - width).abs() > 0.3 {
+                        let got = alpha_at(p);
+                        let want = expected(d);
+                        assert!(
+                            (got - want).abs() < 0.06,
+                            "at ({x:.1},{y:.1}) d={d:.2}: got {got:.3}, want {want:.3}"
+                        );
+                        checked += 1;
+                    }
+                }
+                x += 1.7;
+            }
+            y += 1.7;
+        }
+        assert!(checked > 500, "the grid actually sampled the pool, {checked}");
+    }
+
+    #[test]
+    fn convex_hull_overlap_ignores_interlocking_footprints() {
+        // Two L-bracket footprints hull to triangles. Placed facing each other,
+        // their bounding boxes overlap but the triangles don't touch — the check
+        // must NOT flag a collision (the old AABB-only test wrongly did).
+        let a = [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]]; // lower-left half of [0,10]²
+        let b = [[12.0, 12.0], [2.0, 12.0], [12.0, 2.0]]; // upper-right half of [2,12]²
+        assert!(aabb_overlap([0.0, 0.0, 10.0, 10.0], [2.0, 2.0, 12.0, 12.0]), "boxes overlap");
+        assert!(!convex_polys_overlap(&a, &b), "disjoint footprints must not collide");
+
+        // Genuinely overlapping footprints DO collide.
+        let c = [[3.0, 3.0], [13.0, 3.0], [3.0, 13.0]];
+        assert!(convex_polys_overlap(&a, &c), "overlapping footprints collide");
+
+        // Edge-touching (shared boundary) is not a collision (a hair of slack).
+        let d = [[10.0, 0.0], [20.0, 0.0], [20.0, 10.0]];
+        assert!(!convex_polys_overlap(&a, &d), "edge-touching footprints don't collide");
+    }
+
+    #[test]
+    fn interlocking_l_brackets_dont_read_as_colliding() {
+        // Build an L-shaped prism from two overlapping boxes (bottom arm + left
+        // arm, 6 mm thick, 20 mm span). Its footprint hulls to a pentagon covering
+        // ~half the bbox — exactly the corner-bracket case.
+        fn push_box(t: &mut Vec<[[f64; 3]; 3]>, lo: [f64; 3], hi: [f64; 3]) {
+            let v = [
+                [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+                [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+            ];
+            let q = |a: usize, b: usize, c: usize, d: usize| [[v[a], v[b], v[c]], [v[a], v[c], v[d]]];
+            for tri in [q(0,3,2,1), q(4,5,6,7), q(0,1,5,4), q(2,3,7,6), q(1,2,6,5), q(3,0,4,7)] {
+                t.extend(tri);
+            }
+        }
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 6.0, 4.0]); // bottom arm
+        push_box(&mut tris, [0.0, 0.0, 0.0], [6.0, 20.0, 4.0]); // left arm
+        let l = mesh::Mesh::from_triangle_soup(&tris);
+
+        // Two copies: B rotated 180° so its L faces A's, then placed so their
+        // bounding boxes overlap heavily but the arms interlock without touching.
+        let world_hull = |rot_z: f64, pos: [f64; 2]| -> (Vec<[f64; 2]>, [f64; 4]) {
+            let mut o = SceneObject::new("x".into(), l.clone());
+            o.rot_deg = [0.0, 0.0, rot_z];
+            o.pos = pos;
+            let (minx, miny, maxx, maxy, _) = o.footprint();
+            let (tx, ty) = (pos[0] - (minx + maxx) / 2.0, pos[1] - (miny + maxy) / 2.0);
+            let hull = o.footprint_hull().iter().map(|p| [p[0] + tx, p[1] + ty]).collect();
+            let (hw, hh) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+            (hull, [pos[0] - hw, pos[1] - hh, pos[0] + hw, pos[1] + hh])
+        };
+        let (ha, ba) = world_hull(0.0, [50.0, 50.0]);
+        // B faces A (180°) and is nudged so boxes overlap but the L's nest with a gap.
+        let (hb, bb) = world_hull(180.0, [62.0, 62.0]);
+        assert!(aabb_overlap(ba, bb), "the two brackets' bounding boxes DO overlap");
+        assert!(
+            !convex_polys_overlap(&ha, &hb),
+            "but their real footprints don't — must not read as a collision"
+        );
+    }
+
+    #[test]
+    fn nested_same_orientation_brackets_use_the_silhouette() {
+        // Two identical L's, SAME orientation (a plain Duplicate keeps rotation),
+        // nested so one sits in the other's concave corner. Their convex hulls
+        // OVERLAP (the hull fills the L's concavity) but the real footprints don't —
+        // only the exact silhouette catches it. This is the user's actual case.
+        fn push_box(t: &mut Vec<[[f64; 3]; 3]>, lo: [f64; 3], hi: [f64; 3]) {
+            let v = [
+                [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+                [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+            ];
+            let q = |a: usize, b: usize, c: usize, d: usize| [[v[a], v[b], v[c]], [v[a], v[c], v[d]]];
+            for tri in [q(0,3,2,1), q(4,5,6,7), q(0,1,5,4), q(2,3,7,6), q(1,2,6,5), q(3,0,4,7)] {
+                t.extend(tri);
+            }
+        }
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 6.0, 4.0]); // bottom arm (6mm thick)
+        push_box(&mut tris, [0.0, 0.0, 0.0], [6.0, 20.0, 4.0]); // left arm
+        let l = mesh::Mesh::from_triangle_soup(&tris);
+
+        let world = |pos: [f64; 2]| -> (Vec<[f64; 2]>, geo2d::Polygons) {
+            let mut o = SceneObject::new("x".into(), l.clone());
+            o.pos = pos;
+            let (minx, miny, maxx, maxy, _) = o.footprint();
+            let (tx, ty) = (pos[0] - (minx + maxx) / 2.0, pos[1] - (miny + maxy) / 2.0);
+            let hull = o.footprint_hull().iter().map(|p| [p[0] + tx, p[1] + ty]).collect();
+            (hull, translate_polys(&o.footprint_silhouette(), tx, ty))
+        };
+        // B nested +8,+8 into A's empty [6,20]² corner — arms (6mm) don't touch.
+        let (ha, sa) = world([50.0, 50.0]);
+        let (hb, sb) = world([58.0, 58.0]);
+        assert!(convex_polys_overlap(&ha, &hb), "the hulls DO overlap (concavity filled)");
+        assert!(
+            geo2d::intersection(&sa, &sb).is_empty(),
+            "but the true footprints are disjoint — no collision"
+        );
     }
 
     #[test]
