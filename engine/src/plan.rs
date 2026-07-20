@@ -2122,7 +2122,14 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
         settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
     let clearance = settings.support_xy_clearance_mm;
 
-    // Per-layer overhang, with thin slivers removed (a one-bead ledge is fine).
+    // Per-layer overhang: the part of this layer stepped out beyond the printable
+    // cantilever of the one below. Under a GRADUAL slope (a leaning wall, a curved
+    // shell) each layer's step is only a fraction of a line-width, and consecutive
+    // steps march sideways leaving ~`allowance` gaps between them — so dilate each
+    // by `allowance` to fuse them into the solid region they sweep. (A per-layer
+    // morphological open used to sit here and erased those sub-bead rims, so
+    // gradual overhangs got NO support at any angle; the projected support region
+    // is opened once below instead, which still drops one-off single-layer ledges.)
     let overhang: Vec<Polygons> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -2146,7 +2153,11 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
     let mut accum = Polygons::new();
     for i in (0..n).rev() {
         let blocked = offset(&phys[i], clearance);
-        let here = difference(&accum, &blocked);
+        // Open the projected support footprint (erode then dilate a line-width) so a
+        // one-off single-layer ledge — a lone thin rim that never accumulates into a
+        // real column — drops out, while the swept footprint under a genuine gradual
+        // overhang (many stacked rims) stays. This replaces the old per-layer open.
+        let here = offset(&offset(&difference(&accum, &blocked), -lw), lw);
         if !here.is_empty() {
             let angle = if i % 2 == 0 { 0.0 } else { 90.0 };
             // Interface = the top `iface` support layers below an overhang (its top
@@ -2171,6 +2182,15 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
         // out `gap` layers below it (leaving the removal gap).
         if i + gap < n {
             accum = union(&accum, &overhang[i + gap]);
+        }
+        // Bound the accumulator's complexity. It accretes a dilated overhang band
+        // every layer and is offset/difference/union'd on the next, so without this
+        // its vertex count — and the per-layer cost — grows unbounded, turning a
+        // tall gradual overhang into an O(n²) slice that hangs. Support is coarse
+        // (grid fill at `clearance` spacing), so a sub-quarter-bead simplify is
+        // invisible in the result.
+        if !accum.is_empty() {
+            accum = geo2d::simplify(&accum, lw * 0.25);
         }
     }
 }
