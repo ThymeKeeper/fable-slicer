@@ -550,13 +550,16 @@ fn filament_card_rows(
             .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
             .on_hover_text(format!(
                 "Print a single-wall {:.0} mm square tower whose pressure advance ramps \
-                 0 → {:.2} with height (the sweep is baked into the g-code — nothing to \
-                 run on the printer). Seams stack on one corner; judge the other three \
-                 under raking light: bulged corners = PA too low, gaps right after a \
-                 corner = too high. Measure the height of the crispest band and enter \
+                 0 → {:.2} with height, at your real outer-wall speed (the sweep is \
+                 baked into the g-code — nothing to run on the printer). Seams and the \
+                 10 mm index collars share one corner; judge the other three under \
+                 raking light: bulged corners = PA too low, gaps right after a corner = \
+                 too high — when in doubt pick the LOWER band. Count collars from the \
+                 BED (each = +{:.3} PA) or measure the height from the bed, and enter \
                  it below. Clear the bed first.",
                 engine::PA_TOWER_MM,
                 engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::PA_TOWER_H_MM,
+                engine::PA_TOWER_FACTOR * engine::PA_TOWER_MARK_MM,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()

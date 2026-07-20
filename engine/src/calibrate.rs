@@ -56,8 +56,11 @@ pub fn flow_from_wall(current_flow: f64, line_width_mm: f64, measured_mm: f64) -
 }
 
 /// Footprint edge of the PA tower (mm) — sides long enough that melt pressure
-/// fully settles between corners, so every corner is a clean step transient.
-pub const PA_TOWER_MM: f64 = 30.0;
+/// fully settles between corners, AND that a full-speed layer still takes ≥1 s:
+/// the tower must print at the profile's real outer-wall speed (PA calibrated
+/// slow reads high — the smoothing window dominates the shorter transients),
+/// so the layer-time governor must never throttle it.
+pub const PA_TOWER_MM: f64 = 50.0;
 /// PA tower height (mm). With [`PA_TOWER_FACTOR`] the sweep spans 0–0.10:
 /// the whole direct-drive range, at caliper-grade resolution (±0.5 mm of
 /// height reads as ±0.001 of PA).
@@ -66,24 +69,43 @@ pub const PA_TOWER_H_MM: f64 = 50.0;
 pub const PA_TOWER_START: f64 = 0.0;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
+/// Height between index collars on the seam corner: one every 10 mm from the
+/// bed = +0.020 of PA per collar, so the band is read by counting marks —
+/// no caliper, no measuring-from-the-wrong-end.
+pub const PA_TOWER_MARK_MM: f64 = 10.0;
 
 /// G-code for the pressure-advance tower: a single-wall square tube whose PA
 /// ramps with height — Klipper's `TUNING_TOWER` sweep, but baked into the
 /// file per layer, so there is no console incantation to run. Seams are held
-/// in one corner column ([`config::SeamMode::Sharpest`]); judge the other
-/// three. Too little PA bulges corners (pressure overshoots the slowdown),
-/// too much starves the stretch right after them — the crispest band wins,
-/// and [`pa_from_height`] turns its measured height into the profile value.
+/// in one corner column ([`config::SeamMode::Sharpest`]) and the same corner
+/// carries the 10 mm index collars; judge the other three. Too little PA
+/// bulges corners (pressure overshoots the slowdown), too much starves the
+/// stretch right after them — the crispest band wins, and [`pa_from_height`]
+/// turns its height into the profile value.
 pub fn pa_tower_gcode(settings: &Settings) -> String {
     let mut s = single_wall(settings);
     s.seam_mode = config::SeamMode::Sharpest;
-    let mesh = cuboid(PA_TOWER_MM, PA_TOWER_MM, PA_TOWER_H_MM);
+    // Calibrate at the speed the profile actually prints. The flow cube's
+    // relaxed 2 s layer-time floor would throttle this wall to a fraction of
+    // the outer-wall speed; with the 50 mm footprint a full-speed layer runs
+    // ≥1 s anyway, so this floor never bites.
+    s.min_layer_time_s = 1.0;
+    let mut boxes = vec![[0.0, 0.0, 0.0, PA_TOWER_MM, PA_TOWER_MM, PA_TOWER_H_MM]];
+    let mut z = PA_TOWER_MARK_MM;
+    while z < PA_TOWER_H_MM - 0.5 {
+        // A small collar over the seam corner, two layers tall.
+        boxes.push([-1.2, -1.2, z, 1.2, 1.2, z + 0.4]);
+        z += PA_TOWER_MARK_MM;
+    }
+    let mesh = box_mesh(&boxes);
     let g = to_gcode(&generate(&mesh, &s), &s);
     let mut out = String::with_capacity(g.len() + 8192);
     out.push_str(&format!(
         "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
-         ; measure the height (mm) of the crispest corners and apply it in the\n\
-         ; Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n"
+         ; corner collars mark every {PA_TOWER_MARK_MM} mm from the BED (+{:.3} PA each);\n\
+         ; find the crispest band on the three plain corners, apply its height in\n\
+         ; the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
+        PA_TOWER_FACTOR * PA_TOWER_MARK_MM
     ));
     for line in g.lines() {
         out.push_str(line);
@@ -109,19 +131,21 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// An axis-aligned solid box as a triangle soup (the calibration meshes are
-/// synthetic — no model file involved).
-fn cuboid(x: f64, y: f64, z: f64) -> mesh::Mesh {
-    let v = [
-        [0.0, 0.0, 0.0], [x, 0.0, 0.0], [x, y, 0.0], [0.0, y, 0.0],
-        [0.0, 0.0, z], [x, 0.0, z], [x, y, z], [0.0, y, z],
-    ];
+/// Axis-aligned solid boxes, unioned at slice time, as one triangle soup (the
+/// calibration meshes are synthetic — no model file involved).
+fn box_mesh(boxes: &[[f64; 6]]) -> mesh::Mesh {
     let mut tris = Vec::new();
-    for [a, b, c, d] in
-        [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
-    {
-        tris.push([v[a], v[b], v[c]]);
-        tris.push([v[a], v[c], v[d]]);
+    for &[x0, y0, z0, x1, y1, z1] in boxes {
+        let v = [
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ];
+        for [a, b, c, d] in
+            [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+        {
+            tris.push([v[a], v[b], v[c]]);
+            tris.push([v[a], v[c], v[d]]);
+        }
     }
     mesh::Mesh::from_triangle_soup(&tris)
 }
@@ -179,18 +203,19 @@ mod tests {
     #[test]
     fn pa_tower_ramps_with_height() {
         let g = pa_tower_gcode(&Settings::default());
-        // A 50 mm tower at 0.2 mm layers: one PA line per layer.
-        let pas: Vec<f64> = g
-            .lines()
-            .filter_map(|l| l.strip_prefix("SET_PRESSURE_ADVANCE ADVANCE="))
+        // One injected PA step directly after each layer marker (the index
+        // collars' overhang stretches re-issue their own scaled PA in between,
+        // so only the ramp lines are height-ordered).
+        let lines: Vec<&str> = g.lines().collect();
+        let ramp: Vec<f64> = lines
+            .windows(2)
+            .filter(|w| w[0].starts_with("; LAYER "))
+            .filter_map(|w| w[1].strip_prefix("SET_PRESSURE_ADVANCE ADVANCE="))
             .filter_map(|v| v.parse().ok())
             .collect();
-        // The preamble's profile PA (if any) comes first; the ramp is the one
-        // line per layer that follows.
         let layers = g.matches("; LAYER ").count();
         assert!(layers > 200, "a 50 mm tower is ~250 layers, got {layers}");
-        assert!(pas.len() >= layers, "one PA step per layer");
-        let ramp = &pas[pas.len() - layers..];
+        assert_eq!(ramp.len(), layers, "one injected PA step per layer");
         assert!(ramp.windows(2).all(|w| w[1] >= w[0]), "the sweep is monotonic");
         assert!(ramp[0] < 0.002, "starts at the bottom of the range");
         let top = ramp.last().unwrap();
@@ -200,6 +225,74 @@ mod tests {
         );
         // Single wall: no interior features to muddy the corners.
         assert!(!g.contains(";TYPE:Sparse infill") && !g.contains(";TYPE:Top surface"));
+    }
+
+    #[test]
+    fn pa_tower_prints_at_the_real_outer_wall_speed() {
+        // The whole point of the tower is calibrating at the speed the profile
+        // actually prints. The flow cube's relaxed layer-time floor used to
+        // throttle it ~2.7× — and PA calibrated slow reads high (the user's
+        // 0.070 vs a true ~0.032). Dominant extrusion feed must be the plain
+        // outer-wall speed, unthrottled.
+        let s = Settings::default();
+        let g = pa_tower_gcode(&s);
+        let mut feed_mm: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+        let mut f = 0i64;
+        for l in g.lines() {
+            if !l.starts_with("G1 ") && !l.starts_with("G2 ") && !l.starts_with("G3 ") {
+                continue;
+            }
+            if let Some(fs) = l.split(" F").nth(1) {
+                f = fs.split(' ').next().unwrap_or("0").parse::<f64>().unwrap_or(0.0) as i64;
+            }
+            if l.contains(" E") && !l.contains(" E-") {
+                *feed_mm.entry(f).or_default() += 1;
+            }
+        }
+        let dominant = feed_mm.iter().max_by_key(|(_, n)| **n).map(|(f, _)| *f).unwrap_or(0);
+        let expect = s.external_perimeter_speed_mm_s * 60.0;
+        assert!(
+            (dominant as f64) >= expect * 0.9,
+            "tower must run at outer-wall speed: dominant F{dominant} vs expected F{expect:.0}"
+        );
+    }
+
+    #[test]
+    fn pa_tower_has_index_collars() {
+        // Collars every 10 mm from the bed: the layers just above each mark
+        // height must bulge past the plain square's footprint.
+        let g = pa_tower_gcode(&Settings::default());
+        let mut layer_minx: Vec<(f64, f64)> = Vec::new(); // (z, min x of extrusions)
+        let (mut z, mut minx) = (0.0, f64::MAX);
+        for l in g.lines() {
+            if let Some(rest) = l.strip_prefix("; LAYER ") {
+                if minx < f64::MAX {
+                    layer_minx.push((z, minx));
+                }
+                minx = f64::MAX;
+                z = rest.split("z=").nth(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+            } else if (l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 "))
+                && l.contains(" E")
+                && !l.contains(" E-")
+            {
+                if let Some(xs) = l.split(" X").nth(1) {
+                    if let Ok(x) = xs.split(' ').next().unwrap_or("").parse::<f64>() {
+                        minx = minx.min(x);
+                    }
+                }
+            }
+        }
+        if minx < f64::MAX {
+            layer_minx.push((z, minx));
+        }
+        let plain: Vec<f64> =
+            layer_minx.iter().filter(|(z, _)| (z % 10.0) > 1.0).map(|&(_, x)| x).collect();
+        let base = plain.iter().cloned().fold(f64::MAX, f64::min);
+        let marks = layer_minx
+            .iter()
+            .filter(|&&(z, x)| (z % 10.0) <= 0.5 && z > 5.0 && x < base - 0.8)
+            .count();
+        assert!(marks >= 4, "collars at 10/20/30/40 mm must bulge the outline, saw {marks}");
     }
 
     #[test]
