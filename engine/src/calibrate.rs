@@ -69,10 +69,16 @@ pub const PA_TOWER_H_MM: f64 = 50.0;
 pub const PA_TOWER_START: f64 = 0.0;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
-/// Height between index collars on the seam corner: one every 10 mm from the
-/// bed = +0.020 of PA per collar, so the band is read by counting marks —
-/// no caliper, no measuring-from-the-wrong-end.
+/// Height between index notches on the seam corner: one every 10 mm from the
+/// bed = +0.020 of PA per notch, so the band is read by counting marks —
+/// no caliper, no measuring-from-the-wrong-end. Each notch is an INWARD
+/// two-layer corner chamfer: it prints as a short bridge anchored on both
+/// walls. (The first cut was an outward collar — a cantilever over air on a
+/// bottomless single wall; it curled, caught the nozzle, and bird's-nested
+/// the print. Nothing on this tower may overhang.)
 pub const PA_TOWER_MARK_MM: f64 = 10.0;
+/// How far the notch cuts the corner (each chamfer leg, mm).
+const PA_TOWER_NOTCH_MM: f64 = 2.5;
 
 /// G-code for the pressure-advance tower: a single-wall square tube whose PA
 /// ramps with height — Klipper's `TUNING_TOWER` sweep, but baked into the
@@ -90,19 +96,40 @@ pub fn pa_tower_gcode(settings: &Settings) -> String {
     // the outer-wall speed; with the 50 mm footprint a full-speed layer runs
     // ≥1 s anyway, so this floor never bites.
     s.min_layer_time_s = 1.0;
-    let mut boxes = vec![[0.0, 0.0, 0.0, PA_TOWER_MM, PA_TOWER_MM, PA_TOWER_H_MM]];
-    let mut z = PA_TOWER_MARK_MM;
-    while z < PA_TOWER_H_MM - 0.5 {
-        // A small collar over the seam corner, two layers tall.
-        boxes.push([-1.2, -1.2, z, 1.2, 1.2, z + 0.4]);
-        z += PA_TOWER_MARK_MM;
+    // A tall single-bead tube cornering at full speed needs more than one
+    // bead-ring of bed contact: give it a solid three-layer base plate.
+    s.bottom_layers = 3;
+    // The tube as a stack of prisms: plain squares, with the notch bands'
+    // corner chamfered inward.
+    let sq = [
+        [0.0, 0.0],
+        [PA_TOWER_MM, 0.0],
+        [PA_TOWER_MM, PA_TOWER_MM],
+        [0.0, PA_TOWER_MM],
+    ];
+    let notched = [
+        [PA_TOWER_NOTCH_MM, 0.0],
+        [PA_TOWER_MM, 0.0],
+        [PA_TOWER_MM, PA_TOWER_MM],
+        [0.0, PA_TOWER_MM],
+        [0.0, PA_TOWER_NOTCH_MM],
+    ];
+    let mut tris = Vec::new();
+    let mut z0 = 0.0;
+    let mut mark = PA_TOWER_MARK_MM;
+    while mark < PA_TOWER_H_MM - 0.5 {
+        prism(&sq, z0, mark, &mut tris);
+        prism(&notched, mark, mark + 0.4, &mut tris);
+        z0 = mark + 0.4;
+        mark += PA_TOWER_MARK_MM;
     }
-    let mesh = box_mesh(&boxes);
+    prism(&sq, z0, PA_TOWER_H_MM, &mut tris);
+    let mesh = mesh::Mesh::from_triangle_soup(&tris);
     let g = to_gcode(&generate(&mesh, &s), &s);
     let mut out = String::with_capacity(g.len() + 8192);
     out.push_str(&format!(
         "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
-         ; corner collars mark every {PA_TOWER_MARK_MM} mm from the BED (+{:.3} PA each);\n\
+         ; corner notches mark every {PA_TOWER_MARK_MM} mm from the BED (+{:.3} PA each);\n\
          ; find the crispest band on the three plain corners, apply its height in\n\
          ; the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
         PA_TOWER_FACTOR * PA_TOWER_MARK_MM
@@ -131,23 +158,27 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// Axis-aligned solid boxes, unioned at slice time, as one triangle soup (the
-/// calibration meshes are synthetic — no model file involved).
-fn box_mesh(boxes: &[[f64; 6]]) -> mesh::Mesh {
-    let mut tris = Vec::new();
-    for &[x0, y0, z0, x1, y1, z1] in boxes {
-        let v = [
-            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
-        ];
-        for [a, b, c, d] in
-            [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
-        {
-            tris.push([v[a], v[b], v[c]]);
-            tris.push([v[a], v[c], v[d]]);
-        }
+/// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
+/// stacked prisms union at slice time into one solid.
+fn prism(fp: &[[f64; 2]], z0: f64, z1: f64, tris: &mut Vec<[[f64; 3]; 3]>) {
+    let n = fp.len();
+    for i in 1..n - 1 {
+        tris.push([
+            [fp[0][0], fp[0][1], z0],
+            [fp[i + 1][0], fp[i + 1][1], z0],
+            [fp[i][0], fp[i][1], z0],
+        ]);
+        tris.push([
+            [fp[0][0], fp[0][1], z1],
+            [fp[i][0], fp[i][1], z1],
+            [fp[i + 1][0], fp[i + 1][1], z1],
+        ]);
     }
-    mesh::Mesh::from_triangle_soup(&tris)
+    for i in 0..n {
+        let (a, b) = (fp[i], fp[(i + 1) % n]);
+        tris.push([[a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z1]]);
+        tris.push([[a[0], a[1], z0], [b[0], b[1], z1], [a[0], a[1], z1]]);
+    }
 }
 
 #[cfg(test)]
@@ -236,16 +267,22 @@ mod tests {
         // outer-wall speed, unthrottled.
         let s = Settings::default();
         let g = pa_tower_gcode(&s);
+        // Judge only the wall itself — the base plate's dense first-layer skin
+        // would otherwise dominate the line count at first-layer speed.
         let mut feed_mm: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
-        let mut f = 0i64;
+        let (mut f, mut wall) = (0i64, false);
         for l in g.lines() {
+            if let Some(t) = l.strip_prefix(";TYPE:") {
+                wall = t.trim() == "Outer wall";
+                continue;
+            }
             if !l.starts_with("G1 ") && !l.starts_with("G2 ") && !l.starts_with("G3 ") {
                 continue;
             }
             if let Some(fs) = l.split(" F").nth(1) {
                 f = fs.split(' ').next().unwrap_or("0").parse::<f64>().unwrap_or(0.0) as i64;
             }
-            if l.contains(" E") && !l.contains(" E-") {
+            if wall && l.contains(" E") && !l.contains(" E-") {
                 *feed_mm.entry(f).or_default() += 1;
             }
         }
@@ -258,41 +295,44 @@ mod tests {
     }
 
     #[test]
-    fn pa_tower_has_index_collars() {
-        // Collars every 10 mm from the bed: the layers just above each mark
-        // height must bulge past the plain square's footprint.
+    fn pa_tower_has_index_notches() {
+        // Inward corner chamfers every 10 mm from the bed: at each mark band
+        // the seam corner's min(x+y) steps inward by the notch depth. (Inward,
+        // never outward: an outward collar on a bottomless single wall is a
+        // cantilever over air — the first cut bird's-nested a print.)
         let g = pa_tower_gcode(&Settings::default());
-        let mut layer_minx: Vec<(f64, f64)> = Vec::new(); // (z, min x of extrusions)
-        let (mut z, mut minx) = (0.0, f64::MAX);
+        let mut per_layer: Vec<(f64, f64)> = Vec::new(); // (z, min x+y over extrusions)
+        let (mut z, mut m, mut x, mut y) = (0.0, f64::MAX, 0.0f64, 0.0f64);
         for l in g.lines() {
             if let Some(rest) = l.strip_prefix("; LAYER ") {
-                if minx < f64::MAX {
-                    layer_minx.push((z, minx));
+                if m < f64::MAX {
+                    per_layer.push((z, m));
                 }
-                minx = f64::MAX;
+                m = f64::MAX;
                 z = rest.split("z=").nth(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
-            } else if (l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 "))
-                && l.contains(" E")
-                && !l.contains(" E-")
-            {
-                if let Some(xs) = l.split(" X").nth(1) {
-                    if let Ok(x) = xs.split(' ').next().unwrap_or("").parse::<f64>() {
-                        minx = minx.min(x);
-                    }
+            } else if l.starts_with("G0 ") || l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 ") {
+                let ex = l.split(" X").nth(1).and_then(|s| s.split(' ').next().unwrap_or("").parse::<f64>().ok());
+                let ey = l.split(" Y").nth(1).and_then(|s| s.split(' ').next().unwrap_or("").parse::<f64>().ok());
+                if let Some(v) = ex { x = v; }
+                if let Some(v) = ey { y = v; }
+                if l.contains(" E") && !l.contains(" E-") && (ex.is_some() || ey.is_some()) {
+                    m = m.min(x + y);
                 }
             }
         }
-        if minx < f64::MAX {
-            layer_minx.push((z, minx));
+        if m < f64::MAX {
+            per_layer.push((z, m));
         }
-        let plain: Vec<f64> =
-            layer_minx.iter().filter(|(z, _)| (z % 10.0) > 1.0).map(|&(_, x)| x).collect();
-        let base = plain.iter().cloned().fold(f64::MAX, f64::min);
-        let marks = layer_minx
+        let base = per_layer
             .iter()
-            .filter(|&&(z, x)| (z % 10.0) <= 0.5 && z > 5.0 && x < base - 0.8)
+            .filter(|(z, _)| *z > 2.0 && (z % 10.0) > 1.0)
+            .map(|&(_, v)| v)
+            .fold(f64::MAX, f64::min);
+        let marks = per_layer
+            .iter()
+            .filter(|&&(z, v)| z > 5.0 && (z % 10.0) <= 0.5 && v > base + 1.2)
             .count();
-        assert!(marks >= 4, "collars at 10/20/30/40 mm must bulge the outline, saw {marks}");
+        assert!(marks >= 4, "notches at 10/20/30/40 mm must cut the corner, saw {marks}");
     }
 
     #[test]
