@@ -7417,7 +7417,7 @@ fn category_of(kind: engine::PathKind) -> f32 {
         ExternalPerimeter | Perimeter | OverhangWall => CAT_WALLS,
         Solid => CAT_SOLID,
         TopSkin | BottomSkin => CAT_SURFACE,
-        Infill => CAT_INFILL,
+        Infill | GapFill => CAT_INFILL,
         Ironing => CAT_IRONING,
         Support | Bridge | InternalBridge => CAT_SUPPORT,
     }
@@ -7444,6 +7444,7 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
         TopSkin => col(0.0, 0.90, 0.68),       // the crown — the accent at its brightest
         BottomSkin => col(0.0, 0.70, 0.36),    // dark underside
         Infill => col(40.0, 0.45, 0.54),       // analogous step one way — recedes
+        GapFill => col(-40.0, 0.45, 0.54),     // analogous step the other way — the seam strokes
         Ironing => col(0.0, 0.30, 0.78),       // pale sheen over the top skin
         Support => col(180.0, 0.35, 0.48),     // complement, muted — auxiliary material
         Bridge => col(180.0, 0.55, 0.58),      // complement, brighter — spans over air

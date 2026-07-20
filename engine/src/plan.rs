@@ -43,6 +43,9 @@ pub enum PathKind {
     InternalBridge,
     /// Sparse interior fill.
     Infill,
+    /// Single width-matched strokes filling gaps too thin for a wall or normal
+    /// infill (between/inside walls), traced down each gap's medial axis.
+    GapFill,
     /// Low-flow smoothing pass over exposed top surfaces.
     Ironing,
     /// Removable support structure under overhangs.
@@ -1492,6 +1495,11 @@ fn plan_part(
             // the perimeters it nominally fits — e.g. a hole beside the outline),
             // drop the doubled run so the nozzle doesn't retrace the same bead.
             trim_thin_walls(&mut walls, lw, sp);
+            // Where a ring's own two sides pinch closer than a bead (the innermost
+            // ring at a corner of a near-integer-width channel), narrow the bead
+            // locally so the two passes share the channel instead of over-stuffing
+            // it — the pinch stops bulging into a glossy, raised corner.
+            narrow_pinched_rings(&mut walls, lw);
             // Inner walls stay CLOSED rings here — they are spiralized in Pass 2
             // (spiralize_shells), together with the concentric fill they ring, so the
             // wall stack and cavity fill become one continuous stroke.
@@ -1576,6 +1584,10 @@ fn plan_part(
             }
             difference(&layers[i].polygons, &band)
         };
+
+        // The sparse-infill region, captured for the gap-fill pass below: its
+        // intended between-line gaps must be excluded from void detection.
+        let mut sparse_for_gaps = Polygons::new();
 
         // Run the interior fill when there's material inside the innermost wall — OR
         // when there's an enclosed ceiling to bridge. A thin roof closing over a
@@ -2046,6 +2058,50 @@ fn plan_part(
                     difference(&difference(&difference(&ftw, &solid), &narrow_lintel), &bridged);
                 extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &sparse_anchor);
             }
+            // Even at density 0 the sparse REGION is the intentional hollow —
+            // hand it to gap fill so an unfilled interior never reads as a void.
+            sparse_for_gaps = sparse;
+        }
+
+        // Gap fill (raster oracle): stamp every dense bead actually laid onto a
+        // fine grid and trace the medial axis of whatever the part interior —
+        // minus the sparse-infill region (its between-line gaps are intentional)
+        // — is left uncovered. A raster sees the medial-seam voids that an offset
+        // coverage test merges across. Runs BEFORE spiralize: absorption must
+        // widen plain rings (a spiral stroke can't carry a width profile), and
+        // spiralize then leaves width-carrying rings standalone. The stamped
+        // footprints are the same either way — spiralize rewires connectivity,
+        // not coverage. Spiral vase is intentionally hollow — nothing to fill.
+        if !settings.spiral_vase {
+            let dense = difference(&layers[i].polygons, &sparse_for_gaps);
+            if !dense.is_empty() {
+                let beads: Vec<(Vec<Point>, Vec<f64>)> = paths
+                    .iter()
+                    .filter(|p| p.kind != PathKind::Infill && p.points.len() >= 2)
+                    .map(|p| {
+                        let mut pts = p.points.clone();
+                        let mut ws =
+                            p.widths.clone().unwrap_or_else(|| vec![p.width_mm; pts.len()]);
+                        if p.closed {
+                            pts.push(pts[0]); // stamp the closing segment too
+                            ws.push(ws[0]);
+                        }
+                        (pts, ws)
+                    })
+                    .collect();
+                let raw_voids = crate::coverage::uncovered(&dense, &beads, lw, lw * lw * 1.5);
+                // Light simplify (~one raster cell): knocks the single-cell stair
+                // jaggies off the marching-squares boundary without shrinking the
+                // void, so the medial stays DENSE (its width tracks the true
+                // channel; a heavier simplify makes it sparse and the clearance
+                // reads low at the few surviving vertices → a too-thin bead). Do
+                // NOT morphologically close (that truncates the tip).
+                let voids = simplify(&raw_voids, lw * 0.15);
+                let runts = emit_gap_fill(&voids, lw, sp, &mut paths);
+                // What gap fill declined — sub-length specks, culled ribs —
+                // widens the neighbouring ring instead of staying a pinhole.
+                absorb_dropped_voids(&mut paths, &runts, lw, sp);
+            }
         }
 
         // Capstone: spiralize each supported island's inner walls AND the concentric
@@ -2138,7 +2194,11 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
             }
             let supported = offset(&phys[i - 1], allowance);
             let oh = difference(&layers[i].polygons, &supported);
-            offset(&offset(&oh, -lw), lw) // morphological open
+            if allowance > 0.0 {
+                offset(&oh, allowance)
+            } else {
+                oh
+            }
         })
         .collect();
 
@@ -3076,6 +3136,394 @@ fn spiral_to_toolpath(points: Vec<Point>, kinds: &[PathKind], lw: f64) -> ToolPa
 /// set) and bridged/overhang runs (open, or already segmented) never qualify; and an
 /// island carrying ANY overhang opts out wholesale so its rings stay closed for the
 /// enclosed-void / cantilever ordering ([`order_unsupported_rings_outer_in`]).
+/// Minimum worthwhile gap bead. A seam speck's dab is mostly travel for
+/// negligible fill, and a dash of micro-beads strings the nozzle across the
+/// part — skip anything shorter.
+const GAP_BEAD_MIN_MM: f64 = 2.0;
+
+/// Ignore ring neighbourhood closer than this along the ring itself when
+/// probing for an opposing side — a corner's own flanks are spatially close
+/// but are not a pinch.
+const PINCH_WINDOW_MM: f64 = 1.5;
+
+/// Resample pitch for a pinched ring, fine enough that the width profile can
+/// follow the pinch through a corner arc.
+const PINCH_STEP_MM: f64 = 0.5;
+
+/// Where a closed inner ring's own two sides come closer than a bead width —
+/// the innermost ring wrapping a channel narrower than two beads (an L-plate's
+/// corner, a near-integer-width wall) — narrow the bead locally so the two
+/// passes share the channel instead of over-stuffing it. Each side gets
+/// `(pitch + lw)/2`: at pitch ≥ lw that clamps to today's constant width, at
+/// pitch → 0 it floors at half a bead. Deposited volume then matches the cell,
+/// so the pinch stops bulging (the glossy, raised corner). The outer wall is
+/// never modulated (visible surface); rings that gained per-segment channels
+/// or were cut open keep their width. Rings without a pinch are untouched —
+/// byte-identical paths.
+fn narrow_pinched_rings(walls: &mut [ToolPath], lw: f64) {
+    for p in walls.iter_mut() {
+        if p.kind != PathKind::Perimeter
+            || !p.closed
+            || p.widths.is_some()
+            || p.segs.is_some()
+            || p.points.len() < 4
+        {
+            continue;
+        }
+        // Measure on a fine resample (a straight run simplifies to two far
+        // vertices — the sparse ring can't carry a local width profile, and a
+        // per-segment mean would smear a corner's narrow width down the whole
+        // straight). The resample is DISCARDED unless a pinch is found.
+        let mut wrapped = p.points.clone();
+        wrapped.push(wrapped[0]);
+        let dummy = vec![0.0; wrapped.len()];
+        let (mut rp, _) = resample_thick(&wrapped, &dummy, PINCH_STEP_MM);
+        rp.pop(); // drop the duplicated wrap point — back to a closed ring
+        if rp.len() < 8 {
+            continue;
+        }
+        let pitch = ring_self_pitch(&rp, PINCH_WINDOW_MM, lw);
+        // Hysteresis: a side grazing within float-noise of one bead width is
+        // not a pinch — narrowing it buys nothing and costs the ring its spot
+        // in the shell spiral.
+        if pitch.iter().all(|&d| d >= lw * 0.97) {
+            continue;
+        }
+        let widths: Vec<f64> = pitch
+            .iter()
+            .map(|&d| if d < lw { ((d + lw) * 0.5).max(lw * 0.5) } else { lw })
+            .collect();
+        p.points = rp;
+        p.widths = Some(widths);
+    }
+}
+
+/// For each vertex of a closed ring: distance (mm) to the nearest ring segment
+/// that is NOT within `window_mm` of it along the ring — the local pitch to
+/// the opposing side (∞ when nothing sits within `cutoff_mm`). A uniform grid
+/// of segment indices keeps it near-linear; only sub-cutoff distances matter,
+/// so a cell of one cutoff and a 3×3 probe see every candidate.
+fn ring_self_pitch(pts: &[Point], window_mm: f64, cutoff_mm: f64) -> Vec<f64> {
+    let m = pts.len();
+    let mut arc = vec![0.0; m + 1];
+    for j in 0..m {
+        arc[j + 1] = arc[j] + pt_dist_mm(pts[j], pts[(j + 1) % m]);
+    }
+    let total = arc[m];
+    let mut out = vec![f64::INFINITY; m];
+    if total < 4.0 * window_mm {
+        return out; // too small to have an opposing side at all
+    }
+    let cell = (cutoff_mm * geo2d::UNITS_PER_MM).max(1.0) as i64;
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for j in 0..m {
+        let (a, b) = (pts[j], pts[(j + 1) % m]);
+        for gx in a.x.min(b.x).div_euclid(cell)..=a.x.max(b.x).div_euclid(cell) {
+            for gy in a.y.min(b.y).div_euclid(cell)..=a.y.max(b.y).div_euclid(cell) {
+                grid.entry((gx, gy)).or_default().push(j);
+            }
+        }
+    }
+    for (i, d) in out.iter_mut().enumerate() {
+        let q = pts[i];
+        let (cx, cy) = (q.x.div_euclid(cell), q.y.div_euclid(cell));
+        for gx in (cx - 1)..=(cx + 1) {
+            for gy in (cy - 1)..=(cy + 1) {
+                let Some(js) = grid.get(&(gx, gy)) else { continue };
+                for &j in js {
+                    // Circular arc distance from vertex i to segment j's span —
+                    // inside the window it's the ring's own neighbourhood.
+                    let (s0, s1) = (arc[j], arc[j + 1]);
+                    let raw = if arc[i] < s0 {
+                        s0 - arc[i]
+                    } else if arc[i] > s1 {
+                        arc[i] - s1
+                    } else {
+                        0.0
+                    };
+                    if raw.min(total - (s1 - s0) - raw) < window_mm {
+                        continue;
+                    }
+                    *d = d.min(point_segment_dist_mm(q, pts[j], pts[(j + 1) % m]));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Distance (mm) from point `q` to segment `a`–`b`.
+fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
+    let (qx, qy) = (q.x_mm(), q.y_mm());
+    let (ax, ay) = (a.x_mm(), a.y_mm());
+    let (bx, by) = (b.x_mm(), b.y_mm());
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 <= 0.0 { 0.0 } else { ((qx - ax) * dx + (qy - ay) * dy) / len2 };
+    let t = t.clamp(0.0, 1.0);
+    (qx - (ax + dx * t)).hypot(qy - (ay + dy * t))
+}
+
+/// Trace each detected void's medial axis: long-enough runs become tapered
+/// beads; the rest — sub-length specks and culled corner ribs — come back to
+/// the caller so [`absorb_dropped_voids`] can widen a neighbouring ring over
+/// them instead of leaving pinholes.
+fn emit_gap_fill(
+    raw: &Polygons,
+    lw: f64,
+    sp: f64,
+    out: &mut Vec<ToolPath>,
+) -> Vec<crate::medial::ThickPolyline> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let min = 0.2 * lw;
+    let max = 2.0 * sp;
+    // Drop sub-min hair ribbons (open by min/2) and subtract the >max cores that
+    // should have taken a real ring (the open-by-max/2 part): the fillable band.
+    let opened_min = offset(&offset(&raw, -min * 0.5), min * 0.5);
+    let wide = offset(&offset(&raw, -max * 0.5), max * 0.5);
+    let gaps = difference(&opened_min, &wide);
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    let (beads, mut runts) = crate::medial::medial_axis_with_runts(&gaps, min, max);
+    for tp in beads {
+        if tp.length_mm() < GAP_BEAD_MIN_MM {
+            runts.push(tp);
+            continue;
+        }
+        emit_tapered_bead(&tp, lw, out);
+    }
+    runts
+}
+
+/// The dual of [`narrow_pinched_rings`]: where gap fill DROPPED a void — a
+/// sub-length speck, or a rib the medial's twig cull removed — widen the
+/// nearest inner ring over the void's span instead of leaving a pinhole. Each
+/// receiving vertex shifts half the absorbed width toward the void and widens
+/// by all of it, so the bead's near edge sweeps across the void while its far
+/// edge stays put: the void's volume is deposited without double-covering the
+/// far side. Runt samples already inside a placed gap bead's footprint (a
+/// culled corner rib of a channel that got its bead) are skipped, and the
+/// visible outer wall is never a receiver.
+fn absorb_dropped_voids(
+    paths: &mut [ToolPath],
+    runts: &[crate::medial::ThickPolyline],
+    lw: f64,
+    sp: f64,
+) {
+    if runts.is_empty() {
+        return;
+    }
+    // Placed gap beads' segments — absorption must not re-fill their coverage.
+    let mut placed: Vec<(Point, Point, f64)> = Vec::new();
+    for p in paths.iter() {
+        if p.kind != PathKind::GapFill || p.points.len() < 2 {
+            continue;
+        }
+        if let Some(ws) = &p.widths {
+            for j in 0..p.points.len() - 1 {
+                let hw = ws[j].max(ws[j + 1]) * 0.5;
+                placed.push((p.points[j], p.points[j + 1], hw));
+            }
+        }
+    }
+    // Receiver segments (inner rings only, still plain), on a coarse grid.
+    let receivers: Vec<usize> = (0..paths.len())
+        .filter(|&i| {
+            let p = &paths[i];
+            p.kind == PathKind::Perimeter && p.closed && p.segs.is_none() && p.points.len() >= 4
+        })
+        .collect();
+    if receivers.is_empty() {
+        return;
+    }
+    let cell = ((lw + sp) * geo2d::UNITS_PER_MM).max(1.0) as i64;
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for &i in &receivers {
+        let pts = &paths[i].points;
+        let n = pts.len();
+        for j in 0..n {
+            let (a, b) = (pts[j], pts[(j + 1) % n]);
+            for gx in a.x.min(b.x).div_euclid(cell)..=a.x.max(b.x).div_euclid(cell) {
+                for gy in a.y.min(b.y).div_euclid(cell)..=a.y.max(b.y).div_euclid(cell) {
+                    grid.entry((gx, gy)).or_default().push((i, j));
+                }
+            }
+        }
+    }
+    // Match every runt sample to its nearest receiver.
+    let mut assigned: std::collections::HashMap<usize, Vec<([f64; 2], f64)>> =
+        std::collections::HashMap::new();
+    for tp in runts {
+        let (rp, rw) = resample_thick(&tp.points, &tp.widths, PINCH_STEP_MM);
+        for (q, w) in rp.iter().zip(&rw) {
+            let v = w.min(lw);
+            if v < 0.05 {
+                continue; // dust below print resolution
+            }
+            let qm = [q.x_mm(), q.y_mm()];
+            if placed
+                .iter()
+                .any(|&(a, b, hw)| point_segment_dist_mm(*q, a, b) <= hw + v * 0.5)
+            {
+                continue; // a culled rib of a channel that got its bead
+            }
+            let (cx, cy) = (q.x.div_euclid(cell), q.y.div_euclid(cell));
+            let mut best: Option<(usize, f64)> = None;
+            for gx in (cx - 1)..=(cx + 1) {
+                for gy in (cy - 1)..=(cy + 1) {
+                    let Some(js) = grid.get(&(gx, gy)) else { continue };
+                    for &(i, j) in js {
+                        let pts = &paths[i].points;
+                        let d = point_segment_dist_mm(*q, pts[j], pts[(j + 1) % pts.len()]);
+                        if best.is_none_or(|(_, bd)| d < bd) {
+                            best = Some((i, d));
+                        }
+                    }
+                }
+            }
+            if let Some((i, d)) = best {
+                if d <= lw + v {
+                    assigned.entry(i).or_default().push((qm, v));
+                }
+            }
+        }
+    }
+    // Apply per receiving ring: resample so the profile can be local, then
+    // widen + nudge toward each void, feathered so E doesn't step.
+    for (i, samples) in assigned {
+        let p = &mut paths[i];
+        if p.widths.is_none() {
+            let mut wrapped = p.points.clone();
+            wrapped.push(wrapped[0]);
+            let dummy = vec![0.0; wrapped.len()];
+            let (mut rp, _) = resample_thick(&wrapped, &dummy, PINCH_STEP_MM);
+            rp.pop();
+            if rp.len() < 4 {
+                continue;
+            }
+            let n = rp.len();
+            p.points = rp;
+            p.widths = Some(vec![p.width_mm; n]);
+        }
+        let n = p.points.len();
+        let (mut add, mut sx, mut sy) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for (qm, v) in samples {
+            let (mut k, mut kd) = (0usize, f64::MAX);
+            for (j, pt) in p.points.iter().enumerate() {
+                let d = (qm[0] - pt.x_mm()).hypot(qm[1] - pt.y_mm());
+                if d < kd {
+                    (k, kd) = (j, d);
+                }
+            }
+            if v > add[k] {
+                add[k] = v;
+                let l = kd.max(1e-9);
+                sx[k] = (qm[0] - p.points[k].x_mm()) / l * v * 0.5;
+                sy[k] = (qm[1] - p.points[k].y_mm()) / l * v * 0.5;
+            }
+        }
+        // A tight feather (±1 sample): enough that E doesn't step, without
+        // smearing a short void's volume past its own neighbourhood.
+        let add = smooth_widths(&add, PINCH_STEP_MM, 1.0);
+        let sx = smooth_widths(&sx, PINCH_STEP_MM, 1.0);
+        let sy = smooth_widths(&sy, PINCH_STEP_MM, 1.0);
+        let ws = p.widths.as_mut().unwrap();
+        for j in 0..n {
+            if add[j] > 1e-6 {
+                ws[j] = (ws[j] + add[j]).min(lw * 2.0);
+                p.points[j] = Point::from_mm(
+                    p.points[j].x_mm() + sx[j],
+                    p.points[j].y_mm() + sy[j],
+                );
+            }
+        }
+    }
+}
+
+/// Emit a medial polyline as one continuously-tapered `GapFill` bead. The
+/// centerline is resampled to fine segments and carries a per-point width
+/// (`ToolPath.widths`), so the g-code varies E per segment — a smooth taper to
+/// the tip — and the preview renders a variable-width ribbon. Widths are floored
+/// at the minimum printable bead; `width_mm` carries the mean for feed/flow.
+fn emit_tapered_bead(tp: &crate::medial::ThickPolyline, lw: f64, out: &mut Vec<ToolPath>) {
+    const FLOOR: f64 = 0.1; // min printable bead width
+    // The medial centerline can be sparse — a wedge void traces as just two
+    // points (wide base, thin tip). Resample so the per-segment width actually
+    // varies along it instead of collapsing to one mean.
+    let (pts, ws) = resample_thick(&tp.points, &tp.widths, lw * 0.5);
+    if pts.len() < 2 {
+        return;
+    }
+    // The medial clearance to the raster void's jagged (~0.18mm) boundary
+    // oscillates, which reads as a lumpy bead pinching below the real channel
+    // width. Low-pass the width profile (~2mm window) so the bead fills the
+    // channel smoothly; the centerline itself is already smooth.
+    let ws = smooth_widths(&ws, lw * 0.5, 2.0);
+    let widths: Vec<f64> = ws.iter().map(|&w| w.max(FLOOR)).collect();
+    let mean = widths.iter().sum::<f64>() / widths.len() as f64;
+    let mut p = ToolPath::new(PathKind::GapFill, false, mean, pts);
+    p.widths = Some(widths);
+    out.push(p);
+}
+
+/// Moving-average the width profile over a ~`window_mm` window (samples spaced
+/// `step_mm`) to strip the high-frequency oscillation the raster void's jagged
+/// boundary injects into the medial clearance, while keeping the real taper.
+fn smooth_widths(ws: &[f64], step_mm: f64, window_mm: f64) -> Vec<f64> {
+    let r = ((window_mm / step_mm / 2.0).round() as usize).max(1);
+    if ws.len() <= 2 {
+        return ws.to_vec();
+    }
+    (0..ws.len())
+        .map(|i| {
+            let lo = i.saturating_sub(r);
+            let hi = (i + r + 1).min(ws.len());
+            ws[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+        })
+        .collect()
+}
+
+/// Resample a polyline + per-point widths at ~`step_mm` spacing, interpolating
+/// both position and width — turns a sparse medial centerline into enough points
+/// that its width taper survives the run-split.
+fn resample_thick(pts: &[Point], ws: &[f64], step_mm: f64) -> (Vec<Point>, Vec<f64>) {
+    let n = pts.len();
+    if n < 2 {
+        return (pts.to_vec(), ws.to_vec());
+    }
+    let step = (step_mm * geo2d::UNITS_PER_MM).max(1.0);
+    let mut op = vec![pts[0]];
+    let mut ow = vec![ws[0]];
+    let mut acc = 0.0; // distance walked since the last emitted point
+    for i in 0..n - 1 {
+        let (a, b) = (pts[i], pts[i + 1]);
+        let seg = ((b.x - a.x) as f64).hypot((b.y - a.y) as f64);
+        if seg < 1.0 {
+            continue;
+        }
+        let mut t0 = 0.0; // fraction of this segment already consumed
+        while acc + seg * (1.0 - t0) >= step {
+            let t = t0 + (step - acc) / seg;
+            op.push(Point::new(
+                a.x + ((b.x - a.x) as f64 * t).round() as i64,
+                a.y + ((b.y - a.y) as f64 * t).round() as i64,
+            ));
+            ow.push(ws[i] + (ws[i + 1] - ws[i]) * t);
+            t0 = t;
+            acc = 0.0;
+        }
+        acc += seg * (1.0 - t0);
+    }
+    op.push(pts[n - 1]);
+    ow.push(ws[n - 1]);
+    (op, ow)
+}
+
 fn spiralize_shells(
     paths: Vec<ToolPath>,
     region: &Polygons,
@@ -3116,11 +3564,14 @@ fn spiralize_shells(
         }
     }
     // A shell ring is a CLOSED inner Perimeter wall, or a CLOSED concentric fill loop
-    // (group-less, so monotonic line fill and bridged arcs are excluded).
+    // (group-less, so monotonic line fill and bridged arcs are excluded). A
+    // width-modulated ring (a narrowed pinch) stays standalone: the spiral
+    // family carries only points+kind and would drop its width profile.
     let is_shell = |p: &ToolPath| {
         p.closed
             && p.points.len() >= 3
             && p.segs.is_none()
+            && p.widths.is_none()
             && match p.kind {
                 PathKind::Perimeter => true,
                 PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin => p.group.is_none(),
@@ -5175,6 +5626,262 @@ mod tests {
             interface.paths.iter().filter(|p| p.kind == PathKind::BottomSkin).collect();
         assert!(!skins.is_empty(), "part interface must be skinned");
         assert!(skins.iter().all(|p| p.tool == 1), "the interface skin belongs to the upper part");
+    }
+
+    fn box_soup(boxes: &[[f64; 6]]) -> Vec<[[f64; 3]; 3]> {
+        let mut tris = Vec::new();
+        for &[x0, y0, z0, x1, y1, z1] in boxes {
+            let v = [
+                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+            ];
+            for [a, b, c, d] in
+                [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+            {
+                tris.push([v[a], v[b], v[c]]);
+                tris.push([v[a], v[c], v[d]]);
+            }
+        }
+        tris
+    }
+
+    /// The bracket recipe: the cross-section is all concentric walls, at the
+    /// 0.4 mm line width the slit/pinch arithmetic in these tests assumes.
+    fn all_wall_settings() -> Settings {
+        let mut s = Settings::default();
+        s.line_width_mm = 0.4;
+        s.wall_count = 99;
+        s.top_layers = 0;
+        s.bottom_layers = 0;
+        s.infill_density = 0.0;
+        s.skirt_loops = 0;
+        s
+    }
+
+    fn path_len_mm(p: &ToolPath) -> f64 {
+        p.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum()
+    }
+
+    #[test]
+    fn gap_bead_fills_the_center_slit() {
+        // A 60×6 mm plate at lw 0.4: concentric walls leave a ~0.2 mm slit
+        // down the middle (6.0 isn't an integer number of bead spacings). The
+        // medial gap bead must trace it — long, thin, and on the centerline.
+        // The straight sides facing each other at 0.6 mm pitch must NOT read
+        // as a pinch (no width-modulated rings here).
+        let mesh = mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 60.0, 6.0, 2.0]]));
+        let layers = generate(&mesh, &all_wall_settings());
+        let mid = &layers[layers.len() / 2];
+        let beads: Vec<&ToolPath> =
+            mid.paths.iter().filter(|p| p.kind == PathKind::GapFill).collect();
+        assert!(!beads.is_empty(), "the center slit must get a gap bead");
+        let longest = beads
+            .iter()
+            .max_by(|a, b| path_len_mm(a).partial_cmp(&path_len_mm(b)).unwrap())
+            .unwrap();
+        assert!(
+            path_len_mm(longest) > 20.0,
+            "the slit runs most of the plate, got {:.1} mm",
+            path_len_mm(longest)
+        );
+        let ws = longest.widths.as_ref().expect("a gap bead carries a width profile");
+        let mean = ws.iter().sum::<f64>() / ws.len() as f64;
+        assert!((0.1..0.75).contains(&mean), "slit-sized bead, got mean width {mean:.2}");
+        // On the centerline: compare against the plate's own midline.
+        let ext = mid.paths.iter().find(|p| p.kind == PathKind::ExternalPerimeter).unwrap();
+        let (ymin, ymax) = ext
+            .points
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y_mm()), b.max(p.y_mm())));
+        let bead_y =
+            longest.points.iter().map(|p| p.y_mm()).sum::<f64>() / longest.points.len() as f64;
+        assert!(
+            (bead_y - (ymin + ymax) * 0.5).abs() < 0.4,
+            "the bead rides the plate midline"
+        );
+        assert!(
+            !mid.paths.iter().any(|p| p.kind == PathKind::Perimeter
+                && p.widths.as_ref().is_some_and(|ws| ws.iter().any(|&w| w < 0.4 - 1e-6))),
+            "parallel sides at 0.6 mm pitch are not a pinch"
+        );
+    }
+
+    #[test]
+    fn short_gap_beads_are_skipped() {
+        // A 6×6 column's concentric walls leave only a sub-bead speck at the
+        // center — below even the raster's area floor. No gap fill, and
+        // nothing for absorption to act on either: the rings stay plain.
+        let mesh = mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 6.0, 6.0, 2.0]]));
+        let layers = generate(&mesh, &all_wall_settings());
+        let n: usize = layers.iter().map(|l| count(l, PathKind::GapFill)).sum();
+        assert_eq!(n, 0, "specks under {GAP_BEAD_MIN_MM} mm must not spawn beads, got {n}");
+        assert!(
+            !layers[layers.len() / 2]
+                .paths
+                .iter()
+                .any(|p| p.kind == PathKind::Perimeter && p.widths.is_some()),
+            "a sub-raster speck must not trigger absorption"
+        );
+    }
+
+    #[test]
+    fn dropped_voids_widen_the_nearest_ring() {
+        // A square ring and a hand-made runt lying beside its bottom edge:
+        // absorption must widen the ring locally — the dual of pinch narrowing
+        // — shift the widened stretch toward the void (near edge sweeps the
+        // void, far edge stays put), honor the 2·lw cap, and keep the loop
+        // closed. Coarse corner-only vertices prove the resample kicks in.
+        let square: Vec<Point> = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+            .iter()
+            .map(|&(x, y)| Point::from_mm(x, y))
+            .collect();
+        let mut paths = vec![ToolPath::new(PathKind::Perimeter, true, 0.4, square)];
+        let runt = crate::medial::ThickPolyline {
+            points: vec![Point::from_mm(8.0, -0.4), Point::from_mm(9.5, -0.4)],
+            widths: vec![0.3, 0.3],
+            endpoints: (true, true),
+        };
+        absorb_dropped_voids(&mut paths, &[runt], 0.4, 0.357);
+        let ring = &paths[0];
+        assert!(ring.closed, "the widened ring stays a closed loop");
+        let ws = ring.widths.as_ref().expect("the runt must be absorbed");
+        let (mut wmax, mut at) = (0.0f64, [0.0f64; 2]);
+        for (w, pt) in ws.iter().zip(&ring.points) {
+            assert!(*w >= 0.4 - 1e-6, "absorption only ever widens");
+            assert!(*w <= 0.8 + 1e-6, "the 2·lw cap holds");
+            if *w > wmax {
+                wmax = *w;
+                at = [pt.x_mm(), pt.y_mm()];
+            }
+        }
+        assert!((0.55..=0.72).contains(&wmax), "widens by ≈ the void width, got {wmax:.2}");
+        assert!(
+            (7.0..10.5).contains(&at[0]) && at[1] < 0.0,
+            "widening is localized at the runt and shifted toward it, at ({:.1},{:.2})",
+            at[0], at[1]
+        );
+    }
+
+    #[test]
+    fn covered_runts_are_not_absorbed() {
+        // The same runt, but a placed gap bead already covers it (a culled
+        // corner rib of a channel that got its bead): nothing may widen.
+        let square: Vec<Point> = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+            .iter()
+            .map(|&(x, y)| Point::from_mm(x, y))
+            .collect();
+        let mut bead = ToolPath::new(
+            PathKind::GapFill,
+            false,
+            0.4,
+            vec![Point::from_mm(7.5, -0.4), Point::from_mm(10.0, -0.4)],
+        );
+        bead.widths = Some(vec![0.4, 0.4]);
+        let mut paths = vec![ToolPath::new(PathKind::Perimeter, true, 0.4, square), bead];
+        let runt = crate::medial::ThickPolyline {
+            points: vec![Point::from_mm(8.0, -0.4), Point::from_mm(9.5, -0.4)],
+            widths: vec![0.3, 0.3],
+            endpoints: (true, true),
+        };
+        absorb_dropped_voids(&mut paths, &[runt], 0.4, 0.357);
+        assert!(
+            paths[0].widths.is_none(),
+            "a runt inside a placed bead's footprint is already filled"
+        );
+    }
+
+    /// A vertical prism over a CONVEX CCW footprint (fan triangulation).
+    fn prism(fp: &[[f64; 2]], z0: f64, z1: f64) -> Vec<[[f64; 3]; 3]> {
+        let n = fp.len();
+        let mut t = Vec::new();
+        for i in 1..n - 1 {
+            t.push([
+                [fp[0][0], fp[0][1], z0],
+                [fp[i + 1][0], fp[i + 1][1], z0],
+                [fp[i][0], fp[i][1], z0],
+            ]);
+            t.push([
+                [fp[0][0], fp[0][1], z1],
+                [fp[i][0], fp[i][1], z1],
+                [fp[i + 1][0], fp[i + 1][1], z1],
+            ]);
+        }
+        for i in 0..n {
+            let (a, b) = (fp[i], fp[(i + 1) % n]);
+            t.push([[a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z1]]);
+            t.push([[a[0], a[1], z0], [b[0], b[1], z1], [a[0], a[1], z1]]);
+        }
+        t
+    }
+
+    #[test]
+    fn pinched_ring_narrows_where_the_channel_pinches() {
+        // A tapered plate, 5.5 → 6.1 mm wide over 60 mm: eight rings fit the
+        // whole way, and the innermost ring's own two sides sweep from 0.10 mm
+        // pitch (over-stuffed, the bracket's glossy filleted corner in slow
+        // motion) through one bead width and out to a slit. On the narrow end
+        // the ring must pick up a width profile — ~(pitch+lw)/2 — while
+        // staying a standalone CLOSED loop (the shell spiral would drop the
+        // profile); the wide end keeps full width.
+        let mesh = mesh::Mesh::from_triangle_soup(&prism(
+            &[[0.0, 0.0], [60.0, 0.0], [60.0, 6.1], [0.0, 5.5]],
+            0.0,
+            1.0,
+        ));
+        let layers = generate(&mesh, &all_wall_settings());
+        let mid = &layers[layers.len() / 2];
+        let ring = mid
+            .paths
+            .iter()
+            .find(|p| p.kind == PathKind::Perimeter && p.widths.is_some())
+            .expect("the pinched innermost ring must carry widths");
+        assert!(ring.closed, "the modulated ring stays a closed loop");
+        let ws = ring.widths.as_ref().unwrap();
+        let wmin = ws.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            (0.19..0.38).contains(&wmin),
+            "pinch width narrows toward (pitch+lw)/2, got {wmin:.2}"
+        );
+        assert!(ws.iter().any(|&w| w > 0.39), "the roomy end keeps full width");
+        // The narrowing lives on the narrow (low-x) end of the taper.
+        let xs: Vec<f64> = ring.points.iter().map(|p| p.x_mm()).collect();
+        let xmid = (xs.iter().cloned().fold(f64::MAX, f64::min)
+            + xs.iter().cloned().fold(f64::MIN, f64::max))
+            * 0.5;
+        let k = (0..ws.len()).min_by(|&a, &b| ws[a].partial_cmp(&ws[b]).unwrap()).unwrap();
+        assert!(
+            xs[k] < xmid,
+            "narrowest point sits on the narrow end (x={:.1}, mid={xmid:.1})",
+            xs[k]
+        );
+    }
+
+    #[test]
+    fn gradual_overhang_gets_grid_support() {
+        // A thin wall leaning ~63° from vertical: it steps out only ~0.4 mm/layer
+        // (under a line-width), so the old per-layer sliver-removal open erased the
+        // overhang and it got ZERO grid support at every angle. It must be supported.
+        let (t, l, d, h) = (1.5, 20.0, 40.0, 20.0); // lean = atan(d/h) ≈ 63° from vertical
+        let v = [
+            [0.0, 0.0, 0.0], [t, 0.0, 0.0], [t, l, 0.0], [0.0, l, 0.0],
+            [d, 0.0, h], [d + t, 0.0, h], [d + t, l, h], [d, l, h],
+        ];
+        let q = |a: usize, b: usize, c: usize, dd: usize| [[v[a], v[b], v[c]], [v[a], v[c], v[dd]]];
+        let mut tris = Vec::new();
+        for tri in [q(0, 3, 2, 1), q(4, 5, 6, 7), q(0, 1, 5, 4), q(2, 3, 7, 6), q(1, 2, 6, 5), q(3, 0, 4, 7)] {
+            tris.extend(tri);
+        }
+        let wall = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.support_mode = SupportMode::Grid;
+        let supports: usize = generate(&wall, &s).iter().map(|l| count(l, PathKind::Support)).sum();
+        assert!(supports > 0, "a gradual leaning overhang must get grid support, got {supports}");
+
+        // A plain vertical cube must NOT get spurious support.
+        let cube_support: usize =
+            generate(&Mesh::cube(20.0), &s).iter().map(|l| count(l, PathKind::Support)).sum();
+        assert_eq!(cube_support, 0, "vertical walls need no support, got {cube_support}");
     }
 
     #[test]

@@ -604,9 +604,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             }
 
             if let Some(ws) = &path.widths {
-                // Variable-width bead (gap fill): E per segment from the local
-                // width, so the bead tapers continuously. Arc fitting assumes a
-                // constant width, so it's skipped here.
+                // Variable-width bead (a gap-fill stroke, or a pinch-narrowed
+                // ring): E per segment from the local width, so the bead tapers
+                // continuously. Arc fitting assumes a constant width, so it's
+                // skipped here.
                 let h = layer.height_mm * path.height_scale;
                 let ff = flow_factor(path, t);
                 let mut prev = start;
@@ -616,6 +617,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     let p = path.points[k + 1];
                     g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feed);
                     prev = p;
+                }
+                if path.closed {
+                    // Close the ring — a modulated ring must not leave its seam
+                    // segment unextruded.
+                    let w = (ws[n_pts - 1] + ws[0]) * 0.5;
+                    let c = config::bead_area_mm2(w, h) / area * ff;
+                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * c, feed);
                 }
             } else if path.segs.is_some() {
                 // Per-segment attributes: sub-block the bead into runs of equal
@@ -828,6 +836,9 @@ fn nominal_speed_mm_s(
         PathKind::Solid => s.solid_speed_mm_s,
         // Visible skins share the outer wall's pace: finish over time.
         PathKind::TopSkin | PathKind::BottomSkin => s.external_perimeter_speed_mm_s,
+        // A gap bead is a thin, wiggly precision stroke — the finish pace, not
+        // the interior sprint.
+        PathKind::GapFill => s.external_perimeter_speed_mm_s,
         PathKind::Ironing => s.ironing_speed_mm_s,
         PathKind::Support => s.support_speed_mm_s,
         // Bridges print into air anchored on both ends.
@@ -983,6 +994,7 @@ pub fn kind_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "top surface",
         PathKind::BottomSkin => "bottom surface",
         PathKind::Infill => "infill",
+        PathKind::GapFill => "gap fill",
         PathKind::Ironing => "ironing",
         PathKind::Support => "support",
         PathKind::Bridge => "bridge",
@@ -1002,6 +1014,7 @@ fn type_label(kind: PathKind) -> &'static str {
         PathKind::TopSkin => "Top surface",
         PathKind::BottomSkin => "Bottom surface",
         PathKind::Infill => "Sparse infill",
+        PathKind::GapFill => "Gap infill",
         PathKind::Ironing => "Ironing",
         PathKind::Support => "Support",
         PathKind::Bridge => "Bridge",
@@ -1449,21 +1462,53 @@ fn plan_layer_travels(
                 hop: s.z_hop_mm > 0.0,
             },
             None => Travel { points: vec![start], retract: false, hop: false },
+            Some(prev) if dist_mm(prev, start) < MIN_TRAVEL_MM => {
+                Travel { points: vec![start], retract: false, hop: false }
+            }
+            // Endpoints in different islands (or off the part — a skirt/brim
+            // lead-in): no in-material route can exist, so hop the gap
+            // retracted WITHOUT consulting the comb graph. Asking it anyway
+            // was a bug: on flat faces the edges of separate islands are
+            // collinear, the router admitted diagonals along those shared
+            // lines, and hole-split layers got naked travels dragged across
+            // the outer face (scarred bands beside every hole).
+            Some(prev)
+                if island_of(&plan.outline, prev) != island_of(&plan.outline, start) =>
+            {
+                Travel {
+                    points: vec![start],
+                    retract: s.retract_len_mm > 0.0,
+                    hop: s.z_hop_mm > 0.0,
+                }
+            }
+            Some(prev) if !travel_blocked(&plan.outline, prev, start) => {
+                Travel { points: vec![start], retract: false, hop: false }
+            }
             Some(prev) => {
-                let crosses = dist_mm(prev, start) >= MIN_TRAVEL_MM
-                    && travel_crosses(&plan.outline, prev, start);
-                if !crosses {
-                    Travel { points: vec![start], retract: false, hop: false }
-                } else {
-                    let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
-                    match graph.route(&plan.outline, prev, start) {
-                        Some(route) => Travel { points: route, retract: false, hop: false },
-                        None => Travel {
-                            points: vec![start],
-                            retract: s.retract_len_mm > 0.0,
-                            hop: s.z_hop_mm > 0.0,
-                        },
+                let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
+                match graph.route(&plan.outline, prev, start) {
+                    Some(route) => {
+                        // Combing exists to glide over material unretracted,
+                        // but a long glide still drools the melt pressure out
+                        // and the next bead starts starved — retract past the
+                        // threshold (no hop: the route stays over the part).
+                        let mut len = 0.0;
+                        let mut at = prev;
+                        for &p in &route {
+                            len += dist_mm(at, p);
+                            at = p;
+                        }
+                        Travel {
+                            points: route,
+                            retract: len > COMB_RETRACT_MM && s.retract_len_mm > 0.0,
+                            hop: false,
+                        }
                     }
+                    None => Travel {
+                        points: vec![start],
+                        retract: s.retract_len_mm > 0.0,
+                        hop: s.z_hop_mm > 0.0,
+                    },
                 }
             }
         };
@@ -1715,6 +1760,11 @@ pub fn per_layer_stats(layers: &[LayerPlan], s: &Settings) -> Vec<LayerStats> {
 
 const MIN_TRAVEL_MM: f64 = 0.8;
 
+/// A combed travel longer than this retracts anyway: gliding unretracted over
+/// material is combing's point, but a long enough glide drools the melt
+/// pressure out of the nozzle and the next bead starts starved.
+const COMB_RETRACT_MM: f64 = 30.0;
+
 fn path_end(p: &ToolPath) -> Point {
     if p.closed {
         p.points[0]
@@ -1723,11 +1773,59 @@ fn path_end(p: &ToolPath) -> Point {
     }
 }
 
-fn travel_crosses(outline: &Polygons, a: Point, b: Point) -> bool {
+/// Which island a point sits in: the innermost CCW contour containing it.
+/// `None` = outside every outer (skirt/brim territory). Two points with
+/// different islands can never be joined by an in-material route.
+fn island_of(outline: &Polygons, p: Point) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (k, c) in outline.contours.iter().enumerate() {
+        if c.is_ccw() && c.contains(p) {
+            let a = c.area_mm2();
+            if best.map_or(true, |(_, ba)| a < ba) {
+                best = Some((k, a));
+            }
+        }
+    }
+    best.map(|(k, _)| k)
+}
+
+/// Whether the straight hop `p → q` is blocked by the outline: it properly
+/// crosses a contour edge, passes exactly through a contour vertex, lands an
+/// endpoint on an edge's interior, or overlaps an edge collinearly for any
+/// positive length. Exact integer arithmetic; a shared endpoint alone (a hop
+/// starting or ending AT a vertex) does not block. The degenerate cases are
+/// load-bearing: on any flat face the edges of different islands (and hole
+/// chords) are collinear, which is exactly how void-bridging hops used to
+/// read as clear under a proper-crossings-only test.
+fn travel_blocked(outline: &Polygons, p: Point, q: Point) -> bool {
     for c in &outline.contours {
         let n = c.points.len();
         for i in 0..n {
-            if segments_intersect(a, b, c.points[i], c.points[(i + 1) % n]) {
+            let a = c.points[i];
+            let b = c.points[(i + 1) % n];
+            if a == b {
+                continue;
+            }
+            let o1 = orient(p, q, a);
+            let o2 = orient(p, q, b);
+            let o3 = orient(a, b, p);
+            let o4 = orient(a, b, q);
+            if o1 != 0
+                && o2 != 0
+                && o3 != 0
+                && o4 != 0
+                && (o1 > 0) != (o2 > 0)
+                && (o3 > 0) != (o4 > 0)
+            {
+                return true; // proper crossing
+            }
+            // Degenerate contacts: a contour vertex strictly inside the hop
+            // (pass-through, or the start of a collinear run along the edge),
+            // or a hop endpoint strictly inside an edge (tangent landing).
+            if (o1 == 0 && strictly_between(p, q, a)) || (o2 == 0 && strictly_between(p, q, b)) {
+                return true;
+            }
+            if (o3 == 0 && strictly_between(a, b, p)) || (o4 == 0 && strictly_between(a, b, q)) {
                 return true;
             }
         }
@@ -1735,8 +1833,19 @@ fn travel_crosses(outline: &Polygons, a: Point, b: Point) -> bool {
     false
 }
 
-/// Proper segment intersection (touching/collinear treated as no crossing — the
-/// travel endpoints sit strictly inside the outline, so that's correct here).
+/// For `c` collinear with the segment `a–b`: strictly interior to it?
+fn strictly_between(a: Point, b: Point, c: Point) -> bool {
+    c != a
+        && c != b
+        && c.x >= a.x.min(b.x)
+        && c.x <= a.x.max(b.x)
+        && c.y >= a.y.min(b.y)
+        && c.y <= a.y.max(b.y)
+}
+
+/// Proper segment intersection (touching/collinear treated as no crossing).
+/// Travel decisions use the stricter [`travel_blocked`]; only the
+/// `audit_combing` hole diagnostic keys on this.
 fn segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool {
     let o1 = orient(a, b, c);
     let o2 = orient(a, b, d);
@@ -1761,13 +1870,13 @@ fn in_region(outline: &Polygons, p: Point) -> bool {
 }
 
 /// A segment is a valid in-region travel if its midpoint is inside the solid
-/// region and it crosses no contour edge.
+/// region and it touches no contour except at its own endpoints.
 fn visible(outline: &Polygons, p: Point, q: Point) -> bool {
     if p == q {
         return true;
     }
     let mid = Point::new((p.x + q.x) / 2, (p.y + q.y) / 2);
-    in_region(outline, mid) && !travel_crosses(outline, p, q)
+    in_region(outline, mid) && !travel_blocked(outline, p, q)
 }
 
 /// Above this many outline vertices, skip the O(n²) diagonal precompute and
@@ -1937,12 +2046,138 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_arc, ARC_MIN_PTS};
+    use super::{
+        dist_mm, fit_arc, island_of, path_end, travel_blocked, CombGraph, ARC_MIN_PTS,
+    };
     use crate::{
         estimate_filament, estimate_filament_per_tool, estimate_seconds, generate, generate_parts,
         per_layer_stats, to_gcode, LayerPlan, PathKind,
     };
     use config::Settings;
+    use geo2d::{Contour, Point, Polygons};
+
+    #[test]
+    fn comb_route_never_bridges_islands() {
+        // Cross-section of a standing plate at hole height: two rectangles
+        // whose top and bottom edges lie on shared collinear lines. Diagonals
+        // along those lines used to pass the visibility test (collinear overlap
+        // and vertex pass-throughs read as "no crossing"), so the router
+        // returned "combed" routes straight across the void and island hops
+        // went out unretracted, dragging ooze along the printed face.
+        let rect = |x0: f64, x1: f64| {
+            Contour::new(vec![
+                Point::from_mm(x0, 0.0),
+                Point::from_mm(x1, 0.0),
+                Point::from_mm(x1, 3.0),
+                Point::from_mm(x0, 3.0),
+            ])
+        };
+        let mut outline = Polygons::new();
+        outline.push(rect(0.0, 14.0));
+        outline.push(rect(26.0, 40.0));
+        let a = Point::from_mm(7.0, 1.5);
+        let b = Point::from_mm(33.0, 1.5);
+        assert_ne!(island_of(&outline, a), island_of(&outline, b), "distinct islands");
+        let graph = CombGraph::build(&outline);
+        assert!(
+            graph.route(&outline, a, b).is_none(),
+            "no comb route may bridge disjoint islands"
+        );
+        // The face line itself is blocked, not readable as clear...
+        assert!(travel_blocked(&outline, Point::from_mm(7.0, 0.0), Point::from_mm(33.0, 0.0)));
+        // ...while a clear in-island hop stays unblocked (no spurious retracts).
+        assert!(!travel_blocked(&outline, a, Point::from_mm(2.0, 1.5)));
+    }
+
+    #[test]
+    fn concave_island_still_combs_around_the_void() {
+        // One L-shaped island: the tip-to-tip hop cuts the concave void, so it
+        // must comb around the inside corner — the strict degenerate-contact
+        // rules must not break legitimate routing.
+        let pts = [(0.0, 0.0), (40.0, 0.0), (40.0, 8.0), (8.0, 8.0), (8.0, 40.0), (0.0, 40.0)];
+        let mut outline = Polygons::new();
+        outline.push(Contour::new(pts.iter().map(|&(x, y)| Point::from_mm(x, y)).collect()));
+        let a = Point::from_mm(4.0, 36.0);
+        let b = Point::from_mm(36.0, 4.0);
+        assert_eq!(island_of(&outline, a), island_of(&outline, b), "one island");
+        assert!(travel_blocked(&outline, a, b), "the direct hop cuts the void");
+        let graph = CombGraph::build(&outline);
+        let route = graph.route(&outline, a, b).expect("same island → a comb route exists");
+        assert_eq!(route.last(), Some(&b), "route ends at the target");
+        let mut len = 0.0;
+        let mut at = a;
+        for &p in &route {
+            len += dist_mm(at, p);
+            at = p;
+        }
+        assert!(len > dist_mm(a, b), "the route detours around the corner, not through the void");
+    }
+
+    fn cuboid(tris: &mut Vec<[[f64; 3]; 3]>, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) {
+        let v = [
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ];
+        for [a, b, c, d] in [
+            [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+            [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+        ] {
+            tris.push([v[a], v[b], v[c]]);
+            tris.push([v[a], v[c], v[d]]);
+        }
+    }
+
+    #[test]
+    fn island_hops_at_hole_heights_retract_and_hop() {
+        // A standing 60×3×30 plate with two through-windows (x 14–26 and
+        // 34–46, z 10–20), built from five clean overlapping boxes: at window
+        // heights every layer is three islands. This is the geometry that came
+        // off the printer with scarred bands beside every hole — island hops
+        // were emitted as naked "combed" travels dragged along the outer face.
+        // Every island-to-island travel must be a retracted, z-hopped straight
+        // hop, and the retractions must reach the g-code.
+        let mut tris = Vec::new();
+        cuboid(&mut tris, 0.0, 0.0, 0.0, 14.0, 3.0, 30.0);
+        cuboid(&mut tris, 26.0, 0.0, 0.0, 34.0, 3.0, 30.0);
+        cuboid(&mut tris, 46.0, 0.0, 0.0, 60.0, 3.0, 30.0);
+        cuboid(&mut tris, 0.0, 0.0, 0.0, 60.0, 3.0, 10.0);
+        cuboid(&mut tris, 0.0, 0.0, 20.0, 60.0, 3.0, 30.0);
+        let mesh = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.skirt_loops = 0;
+        s.z_hop_mm = 0.4;
+        assert!(s.retract_len_mm > 0.0, "test needs retraction enabled");
+        let layers = generate(&mesh, &s);
+        let mut hops = 0usize;
+        for layer in &layers {
+            let mut last: Option<Point> = None;
+            for (i, path) in layer.paths.iter().enumerate() {
+                if path.points.len() < 2 {
+                    continue;
+                }
+                let start = path.points[0];
+                if let (Some(prev), Some(tr)) = (last, layer.travels.get(i)) {
+                    if island_of(&layer.outline, prev) != island_of(&layer.outline, start) {
+                        hops += 1;
+                        assert!(
+                            tr.retract && tr.hop && tr.points.len() == 1,
+                            "island hop must be a retracted+hopped straight move at z={:.2} \
+                             (retract={} hop={} pts={})",
+                            layer.print_z_mm,
+                            tr.retract,
+                            tr.hop,
+                            tr.points.len()
+                        );
+                    }
+                }
+                last = Some(path_end(path));
+            }
+        }
+        assert!(hops >= 40, "the window band must produce many island hops, saw {hops}");
+        let gcode = to_gcode(&layers, &s);
+        let retracts = gcode.lines().filter(|l| l.trim_start().starts_with("G1 E-")).count();
+        assert!(retracts >= hops, "retractions must reach the g-code: {retracts} for {hops} hops");
+    }
 
     #[test]
     fn arc_fit_curves_yes_corners_no() {
