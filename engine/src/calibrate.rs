@@ -55,6 +55,77 @@ pub fn flow_from_wall(current_flow: f64, line_width_mm: f64, measured_mm: f64) -
     current_flow * (line_width_mm / measured_mm)
 }
 
+/// Footprint edge of the PA tower (mm) — sides long enough that melt pressure
+/// fully settles between corners, so every corner is a clean step transient.
+pub const PA_TOWER_MM: f64 = 30.0;
+/// PA tower height (mm). With [`PA_TOWER_FACTOR`] the sweep spans 0–0.10:
+/// the whole direct-drive range, at caliper-grade resolution (±0.5 mm of
+/// height reads as ±0.001 of PA).
+pub const PA_TOWER_H_MM: f64 = 50.0;
+/// Pressure advance at the bed.
+pub const PA_TOWER_START: f64 = 0.0;
+/// Pressure advance added per mm of tower height.
+pub const PA_TOWER_FACTOR: f64 = 0.002;
+
+/// G-code for the pressure-advance tower: a single-wall square tube whose PA
+/// ramps with height — Klipper's `TUNING_TOWER` sweep, but baked into the
+/// file per layer, so there is no console incantation to run. Seams are held
+/// in one corner column ([`config::SeamMode::Sharpest`]); judge the other
+/// three. Too little PA bulges corners (pressure overshoots the slowdown),
+/// too much starves the stretch right after them — the crispest band wins,
+/// and [`pa_from_height`] turns its measured height into the profile value.
+pub fn pa_tower_gcode(settings: &Settings) -> String {
+    let mut s = single_wall(settings);
+    s.seam_mode = config::SeamMode::Sharpest;
+    let mesh = cuboid(PA_TOWER_MM, PA_TOWER_MM, PA_TOWER_H_MM);
+    let g = to_gcode(&generate(&mesh, &s), &s);
+    let mut out = String::with_capacity(g.len() + 8192);
+    out.push_str(&format!(
+        "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
+         ; measure the height (mm) of the crispest corners and apply it in the\n\
+         ; Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n"
+    ));
+    for line in g.lines() {
+        out.push_str(line);
+        out.push('\n');
+        // Ride the layer markers: re-issue PA for the new height right after
+        // each one, overriding the profile value the preamble set.
+        if let Some(rest) = line.strip_prefix("; LAYER ") {
+            if let Some(z) = rest.split("z=").nth(1).and_then(|v| v.trim().parse::<f64>().ok()) {
+                let pa = PA_TOWER_START + PA_TOWER_FACTOR * z;
+                out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Pressure advance from the measured best-corner height on the PA tower.
+/// A height off the tower leaves the current value untouched.
+pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
+    if height_mm <= 0.0 || height_mm > PA_TOWER_H_MM {
+        return current_pa;
+    }
+    PA_TOWER_START + PA_TOWER_FACTOR * height_mm
+}
+
+/// An axis-aligned solid box as a triangle soup (the calibration meshes are
+/// synthetic — no model file involved).
+fn cuboid(x: f64, y: f64, z: f64) -> mesh::Mesh {
+    let v = [
+        [0.0, 0.0, 0.0], [x, 0.0, 0.0], [x, y, 0.0], [0.0, y, 0.0],
+        [0.0, 0.0, z], [x, 0.0, z], [x, y, z], [0.0, y, z],
+    ];
+    let mut tris = Vec::new();
+    for [a, b, c, d] in
+        [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+    {
+        tris.push([v[a], v[b], v[c]]);
+        tris.push([v[a], v[c], v[d]]);
+    }
+    mesh::Mesh::from_triangle_soup(&tris)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +174,41 @@ mod tests {
         let layers = generate(&mesh::Mesh::cube(FLOW_TEST_MM), &cal);
         let secs = crate::estimate_seconds(&layers, &cal);
         assert!(secs < 400.0, "cal prints in a few minutes, not the floor's ~13 (got {secs:.0}s)");
+    }
+
+    #[test]
+    fn pa_tower_ramps_with_height() {
+        let g = pa_tower_gcode(&Settings::default());
+        // A 50 mm tower at 0.2 mm layers: one PA line per layer.
+        let pas: Vec<f64> = g
+            .lines()
+            .filter_map(|l| l.strip_prefix("SET_PRESSURE_ADVANCE ADVANCE="))
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        // The preamble's profile PA (if any) comes first; the ramp is the one
+        // line per layer that follows.
+        let layers = g.matches("; LAYER ").count();
+        assert!(layers > 200, "a 50 mm tower is ~250 layers, got {layers}");
+        assert!(pas.len() >= layers, "one PA step per layer");
+        let ramp = &pas[pas.len() - layers..];
+        assert!(ramp.windows(2).all(|w| w[1] >= w[0]), "the sweep is monotonic");
+        assert!(ramp[0] < 0.002, "starts at the bottom of the range");
+        let top = ramp.last().unwrap();
+        assert!(
+            (PA_TOWER_START + PA_TOWER_FACTOR * PA_TOWER_H_MM - top).abs() < 0.003,
+            "ends at the top of the range, got {top}"
+        );
+        // Single wall: no interior features to muddy the corners.
+        assert!(!g.contains(";TYPE:Sparse infill") && !g.contains(";TYPE:Top surface"));
+    }
+
+    #[test]
+    fn pa_from_height_maps_and_guards() {
+        // The user's measured 16 mm reads back the classic direct-drive 0.032.
+        assert!((pa_from_height(0.05, 16.0) - 0.032).abs() < 1e-9);
+        // Off-tower nonsense is a no-op.
+        assert_eq!(pa_from_height(0.05, 0.0), 0.05);
+        assert_eq!(pa_from_height(0.05, 99.0), 0.05);
     }
 
     #[test]

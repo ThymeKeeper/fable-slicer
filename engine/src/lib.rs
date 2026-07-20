@@ -18,7 +18,10 @@ mod paint;
 mod plan;
 mod slice;
 
-pub use calibrate::{flow_from_wall, flow_test_gcode, FLOW_TEST_MM};
+pub use calibrate::{
+    flow_from_wall, flow_test_gcode, pa_from_height, pa_tower_gcode, FLOW_TEST_MM,
+    PA_TOWER_FACTOR, PA_TOWER_H_MM, PA_TOWER_MM, PA_TOWER_START,
+};
 
 pub use emit::{
     audit_combing, audit_flow_clamps, estimate_filament, estimate_filament_per_tool,
