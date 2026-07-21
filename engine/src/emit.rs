@@ -310,6 +310,11 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     if init.pressure_advance > 0.0 {
         g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}", init.pressure_advance));
     }
+    // Every print assumes a neutral extrude factor. Nothing in a normal print
+    // sets M221, but the flow calibration tower sweeps it and only restores on
+    // a COMPLETED print — a canceled tower would otherwise poison every later
+    // print by up to ±15% until a firmware restart.
+    g.raw("M221 S100");
     g.fan(0);
     let mut cur_fan = 0u32;
     let mut cur_tool = init_tool;
@@ -555,14 +560,19 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             };
             // Feature label, acceleration + ATD, pressure advance, and fan for the
             // FIRST segment — set before the lead-in travel so the whole block moves as
-            // one (a segmented bead re-tunes these at each run boundary below, with no
-            // travel between runs). Cooling grades by how unsupported the bead is:
-            // bridges/bottom skins take the bridge fan, an overhang wall grades toward
-            // it, everything else the normal duty. PA eases the same way (see `pa_for`).
+            // one (a segmented bead re-tunes label/accel/fan at each run boundary below,
+            // with no travel between runs; PA is per-path only — see `pa_for_kind`).
+            // Cooling grades by how unsupported the bead is: bridges/bottom skins take
+            // the bridge fan, an overhang wall grades toward it, everything else the
+            // normal duty.
             let (fk, fo) = seg(0);
             set_seg_attrs(
                 &mut g, fk, fo, layer, normal_fan, t, s, &mut cur_type, &mut cur_accel,
                 &mut cur_pa, &mut cur_fan,
+                // PA from the PATH-level kind: base for a mixed wall (its
+                // overhang stretches must not re-issue PA mid-bead), eased for
+                // a uniform overhang loop or bridge.
+                Some((path.kind, path.overhang)),
             );
 
             let z = layer.print_z_mm;
@@ -628,31 +638,88 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             } else if path.segs.is_some() {
                 // Per-segment attributes: sub-block the bead into runs of equal
                 // (kind, overhang), retuning feed/flow — and via set_seg_attrs the
-                // accel/PA/fan — at each run boundary, but never lifting the nozzle.
+                // accel/fan (never PA) — at each run boundary, without lifting the nozzle.
                 // No arc fitting (feed varies within the path). The first run's
                 // attributes were already set before the lead-in travel above.
                 let flow_cap = layer_flow_cap_mm3_s(layer, t);
                 let bead = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale);
-                let mut run = seg(0);
-                let mut rfeed = feed_for_seg(run.0, run.1, path, layer.index, layer.height_mm, flow_cap, t, s)
-                    * layer.speed_scale;
-                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, t);
-                let mut prev = start;
+                // Per-segment target feeds, then SLEW-LIMITED along the bead:
+                // a band boundary used to step the commanded feed by the full
+                // wall-to-overhang gap in one junction (150 mm/s on a fast
+                // profile), and pressure advance turns a step that size into a
+                // visible transient — the zit ring a few cm from the seam on
+                // sloped shells (the seam seeds at the rear, where shells
+                // slope). The limiter plans over ~[`FEED_PIECE_MM`] pieces so
+                // the ramp is continuous along the metal (limiting whole
+                // segments would let a long one dump its change at a single
+                // junction), and only ever LOWERS the fast side into the
+                // transition — slow zones keep their full slowdown. Equal-feed
+                // pieces merge back at emission, so away from transitions the
+                // output is the plain segment.
+                let seg_feed: Vec<f64> = (0..n_segs)
+                    .map(|k| {
+                        let a = seg(k);
+                        feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, t, s)
+                            * layer.speed_scale
+                    })
+                    .collect();
+                // (piece end x/y mm, piece len mm, parent segment)
+                let mut pieces: Vec<(f64, f64, f64, usize)> = Vec::with_capacity(n_segs * 2);
                 for k in 0..n_segs {
+                    let a = path.points[k];
+                    let b = path.points[(k + 1) % n_pts];
+                    let len = dist_mm(a, b);
+                    let np = ((len / FEED_PIECE_MM).ceil() as usize).clamp(1, FEED_PIECES_MAX);
+                    let (ax, ay) = (a.x_mm(), a.y_mm());
+                    let (dx, dy) = (b.x_mm() - ax, b.y_mm() - ay);
+                    for i in 1..=np {
+                        let f = i as f64 / np as f64;
+                        pieces.push((ax + dx * f, ay + dy * f, len / np as f64, k));
+                    }
+                }
+                let n_pc = pieces.len();
+                let mut pf: Vec<f64> = pieces.iter().map(|p| seg_feed[p.3]).collect();
+                // Two wrap-around sweeps each way settle the cyclic constraint.
+                let sweeps = if path.closed { 2 * n_pc } else { n_pc };
+                for i in 1..sweeps {
+                    let (p, k) = ((i - 1) % n_pc, i % n_pc);
+                    pf[k] = pf[k].min(pf[p] + FEED_SLEW_PER_MM * pieces[k].2);
+                }
+                for i in (0..sweeps.saturating_sub(1)).rev() {
+                    let (k, nx) = (i % n_pc, (i + 1) % n_pc);
+                    pf[k] = pf[k].min(pf[nx] + FEED_SLEW_PER_MM * pieces[k].2);
+                }
+                let mut run = seg(0);
+                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, t);
+                // Emit, merging consecutive pieces that share feed + segment
+                // (collinear by construction).
+                let mut i = 0usize;
+                while i < n_pc {
+                    let k = pieces[i].3;
                     let a = seg(k);
                     if a != run {
                         set_seg_attrs(
                             &mut g, a.0, a.1, layer, normal_fan, t, s, &mut cur_type,
                             &mut cur_accel, &mut cur_pa, &mut cur_fan,
+                            // Mid-bead: never touch PA (planner flush = blob).
+                            None,
                         );
-                        rfeed = feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, t, s)
-                            * layer.speed_scale;
                         rcoeff = bead / area * flow_factor_kind(a.0, path.flow, t);
                         run = a;
                     }
-                    let p = path.points[(k + 1) % n_pts];
-                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * rcoeff, rfeed);
-                    prev = p;
+                    let f = pf[i];
+                    let mut len = pieces[i].2;
+                    let mut end = i;
+                    while end + 1 < n_pc
+                        && pieces[end + 1].3 == k
+                        && (pf[end + 1] - f).abs() < 0.5
+                    {
+                        end += 1;
+                        len += pieces[end].2;
+                    }
+                    let (ex, ey, ..) = pieces[end];
+                    g.extrude(ex, ey, len * rcoeff, f);
+                    i = end + 1;
                 }
             } else if s.arc_fitting {
                 emit_arcs(&mut g, &path.points, path.closed, coeff, feed, s.arc_tolerance_mm);
@@ -1057,19 +1124,40 @@ fn atd_cmd(accel: f64, s: &Settings) -> Option<String> {
 /// flow blip where a fast supported wall steps down to a slow overhang/bridge.
 const OVERHANG_PA_FLOOR: f64 = 0.5;
 
+/// Cap on how fast the commanded feed may change along a segmented bead
+/// (mm/min of feed per mm of path). Pressure advance swings filament in
+/// proportion to a speed step — a 150 mm/s wall→overhang cliff at one
+/// junction moves ~0.25 mm of filament in ~25 ms and prints a zit — so band
+/// crossings ramp at ≤25 mm/s per mm instead: the same 150 mm/s change
+/// spread over 6 mm of bead.
+const FEED_SLEW_PER_MM: f64 = 25.0 * 60.0;
+/// Granularity the slew limiter plans at (mm). Long segments are cut into
+/// pieces this size before limiting, so a ramp really happens ALONG the
+/// metal — limiting whole segments lets a long one absorb a big change on
+/// paper and still dump it at a single junction. Equal-feed pieces merge
+/// back at emission (they are collinear), so far from any transition the
+/// g-code is unchanged. Max per-junction step ≈ slew × piece = 10 mm/s.
+const FEED_PIECE_MM: f64 = 0.4;
+/// Piece-count ceiling per segment (a pathological metres-long segment must
+/// not explode the plan; its junction budget grows instead, rarely).
+const FEED_PIECES_MAX: usize = 256;
+
 /// Pressure advance (mm of filament per mm/s of flow) for a feature: the profile
 /// value for supported moves, eased toward [`OVERHANG_PA_FLOOR`]×profile as a
-/// bead loses support — overhang walls graduate with how far they hang, true
-/// bridges take the floor. This is what blunts the line at a closing arch, where
-/// the wall slows hard in one stretch and full PA prints the speed step as a
-/// ridge. Returns 0 when PA is disabled.
+/// bead loses support — a uniformly overhanging wall loop graduates with how far
+/// it hangs, true bridges take the floor. Returns 0 when PA is disabled.
 ///
-/// InternalBridge is deliberately left at the base value: it is cut per-bead into
-/// the surrounding solid, so easing its PA would toggle the setting on and off
-/// along a single onion (a planner flush each time) — the same thrash the fan
-/// code sidesteps for it. Its droop is already handled by the reduced bridge flow.
-/// Pressure advance (mm of filament per mm/s of flow) for one segment's
-/// `(kind, overhang)`.
+/// Applied per PATH, never per segment: `SET_PRESSURE_ADVANCE` flushes Klipper's
+/// lookahead, so changing it mid-bead parks the nozzle on the wall and prints
+/// the ooze as a blob (a StealthBurner cowl collected 470 across its sloped
+/// surface — the band boundaries of a smooth slope wander layer to layer, so the
+/// blobs read as random). A mixed wall therefore keeps base PA through its
+/// overhang stretches (which still slow down and take graded cooling); only
+/// paths that ARE wholly overhang/bridge — entered via a travel, where the
+/// planner was stopping anyway — carry an eased value. InternalBridge stays at
+/// base for the same reason (cut per-bead into the surrounding solid, it would
+/// toggle the setting along a single onion); its droop is already handled by the
+/// reduced bridge flow.
 fn pa_for_kind(kind: PathKind, overhang: f32, tool: &ToolSettings) -> f64 {
     let base = tool.pressure_advance;
     if base <= 0.0 {
@@ -1087,6 +1175,15 @@ fn pa_for_kind(kind: PathKind, overhang: f32, tool: &ToolSettings) -> f64 {
 /// from the tracked current value. Shared by a path's first segment (set before the
 /// lead-in travel) and every attribute-run boundary inside a segmented bead — so a
 /// continuous loop retunes its speed/cooling mid-path without lifting the nozzle.
+///
+/// `pa_src` is the (kind, overhang) that PA eases from, and it is `None` at every
+/// mid-bead run boundary: unlike F/M204/M106, `SET_PRESSURE_ADVANCE` flushes
+/// Klipper's lookahead — a dead stop with the nozzle parked ON the wall, whose
+/// ooze prints as a blob (a StealthBurner main body collected 470 of them across
+/// its sloped cowl). So PA is set once per path, from the PATH-level kind (base
+/// value for a mixed wall; eased for a uniform overhang loop or a bridge, whose
+/// path start follows a travel where the planner was stopping anyway), and the
+/// overhang stretches keep their slowdown, label, and graded cooling instead.
 #[allow(clippy::too_many_arguments)]
 fn set_seg_attrs(
     g: &mut GcodeBuilder,
@@ -1100,6 +1197,7 @@ fn set_seg_attrs(
     cur_accel: &mut f64,
     cur_pa: &mut f64,
     cur_fan: &mut u32,
+    pa_src: Option<(PathKind, f32)>,
 ) {
     let t = type_label(kind);
     if *cur_type != Some(t) {
@@ -1114,11 +1212,13 @@ fn set_seg_attrs(
         }
         *cur_accel = accel;
     }
-    if tool.pressure_advance > 0.0 {
-        let pa = pa_for_kind(kind, overhang, tool);
-        if (pa - *cur_pa).abs() > 1.0e-4 {
-            g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
-            *cur_pa = pa;
+    if let Some((pk, po)) = pa_src {
+        if tool.pressure_advance > 0.0 {
+            let pa = pa_for_kind(pk, po, tool);
+            if (pa - *cur_pa).abs() > 1.0e-4 {
+                g.raw(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}"));
+                *cur_pa = pa;
+            }
         }
     }
     let want_fan = if layer.index < tool.fan_off_layers {
@@ -2048,6 +2148,7 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 mod tests {
     use super::{
         dist_mm, fit_arc, island_of, path_end, travel_blocked, CombGraph, ARC_MIN_PTS,
+        FEED_SLEW_PER_MM,
     };
     use crate::{
         estimate_filament, estimate_filament_per_tool, estimate_seconds, generate, generate_parts,
@@ -2787,6 +2888,171 @@ mod tests {
         let (mm, grams) = estimate_filament(&plans, &s);
         assert_eq!(per.len(), 1);
         assert!((per[0].1 - mm).abs() < 1.0e-12 && (per[0].2 - grams).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn overhang_stretches_never_reissue_pa_mid_bead() {
+        // A wall that rolls into a slope used to re-issue SET_PRESSURE_ADVANCE
+        // at every overhang-band boundary INSIDE the printing loop. Klipper
+        // flushes its lookahead on that command — a dead stop with the nozzle
+        // parked on the visible wall, whose ooze prints as a blob (a
+        // StealthBurner main body collected 470 of them across its sloped
+        // cowl). The stretch keeps its slowdown and label; PA holds the
+        // path-start value until the next travel.
+        //
+        // A box with one face sheared 55° past vertical: every wall loop is
+        // MIXED (three supported faces + one overhang stretch), the shape
+        // that used to thrash PA at the run boundaries.
+        let sh = 8.0 * 55f64.to_radians().tan();
+        let v = [
+            [0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 10.0, 0.0], [0.0, 10.0, 0.0],
+            [0.0, sh, 8.0], [20.0, sh, 8.0], [20.0, 10.0 + sh, 8.0], [0.0, 10.0 + sh, 8.0],
+        ];
+        let idx: [[usize; 3]; 12] = [
+            [0, 2, 1], [0, 3, 2], // bottom
+            [4, 5, 6], [4, 6, 7], // top
+            [0, 1, 5], [0, 5, 4], // front (stays vertical-ish)
+            [2, 7, 6], [2, 3, 7], // back (the 55° slope)
+            [0, 4, 7], [0, 7, 3], // left
+            [1, 6, 5], [1, 2, 6], // right
+        ];
+        let tris: Vec<[[f64; 3]; 3]> = idx.iter().map(|t| [v[t[0]], v[t[1]], v[t[2]]]).collect();
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.pressure_advance = 0.04;
+        let g = to_gcode(&generate(&m, &s), &s);
+        assert!(g.contains(";TYPE:Overhang wall"), "the slope is still classified and slowed");
+        let lines: Vec<&str> = g.lines().collect();
+        let extrude = |l: &str| {
+            l.starts_with("G1 ") && l.contains(" E") && !l.contains(" E-")
+                && (l.contains(" X") || l.contains(" Y"))
+        };
+        let motion = |l: &str| {
+            l.starts_with("G0 ") || l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 ")
+        };
+        let mut prev = "";
+        for (i, l) in lines.iter().enumerate() {
+            if l.starts_with("SET_PRESSURE_ADVANCE") {
+                let nxt = lines[i + 1..].iter().find(|m| motion(m)).copied().unwrap_or("");
+                assert!(
+                    !(extrude(prev) && extrude(nxt)),
+                    "PA re-issued mid-bead at line {i}: a planner flush parks the nozzle on the wall"
+                );
+            }
+            if motion(l) {
+                prev = l;
+            }
+        }
+    }
+
+    #[test]
+    fn overhang_slowdown_ramps_instead_of_stepping() {
+        // A sheared cylinder: a smooth curved shell rolling into a 75° slope,
+        // so every wall loop crosses the full overhang grade mid-arc (75°
+        // reaches degree 1.0 — a 55° shear only grazes 0.1 and never
+        // exercises the floor) — the StealthBurner-cowl shape that used to
+        // step the commanded feed by the full wall→overhang gap at one
+        // junction and print a zit ring near the seam. Every junction's feed
+        // change must now respect the piece budget, while the slow zone
+        // still reaches its full slowdown.
+        let (r, h, n) = (8.0, 8.0, 64);
+        let shear = h * 75f64.to_radians().tan();
+        let ring = |z: f64| -> Vec<[f64; 3]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / n as f64;
+                    [r * a.cos(), r * a.sin() + shear * z / h, z]
+                })
+                .collect()
+        };
+        let (bot, top) = (ring(0.0), ring(h));
+        let mut tris = Vec::new();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            tris.push([bot[i], bot[j], top[j]]);
+            tris.push([bot[i], top[j], top[i]]);
+        }
+        let c0 = [0.0, 0.0, 0.0];
+        let c1 = [0.0, shear, h];
+        for i in 0..n {
+            let j = (i + 1) % n;
+            tris.push([c0, bot[j], bot[i]]);
+            tris.push([c1, top[i], top[j]]);
+        }
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.pressure_advance = 0.04;
+        // A FAST profile, or the test is vacuous: at the default 25 mm/s the
+        // band grading's own steps never exceed the budget even with the
+        // limiter deleted. At 150 → 10 mm/s the unlimited emitter steps
+        // 140 mm/s at one junction — reverting the limiter must trip this.
+        s.external_perimeter_speed_mm_s = 150.0;
+        s.overhang_speed_mm_s = 10.0;
+        s.max_volumetric_speed_mm3_s = 30.0;
+        // No layer-time throttle: the tiny test cylinder would otherwise
+        // print at a per-layer speed_scale and mask the real feed spread.
+        s.min_layer_time_s = 0.0;
+        let g = to_gcode(&generate(&m, &s), &s);
+        assert!(g.contains(";TYPE:Overhang wall"), "the slope grades");
+        // Walk wall extrusions: track position + feed; every mid-bead feed
+        // change must fit the slew budget for that segment's length.
+        let num = |l: &str, k: &str| {
+            l.split(k).nth(1).and_then(|v| v.split(' ').next().unwrap_or("").parse::<f64>().ok())
+        };
+        let (mut x, mut y, mut wall, mut last_ex) = (0.0f64, 0.0f64, false, false);
+        let (mut curf, mut fmin, mut fmax, mut steps) = (None::<f64>, f64::MAX, 0.0f64, 0);
+        for l in g.lines() {
+            if let Some(t) = l.strip_prefix(";TYPE:") {
+                wall = matches!(t.trim(), "Outer wall" | "Overhang wall");
+                continue;
+            }
+            let (nx, ny) = (num(l, " X"), num(l, " Y"));
+            let motion = l.starts_with("G0 ") || l.starts_with("G1 ");
+            let ex = l.starts_with("G1 ")
+                && l.contains(" E")
+                && !l.contains(" E-")
+                && (nx.is_some() || ny.is_some());
+            if ex && wall {
+                if let Some(f) = num(l, " F") {
+                    if last_ex {
+                        if let Some(c) = curf {
+                            // The slew plan works at FEED_PIECE_MM granularity,
+                            // so no junction may step more than one piece's
+                            // budget (≈10 mm/s) — never the old 150 mm/s cliff.
+                            let budget = FEED_SLEW_PER_MM * super::FEED_PIECE_MM + 3.0;
+                            assert!(
+                                (f - c).abs() <= budget,
+                                "feed stepped {c}→{f} (budget {budget:.0})"
+                            );
+                            steps += 1;
+                        }
+                    }
+                    curf = Some(f);
+                }
+                if let Some(f) = curf {
+                    fmin = fmin.min(f);
+                    fmax = fmax.max(f);
+                }
+            }
+            if motion && (nx.is_some() || ny.is_some()) {
+                x = nx.unwrap_or(x);
+                y = ny.unwrap_or(y);
+            }
+            last_ex = ex;
+        }
+        assert!(steps > 20, "the ramp is graded across many junctions, got {steps}");
+        // Non-vacuity: the fast profile really cruises, so an unlimited
+        // emitter would step ~140 mm/s at one junction and trip the budget.
+        assert!(
+            fmax >= s.external_perimeter_speed_mm_s * 60.0 * 0.9,
+            "wall never reached cruise: max F{fmax:.0}"
+        );
+        // The deep-overhang floor is still reached — the min-only limiter
+        // never robs the slow zone of its slowdown.
+        assert!(
+            fmin < s.overhang_speed_mm_s * 60.0 + 1.0,
+            "slow zone floor lost: min F{fmin:.0}"
+        );
     }
 
     #[test]
