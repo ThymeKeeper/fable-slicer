@@ -916,10 +916,14 @@ fn nominal_speed_mm_s(
         // Wall stretches past the layer below slow by how far they overhang:
         // graduated from the outer-wall pace (a barely-unsupported bead) down to
         // the overhang floor (bridge speed) when the bead is fully airborne.
+        // The graduation is concave (see OVERHANG_SPEED_GAMMA) so even a lightly
+        // unsupported bead — which has no material under part of it and droops —
+        // slows meaningfully instead of coasting near wall speed.
         PathKind::OverhangWall => {
             let ceiling = s.external_perimeter_speed_mm_s;
             let floor = s.overhang_speed_mm_s;
-            ceiling + (floor - ceiling) * overhang as f64
+            let d = (overhang as f64).clamp(0.0, 1.0).powf(OVERHANG_SPEED_GAMMA);
+            ceiling + (floor - ceiling) * d
         }
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
         PathKind::Skirt | PathKind::Perimeter | PathKind::Infill => s.print_speed_mm_s,
@@ -1123,6 +1127,16 @@ fn atd_cmd(accel: f64, s: &Settings) -> Option<String> {
 /// pressure, so full PA over-corrects at the bead ends; halving it softens the
 /// flow blip where a fast supported wall steps down to a slow overhang/bridge.
 const OVERHANG_PA_FLOOR: f64 = 0.5;
+
+/// Exponent bending the overhang speed ramp concave (< 1). A linear ramp (1.0)
+/// slows a bead in proportion to how far it hangs, so a 20%-overhanging bead —
+/// the bulk of a smoothly curved shell — gives up only 20% of the wall→floor
+/// drop and still prints near wall speed, fast enough that the unsupported
+/// edge droops before it sets (PLA curls upward as it cools and the next
+/// layer's nozzle then shears the curl into a void). At 0.5 (√degree) that
+/// same bead gives up √0.2 ≈ 45% of the drop; the fully-airborne floor and the
+/// supported ceiling are both unchanged, so only the mid-range slows.
+const OVERHANG_SPEED_GAMMA: f64 = 0.5;
 
 /// Cap on how fast the commanded feed may change along a segmented bead
 /// (mm/min of feed per mm of path). Pressure advance swings filament in
@@ -2943,6 +2957,31 @@ mod tests {
                 prev = l;
             }
         }
+    }
+
+    #[test]
+    fn overhang_speed_ramp_is_concave() {
+        // The linear ramp left moderate overhangs near wall speed — fast
+        // enough for PLA to curl and the next layer to shear it into a void.
+        // A moderate (20%) overhang must now slow well past the linear
+        // midpoint, while the supported ceiling and airborne floor are exact.
+        let mut s = Settings::default();
+        s.external_perimeter_speed_mm_s = 160.0;
+        s.overhang_speed_mm_s = 10.0;
+        let tool = s.flat_tool("x".into());
+        let at = |deg: f32| super::nominal_speed_mm_s(PathKind::OverhangWall, deg, 1, &tool, &s);
+        let (ceil, floor) = (160.0_f64, 10.0_f64);
+        let linear = |deg: f64| ceil + (floor - ceil) * deg;
+        assert!((at(1.0) - floor).abs() < 1e-9, "airborne floor unchanged: {}", at(1.0));
+        assert!(at(0.001) > ceil - 6.0, "supported ceiling ~unchanged: {}", at(0.001));
+        assert!(
+            at(0.2) < linear(0.2) - 20.0,
+            "a 20% overhang slows hard: {:.0} vs linear {:.0}",
+            at(0.2),
+            linear(0.2)
+        );
+        // Monotonic decreasing across the range.
+        assert!(at(0.1) > at(0.3) && at(0.3) > at(0.6) && at(0.6) > at(1.0), "monotone");
     }
 
     #[test]
