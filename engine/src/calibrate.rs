@@ -2,160 +2,256 @@
 //!
 //! The slicer is blind to the true deposited geometry, so flow and pressure
 //! advance can't be derived — they have to be *measured*. These helpers
-//! generate a test print from the **current** settings (so the result is valid
-//! for how the user actually prints) and turn the single number the user
-//! measures back into a profile value. The number lands in the filament
-//! profile (`extrusion_multiplier` / `pressure_advance`); see config::profile.
+//! generate a test print from the **current** settings (so the result is
+//! valid for how the user actually prints) and turn the single number the
+//! user reads off it back into a profile value. The number lands in the
+//! filament profile (`extrusion_multiplier` / `pressure_advance`); see
+//! config::profile.
+//!
+//! Both calibrations share one instrument — a single-wall teardrop tube
+//! printed as a seamless helix — and one philosophy: sweep the parameter
+//! with height, find the height where the print is *right*, and read the
+//! value off that height. Locating an equality beats measuring-and-
+//! correcting: a correction inherits the bead model's error plus the
+//! measurement's and has to be iterated; the height where the wall IS right
+//! identifies the value that makes it right, whatever the true physics.
 
-use crate::{generate, to_gcode};
+use crate::{generate_parts, to_gcode};
 use config::Settings;
 
-/// Edge length of the single-wall flow cube (mm) — tall enough to caliper a
-/// face well above the first few layers, where flow is still settling.
-pub const FLOW_TEST_MM: f64 = 20.0;
-
-/// Strip a copy of the settings down to a single-wall, open-topped box: one
-/// perimeter, no top/bottom/infill, none of the wall-reshaping modes. Printed
-/// at the user's real line width, the wall's measured thickness reads back the
-/// true flow ratio.
-fn single_wall(settings: &Settings) -> Settings {
-    let mut s = settings.clone();
-    s.wall_count = 1;
-    s.top_layers = 0;
-    s.bottom_layers = 0;
-    s.infill_density = 0.0;
-    s.spiral_vase = false;
-    // The cal cube is a lone synthetic mesh at the origin (cube() spans 0..size).
-    // The GUI runs with auto-center OFF (it places objects itself), so without
-    // this the cube prints in the front-left corner and its skirt spills off the
-    // bed edge — the printer rejects it as a move out of range. Force centering.
-    s.auto_center_on_bed = true;
-    // A single-wall cube has a tiny per-layer path; the user's general
-    // min-layer-time (tuned for real prints) stretches each layer to ~8 s by
-    // crawling the walls to a few mm/s — slow, and an unrepresentative speed to
-    // measure at. A throwaway cal only needs the wall *width* (robust to a little
-    // droop), so use a small floor.
-    s.min_layer_time_s = 2.0;
-    s
-}
-
-/// G-code for the single-wall flow-calibration print.
-pub fn flow_test_gcode(settings: &Settings) -> String {
-    let s = single_wall(settings);
-    to_gcode(&generate(&mesh::Mesh::cube(FLOW_TEST_MM), &s), &s)
-}
-
-/// New flow multiplier from a single-wall measurement: the wall should be one
-/// line width thick, so scale the current multiplier by `target / measured`.
-/// A nonsense measurement leaves the multiplier untouched.
-pub fn flow_from_wall(current_flow: f64, line_width_mm: f64, measured_mm: f64) -> f64 {
-    if measured_mm <= 0.0 || line_width_mm <= 0.0 {
-        return current_flow;
-    }
-    current_flow * (line_width_mm / measured_mm)
-}
-
-/// Footprint edge of the PA tower (mm) — sides long enough that melt pressure
-/// fully settles between corners, AND that a full-speed layer still takes ≥1 s:
-/// the tower must print at the profile's real outer-wall speed (PA calibrated
-/// slow reads high — the smoothing window dominates the shorter transients),
-/// so the layer-time governor must never throttle it.
-pub const PA_TOWER_MM: f64 = 50.0;
-/// PA tower height (mm). With [`PA_TOWER_FACTOR`] the sweep spans 0–0.10:
+/// Radius of the tower teardrop's circular back (mm). The footprint is a
+/// teardrop: a 270° arc closed by its two tangent legs meeting in a single
+/// 90° corner at the front. One corner replaces a square's four — corners
+/// on a loop are not independent measurements (same state, same speed;
+/// they differ only by seam pollution and ringing), so the tower keeps the
+/// one that reads clean and spends the rest of the loop settling melt
+/// pressure for it. The curve also braces the single-bead wall: the old
+/// square's index notches jogged the corner and destabilized it, and its
+/// 50 mm flat faces were the floppiest span — the arc is self-bracing and
+/// the tangent legs are only ~30 mm. The ~201 mm perimeter (on par with the
+/// 50 mm square) keeps a layer above 1 s of natural print time for wall
+/// speeds up to ~200 mm/s, so successive layers get real cooling on any
+/// realistic profile.
+pub const TOWER_R_MM: f64 = 30.0;
+/// Tower height (mm). With [`PA_TOWER_FACTOR`] the PA sweep spans 0–0.10:
 /// the whole direct-drive range, at caliper-grade resolution (±0.5 mm of
 /// height reads as ±0.001 of PA).
-pub const PA_TOWER_H_MM: f64 = 50.0;
+pub const TOWER_H_MM: f64 = 50.0;
 /// Pressure advance at the bed.
 pub const PA_TOWER_START: f64 = 0.0;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
-/// Height between index notches on the seam corner: one every 10 mm from the
-/// bed = +0.020 of PA per notch, so the band is read by counting marks —
-/// no caliper, no measuring-from-the-wrong-end. Each notch is an INWARD
-/// two-layer corner chamfer: it prints as a short bridge anchored on both
-/// walls. (The first cut was an outward collar — a cantilever over air on a
-/// bottomless single wall; it curled, caught the nozzle, and bird's-nested
-/// the print. Nothing on this tower may overhang.)
-pub const PA_TOWER_MARK_MM: f64 = 10.0;
-/// How far the notch cuts the corner (each chamfer leg, mm).
-const PA_TOWER_NOTCH_MM: f64 = 2.5;
+/// Flow-tower multiplier at the bed (× the profile flow).
+pub const FLOW_TOWER_START: f64 = 0.85;
+/// Flow-tower multiplier added per mm of height: 0.85× → 1.15× across the
+/// tower, exactly neutral at mid-height. ±15% covers any plausibly
+/// mis-pinned spool; 1 mm of height reads as 0.6% of flow.
+pub const FLOW_TOWER_FACTOR: f64 = 0.006;
 
-/// G-code for the pressure-advance tower: a single-wall square tube whose PA
-/// ramps with height — Klipper's `TUNING_TOWER` sweep, but baked into the
-/// file per layer, so there is no console incantation to run. Seams are held
-/// in one corner column ([`config::SeamMode::Sharpest`]) and the same corner
-/// carries the 10 mm index collars; judge the other three. Too little PA
-/// bulges corners (pressure overshoots the slowdown), too much starves the
-/// stretch right after them — the crispest band wins, and [`pa_from_height`]
-/// turns its height into the profile value.
-pub fn pa_tower_gcode(settings: &Settings) -> String {
-    let mut s = single_wall(settings);
-    s.seam_mode = config::SeamMode::Sharpest;
-    // Calibrate at the speed the profile actually prints. The flow cube's
-    // relaxed 2 s layer-time floor would throttle this wall to a fraction of
-    // the outer-wall speed; with the 50 mm footprint a full-speed layer runs
-    // ≥1 s anyway, so this floor never bites.
-    s.min_layer_time_s = 1.0;
+/// Strip a copy of the settings down to the calibration tower: one bare wall
+/// above a solid three-layer base plate, printed as a seamless helix, at the
+/// profile's true speed.
+fn tower_settings(settings: &Settings) -> Settings {
+    let mut s = settings.clone();
+    s.wall_count = 1;
+    s.top_layers = 0;
+    s.infill_density = 0.0;
     // A tall single-bead tube cornering at full speed needs more than one
-    // bead-ring of bed contact: give it a solid three-layer base plate.
+    // bead-ring of bed contact: give it a solid three-layer base plate. It
+    // also marks which end of the tower is height zero.
     s.bottom_layers = 3;
-    // The tube as a stack of prisms: plain squares, with the notch bands'
-    // corner chamfered inward.
-    let sq = [
-        [0.0, 0.0],
-        [PA_TOWER_MM, 0.0],
-        [PA_TOWER_MM, PA_TOWER_MM],
-        [0.0, PA_TOWER_MM],
-    ];
-    let notched = [
-        [PA_TOWER_NOTCH_MM, 0.0],
-        [PA_TOWER_MM, 0.0],
-        [PA_TOWER_MM, PA_TOWER_MM],
-        [0.0, PA_TOWER_MM],
-        [0.0, PA_TOWER_NOTCH_MM],
-    ];
-    let mut tris = Vec::new();
-    let mut z0 = 0.0;
-    let mut mark = PA_TOWER_MARK_MM;
-    while mark < PA_TOWER_H_MM - 0.5 {
-        prism(&sq, z0, mark, &mut tris);
-        prism(&notched, mark, mark + 0.4, &mut tris);
-        z0 = mark + 0.4;
-        mark += PA_TOWER_MARK_MM;
+    // A fuzzed wall can't be calipered and its jitter (±0.15 mm by default)
+    // is the same order as the artifacts these prints are read by — a
+    // project profile with fuzzy skin on would silently invalidate the
+    // calibration.
+    s.fuzzy_skin = false;
+    // The cal tower is a lone synthetic mesh at the origin. The GUI runs
+    // with auto-center OFF (it places objects itself), so without this the
+    // tower prints in the front-left corner and its skirt spills off the bed
+    // edge — the printer rejects it as a move out of range. Force centering.
+    s.auto_center_on_bed = true;
+    // The seam is a pressure transient of its own — it must never share the
+    // corner being judged. `Sharpest` would chase the apex (the only real
+    // corner on a teardrop), so seed at the rear of the arc instead and hold
+    // that column.
+    s.seam_mode = config::SeamMode::Aligned;
+    // Above the base plate the wall prints as one continuous helix: no
+    // layer-change stop, no retraction, no seam at all — the corner becomes
+    // the loop's ONLY transient. (The per-layer sweep command below still
+    // fires at the revolution boundary on the rear column, and Klipper
+    // flushes its queue on SET_PRESSURE_ADVANCE, so a faint blip column can
+    // remain there — far from the corner, and much gentler than a true
+    // seam.)
+    s.spiral_vase = true;
+    // Calibrate at the speed the profile actually prints — PA calibrated
+    // slow reads high (the smoothing window dominates the shorter corner
+    // transients; a throttled run once read 0.070 for a true ~0.032), and
+    // steady-state flow shifts with real back-pressure too. So no layer-time
+    // floor, at any profile speed. (The ~201 mm perimeter keeps layers ≥1 s
+    // up to ~200 mm/s anyway, so cooling only thins out where the user
+    // genuinely prints faster than that.)
+    s.min_layer_time_s = 0.0;
+    s
+}
+
+/// Slice the teardrop tower with the given (already tower-stripped) settings,
+/// printing with `tool` — on a toolchanger the tower must run on the spool
+/// whose profile the reading will be pinned into, not whatever tool 0 holds.
+fn teardrop_gcode(s: &Settings, tool: u32) -> String {
+    // Teardrop footprint, apex toward the front (-Y) so the corner faces the
+    // user: circle of radius r at the origin, apex at (0, -r√2) — the two
+    // tangents from that point meet at exactly 90°, touching the circle at
+    // -45° and 225°. 1.5° facets keep the chord error (~0.003 mm) under the
+    // slicer's contour resolution, and land a vertex exactly at the rear
+    // (90°) for the seam column to seed on.
+    let r = TOWER_R_MM;
+    let mut fp = vec![[0.0, -r * std::f64::consts::SQRT_2]];
+    let steps = 180;
+    for i in 0..=steps {
+        let a = (-45.0 + 270.0 * f64::from(i) / f64::from(steps)).to_radians();
+        fp.push([r * a.cos(), r * a.sin()]);
     }
-    prism(&sq, z0, PA_TOWER_H_MM, &mut tris);
+    let mut tris = Vec::new();
+    prism(&fp, 0.0, TOWER_H_MM, &mut tris);
     let mesh = mesh::Mesh::from_triangle_soup(&tris);
-    let g = to_gcode(&generate(&mesh, &s), &s);
-    let mut out = String::with_capacity(g.len() + 8192);
-    out.push_str(&format!(
-        "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
-         ; corner notches mark every {PA_TOWER_MARK_MM} mm from the BED (+{:.3} PA each);\n\
-         ; find the crispest band on the three plain corners, apply its height in\n\
-         ; the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
-        PA_TOWER_FACTOR * PA_TOWER_MARK_MM
-    ));
+    to_gcode(&generate_parts(&[(&mesh, tool)], s), s)
+}
+
+/// Bake a per-layer sweep into tower g-code: `header` first, the injected
+/// command for each layer's height right after its marker, and `tail` at the
+/// very end (restoring machine state the sweep dirtied — a sweep must not
+/// leak its top value into the next print).
+fn sweep(g: &str, header: &str, mut per_layer: impl FnMut(f64) -> String, tail: &str) -> String {
+    let mut out = String::with_capacity(g.len() + 16384);
+    out.push_str(header);
     for line in g.lines() {
         out.push_str(line);
         out.push('\n');
-        // Ride the layer markers: re-issue PA for the new height right after
-        // each one, overriding the profile value the preamble set.
         if let Some(rest) = line.strip_prefix("; LAYER ") {
             if let Some(z) = rest.split("z=").nth(1).and_then(|v| v.trim().parse::<f64>().ok()) {
-                let pa = PA_TOWER_START + PA_TOWER_FACTOR * z;
-                out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}\n"));
+                out.push_str(&per_layer(z));
             }
         }
     }
+    out.push_str(tail);
     out
+}
+
+/// G-code for the pressure-advance tower: the teardrop helix with PA ramping
+/// with height — Klipper's `TUNING_TOWER` sweep, but baked into the file per
+/// layer, so there is no console incantation to run. The head enters the one
+/// 90° corner off a long smooth run at fully settled pressure and exits onto
+/// a straight leg where the artifact reads clean; the revolution boundary
+/// (where each layer's PA step lands) holds a rear column on the arc, as far
+/// from the corner as the loop allows. Too little PA bulges the corner
+/// (pressure overshoots the slowdown), too much starves the stretch right
+/// after it — the crispest band wins, and [`pa_from_height`] turns its
+/// height (measured from the bed) into the profile value. Flow is constant
+/// here, so the flat legs double as a caliper check of the pinned flow.
+pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
+    let s = tower_settings(settings);
+    let mut header = format!(
+        "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
+         ; teardrop with one 90° corner at the front, printed as a seamless helix\n\
+         ; (vase mode) above the base — judge ONLY that corner.\n\
+         ; find the height where the corner is crispest (bulged = PA too low, a matte\n\
+         ; starved stretch right after it = too high), measure that height from the BED,\n\
+         ; apply it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n"
+    );
+    // Leave the machine on the profile's PA, not the sweep's top. (A profile
+    // value of 0 means "the printer's own config value", which g-code cannot
+    // read back — no restore is possible, so say so; applying the measured
+    // height re-pins PA on every later print.)
+    let tail = if settings.pressure_advance > 0.0 {
+        format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}\n", settings.pressure_advance)
+    } else {
+        header.push_str(
+            "; NOTE: no profile PA is pinned, so after this print the machine keeps the\n\
+             ; sweep's top value until you apply a height or restart the firmware.\n",
+        );
+        String::new()
+    };
+    sweep(
+        &teardrop_gcode(&s, tool),
+        &header,
+        |z| format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}\n", PA_TOWER_START + PA_TOWER_FACTOR * z),
+        &tail,
+    )
+}
+
+/// G-code for the flow tower: the same teardrop helix, but the sweep is
+/// `M221` — the flow multiplier climbs 0.85× → 1.15× of the profile flow
+/// with height while PA holds the profile value. The wall's thickness sweeps
+/// with it: slide a caliper up a flat front leg to the height where it reads
+/// exactly the line width, and [`flow_from_tower_height`] turns that height
+/// into the profile flow. Measure with the caliper jaw TIPS — the flats span
+/// several mm of height and would read the fattest layer in reach. Finding
+/// the equality is model-free: whatever shape the bead really takes, the
+/// height where the wall IS right identifies the multiplier that makes it
+/// right — no correction loop. And since PA is constant here, the corner
+/// column should be uniformly crisp top to bottom: a free verification
+/// stripe for the value the PA tower pinned.
+pub fn flow_tower_gcode(settings: &Settings, tool: u32) -> String {
+    let mut s = tower_settings(settings);
+    // The file's feedrates respect the melt-rate ceiling at NOMINAL flow, but
+    // the sweep's top band extrudes 15% more — a profile riding the
+    // volumetric cap would starve the hotend up there, thinning the wall and
+    // silently biasing the reading high. Derate the cap so even the 1.15×
+    // band stays within the filament's real melt rate; this only slows
+    // cap-riding profiles.
+    let top = FLOW_TOWER_START + FLOW_TOWER_FACTOR * TOWER_H_MM;
+    s.max_volumetric_speed_mm3_s /= top;
+    for t in &mut s.tools {
+        t.max_volumetric_speed_mm3_s /= top;
+    }
+    let header = format!(
+        "; flow tower: flow = ({FLOW_TOWER_START} + {FLOW_TOWER_FACTOR} * z_mm) x profile flow\n\
+         ; wall thickness sweeps with height; pressure advance stays at the profile value\n\
+         ; and the base plate prints at true flow (the sweep starts above it).\n\
+         ; slide a caliper (jaw TIPS) up a flat front leg to the height where the wall\n\
+         ; reads exactly {:.2} mm — the line width — and enter that height in the\n\
+         ; Filament panel (or flow x= {FLOW_TOWER_START} + {FLOW_TOWER_FACTOR} * height by hand).\n\
+         ; the front corner should be uniformly crisp — it verifies your PA setting.\n\
+         M221 S100\n",
+        s.line_width_mm
+    );
+    // The sweep begins with the helix — the 3-layer base plate prints at true
+    // flow (an 0.85× first layer would grip the bed badly), guaranteed by the
+    // header's M221 S100 even if a previously canceled tower left the machine
+    // dirty. Skip by marker count, not z: layer heights are profile-dependent.
+    let mut marker = 0u32;
+    sweep(
+        &teardrop_gcode(&s, tool),
+        &header,
+        |z| {
+            marker += 1;
+            if marker <= 3 {
+                String::new()
+            } else {
+                format!("M221 S{:.1}\n", 100.0 * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * z))
+            }
+        },
+        "M221 S100\n",
+    )
 }
 
 /// Pressure advance from the measured best-corner height on the PA tower.
 /// A height off the tower leaves the current value untouched.
 pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
-    if height_mm <= 0.0 || height_mm > PA_TOWER_H_MM {
+    if height_mm <= 0.0 || height_mm > TOWER_H_MM {
         return current_pa;
     }
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
+}
+
+/// New flow multiplier from the flow-tower height where the wall calipers at
+/// exactly the line width. Multiplicative on the current value — the sweep
+/// rode on top of it. A height off the tower leaves the value untouched.
+pub fn flow_from_tower_height(current_flow: f64, height_mm: f64) -> f64 {
+    if height_mm <= 0.0 || height_mm > TOWER_H_MM {
+        return current_flow;
+    }
+    current_flow * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * height_mm)
 }
 
 /// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
@@ -185,58 +281,83 @@ fn prism(fp: &[[f64; 2]], z0: f64, z1: f64, tris: &mut Vec<[[f64; 3]; 3]>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn flow_test_is_a_tall_single_wall() {
-        let s = Settings::default();
-        let wall = flow_test_gcode(&s);
-        // Tall enough to measure: a 20 mm cube is ~100 layers at 0.2 mm.
-        assert!(wall.matches("; LAYER ").count() > 50, "tall enough to caliper");
-        // And genuinely stripped down — far leaner than the same cube printed
-        // solid (walls + top/bottom + infill), confirming the overrides took.
-        let solid = to_gcode(&generate(&mesh::Mesh::cube(FLOW_TEST_MM), &s), &s);
-        assert!(
-            wall.lines().count() * 2 < solid.lines().count(),
-            "single wall ({}) should be far leaner than solid ({})",
-            wall.lines().count(),
-            solid.lines().count()
-        );
+    /// Per-layer outer-wall data parsed from tower g-code:
+    /// (z, seam = position where the layer's first outer-wall extrusion
+    /// starts, all outer-wall extrusion endpoints — with G2/G3 arcs sampled
+    /// along their sweep, so an arc's extremes count, not just its ends).
+    fn outer_walls(g: &str) -> Vec<(f64, [f64; 2], Vec<[f64; 2]>)> {
+        let mut layers: Vec<(f64, Option<[f64; 2]>, Vec<[f64; 2]>)> = Vec::new();
+        let (mut x, mut y, mut wall) = (0.0f64, 0.0f64, false);
+        let num = |l: &str, k: &str| {
+            l.split(k).nth(1).and_then(|s| s.split(' ').next().unwrap_or("").parse::<f64>().ok())
+        };
+        for l in g.lines() {
+            if let Some(rest) = l.strip_prefix("; LAYER ") {
+                let z = rest.split("z=").nth(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+                layers.push((z, None, Vec::new()));
+                wall = false;
+                continue;
+            }
+            if let Some(t) = l.strip_prefix(";TYPE:") {
+                wall = t.trim() == "Outer wall";
+                continue;
+            }
+            let arc_cw = l.starts_with("G2 ");
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ") || arc_cw || l.starts_with("G3 ")) {
+                continue;
+            }
+            let (nx, ny) = (num(l, " X"), num(l, " Y"));
+            if wall && l.contains(" E") && !l.contains(" E-") && (nx.is_some() || ny.is_some()) {
+                let (ex, ey) = (nx.unwrap_or(x), ny.unwrap_or(y));
+                if let Some((_, seam, pts)) = layers.last_mut() {
+                    seam.get_or_insert([x, y]);
+                    if arc_cw || l.starts_with("G3 ") {
+                        // Sample the sweep every ~5° from start to end.
+                        let (cx, cy) = (x + num(l, " I").unwrap_or(0.0), y + num(l, " J").unwrap_or(0.0));
+                        let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+                        let a0 = (y - cy).atan2(x - cx);
+                        let a1 = (ey - cy).atan2(ex - cx);
+                        let tau = std::f64::consts::TAU;
+                        let sweep = if arc_cw {
+                            -(a0 - a1).rem_euclid(tau)
+                        } else {
+                            (a1 - a0).rem_euclid(tau)
+                        };
+                        let n = (sweep.abs().to_degrees() / 5.0).ceil().max(1.0) as usize;
+                        for k in 1..=n {
+                            let a = a0 + sweep * k as f64 / n as f64;
+                            pts.push([cx + r * a.cos(), cy + r * a.sin()]);
+                        }
+                    }
+                    pts.push([ex, ey]);
+                }
+            }
+            if let Some(v) = nx { x = v; }
+            if let Some(v) = ny { y = v; }
+        }
+        layers.into_iter().filter_map(|(z, s, p)| s.map(|s| (z, s, p))).collect()
     }
 
     #[test]
-    fn flow_test_centers_on_bed_even_with_auto_center_off() {
+    fn towers_center_on_bed_even_with_auto_center_off() {
         // The GUI positions objects itself, so it runs with auto_center_on_bed
-        // = false. The flow test is a lone cube, so it must re-enable centering
-        // or it prints off the front-left corner and the skirt runs off the bed
-        // (negative coords → the printer's "move out of range").
+        // = false. The tower is a lone synthetic mesh, so it must re-enable
+        // centering or it prints off the front-left corner and the skirt runs
+        // off the bed (negative coords → the printer's "move out of range").
         let mut s = Settings::default();
         s.auto_center_on_bed = false;
         s.bed_size_x_mm = 152.4;
         s.bed_size_y_mm = 152.4;
-        let g = flow_test_gcode(&s);
-        assert!(!g.contains(" X-"), "no off-bed negative X moves");
-        assert!(!g.contains(" Y-"), "no off-bed negative Y moves");
-    }
-
-    #[test]
-    fn flow_test_does_not_crawl_under_a_high_min_layer_time() {
-        // The user's general min-layer-time (8 s) would stretch the tiny
-        // single-wall layers and crawl the walls to a few mm/s (~13 min for a
-        // 20 mm cube). The cal relaxes that floor and prints plainly.
-        let mut s = Settings::default();
-        s.min_layer_time_s = 8.0;
-        let cal = single_wall(&s);
-        assert!(cal.min_layer_time_s <= 2.0, "cal relaxes the layer-time floor");
-        let layers = generate(&mesh::Mesh::cube(FLOW_TEST_MM), &cal);
-        let secs = crate::estimate_seconds(&layers, &cal);
-        assert!(secs < 400.0, "cal prints in a few minutes, not the floor's ~13 (got {secs:.0}s)");
+        for g in [pa_tower_gcode(&s, 0), flow_tower_gcode(&s, 0)] {
+            assert!(!g.contains(" X-"), "no off-bed negative X moves");
+            assert!(!g.contains(" Y-"), "no off-bed negative Y moves");
+        }
     }
 
     #[test]
     fn pa_tower_ramps_with_height() {
-        let g = pa_tower_gcode(&Settings::default());
-        // One injected PA step directly after each layer marker (the index
-        // collars' overhang stretches re-issue their own scaled PA in between,
-        // so only the ramp lines are height-ordered).
+        let g = pa_tower_gcode(&Settings::default(), 0);
+        // One injected PA step directly after each layer marker.
         let lines: Vec<&str> = g.lines().collect();
         let ramp: Vec<f64> = lines
             .windows(2)
@@ -251,22 +372,115 @@ mod tests {
         assert!(ramp[0] < 0.002, "starts at the bottom of the range");
         let top = ramp.last().unwrap();
         assert!(
-            (PA_TOWER_START + PA_TOWER_FACTOR * PA_TOWER_H_MM - top).abs() < 0.003,
+            (PA_TOWER_START + PA_TOWER_FACTOR * TOWER_H_MM - top).abs() < 0.003,
             "ends at the top of the range, got {top}"
         );
-        // Single wall: no interior features to muddy the corners.
+        // Single wall: no interior features to muddy the corner. And no flow
+        // games — the PA read must ride the profile's true flow (the only
+        // M221 allowed is the preamble's neutral S100 hygiene guard).
         assert!(!g.contains(";TYPE:Sparse infill") && !g.contains(";TYPE:Top surface"));
+        assert!(
+            g.lines().filter(|l| l.starts_with("M221")).all(|l| l.trim() == "M221 S100"),
+            "PA tower holds flow constant"
+        );
     }
 
     #[test]
-    fn pa_tower_prints_at_the_real_outer_wall_speed() {
-        // The whole point of the tower is calibrating at the speed the profile
-        // actually prints. The flow cube's relaxed layer-time floor used to
-        // throttle it ~2.7× — and PA calibrated slow reads high (the user's
-        // 0.070 vs a true ~0.032). Dominant extrusion feed must be the plain
-        // outer-wall speed, unthrottled.
-        let s = Settings::default();
-        let g = pa_tower_gcode(&s);
+    fn pa_tower_restores_the_profile_pa() {
+        // The sweep ends at 0.10 — silly-high. The machine must be left on
+        // the profile's value, not the sweep's top, or the next print (whose
+        // profile might say 0 = "leave the printer's value") inherits it.
+        let mut s = Settings::default();
+        s.pressure_advance = 0.032;
+        let g = pa_tower_gcode(&s, 0);
+        let last = g
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("SET_PRESSURE_ADVANCE ADVANCE="))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap();
+        assert!((last - 0.032).abs() < 1e-9, "restores profile PA, got {last}");
+        // With profile PA = 0 ("the printer's own config value") no restore
+        // is POSSIBLE — g-code can't read printer.cfg back. The file must
+        // own that honestly: the sweep's top stays in force, and the header
+        // says so.
+        let g0 = pa_tower_gcode(&Settings::default(), 0);
+        let last0 = g0
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("SET_PRESSURE_ADVANCE ADVANCE="))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap();
+        assert!(last0 > 0.09, "no phantom restore value exists for PA=0 profiles");
+        assert!(g0.contains("; NOTE: no profile PA is pinned"), "the leak is documented");
+    }
+
+    #[test]
+    fn flow_tower_base_plate_is_guarded_against_a_dirty_machine() {
+        // The base plate's "true flow" premise must not depend on machine
+        // state: a previously canceled tower leaves M221 at 85–115%, so the
+        // file normalizes to S100 BEFORE anything prints.
+        let g = flow_tower_gcode(&Settings::default(), 0);
+        let first_m221 = g.find("M221 S").unwrap();
+        assert!(g[first_m221..].starts_with("M221 S100"), "file opens at neutral flow");
+        assert!(first_m221 < g.find("; LAYER").unwrap(), "normalized before any layer");
+    }
+
+    #[test]
+    fn towers_print_with_the_requested_tool() {
+        // On a toolchanger the reading is pinned into the ACTIVE slot's
+        // filament profile, so the tower must physically print with that
+        // tool — not whatever spool tool 0 holds.
+        // (The generic start template carries no T{n} line — real toolchanger
+        // templates take INITIAL_TOOL= — so assert the SLOT's settings landed:
+        // the preamble's PA pin must be tool 1's, not tool 0's.)
+        let mut s = Settings::default();
+        s.machine_kind = config::MachineKind::IndependentHotends;
+        s.tool_count = 2;
+        s.tools = vec![s.flat_tool("a".into()), s.flat_tool("b".into())];
+        s.tools[0].pressure_advance = 0.033;
+        s.tools[1].pressure_advance = 0.077;
+        let g = flow_tower_gcode(&s, 1);
+        assert!(g.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0770"), "tower prints with tool 1's profile");
+        assert!(!g.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0330"), "not tool 0's");
+    }
+
+    #[test]
+    fn flow_tower_sweeps_flow_and_restores() {
+        // One M221 directly after each helix layer marker (the base plate
+        // prints at true flow — an 0.85× first layer would grip the bed
+        // badly), climbing ~85% → 115%, and a final M221 S100 so the extrude
+        // factor never leaks into the next print. PA is NOT swept here — it
+        // stays the profile's value.
+        let g = flow_tower_gcode(&Settings::default(), 0);
+        let lines: Vec<&str> = g.lines().collect();
+        let ramp: Vec<f64> = lines
+            .windows(2)
+            .filter(|w| w[0].starts_with("; LAYER "))
+            .filter_map(|w| w[1].strip_prefix("M221 S"))
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let layers = g.matches("; LAYER ").count();
+        assert!(layers > 200, "a 50 mm tower is ~250 layers, got {layers}");
+        assert_eq!(ramp.len(), layers - 3, "one M221 per layer above the base plate");
+        assert!(ramp.windows(2).all(|w| w[1] >= w[0]), "the sweep is monotonic");
+        assert!(ramp[0] < 100.0 * FLOW_TOWER_START + 1.0, "starts at the bottom");
+        assert!(
+            (100.0 * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * TOWER_H_MM) - ramp.last().unwrap())
+                .abs()
+                < 0.5,
+            "ends at the top of the range"
+        );
+        assert_eq!(lines.last().unwrap().trim(), "M221 S100", "restores flow to 100%");
+        let pa_steps = lines
+            .windows(2)
+            .filter(|w| w[0].starts_with("; LAYER ") && w[1].starts_with("SET_PRESSURE_ADVANCE"))
+            .count();
+        assert_eq!(pa_steps, 0, "flow tower holds PA constant");
+    }
+
+    /// Most-frequent feedrate on outer-wall extrusions (mm/min, rounded).
+    fn dominant_wall_feed(g: &str) -> i64 {
         // Judge only the wall itself — the base plate's dense first-layer skin
         // would otherwise dominate the line count at first-layer speed.
         let mut feed_mm: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
@@ -286,7 +500,18 @@ mod tests {
                 *feed_mm.entry(f).or_default() += 1;
             }
         }
-        let dominant = feed_mm.iter().max_by_key(|(_, n)| **n).map(|(f, _)| *f).unwrap_or(0);
+        feed_mm.iter().max_by_key(|(_, n)| **n).map(|(f, _)| *f).unwrap_or(0)
+    }
+
+    #[test]
+    fn pa_tower_prints_at_the_real_outer_wall_speed() {
+        // The whole point of the tower is calibrating at the speed the profile
+        // actually prints. The flow cube's relaxed layer-time floor used to
+        // throttle it ~2.7× — and PA calibrated slow reads high (the user's
+        // 0.070 vs a true ~0.032). Dominant extrusion feed must be the plain
+        // outer-wall speed, unthrottled.
+        let s = Settings::default();
+        let dominant = dominant_wall_feed(&pa_tower_gcode(&s, 0));
         let expect = s.external_perimeter_speed_mm_s * 60.0;
         assert!(
             (dominant as f64) >= expect * 0.9,
@@ -295,44 +520,84 @@ mod tests {
     }
 
     #[test]
-    fn pa_tower_has_index_notches() {
-        // Inward corner chamfers every 10 mm from the bed: at each mark band
-        // the seam corner's min(x+y) steps inward by the notch depth. (Inward,
-        // never outward: an outward collar on a bottomless single wall is a
-        // cantilever over air — the first cut bird's-nested a print.)
-        let g = pa_tower_gcode(&Settings::default());
-        let mut per_layer: Vec<(f64, f64)> = Vec::new(); // (z, min x+y over extrusions)
-        let (mut z, mut m, mut x, mut y) = (0.0, f64::MAX, 0.0f64, 0.0f64);
-        for l in g.lines() {
-            if let Some(rest) = l.strip_prefix("; LAYER ") {
-                if m < f64::MAX {
-                    per_layer.push((z, m));
-                }
-                m = f64::MAX;
-                z = rest.split("z=").nth(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
-            } else if l.starts_with("G0 ") || l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 ") {
-                let ex = l.split(" X").nth(1).and_then(|s| s.split(' ').next().unwrap_or("").parse::<f64>().ok());
-                let ey = l.split(" Y").nth(1).and_then(|s| s.split(' ').next().unwrap_or("").parse::<f64>().ok());
-                if let Some(v) = ex { x = v; }
-                if let Some(v) = ey { y = v; }
-                if l.contains(" E") && !l.contains(" E-") && (ex.is_some() || ey.is_some()) {
-                    m = m.min(x + y);
-                }
-            }
+    fn pa_tower_is_never_throttled_even_on_a_fast_profile() {
+        // 300 mm/s of outer wall prints the ~200 mm loop in ~0.67 s — any
+        // layer-time floor would throttle that below profile speed, silently
+        // reintroducing the calibrated-slow-reads-high failure. The tower
+        // disables the governor outright, so even this profile runs true.
+        let mut s = Settings::default();
+        s.external_perimeter_speed_mm_s = 300.0;
+        // Out of the way of the *flow* ceiling (real physics, kept): 300 mm/s
+        // at the default bead is ~26 mm³/s.
+        s.max_volumetric_speed_mm3_s = 40.0;
+        let dominant = dominant_wall_feed(&pa_tower_gcode(&s, 0));
+        let expect = s.external_perimeter_speed_mm_s * 60.0;
+        assert!(
+            (dominant as f64) >= expect * 0.9,
+            "fast profile must not be throttled: dominant F{dominant} vs expected F{expect:.0}"
+        );
+    }
+
+    #[test]
+    fn pa_tower_is_one_clean_teardrop_prism() {
+        // A 270° arc closed by two tangent legs meeting at the front apex:
+        // the wall-centerline box is ~2r wide by ~r(1+√2) deep. And it is a
+        // PRISM — the old index notches are gone (a mark in the wall jogs
+        // the very bead being judged, and they destabilized the tower), so
+        // every layer spans the same box.
+        let g = pa_tower_gcode(&Settings::default(), 0);
+        let layers = outer_walls(&g);
+        assert!(layers.len() > 200, "a 50 mm tower is ~250 layers, got {}", layers.len());
+        let span = |pts: &[[f64; 2]], i: usize| {
+            pts.iter().map(|p| p[i]).fold(f64::MIN, f64::max)
+                - pts.iter().map(|p| p[i]).fold(f64::MAX, f64::min)
+        };
+        let (w, d) = (2.0 * TOWER_R_MM, TOWER_R_MM * (1.0 + std::f64::consts::SQRT_2));
+        for (z, _, pts) in &layers {
+            let (sx, sy) = (span(pts, 0), span(pts, 1));
+            assert!((sx - w).abs() < 1.5, "layer z={z}: width {sx:.2} vs {w:.2}");
+            assert!((sy - d).abs() < 1.5, "layer z={z}: depth {sy:.2} vs {d:.2}");
         }
-        if m < f64::MAX {
-            per_layer.push((z, m));
+    }
+
+    #[test]
+    fn pa_tower_is_a_seamless_helix_above_the_base() {
+        // Vase mode: above the 3-layer base plate the wall must climb as one
+        // continuous extrusion — no retraction, no layer-change stop — so the
+        // corner is the loop's only pressure transient. (One trailing retract
+        // at print end is fine.)
+        let g = pa_tower_gcode(&Settings::default(), 0);
+        let spiral = g.find("; LAYER 3 ").expect("tower has spiral layers");
+        let retracts = g[spiral..].matches(" E-").count();
+        assert!(retracts <= 1, "helix must not retract, saw {retracts}");
+    }
+
+    #[test]
+    fn pa_tower_seam_never_touches_the_corner() {
+        // The loop start — the base plate's true seam, and above it the helix
+        // revolution boundary where each layer's PA step (a Klipper queue
+        // flush) lands — is a transient of its own, and the teardrop's whole
+        // point is ONE uncontaminated corner: it must hold a column on the
+        // rounded back — beyond even the tangent points (30 mm from the
+        // apex) — on every layer.
+        let g = pa_tower_gcode(&Settings::default(), 0);
+        let layers = outer_walls(&g);
+        let apex = layers
+            .iter()
+            .flat_map(|(_, _, pts)| pts.iter())
+            .fold([0.0, f64::MAX], |a, p| if p[1] < a[1] { *p } else { a });
+        for (z, seam, _) in &layers {
+            let d = ((seam[0] - apex[0]).powi(2) + (seam[1] - apex[1]).powi(2)).sqrt();
+            assert!(d > 40.0, "layer z={z}: seam {seam:?} only {d:.1} mm from the corner {apex:?}");
         }
-        let base = per_layer
-            .iter()
-            .filter(|(z, _)| *z > 2.0 && (z % 10.0) > 1.0)
-            .map(|&(_, v)| v)
-            .fold(f64::MAX, f64::min);
-        let marks = per_layer
-            .iter()
-            .filter(|&&(z, v)| z > 5.0 && (z % 10.0) <= 0.5 && v > base + 1.2)
-            .count();
-        assert!(marks >= 4, "notches at 10/20/30/40 mm must cut the corner, saw {marks}");
+        // And it is a column, not a wander.
+        let n = layers.len() as f64;
+        let cx = layers.iter().map(|(_, s, _)| s[0]).sum::<f64>() / n;
+        let cy = layers.iter().map(|(_, s, _)| s[1]).sum::<f64>() / n;
+        for (z, seam, _) in &layers {
+            let d = ((seam[0] - cx).powi(2) + (seam[1] - cy).powi(2)).sqrt();
+            assert!(d < 5.0, "layer z={z}: seam {seam:?} strays {d:.1} mm from the column");
+        }
     }
 
     #[test]
@@ -345,14 +610,15 @@ mod tests {
     }
 
     #[test]
-    fn flow_from_wall_scales_and_guards() {
-        // Over-extruding: a 0.45 mm wall measured at 0.50 → drop flow to 0.90×.
-        let f = flow_from_wall(1.0, 0.45, 0.50);
-        assert!((f - 0.9).abs() < 1e-9, "{f}");
-        // Compounds on an already-pinned multiplier.
-        assert!((flow_from_wall(0.95, 0.45, 0.45) - 0.95).abs() < 1e-9);
-        // Nonsense input is a no-op, never a divide-by-zero.
-        assert_eq!(flow_from_wall(1.0, 0.45, 0.0), 1.0);
-        assert_eq!(flow_from_wall(1.0, 0.0, 0.45), 1.0);
+    fn flow_from_tower_height_maps_and_guards() {
+        // Mid-tower is exactly neutral: the sweep is 1.00× at 25 mm.
+        assert!((flow_from_tower_height(1.0, 25.0) - 1.0).abs() < 1e-9);
+        // Compounds multiplicatively on an already-pinned value: the sweep
+        // rode on top of the current flow, so the read multiplies in.
+        assert!((flow_from_tower_height(0.95, 37.5) - 0.95 * 1.075).abs() < 1e-9);
+        assert!((flow_from_tower_height(1.0, 10.0) - 0.91).abs() < 1e-9);
+        // Off-tower nonsense is a no-op.
+        assert_eq!(flow_from_tower_height(0.95, 0.0), 0.95);
+        assert_eq!(flow_from_tower_height(0.95, 99.0), 0.95);
     }
 }

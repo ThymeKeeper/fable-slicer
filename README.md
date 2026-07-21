@@ -56,7 +56,7 @@ Fable Slicer is a from-scratch FDM 3D-printing slicer written in Rust. It takes 
 - Per-feature speeds, accelerations, pressure advance, and fan control; minimum-layer-time cooling
 - Klipper-targeted G-code: relative extrusion (M83), per-feature acceleration (M204), pressure advance, velocity limits, progress (M73), start/end template substitution, chamber pre-soak, and aux/exhaust fan control
 - Trapezoidal print-time estimate (with jerk and look-ahead) and filament estimate in millimeters and grams
-- Guided flow calibration: prints a single-wall test cube and derives an extrusion multiplier from the measured wall thickness
+- Guided calibration towers: a single-wall teardrop printed as a seamless helix — the flow tower sweeps the extrusion multiplier with height (caliper the height where the wall reads exactly the line width), the pressure-advance tower sweeps PA (find the height where the single 90° corner is crispest); each tower holds the other parameter constant, so it doubles as that value's verification
 
 ### GUI
 - Import STL and 3MF (a 3MF splits into one object per build item, preserving plate layout; an object keeps its named parts, each assignable to a tool)

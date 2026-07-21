@@ -425,11 +425,17 @@ impl FilamentBaseline {
 }
 
 /// The App-side state the guided flow-calibration row drives: arming the
-/// test print, the measured wall, and the status line it reports to.
+/// tower print, the height where the wall calipers at exactly the line
+/// width, and the status line it reports to.
 struct FlowCalUi<'a> {
     host_ready: bool,
     start: &'a mut bool,
-    measured_mm: &'a mut f64,
+    height_mm: &'a mut f64,
+    /// Flow the tower was PRINTED with (snapshotted at dispatch). The tower's
+    /// sweep multiplies THAT value, so "apply" must too — applying against
+    /// the live multiplier would compound on a second click or a refined
+    /// re-read. None = no tower printed this session; fall back to live.
+    printed_flow: Option<f64>,
     status: &'a mut String,
 }
 
@@ -488,45 +494,67 @@ fn filament_card_rows(
     });
     // Measured calibration — the slicer is blind to the true output, so
     // these are pinned from a test, not derived (default 1.0 / conservative;
-    // nudge after a flow test or a pressure-advance tower). Density,
+    // nudge after a flow tower or a pressure-advance tower). Density,
     // flow-derate and the heat ceiling are material physics —
     // class-derived, not knobs.
     let flow = f.extrusion_multiplier;
     revert_row(ui, &mut *flow, &base.extrusion_multiplier, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
-            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a single-wall flow test.");
+            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-tower print.");
     });
-    // Guided flow calibration: print a single-wall cube at the current
-    // settings, caliper a wall, enter it → pin flow × (the active tab's
+    // Guided flow calibration: print the flow tower (the PA teardrop's twin,
+    // sweeping flow with height), find the height where the wall calipers at
+    // exactly the line width, enter it → pin flow × (the active tab's
     // multiplier on a toolchanger).
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow test"))
-            .on_hover_text("Print a single-wall 20 mm cube at your current settings, then caliper a side wall's thickness — the ~line-width dimension, on a flat face mid-height, away from the seam (not the height or the 20 mm width) — and enter it below to pin flow ×. Clear the bed first.")
+            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow tower"))
+            .on_hover_text(format!(
+                "Print a single-wall teardrop tower ({:.0} mm wide) whose flow \
+                 multiplier ramps {:.2}× → {:.2}× of your current flow with height, \
+                 as a seamless helix at your real speeds. Slide a caliper (jaw TIPS — \
+                 the flats span several layers and read the fattest one) up a flat \
+                 front leg to the height where the wall reads exactly {:.2} mm (your \
+                 line width) and enter that height below — no correction loop, the \
+                 tower locates the right flow directly. The front corner doubles as a \
+                 check of your pressure advance: it should be crisp the whole way up. \
+                 Clear the bed first.",
+                2.0 * engine::TOWER_R_MM,
+                engine::FLOW_TOWER_START,
+                engine::FLOW_TOWER_START + engine::FLOW_TOWER_FACTOR * engine::TOWER_H_MM,
+                line_width_mm,
+            ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()
         {
             *cal.start = true;
         }
         ui.add(
-            egui::DragValue::new(cal.measured_mm)
-                .speed(0.01)
-                .range(0.0..=2.0)
-                .fixed_decimals(2)
+            egui::DragValue::new(cal.height_mm)
+                .speed(0.1)
+                .range(0.0..=engine::TOWER_H_MM)
+                .fixed_decimals(1)
                 .suffix(" mm"),
         )
-        .on_hover_text(format!("Wall *thickness* off the cube — a flat side, mid-height, away from the seam (not the height or the 20 mm width). Should read ≈{line_width_mm:.2} mm (your line width); thicker = over-extruding."));
+        .on_hover_text(format!("Height up the flow tower where the wall calipers at exactly {line_width_mm:.2} mm (your line width). Lower = the spool was over-extruding, higher = under."));
         if ui
             .button("apply")
-            .on_hover_text("Pin flow × = current × line width ÷ measured wall thickness.")
+            .on_hover_text(format!(
+                "Pin flow × = current × ({} + {} × height).",
+                engine::FLOW_TOWER_START,
+                engine::FLOW_TOWER_FACTOR
+            ))
             .clicked()
-            && *cal.measured_mm > 0.0
+            && *cal.height_mm > 0.0
         {
+            // Apply against the flow the tower PRINTED with, not the live
+            // value — idempotent under double-clicks and refined re-reads.
             let before = *flow;
-            *flow = engine::flow_from_wall(before, line_width_mm, *cal.measured_mm);
+            let base = cal.printed_flow.unwrap_or(before);
+            *flow = engine::flow_from_tower_height(base, *cal.height_mm);
             *cal.status = format!(
-                "flow × {before:.3} → {:.3} (wall {:.2} mm vs {:.2} target)",
-                *flow, *cal.measured_mm, line_width_mm
+                "flow × {before:.3} → {:.3} (wall at target {:.2} mm at height {:.1} mm)",
+                *flow, line_width_mm, *cal.height_mm
             );
         }
     });
@@ -543,23 +571,23 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
     });
-    // Guided PA calibration: print a single-wall tower whose PA ramps with
-    // height, find the crispest corners, enter that height → pin PA.
+    // Guided PA calibration: print a single-wall teardrop tower whose PA ramps
+    // with height, find where its corner is crispest, enter that height → pin PA.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
             .on_hover_text(format!(
-                "Print a single-wall {:.0} mm square tower whose pressure advance ramps \
-                 0 → {:.2} with height, at your real outer-wall speed (the sweep is \
-                 baked into the g-code — nothing to run on the printer). Seams and the \
-                 10 mm index collars share one corner; judge the other three under \
-                 raking light: bulged corners = PA too low, gaps right after a corner = \
-                 too high — when in doubt pick the LOWER band. Count collars from the \
-                 BED (each = +{:.3} PA) or measure the height from the bed, and enter \
-                 it below. Clear the bed first.",
-                engine::PA_TOWER_MM,
-                engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::PA_TOWER_H_MM,
-                engine::PA_TOWER_FACTOR * engine::PA_TOWER_MARK_MM,
+                "Print a single-wall teardrop tower ({:.0} mm wide) whose pressure \
+                 advance ramps 0 → {:.2} with height, at your real outer-wall speed \
+                 (the sweep is baked into the g-code — nothing to run on the printer). \
+                 One 90° corner faces the front; above the base the wall prints as a \
+                 seamless helix (vase mode), so that corner is the only transient. \
+                 Judge it under raking light: bulged = PA too low, a matte \
+                 starved stretch right after it = too high — when in doubt pick the \
+                 LOWER band. Measure the height of the crispest band from the BED and \
+                 enter it below. Clear the bed first.",
+                2.0 * engine::TOWER_R_MM,
+                engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()
@@ -569,11 +597,11 @@ fn filament_card_rows(
         ui.add(
             egui::DragValue::new(pa_cal.height_mm)
                 .speed(0.1)
-                .range(0.0..=engine::PA_TOWER_H_MM)
+                .range(0.0..=engine::TOWER_H_MM)
                 .fixed_decimals(1)
                 .suffix(" mm"),
         )
-        .on_hover_text("Height up the tower where the corners look crispest — neither bulged nor starved.");
+        .on_hover_text("Height up the tower where the front corner looks crispest — neither bulged nor starved.");
         if ui
             .button("apply")
             .on_hover_text(format!(
@@ -587,7 +615,7 @@ fn filament_card_rows(
             let before = *pa;
             *pa = engine::pa_from_height(before, *pa_cal.height_mm);
             *pa_cal.status = format!(
-                "pressure advance {before:.4} → {:.4} (best corners at {:.1} mm)",
+                "pressure advance {before:.4} → {:.4} (best corner at {:.1} mm)",
                 *pa, *pa_cal.height_mm
             );
         }
@@ -1751,11 +1779,14 @@ struct App {
     /// Open save/delete-profile dialog, if any.
     profile_dialog: Option<ProfileDialog>,
     /// Flow calibration: the Filament-panel button arms this; the dispatch
-    /// generates the single-wall test cube and sends it to the printer.
+    /// generates the flow-swept teardrop tower and sends it to the printer.
     start_flow_cal: bool,
-    /// Measured wall thickness (mm) entered after the flow-cal print; "apply"
+    /// Height (mm) where the flow-tower wall calipers at the line width; "apply"
     /// turns it into the filament's `extrusion_multiplier`.
-    flow_cal_mm: f64,
+    flow_cal_height_mm: f64,
+    /// Flow the last-dispatched tower was printed with — "apply" multiplies
+    /// this snapshot, keeping repeat clicks and re-reads idempotent.
+    flow_cal_printed_flow: Option<f64>,
     /// Pressure-advance calibration: the Filament-panel button arms this; the
     /// dispatch generates the PA tower and sends it to the printer.
     start_pa_cal: bool,
@@ -2087,7 +2118,8 @@ impl App {
             baseline,
             profile_dialog: None,
             start_flow_cal: false,
-            flow_cal_mm: 0.0,
+            flow_cal_height_mm: 0.0,
+            flow_cal_printed_flow: None,
             start_pa_cal: false,
             pa_cal_mm: 0.0,
             pending_switch: None,
@@ -4958,7 +4990,8 @@ impl eframe::App for App {
                     let cal = FlowCalUi {
                         host_ready: host_set && !host_busy,
                         start: &mut self.start_flow_cal,
-                        measured_mm: &mut self.flow_cal_mm,
+                        height_mm: &mut self.flow_cal_height_mm,
+                        printed_flow: self.flow_cal_printed_flow,
                         status: &mut self.status,
                     };
                     // The PA row reports through a local: `cal` above already
@@ -6856,19 +6889,32 @@ impl eframe::App for App {
         }
 
         // Flow calibration: the Filament-panel button armed `start_flow_cal`.
-        // Generate the single-wall test from the current settings and send it;
-        // the user calipers a wall and applies the result back in the panel.
+        // Generate the flow-swept tower from the current settings and send it;
+        // the user finds the height where the wall calipers at the line width
+        // and applies that height back in the panel. On a toolchanger the
+        // tower prints with the ACTIVE tab's tool — the spool whose profile
+        // the reading pins.
         if std::mem::take(&mut self.start_flow_cal) {
-            let gcode = engine::flow_test_gcode(&self.settings);
+            let tool = self.active_tool_tab as u32;
+            let gcode = engine::flow_tower_gcode(&self.settings, tool);
+            // Snapshot the flow the tower bakes in: "apply" multiplies THIS,
+            // so repeat clicks and refined re-reads stay idempotent.
+            self.flow_cal_printed_flow = Some(
+                self.settings
+                    .tools
+                    .get(self.active_tool_tab)
+                    .map(|t| t.extrusion_multiplier)
+                    .unwrap_or(self.settings.extrusion_multiplier),
+            );
             let lw = self.settings.line_width_mm;
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
-                match c.upload("flow-cal.gcode", gcode.as_bytes(), true) {
+                match c.upload("flow-tower.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the flow cube — when it's done, caliper a side wall's THICKNESS (mid-height, away from the seam; should read ≈{lw:.2} mm) and enter it in the Filament panel."),
+                        msg: format!("Printing the flow tower — when it's done, slide a caliper (jaw tips) up a flat front leg to the height where the wall reads exactly {lw:.2} mm and enter that height in the Filament panel. The front corner should be crisp the whole way up — it double-checks your pressure advance."),
                     },
-                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-cal upload failed: {e}") },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-tower upload failed: {e}") },
                 }
             });
         }
@@ -6877,13 +6923,21 @@ impl eframe::App for App {
         // Generate the ramped tower from the current settings and send it; the
         // user reads off the best-corner height and applies it in the panel.
         if std::mem::take(&mut self.start_pa_cal) {
-            let gcode = engine::pa_tower_gcode(&self.settings);
+            let tool = self.active_tool_tab as u32;
+            let gcode = engine::pa_tower_gcode(&self.settings, tool);
+            // With no profile PA pinned there is nothing to restore to — the
+            // machine keeps the sweep's top until a height is applied.
+            let pa_note = if self.settings.pressure_advance > 0.0 {
+                ""
+            } else {
+                " (Until you apply, the printer keeps the sweep's top PA — apply promptly.)"
+            };
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
                 match c.upload("pa-tower.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: "Printing the PA tower — when it's done, find the height band with the crispest corners (bulges = PA too low, post-corner gaps = too high; skip the seam corner) and enter that height in the Filament panel.".to_string(),
+                        msg: format!("Printing the PA tower — when it's done, find the height where the front corner looks crispest (bulged = PA too low, a matte starved stretch right after it = too high), measure it from the bed, and enter it in the Filament panel.{pa_note}"),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("PA-tower upload failed: {e}") },
                 }

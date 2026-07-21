@@ -19,8 +19,8 @@ mod plan;
 mod slice;
 
 pub use calibrate::{
-    flow_from_wall, flow_test_gcode, pa_from_height, pa_tower_gcode, FLOW_TEST_MM,
-    PA_TOWER_FACTOR, PA_TOWER_H_MM, PA_TOWER_MARK_MM, PA_TOWER_MM, PA_TOWER_START,
+    flow_from_tower_height, flow_tower_gcode, pa_from_height, pa_tower_gcode,
+    FLOW_TOWER_FACTOR, FLOW_TOWER_START, PA_TOWER_FACTOR, PA_TOWER_START, TOWER_H_MM, TOWER_R_MM,
 };
 
 pub use emit::{
