@@ -6,3 +6,5 @@ material = "abs"
 filament_diameter_mm = 1.75
 nozzle_temp_c = 245
 bed_temp_c = 100
+# Retraction distance (mm); direct-drive short pull.
+retract_len_mm = 0.5

@@ -8,7 +8,8 @@ nozzle_diameter_mm = 0.4
 travel_speed_mm_s = 120.0
 acceleration = 3000.0
 jerk = 10.0
-retract_len_mm = 0.8
+# Retraction distance is a filament property (see the filament profiles);
+# speed and z-hop are machine mechanics.
 retract_speed_mm_s = 35.0
 # Lift over voids on travels that can't be combed.
 z_hop_mm = 0.4

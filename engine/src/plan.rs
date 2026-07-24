@@ -102,6 +102,14 @@ pub struct ToolPath {
     /// part's paths are complete; ordering groups by it and emit changes tools at
     /// group boundaries. 0 on a single-tool printer.
     pub tool: u32,
+    /// This path is entered AT PRESSURE from the path printed just before it:
+    /// emission skips the travel/retract/unretract and extrudes a short junction
+    /// bead from the predecessor's exit to `points[0]` instead, so the visible
+    /// wall never sees a stop's flow transient. Set by `join_walls` only after
+    /// verifying adjacency, tool equality, and that the junction chord stays in
+    /// material; stripped whenever paths are re-split or re-ordered afterwards
+    /// (bead dabs).
+    pub joined: bool,
 }
 
 impl ToolPath {
@@ -118,7 +126,39 @@ impl ToolPath {
             overhang: 0.0,
             segs: None,
             tool: 0,
+            joined: false,
         }
+    }
+}
+
+/// Rotate a closed loop's start to vertex `vi`, keeping the per-point `widths`
+/// and per-segment `segs` channels in lockstep (on a closed n-point loop both
+/// carry n entries, aligned with the point that starts them).
+pub(crate) fn rotate_loop_start(p: &mut ToolPath, vi: usize) {
+    if vi == 0 || vi >= p.points.len() {
+        return;
+    }
+    p.points.rotate_left(vi);
+    if let Some(w) = &mut p.widths {
+        let n = w.len();
+        w.rotate_left(vi.min(n));
+    }
+    if let Some(s) = &mut p.segs {
+        let n = s.len();
+        s.rotate_left(vi.min(n));
+    }
+}
+
+/// Reverse an open path end-for-end, keeping `widths` (per-point) and `segs`
+/// (per-segment: reversed segment j was segment n−2−j) aligned with the
+/// reversed points.
+pub(crate) fn reverse_open_path(p: &mut ToolPath) {
+    p.points.reverse();
+    if let Some(w) = &mut p.widths {
+        w.reverse();
+    }
+    if let Some(s) = &mut p.segs {
+        s.reverse();
     }
 }
 
@@ -852,6 +892,12 @@ fn stamp_and_finish(
     if matches!(settings.seam_mode, SeamMode::Aligned | SeamMode::Sharpest) {
         align_seams(&mut plans, settings.seam_mode);
     }
+    // Hand each outer wall its nozzle at pressure where the adjacency allows,
+    // then trim the remaining butt-seam closures short of their start
+    // (anti-zit) before travels are planned, so travel/wipe chain from the
+    // real ends.
+    join_walls(&mut plans, settings);
+    crate::emit::apply_seam_gap(&mut plans, settings);
     crate::emit::plan_travels(&mut plans, settings);
     crate::emit::apply_min_layer_time(&mut plans, settings);
     plans
@@ -1245,6 +1291,20 @@ pub fn apply_bead_dabs(layers: &mut [LayerPlan], dabs: &[BeadDab], settings: &Se
     // owns before docking — otherwise the freshly-split arcs interleave with the
     // base tool and every crossing is a dock trip (hundreds per small region).
     order_layers(layers, settings.outer_wall_first);
+    // Splitting re-shaped and re-ordered the paths: any pressure-join adjacency
+    // is void, and the planned travels are stale (emission indexes them 1:1
+    // with paths, whose count just grew). Strip the joins, then RE-derive the
+    // seam treatment — order_layers has already re-seated donors before their
+    // exts, so unsplit walls re-join; the rest fall back to the butt-seam trim
+    // (idempotent: loops the first pass already trimmed are open and skipped).
+    for layer in layers.iter_mut() {
+        for p in &mut layer.paths {
+            p.joined = false;
+        }
+    }
+    join_walls(layers, settings);
+    crate::emit::apply_seam_gap(layers, settings);
+    crate::emit::plan_travels(layers, settings);
 }
 
 /// Re-stamp paint onto a cached [`GeometryPlan`] without re-slicing: only the
@@ -1442,6 +1502,7 @@ fn plan_part(
                                 overhang: 0.0,
                                 segs: None,
                                 tool: 0,
+                                joined: false,
                             });
                         }
                     }
@@ -3909,7 +3970,7 @@ fn order_paths(remaining: Vec<ToolPath>, start: Point) -> Vec<ToolPath> {
         if best_rev {
             b.reverse();
             for p in &mut b {
-                p.points.reverse();
+                reverse_open_path(p);
             }
         }
         cur = path_end(&b[b.len() - 1]);
@@ -3969,19 +4030,104 @@ fn order_walls(walls: Vec<ToolPath>, start: Point, outer_first: bool) -> Vec<Too
             .swap_remove(pick)
             .into_iter()
             .partition(|p| p.kind == PathKind::ExternalPerimeter);
-        let seq = if outer_first { [exts, inners] } else { [inners, exts] };
-        for sub in seq {
-            if sub.is_empty() {
-                continue;
+        if outer_first {
+            for sub in [exts, inners] {
+                if sub.is_empty() {
+                    continue;
+                }
+                let ordered = order_paths(sub, cur);
+                if let Some(last) = ordered.last() {
+                    cur = path_end(last);
+                }
+                out.extend(ordered);
             }
-            let ordered = order_paths(sub, cur);
+            continue;
+        }
+        // Inner-first: pair each external perimeter with its adjacent inner
+        // wall — its join DONOR, the ring or spiralized shell stroke one bead
+        // spacing inside it — and print the donor immediately before its ext so
+        // `join_walls` can hand the nozzle across at pressure. Largest ext
+        // picks first, so a spiralized island's single stroke feeds the
+        // VISIBLE outer wall, not a hole. Pairing is a permissive geometric
+        // heuristic; `join_walls` re-verifies reach and material strictly, so a
+        // mispairing costs only travel, never a weld.
+        let mut ext_order: Vec<usize> = (0..exts.len()).collect();
+        ext_order.sort_by(|&a, &b| {
+            loop_area_mm2(&exts[b].points)
+                .partial_cmp(&loop_area_mm2(&exts[a].points))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut donor_of: Vec<Option<usize>> = vec![None; exts.len()];
+        let mut taken = vec![false; inners.len()];
+        for &e in &ext_order {
+            let reach = exts[e].width_mm * 3.0;
+            let mut best: Option<(usize, f64)> = None;
+            for (i, q) in inners.iter().enumerate() {
+                if taken[i] || q.kind != PathKind::Perimeter {
+                    continue;
+                }
+                let d = approx_polyline_gap(&exts[e].points, &q.points);
+                if d <= reach && best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((i, d));
+                }
+            }
+            if let Some((i, _)) = best {
+                donor_of[e] = Some(i);
+                taken[i] = true;
+            }
+        }
+        let mut rest = Vec::new();
+        let mut donors: Vec<Option<ToolPath>> = (0..exts.len()).map(|_| None).collect();
+        for (i, q) in inners.into_iter().enumerate() {
+            match donor_of.iter().position(|d| *d == Some(i)) {
+                Some(e) => donors[e] = Some(q),
+                None => rest.push(q),
+            }
+        }
+        if !rest.is_empty() {
+            let ordered = order_paths(rest, cur);
             if let Some(last) = ordered.last() {
                 cur = path_end(last);
             }
             out.extend(ordered);
         }
+        // Each ext follows its donor; units are greedily ordered by travel.
+        let mut units: Vec<(Option<ToolPath>, ToolPath)> = donors.into_iter().zip(exts).collect();
+        while !units.is_empty() {
+            let pick = (0..units.len())
+                .min_by_key(|&i| {
+                    let start = units[i].0.as_ref().unwrap_or(&units[i].1);
+                    dist2(cur, start.points[0])
+                })
+                .unwrap();
+            let (donor, ext) = units.swap_remove(pick);
+            if let Some(d) = donor {
+                out.push(d);
+            }
+            cur = path_end(&ext);
+            out.push(ext);
+        }
     }
     out
+}
+
+/// Approximate minimum distance (mm) between two polylines by strided
+/// vertex-to-vertex checks — a cheap adjacency test for donor pairing. Nested
+/// rings share corner neighbourhoods, so vertex sampling is enough here; the
+/// join pass re-measures exactly (edge projection) before committing.
+fn approx_polyline_gap(a: &[Point], b: &[Point]) -> f64 {
+    let stride = |n: usize| (n / 48).max(1);
+    let (sa, sb) = (stride(a.len()), stride(b.len()));
+    let mut best = f64::INFINITY;
+    for i in (0..a.len()).step_by(sa) {
+        for j in (0..b.len()).step_by(sb) {
+            let d = pt_dist_mm(a[i], b[j]);
+            if d < best {
+                best = d;
+            }
+        }
+    }
+    best
 }
 
 /// Vertex-average centroid of a loop — a representative interior point.
@@ -4317,6 +4463,107 @@ fn place_seam(mut points: Vec<Point>, mode: SeamMode, layer_index: usize) -> Vec
     points
 }
 
+/// How far (in bead spacings) a junction bead may reach from the donor's exit
+/// to the outer wall's seam. One spacing is the nominal wall gap; 1.5 covers
+/// the mitered stretch at ring corners without admitting the NEXT ring inward
+/// (two spacings away) or anything across a real gap.
+const JOIN_REACH_SPACINGS: f64 = 1.5;
+
+/// Mark external perimeters that can be entered AT PRESSURE from the path
+/// printed immediately before them — their island's adjacent inner wall ring
+/// or spiralized shell stroke (the donor `order_walls` seated just before
+/// them). The donor is rotated (ring) or reversed (stroke) so it exits next to
+/// the ext's seam; the junction chord must stay inside material
+/// (`travel_blocked` — never weld a slot, a hinge clearance, or another
+/// island) and within [`JOIN_REACH_SPACINGS`]. Emission then replaces the
+/// travel/retract/unretract stop — the seam's uncontrollable flow transient —
+/// with one short junction extrude, so the visible wall never sees a restart.
+/// Donors are mutated only when their join commits; every gate failure leaves
+/// both paths untouched (graceful fallback to the scarf/butt seam).
+fn join_walls(plans: &mut [LayerPlan], settings: &Settings) {
+    if settings.spiral_vase {
+        return;
+    }
+    for plan in plans.iter_mut() {
+        let reach =
+            JOIN_REACH_SPACINGS * config::bead_spacing_mm(settings.line_width_mm, plan.height_mm);
+        for i in 1..plan.paths.len() {
+            let (before, after) = plan.paths.split_at_mut(i);
+            let q = before.last_mut().unwrap();
+            let p = &mut after[0];
+            if p.kind != PathKind::ExternalPerimeter
+                || !p.closed
+                || p.points.len() < 3
+                || p.widths.is_some()
+                || q.kind != PathKind::Perimeter
+                || q.tool != p.tool
+                || q.points.len() < 2
+            {
+                continue;
+            }
+            let seam = p.points[0];
+            if q.closed {
+                if q.points.len() < 3 {
+                    continue;
+                }
+                // Nearest point on the donor ring to the seam, by edge
+                // projection — straight walls keep vertices only at corners,
+                // so vertex-only matching would miss a ring one spacing away.
+                let n = q.points.len();
+                let mut best: Option<(f64, usize, Point)> = None;
+                for k in 0..n {
+                    let (a, b) = (q.points[k], q.points[(k + 1) % n]);
+                    let c = nearest_point_on_seg(seam, a, b);
+                    let d = pt_dist_mm(seam, c);
+                    if best.map_or(true, |(bd, ..)| d < bd) {
+                        best = Some((d, k, c));
+                    }
+                }
+                let Some((d, k, c)) = best else { continue };
+                if d > reach || crate::emit::travel_blocked(&plan.outline, c, seam) {
+                    continue;
+                }
+                // Commit: seat the exit — insert the projected point (unless
+                // it already is a vertex) and rotate the ring to end there.
+                let vi = if c == q.points[k] {
+                    k
+                } else if c == q.points[(k + 1) % n] {
+                    (k + 1) % n
+                } else {
+                    // Interpolate the width at the projection parameter (a
+                    // pinch-narrowed ring tapers along the edge — a midpoint
+                    // width would mis-model E on both halves of the split).
+                    let (a, b) = (q.points[k], q.points[(k + 1) % n]);
+                    let t = pt_dist_mm(a, c) / pt_dist_mm(a, b);
+                    q.points.insert(k + 1, c);
+                    if let Some(w) = &mut q.widths {
+                        let wi = w[k] + (w[(k + 1) % n] - w[k]) * t;
+                        w.insert(k + 1, wi);
+                    }
+                    if let Some(s) = &mut q.segs {
+                        let sk = s[k];
+                        s.insert(k + 1, sk);
+                    }
+                    k + 1
+                };
+                rotate_loop_start(q, vi);
+            } else {
+                let last = *q.points.last().unwrap();
+                let (ds, de) = (pt_dist_mm(q.points[0], seam), pt_dist_mm(last, seam));
+                let (d, rev) = if ds < de { (ds, true) } else { (de, false) };
+                let exit = if rev { q.points[0] } else { last };
+                if d > reach || crate::emit::travel_blocked(&plan.outline, exit, seam) {
+                    continue;
+                }
+                if rev {
+                    reverse_open_path(q);
+                }
+            }
+            p.joined = true;
+        }
+    }
+}
+
 /// Hold external seams in line across layers: walk the layers bottom-up,
 /// rotating every closed outer-wall loop to start at the candidate vertex
 /// nearest the seam of the loop below it, so the seam follows one continuous
@@ -4430,7 +4677,7 @@ fn align_seams(plans: &mut [LayerPlan], mode: SeamMode) {
                         .unwrap()
                 }),
             };
-            path.points.rotate_left(vi);
+            rotate_loop_start(path, vi);
             match assigned[li] {
                 Some((_, ti)) => tracks[ti] = path.points[0],
                 None => tracks.push(path.points[0]),
@@ -4597,7 +4844,10 @@ mod tests {
     /// assignment, path geometry, AND the by-tool ordering — everything a
     /// paint change can touch.
     #[allow(clippy::type_complexity)]
-    fn fp(plans: &[LayerPlan]) -> Vec<(usize, i64, Vec<(u32, PathKind, bool, Vec<(i64, i64)>)>)> {
+    #[allow(clippy::type_complexity)]
+    fn fp(
+        plans: &[LayerPlan],
+    ) -> Vec<(usize, i64, Vec<(u32, PathKind, bool, bool, usize, usize, Vec<(i64, i64)>)>)> {
         plans
             .iter()
             .map(|l| {
@@ -4612,12 +4862,151 @@ mod tests {
                                 .iter()
                                 .map(|pt| ((pt.x_mm() * 1e5).round() as i64, (pt.y_mm() * 1e5).round() as i64))
                                 .collect();
-                            (p.tool, p.kind, p.closed, pts)
+                            // joined + attr-channel lengths are in the print:
+                            // a restamp that desyncs them must fail the test.
+                            (
+                                p.tool,
+                                p.kind,
+                                p.closed,
+                                p.joined,
+                                p.segs.as_ref().map_or(0, Vec::len),
+                                p.widths.as_ref().map_or(0, Vec::len),
+                                pts,
+                            )
                         })
                         .collect(),
                 )
             })
             .collect()
+    }
+
+    fn join_layer(paths: Vec<ToolPath>, contours: Vec<Vec<(f64, f64)>>) -> LayerPlan {
+        let mut outline = Polygons::new();
+        for c in contours {
+            outline.push(Contour::new(c.into_iter().map(|(x, y)| Point::from_mm(x, y)).collect()));
+        }
+        LayerPlan {
+            index: 1,
+            print_z_mm: 0.4,
+            height_mm: 0.2,
+            paths,
+            travels: Vec::new(),
+            outline,
+            speed_scale: 1.0,
+            planned_temp_c: None,
+            temp_command_c: None,
+        }
+    }
+
+    fn ring(kind: PathKind, pts: &[(f64, f64)]) -> ToolPath {
+        ToolPath::new(kind, true, 0.45, pts.iter().map(|&(x, y)| Point::from_mm(x, y)).collect())
+    }
+
+    #[test]
+    fn join_marks_adjacent_ext_and_rotates_donor() {
+        // A 10 mm ext square with its seam at (0,0), its donor ring one bead
+        // spacing (≈0.407) inside, seam initially at the FAR corner. The join
+        // must rotate the donor to exit at its near corner (√2·sp ≈ 0.58 mm
+        // from the ext seam, inside the 1.5-spacing reach) and mark the ext.
+        let sp = 0.407;
+        let donor = ring(
+            PathKind::Perimeter,
+            &[(10.0 - sp, 10.0 - sp), (sp, 10.0 - sp), (sp, sp), (10.0 - sp, sp)],
+        );
+        let ext = ring(
+            PathKind::ExternalPerimeter,
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+        );
+        let mut plans = vec![join_layer(
+            vec![donor, ext],
+            vec![vec![(-1.0, -1.0), (11.0, -1.0), (11.0, 11.0), (-1.0, 11.0)]],
+        )];
+        join_walls(&mut plans, &Settings::default());
+        assert!(plans[0].paths[1].joined, "adjacent same-tool ext joins its donor");
+        let exit = plans[0].paths[0].points[0];
+        assert!(
+            pt_dist_mm(exit, Point::from_mm(sp, sp)) < 1.0e-6,
+            "donor rotated to exit at its corner nearest the ext seam, got ({}, {})",
+            exit.x_mm(),
+            exit.y_mm()
+        );
+    }
+
+    #[test]
+    fn join_refuses_air_gaps_and_foreign_tools() {
+        // Two islands 0.3 mm apart: the donor's exit is within reach of the
+        // neighbour's seam, but the junction chord crosses the gap — never
+        // weld it. And a tool mismatch on the same island must also refuse.
+        let donor = ring(
+            PathKind::Perimeter,
+            &[(9.9, 5.0), (0.5, 5.0), (0.5, 0.5), (9.9, 0.5)],
+        );
+        let ext = ring(
+            PathKind::ExternalPerimeter,
+            &[(10.4, 5.0), (20.0, 5.0), (20.0, 0.0), (10.4, 0.0)],
+        );
+        let islands = vec![
+            vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            vec![(10.3, 0.0), (20.3, 0.0), (20.3, 10.0), (10.3, 10.0)],
+        ];
+        let mut plans = vec![join_layer(vec![donor.clone(), ext.clone()], islands)];
+        join_walls(&mut plans, &Settings::default());
+        assert!(!plans[0].paths[1].joined, "a junction chord across air must not join");
+
+        // Same island, different tools: refuse.
+        let mut foreign = donor.clone();
+        foreign.tool = 1;
+        let near_ext = ring(
+            PathKind::ExternalPerimeter,
+            &[(10.0, 5.0), (20.0, 5.0), (20.0, 0.0), (10.0, 0.0)],
+        );
+        let mut plans = vec![join_layer(
+            vec![foreign, near_ext],
+            vec![vec![(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)]],
+        )];
+        join_walls(&mut plans, &Settings::default());
+        assert!(!plans[0].paths[1].joined, "a tool mismatch must not join");
+    }
+
+    #[test]
+    fn join_reverses_open_donor_with_its_attrs() {
+        // An open spiralized stroke whose START sits nearest the ext seam: the
+        // join must reverse it end-for-end — including its per-segment attrs —
+        // so it EXITS there, then mark the ext.
+        let sp = 0.407;
+        let mut donor = ToolPath::new(
+            PathKind::Perimeter,
+            false,
+            0.45,
+            [(sp, sp), (10.0 - sp, sp), (10.0 - sp, 10.0 - sp), (sp, 10.0 - sp), (sp, 2.0)]
+                .iter()
+                .map(|&(x, y)| Point::from_mm(x, y))
+                .collect(),
+        );
+        let mut segs = vec![SegAttr { kind: PathKind::Perimeter, overhang: 0.0 }; 4];
+        segs[0].overhang = 0.5; // the stroke's FIRST segment, pre-reversal
+        donor.segs = Some(segs);
+        let ext = ring(
+            PathKind::ExternalPerimeter,
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+        );
+        let mut plans = vec![join_layer(
+            vec![donor, ext],
+            vec![vec![(-1.0, -1.0), (11.0, -1.0), (11.0, 11.0), (-1.0, 11.0)]],
+        )];
+        join_walls(&mut plans, &Settings::default());
+        assert!(plans[0].paths[1].joined, "open donor joins after reversal");
+        let d = &plans[0].paths[0];
+        assert!(
+            pt_dist_mm(*d.points.last().unwrap(), Point::from_mm(sp, sp)) < 1.0e-6,
+            "stroke reversed to END at the point nearest the ext seam"
+        );
+        let segs = d.segs.as_ref().unwrap();
+        assert_eq!(segs.len(), 4, "per-segment attrs keep their count through reversal");
+        assert!(
+            (segs[3].overhang - 0.5).abs() < 1.0e-6,
+            "attrs reversed in lockstep: the old first segment is now last"
+        );
     }
 
     #[test]
@@ -4698,7 +5087,9 @@ mod tests {
         let mut out = Vec::new();
         for l in layers {
             for p in &l.paths {
-                if p.kind == PathKind::ExternalPerimeter && p.closed && p.points.len() >= 3 {
+                // The butt-seam trim opens loops after seam placement, so a
+                // wall may arrive here open — points[0] is the seam either way.
+                if p.kind == PathKind::ExternalPerimeter && p.points.len() >= 3 {
                     out.push((l.index, p.points[0].x_mm(), p.points[0].y_mm()));
                 }
             }
@@ -4908,9 +5299,11 @@ mod tests {
         let starts: Vec<Point> = plans
             .iter()
             .filter_map(|p| {
+                // The butt-seam trim may have opened the loop — points[0] is
+                // still the placed seam.
                 p.paths
                     .iter()
-                    .find(|t| t.kind == PathKind::ExternalPerimeter && t.closed)
+                    .find(|t| t.kind == PathKind::ExternalPerimeter)
                     .map(|t| t.points[0])
             })
             .collect();

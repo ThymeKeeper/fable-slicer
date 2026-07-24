@@ -21,8 +21,7 @@ travel_speed_mm_s = 350.0
 print_speed_mm_s = 150.0
 first_layer_speed_mm_s = 30.0
 
-# Direct-drive extruder: short, fast retraction.
-retract_len_mm = 0.5
+# Direct-drive extruder: fast retraction. Distance is filament-tier now.
 retract_speed_mm_s = 40.0
 
 # Chamber thermistor: the 2.4 spec wires one as [temperature_sensor chamber].

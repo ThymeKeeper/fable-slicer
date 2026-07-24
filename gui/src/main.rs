@@ -309,6 +309,8 @@ struct FilamentFields<'a> {
     extrusion_multiplier: &'a mut f64,
     max_volumetric_speed_mm3_s: &'a mut f64,
     pressure_advance: &'a mut f64,
+    retract_len_mm: &'a mut f64,
+    retract_restart_extra_mm: &'a mut f64,
     bridge_flow: &'a mut f64,
     bridge_speed_mm_s: &'a mut f64,
     fan_speed: &'a mut f64,
@@ -330,6 +332,8 @@ impl<'a> FilamentFields<'a> {
             extrusion_multiplier: &mut s.extrusion_multiplier,
             max_volumetric_speed_mm3_s: &mut s.max_volumetric_speed_mm3_s,
             pressure_advance: &mut s.pressure_advance,
+            retract_len_mm: &mut s.retract_len_mm,
+            retract_restart_extra_mm: &mut s.retract_restart_extra_mm,
             bridge_flow: &mut s.bridge_flow,
             bridge_speed_mm_s: &mut s.bridge_speed_mm_s,
             fan_speed: &mut s.fan_speed,
@@ -351,6 +355,8 @@ impl<'a> FilamentFields<'a> {
             extrusion_multiplier: &mut t.extrusion_multiplier,
             max_volumetric_speed_mm3_s: &mut t.max_volumetric_speed_mm3_s,
             pressure_advance: &mut t.pressure_advance,
+            retract_len_mm: &mut t.retract_len_mm,
+            retract_restart_extra_mm: &mut t.retract_restart_extra_mm,
             bridge_flow: &mut t.bridge_flow,
             bridge_speed_mm_s: &mut t.bridge_speed_mm_s,
             fan_speed: &mut t.fan_speed,
@@ -373,6 +379,8 @@ struct FilamentBaseline {
     extrusion_multiplier: f64,
     max_volumetric_speed_mm3_s: f64,
     pressure_advance: f64,
+    retract_len_mm: f64,
+    retract_restart_extra_mm: f64,
     bridge_flow: f64,
     bridge_speed_mm_s: f64,
     fan_speed: f64,
@@ -393,6 +401,8 @@ impl FilamentBaseline {
             extrusion_multiplier: s.extrusion_multiplier,
             max_volumetric_speed_mm3_s: s.max_volumetric_speed_mm3_s,
             pressure_advance: s.pressure_advance,
+            retract_len_mm: s.retract_len_mm,
+            retract_restart_extra_mm: s.retract_restart_extra_mm,
             bridge_flow: s.bridge_flow,
             bridge_speed_mm_s: s.bridge_speed_mm_s,
             fan_speed: s.fan_speed,
@@ -413,6 +423,8 @@ impl FilamentBaseline {
             extrusion_multiplier: t.extrusion_multiplier,
             max_volumetric_speed_mm3_s: t.max_volumetric_speed_mm3_s,
             pressure_advance: t.pressure_advance,
+            retract_len_mm: t.retract_len_mm,
+            retract_restart_extra_mm: t.retract_restart_extra_mm,
             bridge_flow: t.bridge_flow,
             bridge_speed_mm_s: t.bridge_speed_mm_s,
             fan_speed: t.fan_speed,
@@ -491,6 +503,14 @@ fn filament_card_rows(
     revert_row(ui, f.filament_diameter_mm, &base.filament_diameter_mm, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 1.0..=3.0), "filament Ø mm",
             "Filament diameter (1.75 or 2.85). Drives the extrusion math.");
+    });
+    revert_row(ui, f.retract_len_mm, &base.retract_len_mm, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 0.0..=10.0), "retract mm",
+            "Filament pulled back on travels to stop oozing/stringing — a material property (PETG oozes more than PLA), so it lives here per filament. Retraction speed, z-hop, and wipe are on the printer. 0 = off.");
+    });
+    revert_row(ui, f.retract_restart_extra_mm, &base.retract_restart_extra_mm, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, -0.3..=0.3), "restart extra mm",
+            "Filament added to the de-retract at each restart. NEGATIVE de-primes to absorb the pressure the unretract would otherwise dump as a seam blob/zit (start here if seams zit); positive compensates travel ooze. 0 = a symmetric restart.");
     });
     // Measured calibration — the slicer is blind to the true output, so
     // these are pinned from a test, not derived (default 1.0 / conservative;
@@ -3443,6 +3463,8 @@ impl App {
             s.max_flow_derate_per_c = t0.max_flow_derate_per_c;
             s.extrusion_multiplier = t0.extrusion_multiplier;
             s.pressure_advance = t0.pressure_advance;
+            s.retract_len_mm = t0.retract_len_mm;
+            s.retract_restart_extra_mm = t0.retract_restart_extra_mm;
             s.bridge_flow = t0.bridge_flow;
             s.bridge_speed_mm_s = t0.bridge_speed_mm_s;
             s.fan_speed = t0.fan_speed;
@@ -5485,7 +5507,7 @@ impl eframe::App for App {
                         "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
                     revert_row(ui, &mut s.seam_mode, &self.baseline.seam_mode, |ui, v| {
                         seam_combo(ui, v)
-                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random.");
+                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random. Seam mechanics are automatic — an outer wall reachable from its inner wall is entered at pressure with no stop at the seam; the rest get a derived scarf or a fixed butt trim.");
                     });
                     revert_row(ui, &mut s.elephant_foot_mm, &self.baseline.elephant_foot_mm, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "elephant foot mm",
@@ -5634,10 +5656,8 @@ impl eframe::App for App {
                     });
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
-                    revert_row(ui, &mut s.retract_len_mm, &self.baseline.retract_len_mm, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 0.0..=10.0), "length mm",
-                            "Filament pulled back on travels to prevent oozing/stringing.");
-                    });
+                    // Retraction distance is a filament property — it lives on the
+                    // Filament card. Speed, z-hop, and wipe are machine mechanics.
                     revert_row(ui, &mut s.retract_speed_mm_s, &self.baseline.retract_speed_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 5.0..=100.0), "speed mm/s",
                             "How fast filament is retracted and recovered.");

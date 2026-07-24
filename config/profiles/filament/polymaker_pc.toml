@@ -8,6 +8,8 @@ material = "abs"
 filament_diameter_mm = 1.75
 nozzle_temp_c = 260
 bed_temp_c = 100
+# Retraction distance (mm); PC oozes when hot — a touch more.
+retract_len_mm = 0.6
 
 # --- calibration ---
 density_g_cm3 = 1.2

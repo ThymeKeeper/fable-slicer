@@ -54,8 +54,6 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_tolerance_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retract_len_mm: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub retract_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub z_hop_mm: Option<f64>,
@@ -128,6 +126,15 @@ pub struct FilamentProfile {
     pub max_volumetric_speed_mm3_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pressure_advance: Option<f64>,
+    /// Filament pulled back on travels (mm). A material property — PETG oozes
+    /// more than PLA — so it lives here, not on the printer. Retraction speed,
+    /// z-hop, and wipe stay machine-tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retract_len_mm: Option<f64>,
+    /// Filament added (mm) to the de-retract at each restart; negative de-primes
+    /// to absorb the unretract's seam blob. 0 = symmetric.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retract_restart_extra_mm: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,7 +272,7 @@ impl Tier for PrinterProfile {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
-            retract_len_mm, retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
+            retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             aux_fan, exhaust_fan, chamber_sensor,
             machine_kind, tool_count, toolchange_gcode, toolchange_seconds, purge_volume_mm3,
             standby_after_s, start_gcode, end_gcode)
@@ -280,7 +287,7 @@ impl Tier for FilamentProfile {
         merge_fields!(self, base, material, color, filament_diameter_mm, density_g_cm3,
             nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
-            pressure_advance,
+            pressure_advance, retract_len_mm, retract_restart_extra_mm,
             fan_speed, bridge_fan_speed, bridge_flow, bridge_speed_mm_s,
             fan_off_layers, aux_fan_speed, exhaust_fan_speed,
             chamber_temp_c, standby_temp_c)
@@ -338,7 +345,6 @@ impl PrinterProfile {
             min_cruise_ratio: diff_field!(cur.min_cruise_ratio, base.min_cruise_ratio),
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
             arc_tolerance_mm: diff_field!(cur.arc_tolerance_mm, base.arc_tolerance_mm),
-            retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
             retract_speed_mm_s: diff_field!(cur.retract_speed_mm_s, base.retract_speed_mm_s),
             z_hop_mm: diff_field!(cur.z_hop_mm, base.z_hop_mm),
             wipe_mm: diff_field!(cur.wipe_mm, base.wipe_mm),
@@ -382,6 +388,8 @@ impl FilamentProfile {
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
             max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
+            retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
+            retract_restart_extra_mm: diff_field!(cur.retract_restart_extra_mm, base.retract_restart_extra_mm),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
@@ -413,6 +421,8 @@ impl FilamentProfile {
             max_volumetric_speed_mm3_s: diff_field!(cur.max_volumetric_speed_mm3_s, base.max_volumetric_speed_mm3_s),
             max_flow_derate_per_c: diff_field!(cur.max_flow_derate_per_c, base.max_flow_derate_per_c),
             pressure_advance: diff_field!(cur.pressure_advance, base.pressure_advance),
+            retract_len_mm: diff_field!(cur.retract_len_mm, base.retract_len_mm),
+            retract_restart_extra_mm: diff_field!(cur.retract_restart_extra_mm, base.retract_restart_extra_mm),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
@@ -813,7 +823,11 @@ impl Profiles {
             max_bridge_span_mm: pc.max_bridge_span_mm.unwrap_or(d.max_bridge_span_mm),
             blend_band_mm: pc.blend_band_mm.unwrap_or(d.blend_band_mm),
             bridge_foothold_mm: pc.bridge_foothold_mm.unwrap_or(d.bridge_foothold_mm),
-            retract_len_mm: pr.retract_len_mm.unwrap_or(d.retract_len_mm),
+            // Retraction distance now rides the filament tier — mirror tool 0's,
+            // like every other per-tool filament field. Speed/z-hop/wipe stay
+            // machine-tier (`pr`).
+            retract_len_mm: t0.retract_len_mm,
+            retract_restart_extra_mm: t0.retract_restart_extra_mm,
             retract_speed_mm_s: pr.retract_speed_mm_s.unwrap_or(d.retract_speed_mm_s),
             z_hop_mm: pr.z_hop_mm.unwrap_or(d.z_hop_mm),
             wipe_mm: pr.wipe_mm.unwrap_or(d.wipe_mm),
@@ -932,6 +946,8 @@ fn tool_settings(name: &str, fl: &FilamentProfile, d: &Settings) -> crate::ToolS
         max_flow_derate_per_c: fl.max_flow_derate_per_c.unwrap_or_else(|| material.max_flow_derate_per_c()),
         extrusion_multiplier: fl.extrusion_multiplier.unwrap_or(d.extrusion_multiplier),
         pressure_advance: fl.pressure_advance.unwrap_or(d.pressure_advance),
+        retract_len_mm: fl.retract_len_mm.unwrap_or(d.retract_len_mm),
+        retract_restart_extra_mm: fl.retract_restart_extra_mm.unwrap_or(d.retract_restart_extra_mm),
         bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
         bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
         fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
@@ -1309,6 +1325,10 @@ mod tests {
         assert_eq!(s.tools.len(), 2);
         assert_eq!(s.tools[0].nozzle_temp_c, 210); // pla
         assert_eq!(s.tools[1].nozzle_temp_c, 240); // petg
+        // Retraction distance rides each slot's own filament now.
+        assert_eq!(s.tools[0].retract_len_mm, 0.5); // pla
+        assert_eq!(s.tools[1].retract_len_mm, 0.6); // petg
+        assert_eq!(s.retract_len_mm, s.tools[0].retract_len_mm); // flat mirrors tool 0
         assert_eq!(s.tools[1].first_layer_nozzle_temp_c, 250); // +10 PETG bump
         // Colors: parsed hex, garbage → the neutral fallback.
         assert_eq!(s.tools[0].color_rgb, [1.0, 0.0, 0.0]);

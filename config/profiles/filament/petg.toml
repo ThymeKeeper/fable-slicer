@@ -4,6 +4,8 @@ material = "petg"
 filament_diameter_mm = 1.75
 nozzle_temp_c = 240
 bed_temp_c = 80
+# Retraction distance (mm). PETG oozes/strings more than PLA — a touch more.
+retract_len_mm = 0.6
 
 # --- calibration ---
 max_volumetric_speed_mm3_s = 11.0

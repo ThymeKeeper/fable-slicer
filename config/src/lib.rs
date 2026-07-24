@@ -343,6 +343,15 @@ pub struct ToolSettings {
     pub max_flow_derate_per_c: f64,
     pub extrusion_multiplier: f64,
     pub pressure_advance: f64,
+    /// Filament pulled back on travels (mm) — a material property (PETG oozes
+    /// more than PLA), so it rides the filament tier per tool. Speed, z-hop,
+    /// and wipe stay machine-tier on [`Settings`].
+    pub retract_len_mm: f64,
+    /// Filament added (mm) to the de-retract at each restart. NEGATIVE de-primes,
+    /// absorbing the pressure the unretract would otherwise dump as a seam blob;
+    /// positive compensates travel ooze (Orca's retract_restart_extra). 0 = a
+    /// symmetric restart. Material-dependent, so it rides the filament tier.
+    pub retract_restart_extra_mm: f64,
     pub bridge_flow: f64,
     pub bridge_speed_mm_s: f64,
     pub fan_speed: f64,
@@ -449,7 +458,10 @@ pub struct Settings {
     pub skirt_gap_mm: f64,
     /// Number of brim loops extending outward from the part (0 disables).
     pub brim_loops: usize,
-    /// Where to place the wall seam.
+    /// Where to place the wall seam. Seam MECHANICS are automatic: an outer
+    /// wall adjacent to its inner wall is entered at pressure (no stop at the
+    /// seam at all), the rest fall back to a derived-length scarf or a fixed
+    /// butt-seam trim — no knobs.
     pub seam_mode: SeamMode,
     /// Auto-center the model on the bed before slicing. The GUI positions objects
     /// explicitly (multi-object layout) so it turns this off; the CLI keeps it on.
@@ -482,6 +494,9 @@ pub struct Settings {
 
     // --- retraction ---
     pub retract_len_mm: f64,
+    /// Filament added (mm) to the de-retract at each restart (filament-tier,
+    /// mirrors tool 0). Negative de-primes to absorb the unretract's seam blob.
+    pub retract_restart_extra_mm: f64,
     pub retract_speed_mm_s: f64,
     /// Z lift on travels that can't be combed (cross a void). 0 disables.
     pub z_hop_mm: f64,
@@ -691,6 +706,7 @@ impl Default for Settings {
             // length; tighten for saturated colors, at a sparser palette.
             blend_band_mm: 0.8,
             retract_len_mm: 0.8,
+            retract_restart_extra_mm: 0.0,
             retract_speed_mm_s: 35.0,
             z_hop_mm: 0.0,
             wipe_mm: 2.0,
@@ -788,6 +804,8 @@ impl Settings {
             max_flow_derate_per_c: self.max_flow_derate_per_c,
             extrusion_multiplier: self.extrusion_multiplier,
             pressure_advance: self.pressure_advance,
+            retract_len_mm: self.retract_len_mm,
+            retract_restart_extra_mm: self.retract_restart_extra_mm,
             bridge_flow: self.bridge_flow,
             bridge_speed_mm_s: self.bridge_speed_mm_s,
             fan_speed: self.fan_speed,

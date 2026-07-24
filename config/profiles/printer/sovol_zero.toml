@@ -27,7 +27,6 @@ travel_speed_mm_s = 1000.0
 print_speed_mm_s = 400.0
 first_layer_speed_mm_s = 55.0
 
-retract_len_mm = 0.5
 retract_speed_mm_s = 40.0
 
 # Beyond the toolhead part fan: an auxiliary side fan and a chamber exhaust,

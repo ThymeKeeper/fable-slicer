@@ -6,6 +6,8 @@ material = "pla"
 filament_diameter_mm = 1.75
 nozzle_temp_c = 210
 bed_temp_c = 65
+# Retraction distance (mm). PLA sets little; direct-drive short pull.
+retract_len_mm = 0.5
 
 # --- calibration (measured on the Zero's stock hotend / Orca-matched) ---
 pressure_advance = 0.032
