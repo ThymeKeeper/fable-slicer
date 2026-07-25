@@ -45,12 +45,16 @@ chamber_sensor = "chamber_temp"
 # api_key = ""
 
 # Stock firmware defines bare START_PRINT / END_PRINT macros that take no
-# parameters and do no heating — heat explicitly around them, mirroring Sovol's
-# own Orca profile: bed → home → START_PRINT → home → park front-left → chamber
-# soak → nozzle. Nozzle heats only after homing/probing AND after the chamber
-# soak, so it never oozes onto the bed mesh and never idles hot over the bed
-# while the chamber catches up. The double G28 is vendor-shipped; keep the
-# known-good sequence verbatim.
+# parameters and do no heating — heat explicitly around them: bed → home →
+# START_PRINT → home → park OFF-BED at the wiper corner → chamber soak →
+# nozzle heat → CLEAN_NOZZLE_HOT. The nozzle heats only after homing/probing
+# AND after the chamber soak, parked off the bed so heat-up/soak ooze drips
+# beside the brush, never onto the plate; CLEAN_NOZZLE_HOT (our macro on the
+# machine, alongside the cached-Z-anchor START_PRINT) then brushes the hot tip
+# and re-homes Z at print temperature — the one and only nozzle heat of the
+# whole ceremony on cache-hit prints. After a nozzle or plate change run
+# Z_ANCHOR_RESET on the printer so the next print re-runs the full contact
+# calibration. The double G28 is vendor-shipped; keep the known-good sequence.
 #
 # {chamber_soak} expands to a TEMPERATURE_WAIT on the chamber sensor when the
 # filament wants a warm chamber (ABS/ASA), and to nothing for PLA. A machine
@@ -63,11 +67,12 @@ G28
 START_PRINT
 G28
 G90
-G1 X0 Y0 F12000
-G1 Z0.300 F600
+G1 X-1 Y2 F12000
+G1 Z5 F600
 {chamber_soak}
 M104 S{first_layer_nozzle_temp}
 M109 S{first_layer_nozzle_temp}
+CLEAN_NOZZLE_HOT
 """
 
 end_gcode = """
