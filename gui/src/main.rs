@@ -128,6 +128,9 @@ enum HostOp {
     Resume,
     Cancel,
     Status,
+    /// Toggle the printer's auxiliary fan as a live chamber-circulation
+    /// control (destratify while an external chamber heater runs).
+    Circulate { on: bool },
 }
 
 /// What a finished host operation reports back to the UI thread.
@@ -1886,6 +1889,10 @@ struct App {
     joint_layer_ends: Vec<u32>,
     /// false = show the model mesh; true = show the sliced toolpaths.
     view_preview: bool,
+    /// Last commanded state of the live chamber-circulation toggle (what WE
+    /// sent, not polled hardware state — a starting print's own fan settings
+    /// take over and this resets with the app).
+    circulate_on: bool,
     /// Highest layer shown in preview (1-based).
     preview_layer: usize,
     show_walls: bool,
@@ -2169,6 +2176,7 @@ impl App {
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view_preview: false,
+            circulate_on: false,
             preview_layer: 1,
             show_walls: true,
             show_solid: true,
@@ -4762,6 +4770,35 @@ impl eframe::App for App {
                     host_op = Some(HostOp::Send { start: true });
                 }
             });
+            // Live chamber circulation: only on machines that declare an aux
+            // fan. While an external chamber heater runs, the hot layer pools
+            // at the ceiling — exactly where a CoreXY toolhead lives — and
+            // the chamber probe (lower, in bulk air) under-reads; stirring
+            // mixes the layer down, protects the toolhead board, and makes
+            // the ASA soak gate (which waits on that probe) honest.
+            if self.settings.has_aux_fan {
+                ui.horizontal(|ui| {
+                    let resp = ui
+                        .add_enabled(
+                            host_set && !host_busy,
+                            egui::Button::selectable(self.circulate_on, "🌀 stir chamber"),
+                        )
+                        .on_hover_text(
+                            "Run the printer's auxiliary fan at 60% right now, over the live \
+                             connection — use it while pre-heating the chamber with an external \
+                             heater: it mixes the hot ceiling layer away from the toolhead and \
+                             lets the chamber probe read true bulk temperature. A starting \
+                             print's own fan settings take over from there.",
+                        )
+                        .on_disabled_hover_text(
+                            "Needs a printer host (Connection section) and no host operation in flight.",
+                        );
+                    if resp.clicked() {
+                        self.circulate_on = !self.circulate_on;
+                        host_op = Some(HostOp::Circulate { on: self.circulate_on });
+                    }
+                });
+            }
             if !bed_printable {
                 ui.label(
                     egui::RichText::new(format!(
@@ -6905,6 +6942,17 @@ impl eframe::App for App {
                     self.last_status_poll = Some(std::time::Instant::now());
                     self.spawn_host_op(&ctx, true, |c| HostReply::Status(c.print_status()));
                 }
+                HostOp::Circulate { on } => self.spawn_host_op(&ctx, false, move |c| {
+                    let script = if on { "M106 P2 S153" } else { "M106 P2 S0" };
+                    HostReply::Message(match c.run_gcode(script) {
+                        Ok(()) => if on {
+                            "Chamber circulation on (aux fan 60%).".into()
+                        } else {
+                            "Chamber circulation off.".into()
+                        },
+                        Err(e) => format!("Circulation command failed: {e}"),
+                    })
+                }),
             }
         }
 

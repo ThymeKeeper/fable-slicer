@@ -1318,6 +1318,283 @@ pub fn restamp_paint(geo: &GeometryPlan, parts: &[(&Mesh, PartPaint)]) -> Vec<La
     stamp_and_finish(geo, geo.part_plans.clone(), parts)
 }
 
+/// Hollows (over-air islands) the WALL FIELD itself may span, printed as if the
+/// void weren't there: each ring bead crosses in a short, straight, both-ends-
+/// anchored hop (its own continuation is the anchor) and the per-segment
+/// overhang machinery slows/cools the airborne stretch. This is the strongest
+/// cover for a horizontal bore's crown inside a wall band — continuous beads,
+/// no patch, no weld line — so such islands are exempted from the enclosed-
+/// ceiling carve (which exists for the OPPOSITE case: hollows so large that
+/// rings over them are a liability). An island qualifies only when:
+///   - it lies within the wall band (walls actually cover it; a hollow in the
+///     fill interior belongs to the bridge machinery). A through-bore's crown
+///     touches the outline at its mouths — that's fine: the outer perimeter
+///     crossing a mouth is the hole-top-on-a-vertical-face bridge every wall
+///     printer does,
+///   - the nearest outline stretch is STRAIGHT around it (rings are local
+///     offsets of the outline, so straight outline ⇒ straight crossings — a
+///     bend over air sags),
+///   - every crossing chord along the ring direction is ≤ `max_span`,
+///   - it is small (a crown sliver, not a cabin roof).
+fn wall_spannable_hollows(
+    outline: &Polygons,
+    below: &Polygons,
+    lw: f64,
+    wall_depth: f64,
+    max_span: f64,
+) -> Polygons {
+    let mut out = Polygons::new();
+    if max_span <= 0.0 {
+        return out;
+    }
+    let hollow = difference(outline, below);
+    let wall_band = difference(outline, &offset(outline, -wall_depth));
+    for h in islands(&hollow) {
+        // Small crown slivers only.
+        let area: f64 = h
+            .contours
+            .iter()
+            .map(|c| if c.is_ccw() { c.area_mm2() } else { -c.area_mm2() })
+            .sum();
+        if area <= 0.0 || area > 60.0 {
+            continue;
+        }
+        // Covered by walls.
+        if !difference(&h, &wall_band).is_empty() {
+            continue;
+        }
+        // Local ring direction = the nearest outline segment's direction; the
+        // outline must be straight for the island's whole extent around that
+        // point, or the rings crossing the void would bend mid-air.
+        let c0 = loop_centroid(&h.contours[0].points);
+        let mut best: Option<(f64, usize, usize)> = None; // (dist, contour, seg)
+        for (ci, c) in outline.contours.iter().enumerate() {
+            let m = c.points.len();
+            for k in 0..m {
+                let q = nearest_point_on_seg(c0, c.points[k], c.points[(k + 1) % m]);
+                let d = pt_dist_mm(c0, q);
+                if best.map_or(true, |(bd, ..)| d < bd) {
+                    best = Some((d, ci, k));
+                }
+            }
+        }
+        let Some((_, ci, k0)) = best else { continue };
+        let c = &outline.contours[ci];
+        let m = c.points.len();
+        let dir = |k: usize| -> (f64, f64) {
+            let (a, b) = (c.points[k % m], c.points[(k + 1) % m]);
+            let (dx, dy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+            let l = (dx * dx + dy * dy).sqrt().max(1.0e-9);
+            (dx / l, dy / l)
+        };
+        let (ux, uy) = dir(k0);
+        // Extent of the island (bounding-circle radius around its centroid).
+        let ext = h
+            .contours
+            .iter()
+            .flat_map(|c| &c.points)
+            .map(|p| pt_dist_mm(*p, c0))
+            .fold(0.0f64, f64::max);
+        // Walk the outline both ways from the nearest segment for `ext + 3mm`
+        // of arc; every segment must stay within ~15° of the ring direction.
+        let window = ext + 3.0;
+        let mut straight = true;
+        for sign in [1i64, -1] {
+            let mut acc = 0.0;
+            let mut k = k0;
+            while acc < window {
+                let (vx, vy) = dir(k);
+                if (vx * ux + vy * uy).abs() < 0.966 {
+                    straight = false;
+                    break;
+                }
+                let (a, b) = (c.points[k % m], c.points[(k + 1) % m]);
+                acc += pt_dist_mm(a, b);
+                k = ((k as i64 + sign).rem_euclid(m as i64)) as usize;
+            }
+            if !straight {
+                break;
+            }
+        }
+        if !straight {
+            continue;
+        }
+        // Every crossing chord along the ring direction must be spannable.
+        let theta = uy.atan2(ux).to_degrees();
+        let chords = infill_lines(&h, theta, lw, false, 0.5, false);
+        if chords.is_empty() {
+            continue;
+        }
+        let ok = chords.iter().all(|seg| {
+            seg.len() < 2 || pt_dist_mm(seg[0], seg[seg.len() - 1]) <= max_span
+        });
+        if ok {
+            out.contours.extend(h.contours);
+        }
+    }
+    out
+}
+
+/// Insert vertices where wall segments cross `region`'s boundary, so the
+/// per-segment overhang grading can treat the inside-region stretch as its own
+/// segment (a simplified straight wall is one long segment — a short airborne
+/// hop interior to it would otherwise dilute to nothing). Pure refinement:
+/// geometry and E are unchanged. Fresh pass-1 walls only — no widths/segs
+/// exist yet to keep in lockstep.
+fn split_walls_at_region(walls: &mut [ToolPath], region: &Polygons) {
+    if region.contours.is_empty() {
+        return;
+    }
+    for w in walls.iter_mut() {
+        debug_assert!(w.widths.is_none() && w.segs.is_none());
+        let n = w.points.len();
+        if n < 2 {
+            continue;
+        }
+        let closed = w.closed;
+        let mut out: Vec<Point> = Vec::with_capacity(n + 8);
+        let last = if closed { n } else { n - 1 };
+        for k in 0..last {
+            let a = w.points[k];
+            let b = w.points[(k + 1) % n];
+            out.push(a);
+            let mut ts: Vec<f64> = Vec::new();
+            for c in &region.contours {
+                let m = c.points.len();
+                for j in 0..m {
+                    if let Some(t) = seg_cross_t(a, b, c.points[j], c.points[(j + 1) % m]) {
+                        ts.push(t);
+                    }
+                }
+            }
+            ts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            ts.dedup_by(|x, y| (*x - *y).abs() < 1.0e-9);
+            for &t in &ts {
+                if t > 1.0e-6 && t < 1.0 - 1.0e-6 {
+                    out.push(Point::from_mm(
+                        a.x_mm() + (b.x_mm() - a.x_mm()) * t,
+                        a.y_mm() + (b.y_mm() - a.y_mm()) * t,
+                    ));
+                }
+            }
+        }
+        if !closed {
+            out.push(w.points[n - 1]);
+        }
+        w.points = out;
+    }
+}
+
+/// Parameter t ∈ (0,1) where segment a→b crosses c→d, else None.
+fn seg_cross_t(a: Point, b: Point, c: Point, d: Point) -> Option<f64> {
+    let (ax, ay) = (a.x_mm(), a.y_mm());
+    let (bx, by) = (b.x_mm(), b.y_mm());
+    let (cx, cy) = (c.x_mm(), c.y_mm());
+    let (dx, dy) = (d.x_mm(), d.y_mm());
+    let (rx, ry) = (bx - ax, by - ay);
+    let (sx, sy) = (dx - cx, dy - cy);
+    let denom = rx * sy - ry * sx;
+    if denom.abs() < 1.0e-12 {
+        return None;
+    }
+    let t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
+    let u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
+    if t > 0.0 && t < 1.0 && (0.0..=1.0).contains(&u) {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Hollows under the WALL BAND that the enclosure proxy skips — they reach
+/// near the outline, so dilating them escapes the slice — but that a real
+/// anchored bridge span covers. Without this, a tall wall stack roofs such a
+/// hollow with loops wandering over air; `bridge_angle` is the honest
+/// anchoring test the proxy stands in for. Wall-band-only: hollows in the
+/// fill interior already route through `oh ∩ inner`, and wall-spannable
+/// hollows stay with the ring field.
+#[allow(clippy::too_many_arguments)]
+fn anchored_wallband_sheet(
+    outline: &Polygons,
+    below: &Polygons,
+    lw: f64,
+    allowance: f64,
+    reach: f64,
+    wall_depth: f64,
+    max_span: f64,
+    spannable: &Polygons,
+) -> Polygons {
+    let supported = offset(below, allowance);
+    let over_air = difference(outline, &supported);
+    if over_air.is_empty() {
+        return Polygons::new();
+    }
+    let wall_band = difference(outline, &offset(outline, -wall_depth));
+    let inside_outer = offset(outline, -lw);
+    let mut band = Polygons::new();
+    for h in islands(&over_air) {
+        if !difference(&h, &wall_band).is_empty() {
+            continue; // reaches the fill interior — `oh ∩ inner` owns it
+        }
+        if !intersection(&h, spannable).contours.is_empty() {
+            continue; // the ring field spans it whole
+        }
+        if difference(&offset(&h, lw), outline).is_empty() {
+            continue; // enclosed — enclosed_ceiling_sheet already takes it
+        }
+        if bridge_angle(&h, &supported, lw, max_span).is_none() {
+            continue; // a true cantilever: no anchored span exists
+        }
+        band = union(&band, &intersection(&offset(&h, reach), &inside_outer));
+    }
+    band
+}
+
+/// Drop from `sheet` (an enclosed-ceiling carve region) every island that
+/// contains a wall-spannable hollow — both the pass-1 wall carve and the
+/// pass-2 bridge coverage consult this, so they always agree.
+fn drop_spannable(sheet: Polygons, spannable: &Polygons) -> Polygons {
+    if spannable.contours.is_empty() || sheet.contours.is_empty() {
+        return sheet;
+    }
+    let mut out = Polygons::new();
+    for isl in islands(&sheet) {
+        if intersection(&isl, spannable).contours.is_empty() {
+            out.contours.extend(isl.contours);
+        }
+    }
+    out
+}
+
+/// With NO bottom shells, a carved hollow has exactly one guaranteed cover:
+/// the bridge pass. Keep only carve islands whose underlying hollow really
+/// anchors a span — an unbridgeable enclosed void (wider than the bridge span
+/// in every direction) keeps its walls instead, which ring-roof it outer→in
+/// (each ring bonds to the previous one — the old, and for that case better,
+/// strategy). With shells configured the skins guarantee cover, so no filter.
+fn keep_bridgeable(
+    sheet: Polygons,
+    outline: &Polygons,
+    supported: &Polygons,
+    lw: f64,
+    max_span: f64,
+) -> Polygons {
+    if sheet.contours.is_empty() {
+        return sheet;
+    }
+    let over_air = difference(outline, supported);
+    let mut out = Polygons::new();
+    for isl in islands(&sheet) {
+        let hollow = intersection(&isl, &over_air);
+        if !hollow.contours.is_empty()
+            && bridge_angle(&hollow, supported, lw, max_span).is_some()
+        {
+            out.contours.extend(isl.contours);
+        }
+    }
+    out
+}
+
 /// Plan one part's layers into per-layer toolpaths — everything that reads only
 /// this part's own material. `phys` is the per-layer union of ALL parts: the
 /// "is there something below me" physical tests (overhang walls, bridges,
@@ -1332,11 +1609,38 @@ fn plan_part(
     let lw = settings.line_width_mm;
     let n = layers.len();
 
+    // Hollows the ring field spans as continuous straight beads (a bore's
+    // crown inside the wall band): every consumer that would otherwise
+    // interrupt the walls there — the surface-overrides-wall reservation, the
+    // enclosed-ceiling carve, and pass 2's bridge coverage — consults this ONE
+    // set, so the walls stay whole and exactly one mechanism covers the void.
+    let spannable_per_layer: Vec<Polygons> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            if i == 0 || settings.spiral_vase {
+                return Polygons::new();
+            }
+            let sp = config::bead_spacing_mm(lw, layers[i].height_mm);
+            let wall_depth = match settings.wall_count {
+                0 => 0.0,
+                wc => lw + (wc - 1) as f64 * sp,
+            };
+            wall_spannable_hollows(
+                &layers[i].polygons,
+                &phys[i - 1],
+                lw,
+                wall_depth,
+                settings.max_bridge_span_mm,
+            )
+        })
+        .collect();
+
     // A region with nothing immediately above (or below) is a top (or bottom)
     // surface, and a surface overrides a wall — it must be skinned even when the
     // wall count alone would otherwise fill the whole cross-section. Precompute
     // the exposed faces from the full outlines so pass 1 keeps the inner walls
-    // clear of them and the skin can claim them.
+    // clear of them and the skin can claim them. A wall-spannable hollow is
+    // NOT a skinnable face — the ring field crosses it whole.
     let surface_per_layer: Vec<Polygons> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -1360,7 +1664,8 @@ fn plan_part(
                 here.clone()
             };
             // Open at half a line to drop ribbons too thin to skin or carve out.
-            offset(&offset(&union(&top, &bot), -lw * 0.5), lw * 0.5)
+            let faces = offset(&offset(&union(&top, &bot), -lw * 0.5), lw * 0.5);
+            difference(&faces, &spannable_per_layer[i])
         })
         .collect();
 
@@ -1376,13 +1681,51 @@ fn plan_part(
             // hollow dominating the island) prints as ONE bridge sheet anchored on
             // the outer wall — no inner perimeters boxing it in. Carve its interior
             // out of the wall region here; Pass 2 bridges it.
-            let ceiling = if layer.index > 0 && settings.bottom_layers > 0 {
+            // Geometry, not shell config, decides over-air wall coverage: even
+            // with bottom_layers = 0 an enclosed hollow must not be roofed by
+            // wall loops wandering over air — it is carved and bridged, unless
+            // it is wall-spannable (below), in which case the field crosses it
+            // whole. Pass 2 guarantees cover for whatever is carved here.
+            let ceiling = if layer.index > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 // Carve reach: clears inner perimeters out of the hollow + the
                 // foothold band, but keeps the rings beyond it.
                 let foothold = settings.bridge_foothold_mm;
-                enclosed_ceiling_sheet(&layer.polygons, &phys[layer.index - 1], lw, allowance, foothold)
+                let sheet =
+                    enclosed_ceiling_sheet(&layer.polygons, &phys[layer.index - 1], lw, allowance, foothold);
+                let wall_depth = match settings.wall_count {
+                    0 => 0.0,
+                    wc => lw + (wc - 1) as f64 * sp,
+                };
+                let anchored = anchored_wallband_sheet(
+                    &layer.polygons,
+                    &phys[layer.index - 1],
+                    lw,
+                    allowance,
+                    foothold,
+                    wall_depth,
+                    settings.max_bridge_span_mm,
+                    &spannable_per_layer[layer.index],
+                );
+                // A hollow the ring field can span as continuous straight beads
+                // (a bore's crown inside the wall band) keeps its walls — the
+                // strongest cover is the uninterrupted field itself, not a
+                // carved patch. Pass 2 makes the same exemption, so nothing
+                // double-fills it.
+                let carve =
+                    drop_spannable(union(&sheet, &anchored), &spannable_per_layer[layer.index]);
+                if settings.bottom_layers == 0 {
+                    keep_bridgeable(
+                        carve,
+                        &layer.polygons,
+                        &offset(&phys[layer.index - 1], allowance),
+                        lw,
+                        settings.max_bridge_span_mm,
+                    )
+                } else {
+                    carve
+                }
             } else {
                 Polygons::new()
             };
@@ -1547,6 +1890,13 @@ fn plan_part(
                 if unsupported.is_empty() {
                     walls
                 } else {
+                    // Rings crossing a wall-spannable hollow are simplified
+                    // straight segments far longer than the void — split them
+                    // at the hollow boundary first, so the airborne hop is its
+                    // OWN segment for the grading to mark (slow + cooled)
+                    // instead of diluting across the whole run.
+                    let mut walls = walls;
+                    split_walls_at_region(&mut walls, &spannable_per_layer[layer.index]);
                     slow_overhanging_walls(walls, &below, lw)
                 }
             } else {
@@ -1657,26 +2007,55 @@ fn plan_part(
         // ceiling prints as an unfilled hollow (then solid-over-air a layer up) instead
         // of bridging. The ceiling is wall-count-independent (it's the mesh slice), so
         // the enclosed-sheet probe is only paid when `inner` is empty (short-circuit).
-        if !inner.is_empty()
-            || (i > 0
-                && settings.bottom_layers > 0
-                && !enclosed_ceiling_sheet(
+        // Wall-spannable hollows are covered by the ring field itself (pass 1
+        // left their walls uncarved) — both the ceiling probe and the bridge
+        // coverage below must ignore them or they'd be filled twice. This
+        // carve mirrors pass 1's exactly (enclosed sheet ∪ anchored wall-band
+        // hollows, minus spannable), so the two passes always agree on what
+        // the walls gave up and pass 2 must cover.
+        let spannable = &spannable_per_layer[i];
+        let carved_pre = if i > 0 {
+            let allowance =
+                settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
+            let reach = settings.bridge_foothold_mm + sp;
+            let sheet = enclosed_ceiling_sheet(&layers[i].polygons, &phys[i - 1], lw, allowance, reach);
+            let wall_depth = match settings.wall_count {
+                0 => 0.0,
+                wc => lw + (wc - 1) as f64 * sp,
+            };
+            let anchored = anchored_wallband_sheet(
+                &layers[i].polygons,
+                &phys[i - 1],
+                lw,
+                allowance,
+                reach,
+                wall_depth,
+                settings.max_bridge_span_mm,
+                spannable,
+            );
+            let carve = drop_spannable(union(&sheet, &anchored), spannable);
+            if settings.bottom_layers == 0 {
+                keep_bridgeable(
+                    carve,
                     &layers[i].polygons,
-                    &phys[i - 1],
+                    &offset(&phys[i - 1], allowance),
                     lw,
-                    settings.layer_height_mm
-                        * settings.support_overhang_angle_deg.to_radians().tan(),
-                    settings.bridge_foothold_mm + sp,
+                    settings.max_bridge_span_mm,
                 )
-                .is_empty())
-        {
+            } else {
+                carve
+            }
+        } else {
+            Polygons::new()
+        };
+        if !inner.is_empty() || !carved_pre.is_empty() {
             // Unsupported interior, computed in every mode. A span anchored on
             // both ends (a ceiling enclosed by walls) is reliably bridgeable — it's
             // correct bottom-surface printing, so it bridges in every support mode.
             // A NON-anchored overhang (a cantilever past its free edge) can't bridge
             // and falls through to the ordered bottom shell.
             let mut supported_below = Polygons::new();
-            let overhang_region = if i > 0 {
+            let (overhang_region, carved) = if i > 0 {
                 let allowance =
                     settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
                 supported_below = offset(&phys[i - 1], allowance);
@@ -1686,17 +2065,13 @@ fn plan_part(
                 // on solid the layer below holds up (a foothold), not over air. The
                 // bridge reaches one wall-spacing PAST the carve (the foothold band)
                 // so the strands just kiss the innermost kept ring, which sits sp
-                // beyond the carve.
-                let ceiling = enclosed_ceiling_sheet(
-                    &layers[i].polygons,
-                    &phys[i - 1],
-                    lw,
-                    allowance,
-                    settings.bridge_foothold_mm + sp,
-                );
-                union(&intersection(&oh, inner), &ceiling)
+                // beyond the carve. `carved_pre` is the pass-1-mirroring carve.
+                (
+                    union(&difference(&intersection(&oh, inner), spannable), &carved_pre),
+                    carved_pre,
+                )
             } else {
-                Polygons::new()
+                (Polygons::new(), Polygons::new())
             };
 
             // Narrow lintels — a door/window top closing as a thin bar — should span as
@@ -1718,9 +2093,35 @@ fn plan_part(
             let thin_d = lw * NARROW_FILL_BEADS * 0.5;
             let mut cand = Polygons::new();
             for isl in islands(&union(solid_all, &overhang_region)) {
-                if offset(&isl, -thin_d).is_empty() {
-                    cand = union(&cand, &isl);
+                if !offset(&isl, -thin_d).is_empty() {
+                    continue;
                 }
+                // A thin island that floats (almost) WHOLLY over air is not a
+                // lintel — it is a hole's roof: the crown sliver where a
+                // horizontal bore closes, or a slot ceiling. Concentric loops
+                // there merely ENCIRCLE the void — the long beads run parallel
+                // to the rim over open air, anchored only at the tips — where
+                // straight strands span it anchored at both ends. When the
+                // bridge pass can take it (a valid anchored angle exists),
+                // leave it in `overhang_region` for that pass; a genuinely
+                // mixed lintel (part supported, part over air — the onion
+                // fragmentation case this rule exists for) stays concentric.
+                let net = |p: &Polygons| -> f64 {
+                    p.contours
+                        .iter()
+                        .map(|c| if c.is_ccw() { c.area_mm2() } else { -c.area_mm2() })
+                        .sum()
+                };
+                let a = net(&isl);
+                let over_air = net(&intersection(&isl, &overhang_region));
+                if a > 1.0e-9
+                    && over_air / a > 0.75
+                    && bridge_angle(&isl, &supported_below, lw, settings.max_bridge_span_mm)
+                        .is_some()
+                {
+                    continue;
+                }
+                cand = union(&cand, &isl);
             }
             let narrow_lintel = difference(&cand, &offset(&offset(&cand, -thin_d), thin_d));
             if !narrow_lintel.is_empty() {
@@ -1804,7 +2205,28 @@ fn plan_part(
 
             // `solid_all` was bound above (for the lintel pull). Exclude the lintels
             // from both fills so they aren't traced twice.
-            let solid = difference(&difference(solid_all, &bridged), &narrow_lintel);
+            //
+            // STRANDED CARVE GUARD: pass 1 removed walls from `carved`; if the
+            // bridge pass declined part of it (no anchored angle on the grown
+            // island) and no skin owns it (bottom_layers = 0), nothing below
+            // would cover it — a naked hole where walls used to loop. Route
+            // that remainder into the solid fill: sagging line fill over air is
+            // the worst case, and it is still no worse than the wandering wall
+            // loops it replaces. With shells configured this set is empty (the
+            // skins own the carve), so normal prints are untouched.
+            // Subtract the bridge grown by its landing reach, not just its fill
+            // region: the strands' extended ends already cover the foothold
+            // band around the span, so leaving that annulus "stranded" would
+            // print an orphan squiggle pinched between the bridge and the
+            // field — unanchored and colliding with the strand landings.
+            let stranded = difference(
+                &difference(&carved, &offset(&bridged, settings.bridge_foothold_mm + sp)),
+                solid_all,
+            );
+            let solid = union(
+                &difference(&difference(solid_all, &bridged), &narrow_lintel),
+                &stranded,
+            );
             let sparse =
                 difference(&difference(&difference(inner, solid_all), &bridged), &narrow_lintel);
             let (solid, sparse) = rebalance_solid_sparse(solid, sparse, lw);
@@ -1814,7 +2236,7 @@ fn plan_part(
             // thin SOLID at least closes the surface, thin sparse just looks
             // broken). Only where skin is actually laid: with top/bottom layers off
             // (a hollow single-wall print) the surface is intentionally open.
-            let (solid, sparse) = if solid_all.is_empty() {
+            let (solid, mut sparse) = if solid_all.is_empty() {
                 (solid, sparse)
             } else {
                 let on_surf = intersection(&sparse, &surface_per_layer[i]);
@@ -1929,6 +2351,22 @@ fn plan_part(
                     Polygons::new()
                 } else {
                     difference(&layers[i].polygons, &bridge)
+                };
+                // Dense sparse + identical solid pattern = ONE field: at
+                // density ~1.0 the sparse fill IS solid lines at bead spacing,
+                // so a plain Solid region beside it (a stranded-carve cover, a
+                // buried solid band) would print as a second colliding field
+                // with a boundary seam. Hand it to the sparse fill instead,
+                // which sweeps both as one region. Skins and bridges keep
+                // their own treatment (patterns, flow, anchoring).
+                let internal = if settings.infill_density >= 0.999
+                    && settings.sparse_pattern == settings.solid_pattern
+                    && !internal.is_empty()
+                {
+                    sparse = union(&sparse, &internal);
+                    Polygons::new()
+                } else {
+                    internal
                 };
                 let regions = [
                     (skin_bottom, PathKind::BottomSkin, true),
@@ -2105,6 +2543,12 @@ fn plan_part(
                 } else {
                     grown
                 };
+                // Open at half a bead: a sub-bead sliver pinched between a
+                // bridged span and the void edge (or any boundary) is not
+                // printable fill — left in, it becomes an orphan squiggle of
+                // stitched stubs dangling beside the bridge. Solid and
+                // surface regions already drop such ribbons the same way.
+                let sparse_fill = offset(&offset(&sparse_fill, -lw * 0.5), lw * 0.5);
                 let n0 = paths.len();
                 fill_region(
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
@@ -2118,6 +2562,17 @@ fn plan_part(
                 let sparse_anchor =
                     difference(&difference(&difference(&ftw, &solid), &narrow_lintel), &bridged);
                 extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &sparse_anchor);
+                // Dense "sparse" (a lines cross-section at high density) prints
+                // as one serpentine, not hundreds of strokes — connect runs
+                // whose turnaround is bead-scale. The jump cap IS the
+                // sparseness guard: at real sparse densities consecutive ends
+                // sit a full spacing apart and nothing qualifies, so classic
+                // sparse keeps its travels (its ends aren't visible and
+                // connectors would add unwanted material there). Join against
+                // the region the lines were clipped to (`sparse_fill` — grown
+                // by the interior-bond overlap), not `ftw`: the ends live up
+                // to `ov` outside the raw outline and would fail its test.
+                connect_fill_runs(&mut paths, n0, &sparse_fill, sp * 3.0);
             }
             // Even at density 0 the sparse REGION is the intentional hollow —
             // hand it to gap fill so an unfilled interior never reads as a void.
@@ -4880,6 +5335,140 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn hole_crown_bridges_instead_of_looping() {
+        // A block with a narrow horizontal slot through it (the analogue of a
+        // horizontal bore's crown): the closing layer's over-air sliver is
+        // thinner than the narrow-lintel gate, but it floats WHOLLY over air —
+        // it must span as straight anchored Bridge strands, not as concentric
+        // Solid loops that encircle the void anchored only at their tips
+        // (the corner-bracket layer-279 defect).
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 8.0, 4.0]); // below the slot
+        push_box(&mut tris, [0.0, 0.0, 4.0], [4.5, 8.0, 6.0]); // left cheek
+        push_box(&mut tris, [14.3, 0.0, 4.0], [20.0, 8.0, 6.0]); // right cheek
+        // (slot: x 4.5..14.3 = 9.8mm long, full-depth y, z 4..6)
+        push_box(&mut tris, [0.0, 0.0, 6.0], [20.0, 8.0, 10.0]); // the roof
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.wall_count = 99;
+        s.top_layers = 0;
+        s.bottom_layers = 1;
+        s.skirt_loops = 0;
+        let plans = generate(&m, &s);
+        // The roof's first layer sits at z=6.2 (0.2mm layers).
+        let roof = plans.iter().find(|l| (l.print_z_mm - 6.2).abs() < 1.0e-6).expect("roof layer");
+        // connect_fill_runs stitches the strands into few continuous runs —
+        // judge by deposited bridge length, not path count.
+        let bridge_len: f64 = roof
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Bridge)
+            .map(|p| {
+                p.points
+                    .windows(2)
+                    .map(|w| pt_dist_mm(w[0], w[1]))
+                    .sum::<f64>()
+            })
+            .sum();
+        assert!(bridge_len > 20.0, "the slot roof spans as anchored bridge strands, got {bridge_len:.1}mm");
+        // And no closed Solid loop hovers over the slot (x 4.5..14.3).
+        for p in &roof.paths {
+            if p.kind == PathKind::Solid && p.closed {
+                let cx = p.points.iter().map(|q| q.x_mm()).sum::<f64>() / p.points.len() as f64;
+                assert!(
+                    !(4.5..14.3).contains(&cx),
+                    "no concentric Solid loop may encircle the slot void"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_sparse_fill_connects_into_a_serpentine() {
+        // At density 1.0 with no walls and no shells, a "lines" cross-section
+        // must print as one continuous zigzag, not hundreds of strokes each
+        // with its own travel+stop. (At real sparse densities the jump cap
+        // keeps every line separate — sparseness preserved by geometry.)
+        let m = mesh::Mesh::cube(20.0);
+        let mut s = Settings::default();
+        s.wall_count = 0;
+        s.top_layers = 0;
+        s.bottom_layers = 0;
+        s.infill_density = 1.0;
+        s.skirt_loops = 0;
+        let plans = generate(&m, &s);
+        let mid = &plans[plans.len() / 2];
+        let infill = mid.paths.iter().filter(|p| p.kind == PathKind::Infill).count();
+        assert!(
+            (1..=3).contains(&infill),
+            "a dense lines layer stitches into few serpentines, got {infill} paths"
+        );
+    }
+
+    #[test]
+    fn probe_seg_inside_on_edge() {
+        let mut ftw = Polygons::new();
+        ftw.push(Contour::new(vec![
+            Point::from_mm(0.0, 0.0),
+            Point::from_mm(20.0, 0.0),
+            Point::from_mm(20.0, 20.0),
+            Point::from_mm(0.0, 20.0),
+        ]));
+        let inflated = offset(&ftw, 0.1);
+        let a = Point::from_mm(5.0, 0.0);
+        let b = Point::from_mm(5.36, 0.0);
+        assert!(join_inside(a, b, &inflated, 1.07), "on-edge turnaround must pass");
+    }
+
+    #[test]
+    fn small_crown_is_spanned_by_the_wall_field_itself() {
+        // A SMALL interior slot inside a walls=99 band: the ring field must
+        // cross its crown as continuous straight beads — no bridge patch, no
+        // concentric loops, the layer structured as if the void weren't there
+        // — with the airborne hops marked by per-segment overhang attrs so
+        // they print slow and cooled.
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [20.0, 8.0, 4.0]);
+        push_box(&mut tris, [0.0, 0.0, 4.0], [20.0, 2.0, 6.0]); // front cheek
+        push_box(&mut tris, [0.0, 6.0, 4.0], [20.0, 8.0, 6.0]); // rear cheek
+        push_box(&mut tris, [0.0, 2.0, 4.0], [8.0, 6.0, 6.0]); // left of slot
+        push_box(&mut tris, [13.0, 2.0, 4.0], [20.0, 6.0, 6.0]); // right of slot
+        // (slot: x 8..13, y 2..6, z 4..6 — 20mm², interior, straight outline)
+        push_box(&mut tris, [0.0, 0.0, 6.0], [20.0, 8.0, 10.0]); // the roof
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let mut s = Settings::default();
+        s.wall_count = 99;
+        s.top_layers = 0;
+        s.bottom_layers = 2;
+        s.skirt_loops = 0;
+        let plans = generate(&m, &s);
+        let roof = plans.iter().find(|l| (l.print_z_mm - 6.2).abs() < 1.0e-6).expect("roof layer");
+        for p in &roof.paths {
+            assert!(
+                !matches!(p.kind, PathKind::Bridge | PathKind::Solid),
+                "the wall field spans a small crown itself — no patch, found {:?}",
+                p.kind
+            );
+        }
+        // The crossing hops are annotated: the slot is the layer's only void,
+        // so any high-overhang wall segment is a crossing bead.
+        let mut marked = 0.0f64;
+        for p in &roof.paths {
+            let Some(sa) = &p.segs else { continue };
+            let n = p.points.len();
+            for (k, a) in sa.iter().enumerate() {
+                if a.overhang >= 0.5 {
+                    marked += pt_dist_mm(p.points[k], p.points[(k + 1) % n]);
+                }
+            }
+        }
+        assert!(
+            marked > 3.0,
+            "airborne wall hops over the crown are overhang-marked, got {marked:.1}mm"
+        );
+    }
+
     fn join_layer(paths: Vec<ToolPath>, contours: Vec<Vec<(f64, f64)>>) -> LayerPlan {
         let mut outline = Polygons::new();
         for c in contours {
@@ -5359,15 +5948,17 @@ mod tests {
 
     #[test]
     fn enclosed_void_walls_print_outer_in() {
-        // Four walls form a ring around a void; a cap slab tops it. With no bottom
-        // shell the cap's first layer over the void prints as concentric walls, and
-        // they must lay supported-edge inward (outer→in / area-descending).
+        // Four walls ring a void WIDER than the bridge span; a cap slab tops it.
+        // With no bottom shell the bridge pass can't anchor it, so the carve is
+        // withheld: the cap's first layer prints as concentric ring-roof walls,
+        // laid supported-edge inward (outer→in / area-descending) so each ring
+        // bonds to the previous one.
         let mut tris = Vec::new();
-        push_box(&mut tris, [0.0, 0.0, 0.0], [2.0, 12.0, 8.0]);
-        push_box(&mut tris, [10.0, 0.0, 0.0], [12.0, 12.0, 8.0]);
-        push_box(&mut tris, [0.0, 0.0, 0.0], [12.0, 2.0, 8.0]);
-        push_box(&mut tris, [0.0, 10.0, 0.0], [12.0, 12.0, 8.0]);
-        push_box(&mut tris, [0.0, 0.0, 8.0], [12.0, 12.0, 10.0]);
+        push_box(&mut tris, [0.0, 0.0, 0.0], [3.0, 36.0, 8.0]);
+        push_box(&mut tris, [33.0, 0.0, 0.0], [36.0, 36.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 0.0], [36.0, 3.0, 8.0]);
+        push_box(&mut tris, [0.0, 33.0, 0.0], [36.0, 36.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 8.0], [36.0, 36.0, 10.0]);
         let m = mesh::Mesh::from_triangle_soup(&tris);
         let s = Settings { skirt_loops: 0, wall_count: 20, top_layers: 0, bottom_layers: 0, ..Settings::default() };
         let plans = generate(&m, &s);
@@ -5378,6 +5969,30 @@ mod tests {
             areas.windows(2).all(|w| w[0] >= w[1] - 1.0),
             "enclosed rings must print outer→in: {areas:?}"
         );
+    }
+
+    #[test]
+    fn small_enclosed_void_cap_bridges_even_without_shells() {
+        // The same shape with a void the bridge CAN anchor (8mm < max span):
+        // even at bottom_layers = 0, the cap must not be roofed by wall loops
+        // wandering over air — it bridges as anchored straight strands.
+        let mut tris = Vec::new();
+        push_box(&mut tris, [0.0, 0.0, 0.0], [2.0, 12.0, 8.0]);
+        push_box(&mut tris, [10.0, 0.0, 0.0], [12.0, 12.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 0.0], [12.0, 2.0, 8.0]);
+        push_box(&mut tris, [0.0, 10.0, 0.0], [12.0, 12.0, 8.0]);
+        push_box(&mut tris, [0.0, 0.0, 8.0], [12.0, 12.0, 10.0]);
+        let m = mesh::Mesh::from_triangle_soup(&tris);
+        let s = Settings { skirt_loops: 0, wall_count: 20, top_layers: 0, bottom_layers: 0, ..Settings::default() };
+        let plans = generate(&m, &s);
+        let cap = plans.iter().find(|p| p.print_z_mm > 8.05).unwrap();
+        let bridge_len: f64 = cap
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Bridge)
+            .map(|p| p.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum::<f64>())
+            .sum();
+        assert!(bridge_len > 40.0, "the small cap void bridges, got {bridge_len:.1}mm");
     }
 
     #[test]
