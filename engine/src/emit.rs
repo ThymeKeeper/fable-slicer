@@ -715,6 +715,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     &mut g, worst.0, worst.1, layer, normal_fan, t, s, &mut cur_type,
                     &mut cur_accel, &mut cur_pa, &mut cur_fan, None,
                 );
+                // A joined scarf enters via the junction bead — pressure
+                // engaged before the ramp's first commanded deposit.
+                emit_junction(&mut g, scarf_feed);
                 emit_scarf_loop(
                     &mut g,
                     &path.points,
@@ -856,7 +859,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff * ov(n_pts - 1), feed);
                 }
             }
-            if path.joined {
+            if path.joined && !use_scarf {
+                // (A scarfed joined loop needs no dive — it feathers its own
+                // exit to zero flow; a dive from the scarf exit would drag an
+                // unextruded pass back across several mm of fresh wall.)
                 // Exit relocation — the PA-flush cut. The loop just finished at
                 // full pressure a trim short of its seam; stopping HERE parks
                 // the flush ooze on the seam column (and an unretracted glide
@@ -2355,13 +2361,15 @@ fn scarf_len_mm(s: &Settings) -> f64 {
 /// Whether a path is emitted with a scarf seam. MUST match the `use_scarf` gate
 /// in `to_gcode` exactly, so travel planning agrees with emission on where the
 /// loop ends (a scarf ends `scarf_len` along the contour, not at the seam).
-/// The scarf is the FALLBACK seam for outer loops that could not be
-/// pressure-joined: a joined loop is seamless already, and a mixed-overhang
-/// loop (`segs`) keeps the per-segment branch — a scarf prints the whole loop
-/// at its minimum feed, which would swallow the graded overhang speed ramp.
+/// A JOINED loop scarfs too — that pairing is the whole prize: the junction
+/// delivers the nozzle at full, known pressure, so the scarf's 0→full ramp
+/// deposits exactly what it commands (a cold-started scarf's ramp rides an
+/// unknowable post-travel pressure — the rough seam), and the diagonal
+/// closure never stacks into a column. Mixed-overhang loops (`segs`) keep
+/// the per-segment branch — a scarf prints the whole loop at its minimum
+/// feed, which would swallow the graded overhang speed ramp.
 fn will_scarf(p: &ToolPath, layer_index: usize, s: &Settings) -> bool {
     if s.spiral_vase
-        || p.joined
         || !p.closed
         || p.widths.is_some()
         || p.segs.is_some()
@@ -3759,30 +3767,14 @@ mod tests {
                 "no travel/retract/unretract/Z between donor and joined wall, found: {l}"
             );
         }
-        // No scarf on a joined wall: its body never ramps Z while extruding.
+        // A joined UNIFORM wall scarfs — the pressure-accurate ramp: its body
+        // ramps Z while extruding (the wedge), and the feathered scarf exit
+        // replaces the dive.
         let wall_body = &after[..after[1..].find(";TYPE:").map(|i| i + 1).unwrap_or(after.len())];
         assert!(
-            !wall_body.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
-            "a joined wall prints flat (plain ring, no scarf wedge)"
+            wall_body.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
+            "a joined uniform wall closes with a scarf (extruding Z-ramp)"
         );
-        // Exit relocation: after the wall's last extrude the nozzle dives back
-        // into the wall gap (a short G0) BEFORE any retract fires — the stop
-        // and its pressure flush land buried, never on the seam. And no
-        // backward wipe crosses the fresh closure.
-        let last_ex = wall_body
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| l.starts_with("G1 ") && l.contains(" E") && !l.contains(" E-"))
-            .map(|(k, _)| k)
-            .last()
-            .expect("wall extrudes");
-        let tail: Vec<&str> = wall_body.lines().skip(last_ex + 1).collect();
-        let dive = tail.iter().position(|l| l.starts_with("G0 "));
-        let retract = tail.iter().position(|l| l.starts_with("G1 E-"));
-        assert!(dive.is_some(), "a joined wall exits with a dive into the gap");
-        if let (Some(d), Some(r)) = (dive, retract) {
-            assert!(d < r, "the dive precedes the retract — the flush is buried");
-        }
     }
 
     #[test]
@@ -3861,10 +3853,15 @@ mod tests {
             .find(|p| matches!(p.kind, PathKind::ExternalPerimeter | PathKind::OverhangWall) && p.closed)
             .expect("a closed outer wall on layer 40");
         let seam = super::path_end(path);
-        // A joined copy never scarfs — it exits at the seam.
+        // A joined copy scarfs too (the pressure-accurate pairing) — its
+        // exit matches the scarf exit, keeping travel planning in lockstep.
         let mut jp = path.clone();
         jp.joined = true;
-        assert_eq!(super::path_exit(&jp, 40, &s).x, seam.x, "a joined loop exits at the seam");
+        assert_eq!(
+            super::path_exit(&jp, 40, &s).x,
+            super::path_exit(path, 40, &s).x,
+            "a joined loop shares the scarf exit"
+        );
         // The overlap stops a seam-gap short of the derived scarf length, so
         // the loop exits where its last deposit is flush.
         let d = dist_mm(seam, super::path_exit(path, 40, &s));
