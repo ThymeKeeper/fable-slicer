@@ -28,7 +28,35 @@ fn main() {
     println!("total layers: {}", plans.len());
     for &li in &layers {
         let l = &plans[li];
-        println!("\n=== layer {} z={:.2} paths={} ===", li, l.print_z_mm, l.paths.len());
+        let outline_area: f64 = l
+            .outline
+            .contours
+            .iter()
+            .map(|c| if c.is_ccw() { c.area_mm2() } else { -c.area_mm2() })
+            .sum();
+        let covered: f64 = l
+            .paths
+            .iter()
+            .map(|p| {
+                p.points
+                    .windows(2)
+                    .map(|w| {
+                        let dx = w[0].x_mm() - w[1].x_mm();
+                        let dy = w[0].y_mm() - w[1].y_mm();
+                        (dx * dx + dy * dy).sqrt()
+                    })
+                    .sum::<f64>()
+                    * p.width_mm
+            })
+            .sum();
+        println!(
+            "\n=== layer {} z={:.2} paths={} outline={:.0}mm2 covered≈{:.0}mm2 ===",
+            li,
+            l.print_z_mm,
+            l.paths.len(),
+            outline_area,
+            covered
+        );
         let mut by_kind: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
         for p in &l.paths {
             let len: f64 = p

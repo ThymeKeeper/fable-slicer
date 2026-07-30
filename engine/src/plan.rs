@@ -131,6 +131,33 @@ impl ToolPath {
     }
 }
 
+/// Remove hole contours that cannot survive a half-bead erosion — slots and
+/// gaps below the printable resolution floor (usually coincident-face CSG
+/// artifacts). Outer boundaries and holes ≥ one bead wide are untouched.
+fn heal_subbead_holes(polys: &mut Polygons, lw: f64) {
+    if polys.contours.len() < 2 {
+        return;
+    }
+    let outer_ccw = polys
+        .contours
+        .iter()
+        .max_by(|a, b| a.area_mm2().partial_cmp(&b.area_mm2()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|c| c.is_ccw())
+        .unwrap_or(true);
+    polys.contours.retain(|c| {
+        if c.is_ccw() == outer_ccw {
+            return true; // an outer boundary
+        }
+        // The hole as its own positive polygon: wide enough to keep only if
+        // a half-bead erosion leaves anything.
+        let mut pts = c.points.clone();
+        pts.reverse();
+        let mut h = Polygons::new();
+        h.push(geo2d::Contour::new(pts));
+        !offset(&h, -lw * 0.5).is_empty()
+    });
+}
+
 /// Rotate a closed loop's start to vertex `vi`, keeping the per-point `widths`
 /// and per-segment `segs` channels in lockstep (on a closed n-point loop both
 /// carry n entries, aligned with the point that starts them).
@@ -622,9 +649,19 @@ fn plan_geometry_inner(
     // compensation: XY grow/shrink on every layer, and the first layer pulled in
     // to counter squish (elephant foot).
     let res = config::contour_resolution_mm();
+    let lw = settings.line_width_mm;
     for layers in &mut part_layers {
         layers.par_iter_mut().for_each(|layer| {
             layer.polygons = simplify(&layer.polygons, res);
+            // Resolution floor for HOLES: a slot narrower than one bead can
+            // neither be ringed by walls (a doubled sliver loop) nor kept
+            // open by fill (its rims fragment every neighboring turnaround)
+            // — 0.4mm plastic simply has no move that preserves it. Heal
+            // such holes at the source so walls, fill, and stitching all
+            // agree the material is solid; coincident-face CSG gaps are the
+            // usual culprit. Holes a bead wide or more are real features and
+            // pass untouched.
+            heal_subbead_holes(&mut layer.polygons, lw);
             if settings.xy_compensation_mm != 0.0 {
                 layer.polygons = offset(&layer.polygons, settings.xy_compensation_mm);
             }
@@ -2114,11 +2151,13 @@ fn plan_part(
                 };
                 let a = net(&isl);
                 let over_air = net(&intersection(&isl, &overhang_region));
-                if a > 1.0e-9
-                    && over_air / a > 0.75
-                    && bridge_angle(&isl, &supported_below, lw, settings.max_bridge_span_mm)
-                        .is_some()
-                {
+                if a > 1.0e-9 && over_air / a > 0.75 {
+                    // Mostly over air: never a lintel, bridgeable or not. A
+                    // valid anchored span → the bridge pass takes it; no
+                    // anchored span → a concentric oval would FLOAT (a ring
+                    // touching material only at the rim — unprintable), so
+                    // let it fall through to the fill flow, whose sub-bead
+                    // open discards what cannot be printed.
                     continue;
                 }
                 cand = union(&cand, &isl);
@@ -2154,16 +2193,6 @@ fn plan_part(
             // below re-kinds the crossing stretches so the hops still print
             // at bridge flow/speed/cooling mid-bead.
             let mut absorbed = Polygons::new();
-            // The covering fill's sweep angle (mirrors pat_angle below, which
-            // is defined after this pass): aligned lines pin 45°, everything
-            // else alternates per layer.
-            let fill_angle = if settings.sparse_pattern == InfillPattern::AlignedLines {
-                45.0
-            } else if i % 2 == 0 {
-                45.0
-            } else {
-                135.0
-            };
             let bridge_start = paths.len();
             for island in islands(&overhang_region) {
                 let area: f64 = island
@@ -2171,24 +2200,21 @@ fn plan_part(
                     .iter()
                     .map(|c| if c.is_ccw() { c.area_mm2() } else { -c.area_mm2() })
                     .sum();
-                if area > 0.0 && area <= 25.0 && settings.infill_density >= 0.999 {
-                    let chords = infill_lines(&island, fill_angle, lw, false, 0.5, false);
-                    let ok = !chords.is_empty()
-                        && chords.iter().all(|seg| {
-                            seg.len() < 2
-                                || (pt_dist_mm(seg[0], seg[seg.len() - 1])
-                                    <= settings.max_bridge_span_mm
-                                    && bridge_anchored(
-                                        seg[0],
-                                        seg[seg.len() - 1],
-                                        &supported_below,
-                                        lw,
-                                    ))
-                        });
-                    if ok {
-                        absorbed.contours.extend(island.contours);
-                        continue;
-                    }
+                // A tiny void in a dense field is the FIELD's to cover,
+                // unconditionally: its beads sweep across, and a bead ending
+                // short over the rim side-bonds to its neighbor — how solid
+                // infill meets every hole edge. But only when a field will
+                // actually SWEEP it: the island must lie in the fill region
+                // (`inner`). At high wall counts inner is empty there — an
+                // "absorbed" island would be covered by nobody and simply
+                // vanish, so it stays with the bridge ladder instead.
+                if area > 0.0
+                    && area <= 25.0
+                    && settings.infill_density >= 0.999
+                    && !intersection(&offset(&island, lw), inner).contours.is_empty()
+                {
+                    absorbed.contours.extend(island.contours);
+                    continue;
                 }
                 // Decide on the TRUE unsupported span (so the reach below can't inflate
                 // it past max_span), then fill a region grown to reach the walls.
@@ -2553,7 +2579,7 @@ fn plan_part(
                         // Sparse is left untouched (its ends aren't visible and connecting
                         // would add material and defeat the sparseness).
                         if matches!(kind, PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin) {
-                            connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
+                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
                         }
                         if !bridge.is_empty() && matches!(kind, PathKind::Solid | PathKind::TopSkin) {
                             split_bridge_beads(&mut paths, n0, &bridge, &supported);
@@ -2570,7 +2596,7 @@ fn plan_part(
                             // Stitch them (and the surviving solid arcs) back into
                             // continuous runs — a bridge surface should print without
                             // stopping the flow at every line, same as solid.
-                            connect_fill_runs(&mut paths, n0, &ftw, sp * 3.0);
+                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
                         }
                     }
                 }
@@ -2616,14 +2642,20 @@ fn plan_part(
                 // the region the lines were clipped to (`sparse_fill` — grown
                 // by the interior-bond overlap), not `ftw`: the ends live up
                 // to `ov` outside the raw outline and would fail its test.
-                connect_fill_runs(&mut paths, n0, &sparse_fill, sp * 3.0);
+                // Cap scales with the line spacing, so sparse connects at ANY
+                // density (connected rectilinear — the turnaround along the
+                // boundary bonds the ends and quiets hundreds of travels);
+                // the sp-based floor keeps dense staircase gaps stitching.
+                connect_fill_runs(&mut paths, n0, &sparse_fill, CONNECT_MAX_MM);
                 // Beads sweeping an ABSORBED tiny void get the airborne
                 // treatment mid-bead: cut at the void boundary, the crossing
                 // stretch re-kinded to bridge flow/speed/cooling — one
                 // continuous bead that steps at the boundary, no patch.
-                if !absorbed.contours.is_empty() {
-                    split_bridge_beads(&mut paths, n0, &absorbed, &supported_below);
-                }
+                // Absorbed voids need nothing further: the ≤25mm² gate bounds
+                // any crossing to a few mm, and at dense spacing each pass
+                // side-bonds to the neighbor just laid — nothing like an
+                // isolated span. The field prints straight through at its own
+                // parameters; absorption is pure region bookkeeping.
             }
             // Even at density 0 the sparse REGION is the intentional hollow —
             // hand it to gap fill so an unfilled interior never reads as a void.
@@ -2886,6 +2918,11 @@ fn is_annular(region: &Polygons) -> bool {
             .iter()
             .all(|isl| isl.contours.iter().any(|c| c.points.len() >= 3 && !c.is_ccw()))
 }
+
+/// A fill turnaround (the connector stitching two neighboring beads into one
+/// serpentine) may never exceed this length: past it, a travel is cheaper than
+/// the extra bead, whatever the geometry.
+const CONNECT_MAX_MM: f64 = 4.0;
 
 /// A region is a NARROW ring-band (worth filling concentric) when it vanishes once
 /// eroded by a ring-band's half-width (`NARROW_FILL_BEADS`) — i.e. it's thin enough
@@ -3540,8 +3577,101 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
     // The bead ends sit ON the wall edge (extend_ends_to_wall stopped them there), so
     // test joins against the walls grown a hair — otherwise an on-edge sample reads as
     // "outside" and every flat-wall turnaround is wrongly rejected.
-    let inflated = offset(inside, 0.1);
-    let beads: Vec<ToolPath> = paths.split_off(start);
+    // Slack scales with the jump cap (~half a bead at dense fill): a
+    // turnaround chord between two staircase step-ends dips outside the
+    // region between the teeth by up to the stair depth — a bead edge
+    // overhanging an exposed edge that much, anchored at both ends, prints
+    // fine. A hairline 0.1 rejected every jagged-boundary join; genuine
+    // void crossings still dip out by bead-widths and stay refused.
+    let inflated = offset(inside, (max_jump * 0.15).max(0.1));
+    // The slack above forgives staircase-tooth dips — but it must NEVER
+    // forgive crossing a real HOLE: a sub-slack slot (a vent, a wire
+    // channel) would be bridged over and erased from the print. A hole is a
+    // closed CW contour of the region; a tooth is a concavity of the outer
+    // boundary — test hole interiors directly, un-inflated.
+    // Hole-ness is RELATIVE: whichever way this polygon set winds its outers
+    // (clipper output isn't guaranteed CCW-outer here), the largest contour
+    // is surely one — holes wind the other way.
+    let outer_ccw = inside
+        .contours
+        .iter()
+        .max_by(|a, b| {
+            a.area_mm2().partial_cmp(&b.area_mm2()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|c| c.is_ccw())
+        .unwrap_or(true);
+    let hole_contours: Vec<&geo2d::Contour> =
+        inside.contours.iter().filter(|c| c.is_ccw() != outer_ccw).collect();
+    if std::env::var_os("FABLE_DEBUG_CONNECT").is_some() {
+        eprintln!(
+            "connect: {} contours, {} holes, outer_ccw={}",
+            inside.contours.len(),
+            hole_contours.len(),
+            outer_ccw
+        );
+    }
+    // CROSSING, not containment: a hole ring geometrically contains every
+    // island nested inside it (a glyph in a recess), so containment sampling
+    // refuses legitimate joins on nested material. A chord that actually
+    // bridges a hole must PIERCE the hole's ring; one on nested material
+    // never touches it, and a stair-tooth dip crosses only the outer
+    // boundary.
+    let crosses_hole = |a: Point, b: Point| -> bool {
+        for c in &hole_contours {
+            let m = c.points.len();
+            for j in 0..m {
+                if seg_cross_t(a, b, c.points[j], c.points[(j + 1) % m]).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    // Long joins must HUG THE EDGE: a long chord that is merely in-material
+    // can cut across the field interior, laying a scar bead over the swept
+    // fill. Anything deeper than ~a bead's reach from the boundary refuses.
+    let deep = offset(inside, -(max_jump * 0.06).max(0.5));
+    let hug_limit = max_jump * 0.35;
+    let mut beads: Vec<ToolPath> = paths.split_off(start);
+    // Stitch to a FIXPOINT: a run assembled this pass (e.g. two collinear
+    // halves zipped across an island seam) may itself be the natural
+    // turnaround partner of the next run — but the single pass can only
+    // attach incoming beads to runs, never merge two finished runs. Feed the
+    // runs back through until the count stops falling.
+    loop {
+        let before = beads.len();
+    // Stitch in SPATIAL scanline order, not emission order: with a jump cap
+    // above one line spacing, emission-order joins can reach PAST an
+    // intermediate line (A1 joins A3 across A2's lane), and by the time A2
+    // arrives both its natural partners' ends are buried mid-run — an
+    // alternating pattern of stranded ends. Sort by position across the
+    // dominant line direction (then along it), so the frontier only ever
+    // meets true neighbors. Closed paths are untouched by joining and sort
+    // wherever their seam falls — harmless.
+    let dominant = beads
+        .iter()
+        .filter(|b| !b.closed && b.points.len() >= 2)
+        .max_by(|x, y| {
+            let l = |b: &ToolPath| pt_dist_mm(b.points[0], *b.points.last().unwrap());
+            l(x).partial_cmp(&l(y)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|b| {
+            let (a, z) = (b.points[0], *b.points.last().unwrap());
+            let (dx, dy) = (z.x_mm() - a.x_mm(), z.y_mm() - a.y_mm());
+            let l = (dx * dx + dy * dy).sqrt().max(1.0e-9);
+            (dx / l, dy / l)
+        });
+    if let Some((dx, dy)) = dominant {
+        let key = |b: &ToolPath| -> (i64, i64) {
+            let m = b.points[b.points.len() / 2];
+            let across = -m.x_mm() * dy + m.y_mm() * dx;
+            let along = m.x_mm() * dx + m.y_mm() * dy;
+            // Quantize across-line position to ~a tenth of a bead so nearly
+            // collinear segments of one scanline share a bucket.
+            ((across * 20.0).round() as i64, (along * 20.0).round() as i64)
+        };
+        beads.sort_by_key(key);
+    }
     let mut runs: Vec<ToolPath> = Vec::new();
     for bead in beads {
         if bead.closed || bead.points.len() < 2 {
@@ -3552,17 +3682,87 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
         // Nearest open run this bead can continue — in either orientation, since a
         // boustrophedon reversal or a hole-split span may present its far end first.
         let mut best: Option<(usize, bool, f64)> = None;
+        let dbg = std::env::var_os("FABLE_DEBUG_CONNECT").is_some();
+        let mut nearest_reject: Option<(f64, bool, bool)> = None; // (d, dist_ok, inside_ok)
         for (i, r) in runs.iter().enumerate() {
             if r.closed || r.kind != bead.kind || r.group != bead.group || r.points.len() < 2 {
+                if dbg && !r.closed && r.points.len() >= 2 {
+                    let end = *r.points.last().unwrap();
+                    let d = pt_dist_mm(end, head).min(pt_dist_mm(end, tail));
+                    if d <= max_jump {
+                        eprintln!(
+                            "REJ kind/group: d={d:.2} kinds {:?}/{:?} groups {:?}/{:?}",
+                            r.kind, bead.kind, r.group, bead.group
+                        );
+                    }
+                }
                 continue;
             }
             let end = *r.points.last().unwrap();
             let (fwd, rev) = (pt_dist_mm(end, head), pt_dist_mm(end, tail));
             let (d, flip) = if fwd <= rev { (fwd, false) } else { (rev, true) };
-            if best.map_or(true, |(_, _, bd)| d < bd)
-                && join_inside(end, if flip { tail } else { head }, &inflated, max_jump)
+            let target = if flip { tail } else { head };
+            // ADJACENCY guard: a real serpentine turnaround joins two beads
+            // lying side-by-side — their extents along the line direction
+            // must overlap. Two nearly collinear beads whose ends merely
+            // continue each other share no lateral adjacency; joining them
+            // lays a long detour bead (the diagonal scar), so they keep
+            // their travel.
+            // Ends that practically TOUCH (a scanline resuming across a
+            // zero-width island seam — coincident internal geometry) continue
+            // as one bead regardless of adjacency: collinear continuation at
+            // sub-bead gap is not a detour. The adjacency rule governs only
+            // real jumps.
+            let adjacent = d <= max_jump * 0.15
+                || match dominant {
+                None => true,
+                Some((dx, dy)) => {
+                    let along = |p: Point| p.x_mm() * dx + p.y_mm() * dy;
+                    let (b0, b1) = bead.points.iter().fold(
+                        (f64::INFINITY, f64::NEG_INFINITY),
+                        |(lo, hi), p| (lo.min(along(*p)), hi.max(along(*p))),
+                    );
+                    // The candidate's TAIL line: walk back from its end for
+                    // roughly the bead's own length (its most recent pass).
+                    let budget = (b1 - b0).max(2.0);
+                    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                    let mut acc = 0.0;
+                    let pts = &r.points;
+                    for w in (1..pts.len()).rev() {
+                        let (p, q) = (pts[w], pts[w - 1]);
+                        lo = lo.min(along(p)).min(along(q));
+                        hi = hi.max(along(p)).max(along(q));
+                        acc += pt_dist_mm(p, q);
+                        if acc >= budget {
+                            break;
+                        }
+                    }
+                    let overlap = hi.min(b1) - lo.max(b0);
+                    overlap >= 0.25 * (b1 - b0).min(hi - lo).max(0.1)
+                }
+            };
+            if adjacent
+                && best.map_or(true, |(_, _, bd)| d < bd)
+                && join_inside(end, target, &inflated, max_jump)
+                && !crosses_hole(end, target)
+                && (d <= hug_limit || !seg_touches(end, target, &deep))
             {
                 best = Some((i, flip, d));
+            } else if dbg && best.is_none() {
+                let dist_ok = d <= max_jump;
+                let inside_ok = seg_inside(end, if flip { tail } else { head }, &inflated);
+                if nearest_reject.map_or(true, |(nd, ..)| d < nd) {
+                    nearest_reject = Some((d, dist_ok, inside_ok));
+                }
+            }
+        }
+        if dbg && best.is_none() {
+            if let Some((d, dist_ok, inside_ok)) = nearest_reject {
+                eprintln!(
+                    "ORPHAN at ({:.1},{:.1}): nearest end d={d:.2} (cap {max_jump:.2}) dist_ok={dist_ok} inside_ok={inside_ok}",
+                    head.x_mm(),
+                    head.y_mm()
+                );
             }
         }
         match best {
@@ -3571,7 +3771,33 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
             None => runs.push(bead),
         }
     }
-    paths.extend(runs);
+        beads = runs;
+        if beads.len() == before {
+            break;
+        }
+    }
+    paths.extend(beads);
+}
+
+/// Any sample along a→b lands inside `region` — used to refuse long turnaround
+/// chords that stray into the deep interior (a scar bead over swept fill).
+fn seg_touches(a: Point, b: Point, region: &Polygons) -> bool {
+    if region.contours.is_empty() {
+        return false;
+    }
+    let d = pt_dist_mm(a, b);
+    let steps = (d / 0.4).ceil().max(1.0) as usize;
+    for k in 0..=steps {
+        let t = k as f64 / steps as f64;
+        let s = Point::from_mm(
+            a.x_mm() + (b.x_mm() - a.x_mm()) * t,
+            a.y_mm() + (b.y_mm() - a.y_mm()) * t,
+        );
+        if point_in(region, s) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Every sample along a→b stays inside `inside` — so the stitched bead never crosses
