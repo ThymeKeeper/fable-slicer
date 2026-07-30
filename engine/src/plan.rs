@@ -2144,8 +2144,52 @@ fn plan_part(
             // flow. Only the islands that actually got covered are carved out of
             // the solid/sparse split.
             let mut bridged = Polygons::new();
+            // Tiny anchored voids ABSORBED by the surrounding fill — like the
+            // wall-spanned crowns: a two-strand bridge patch costs more in
+            // field disruption (four region boundaries, travels, collision
+            // edges) than it delivers. The gate mirrors wall_spannable but at
+            // the FILL's sweep angle (the field doesn't get to choose its
+            // anchoring direction, so every chord at that angle must anchor).
+            // Absorbed islands stay in the fill's books; split_bridge_beads
+            // below re-kinds the crossing stretches so the hops still print
+            // at bridge flow/speed/cooling mid-bead.
+            let mut absorbed = Polygons::new();
+            // The covering fill's sweep angle (mirrors pat_angle below, which
+            // is defined after this pass): aligned lines pin 45°, everything
+            // else alternates per layer.
+            let fill_angle = if settings.sparse_pattern == InfillPattern::AlignedLines {
+                45.0
+            } else if i % 2 == 0 {
+                45.0
+            } else {
+                135.0
+            };
             let bridge_start = paths.len();
             for island in islands(&overhang_region) {
+                let area: f64 = island
+                    .contours
+                    .iter()
+                    .map(|c| if c.is_ccw() { c.area_mm2() } else { -c.area_mm2() })
+                    .sum();
+                if area > 0.0 && area <= 25.0 && settings.infill_density >= 0.999 {
+                    let chords = infill_lines(&island, fill_angle, lw, false, 0.5, false);
+                    let ok = !chords.is_empty()
+                        && chords.iter().all(|seg| {
+                            seg.len() < 2
+                                || (pt_dist_mm(seg[0], seg[seg.len() - 1])
+                                    <= settings.max_bridge_span_mm
+                                    && bridge_anchored(
+                                        seg[0],
+                                        seg[seg.len() - 1],
+                                        &supported_below,
+                                        lw,
+                                    ))
+                        });
+                    if ok {
+                        absorbed.contours.extend(island.contours);
+                        continue;
+                    }
+                }
                 // Decide on the TRUE unsupported span (so the reach below can't inflate
                 // it past max_span), then fill a region grown to reach the walls.
                 let Some(angle) = bridge_angle(&island, &supported_below, lw, settings.max_bridge_span_mm)
@@ -2573,6 +2617,13 @@ fn plan_part(
                 // by the interior-bond overlap), not `ftw`: the ends live up
                 // to `ov` outside the raw outline and would fail its test.
                 connect_fill_runs(&mut paths, n0, &sparse_fill, sp * 3.0);
+                // Beads sweeping an ABSORBED tiny void get the airborne
+                // treatment mid-bead: cut at the void boundary, the crossing
+                // stretch re-kinded to bridge flow/speed/cooling — one
+                // continuous bead that steps at the boundary, no patch.
+                if !absorbed.contours.is_empty() {
+                    split_bridge_beads(&mut paths, n0, &absorbed, &supported_below);
+                }
             }
             // Even at density 0 the sparse REGION is the intentional hollow —
             // hand it to gap fill so an unfilled interior never reads as a void.
