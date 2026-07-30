@@ -5341,6 +5341,29 @@ fn align_seams(plans: &mut [LayerPlan], mode: SeamMode) {
                     && !(concave.is_empty() && convex.is_empty())
                 {
                     concave.iter().chain(convex.iter()).map(|c| c.idx).collect()
+                } else if mode == SeamMode::Sharpest {
+                    // Smooth loop — no REAL corner clears the threshold, but
+                    // the seam still belongs at the least-bad spot: the
+                    // curvature maxima (a gentle fillet hides a seam; the
+                    // middle of a flat displays it). Only a truly featureless
+                    // loop (max turn ≲ 4°) keeps every vertex and lets the
+                    // track column decide.
+                    let (rc, rx) = corner_candidates_min(pts, 0.0);
+                    let max_sharp = rc
+                        .iter()
+                        .chain(rx.iter())
+                        .map(|c| c.sharp)
+                        .fold(0.0f64, f64::max);
+                    if max_sharp >= 0.002 {
+                        let floor = (max_sharp * 0.6).max(0.002);
+                        rc.iter()
+                            .chain(rx.iter())
+                            .filter(|c| c.sharp >= floor)
+                            .map(|c| c.idx)
+                            .collect()
+                    } else {
+                        (0..pts.len()).collect()
+                    }
                 } else {
                     (0..pts.len()).collect()
                 };
@@ -5444,6 +5467,12 @@ struct Corner {
 /// run of fillet vertices simply yields a cluster of candidates. Both lists
 /// empty = smooth loop.
 fn corner_candidates(points: &[Point]) -> (Vec<Corner>, Vec<Corner>) {
+    corner_candidates_min(points, SEAM_CORNER_MIN_SHARP)
+}
+
+/// As `corner_candidates`, with an explicit sharpness floor — the smooth-loop
+/// fallback re-runs at 0.0 to rank every vertex by curvature.
+fn corner_candidates_min(points: &[Point], min_sharp: f64) -> (Vec<Corner>, Vec<Corner>) {
     let n = points.len();
     // Cumulative arc length around the ring, for the window walks.
     let mut cum = vec![0.0_f64; n + 1];
@@ -5478,7 +5507,7 @@ fn corner_candidates(points: &[Point]) -> (Vec<Corner>, Vec<Corner>) {
         let a = unit(cur.x_mm() - points[back].x_mm(), cur.y_mm() - points[back].y_mm());
         let b = unit(points[fwd].x_mm() - cur.x_mm(), points[fwd].y_mm() - cur.y_mm());
         let sharp = 1.0 - (a.0 * b.0 + a.1 * b.1);
-        if sharp < SEAM_CORNER_MIN_SHARP {
+        if sharp < min_sharp {
             continue;
         }
         let cross = a.0 * b.1 - a.1 * b.0;
