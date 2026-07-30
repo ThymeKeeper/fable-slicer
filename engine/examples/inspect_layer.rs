@@ -13,14 +13,14 @@ fn main() {
     let mut s = config::Settings::default();
     // The user's process: walls=99, 0.2/0.4, top 0 bottom 2, lines fill,
     // outer wall first, sharpest seam.
-    s.wall_count = 0;
+    s.wall_count = 99;
     s.layer_height_mm = 0.2;
     s.first_layer_height_mm = 0.2;
     s.line_width_mm = 0.4;
-    s.top_layers = 0;
-    s.bottom_layers = 0;
-    s.infill_density = 1.0;
-    s.outer_wall_first = true;
+    s.top_layers = 1;
+    s.bottom_layers = 1;
+    s.infill_density = 0.15;
+    s.outer_wall_first = false;
     s.seam_mode = config::SeamMode::Sharpest;
     s.skirt_loops = 0;
 

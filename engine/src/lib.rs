@@ -29,7 +29,7 @@ pub use emit::{
     LayerStats,
 };
 pub use plan::{
-    apply_bead_dabs, dab_covers, debug_uncovered, generate, generate_painted, generate_parts,
+    apply_bead_dabs, dab_covers, debug_islands, debug_uncovered, generate, generate_painted, generate_parts,
     plan_geometry, plan_geometry_tracked, restamp_paint, BeadDab, GeometryPlan, LayerPlan,
     PartPaint, PathKind, SliceProgress, ToolPath, Travel,
 };

@@ -1579,10 +1579,19 @@ fn anchored_wallband_sheet(
         if difference(&offset(&h, lw), outline).is_empty() {
             continue; // enclosed — enclosed_ceiling_sheet already takes it
         }
-        if bridge_angle(&h, &supported, lw, max_span).is_none() {
-            continue; // a true cantilever: no anchored span exists
+        // Too thin for a sheet (under four beads wide): the ring field crosses
+        // it side-bonded — the overhang-wall treatment (see the same gate in
+        // `enclosed_ceiling_sheet`).
+        if offset(&h, -lw * 2.0).is_empty() {
+            continue;
         }
-        band = union(&band, &intersection(&offset(&h, reach), &inside_outer));
+        let Some(angle) = bridge_angle(&h, &supported, lw, max_span) else {
+            continue; // a true cantilever: no anchored span exists
+        };
+        band = union(
+            &band,
+            &intersection(&directional_band(&h, angle, reach, lw), &inside_outer),
+        );
     }
     band
 }
@@ -1603,12 +1612,13 @@ fn drop_spannable(sheet: Polygons, spannable: &Polygons) -> Polygons {
     out
 }
 
-/// With NO bottom shells, a carved hollow has exactly one guaranteed cover:
-/// the bridge pass. Keep only carve islands whose underlying hollow really
-/// anchors a span — an unbridgeable enclosed void (wider than the bridge span
-/// in every direction) keeps its walls instead, which ring-roof it outer→in
-/// (each ring bonds to the previous one — the old, and for that case better,
-/// strategy). With shells configured the skins guarantee cover, so no filter.
+/// A carved hollow has exactly one guaranteed cover: the bridge pass. Keep
+/// only carve islands whose underlying hollow really anchors a span — an
+/// unbridgeable enclosed void (wider than the bridge span in every direction)
+/// keeps its walls instead, which ring-roof it outer→in (each ring bonds to
+/// the previous one — the old, and for that case better, strategy). Runs at
+/// every shell count: the skin reservation refuses unbridgeable over-air
+/// undersides too, so nothing else would cover what this carves.
 fn keep_bridgeable(
     sheet: Polygons,
     outline: &Polygons,
@@ -1700,8 +1710,67 @@ fn plan_part(
             } else {
                 here.clone()
             };
+            // A face hanging over OPEN AIR is not skinnable — it is a physics
+            // problem. This catches bottom faces (unsupported undersides) AND
+            // top faces over air (the top of a single-layer floating bar IS
+            // its unsupported underside — layer 153's mid-span pocket). A
+            // bridgeable island stays reserved (pass 2 bridges it: the
+            // printable surface). A thin or unbridgeable one in the wall band
+            // is left to the ring field, whose beads cross it end-anchored
+            // and side-bonded — exactly how shell-less slicing covers it.
+            // Without this the reservation routes a floating region through
+            // the solid/skin split: rungs across air, or a concentric onion
+            // floating mid-span with the rings turning back around it.
             // Open at half a line to drop ribbons too thin to skin or carve out.
             let faces = offset(&offset(&union(&top, &bot), -lw * 0.5), lw * 0.5);
+            let faces = if i > 0 && !faces.is_empty() {
+                let allowance = settings.layer_height_mm
+                    * settings.support_overhang_angle_deg.to_radians().tan();
+                let supported = offset(&phys[i - 1], allowance);
+                let over_air = difference(&faces, &supported);
+                let wall_depth = match settings.wall_count {
+                    0 => 0.0,
+                    wc => lw + (wc - 1) as f64 * config::bead_spacing_mm(lw, layers[i].height_mm),
+                };
+                let wall_band = difference(here, &offset(here, -wall_depth));
+                let dbg = std::env::var("FABLE_DEBUG_BOTFACE").is_ok();
+                let mut keep_walls = Polygons::new();
+                for isl in islands(&over_air) {
+                    // Area test, not contour count: the boolean difference
+                    // leaves zero-area sliver contours along shared edges.
+                    if difference(&isl, &wall_band).net_area_mm2() > lw * lw {
+                        if dbg {
+                            eprintln!("airface L{i}: island {:.1}mm2 leaves wall band", isl.net_area_mm2());
+                        }
+                        continue; // reaches the fill interior — no rings to cross it
+                    }
+                    // Thin (under four beads somewhere in every direction) or
+                    // unbridgeable: the ring field covers it. Same thin gate
+                    // as the ceiling-sheet carve, so a crown sliver gets ONE
+                    // answer at every shell count.
+                    let thin = offset(&isl, -lw * 2.0).is_empty();
+                    let ang = if thin {
+                        None
+                    } else {
+                        bridge_angle(&isl, &supported, lw, settings.max_bridge_span_mm)
+                    };
+                    if dbg {
+                        let b = isl.bounds().unwrap();
+                        eprintln!(
+                            "airface L{i}: island {:.1}mm2 bbox ({:.1},{:.1})..({:.1},{:.1}) thin={thin} bridge_angle={ang:?}",
+                            isl.net_area_mm2(),
+                            geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y),
+                            geo2d::to_mm(b.max.x), geo2d::to_mm(b.max.y)
+                        );
+                    }
+                    if thin || ang.is_none() {
+                        keep_walls.contours.extend(isl.contours);
+                    }
+                }
+                difference(&faces, &keep_walls)
+            } else {
+                faces
+            };
             difference(&faces, &spannable_per_layer[i])
         })
         .collect();
@@ -1729,8 +1798,14 @@ fn plan_part(
                 // Carve reach: clears inner perimeters out of the hollow + the
                 // foothold band, but keeps the rings beyond it.
                 let foothold = settings.bridge_foothold_mm;
-                let sheet =
-                    enclosed_ceiling_sheet(&layer.polygons, &phys[layer.index - 1], lw, allowance, foothold);
+                let sheet = enclosed_ceiling_sheet(
+                    &layer.polygons,
+                    &phys[layer.index - 1],
+                    lw,
+                    allowance,
+                    foothold,
+                    settings.max_bridge_span_mm,
+                );
                 let wall_depth = match settings.wall_count {
                     0 => 0.0,
                     wc => lw + (wc - 1) as f64 * sp,
@@ -1752,17 +1827,13 @@ fn plan_part(
                 // double-fills it.
                 let carve =
                     drop_spannable(union(&sheet, &anchored), &spannable_per_layer[layer.index]);
-                if settings.bottom_layers == 0 {
-                    keep_bridgeable(
-                        carve,
-                        &layer.polygons,
-                        &offset(&phys[layer.index - 1], allowance),
-                        lw,
-                        settings.max_bridge_span_mm,
-                    )
-                } else {
-                    carve
-                }
+                keep_bridgeable(
+                    carve,
+                    &layer.polygons,
+                    &offset(&phys[layer.index - 1], allowance),
+                    lw,
+                    settings.max_bridge_span_mm,
+                )
             } else {
                 Polygons::new()
             };
@@ -2055,7 +2126,14 @@ fn plan_part(
             let allowance =
                 settings.layer_height_mm * settings.support_overhang_angle_deg.to_radians().tan();
             let reach = settings.bridge_foothold_mm + sp;
-            let sheet = enclosed_ceiling_sheet(&layers[i].polygons, &phys[i - 1], lw, allowance, reach);
+            let sheet = enclosed_ceiling_sheet(
+                &layers[i].polygons,
+                &phys[i - 1],
+                lw,
+                allowance,
+                reach,
+                settings.max_bridge_span_mm,
+            );
             let wall_depth = match settings.wall_count {
                 0 => 0.0,
                 wc => lw + (wc - 1) as f64 * sp,
@@ -2071,17 +2149,13 @@ fn plan_part(
                 spannable,
             );
             let carve = drop_spannable(union(&sheet, &anchored), spannable);
-            if settings.bottom_layers == 0 {
-                keep_bridgeable(
-                    carve,
-                    &layers[i].polygons,
-                    &offset(&phys[i - 1], allowance),
-                    lw,
-                    settings.max_bridge_span_mm,
-                )
-            } else {
-                carve
-            }
+            keep_bridgeable(
+                carve,
+                &layers[i].polygons,
+                &offset(&phys[i - 1], allowance),
+                lw,
+                settings.max_bridge_span_mm,
+            )
         } else {
             Polygons::new()
         };
@@ -2532,7 +2606,16 @@ fn plan_part(
                     // the wall and the sparse boundary. Buried line-fill solid keeps the
                     // plain half-bead inset for a clean kiss against the sparse it borders.
                     let fill = if matches!(kind, PathKind::TopSkin | PathKind::BottomSkin) {
-                        let void = difference(&ftw_ex, inner);
+                        // The gap ring against the walls the skin borders — clipped one
+                        // bead inside the slice: `ftw` also carries hairline slivers
+                        // between the OUTERMOST bead's coverage and the outline
+                        // (curvature, simplify), and the dilation would jump ACROSS the
+                        // outer wall into them, spraying zero-length crumbs ON the
+                        // outline (first-layer nubs outside the wall).
+                        let void = intersection(
+                            &difference(&ftw_ex, inner),
+                            &offset(&layers[i].polygons, -lw),
+                        );
                         union(&region, &intersection(&offset(&region, lw * 1.5), &void))
                     } else if pattern == InfillPattern::Concentric {
                         region.clone()
@@ -2887,6 +2970,15 @@ fn add_support_region(
 /// Split a region into its disjoint islands (each CCW outer plus the holes inside
 /// it), so each can be handled — bridged or arc-filled — independently.
 fn islands(polys: &Polygons) -> Vec<Polygons> {
+    islands_impl(polys)
+}
+
+/// Debug-tooling export of the island split (examples/hollow_probe).
+pub fn debug_islands(polys: &Polygons) -> Vec<Polygons> {
+    islands_impl(polys)
+}
+
+fn islands_impl(polys: &Polygons) -> Vec<Polygons> {
     let outers: Vec<&Contour> = polys.contours.iter().filter(|c| c.points.len() >= 3 && c.is_ccw()).collect();
     let holes: Vec<&Contour> = polys.contours.iter().filter(|c| c.points.len() >= 3 && !c.is_ccw()).collect();
     outers
@@ -3465,7 +3557,14 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
 /// layer below holds up (a real foothold) — and the band is kept clear of inner
 /// perimeters (Pass 1) so nothing boxes the sheet in. Inner walls beyond the band
 /// are untouched. `below` is the layer underneath; `allowance` the overhang reach.
-fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance: f64, reach: f64) -> Polygons {
+fn enclosed_ceiling_sheet(
+    layer: &Polygons,
+    below: &Polygons,
+    lw: f64,
+    allowance: f64,
+    reach: f64,
+    max_span: f64,
+) -> Polygons {
     let supported = offset(below, allowance);
     let over_air = difference(layer, &supported);
     if over_air.is_empty() {
@@ -3474,13 +3573,60 @@ fn enclosed_ceiling_sheet(layer: &Polygons, below: &Polygons, lw: f64, allowance
     let inside_outer = offset(layer, -lw);
     let mut band = Polygons::new();
     for h in islands(&over_air) {
+        // Too thin for a sheet (under four beads wide): the ring field crosses
+        // it side-bonded — the overhang-wall treatment, ring by ring, the way
+        // every gradual crown prints. Carving would replace supported walls
+        // with a bridge patch that is mostly anchor rind: the foothold the
+        // strokes need on each side outweighs the sliver of actual air.
+        if offset(&h, -lw * 2.0).is_empty() {
+            continue;
+        }
         // Enclosed only: dilating the hollow stays inside the slice. A cantilever's
         // over-air reaches the part's free edge, so dilating it leaves the slice.
         if difference(&offset(&h, lw), layer).is_empty() {
-            band = union(&band, &intersection(&offset(&h, reach), &inside_outer));
+            let hb = match bridge_angle(&h, &supported, lw, max_span) {
+                Some(a) => directional_band(&h, a, reach, lw),
+                None => offset(&h, reach),
+            };
+            band = union(&band, &intersection(&hb, &inside_outer));
         }
     }
     band
+}
+
+/// Translate a polygon set by (dx, dy) mm.
+fn translate_polys(p: &Polygons, dx: f64, dy: f64) -> Polygons {
+    let mut out = Polygons::new();
+    for c in &p.contours {
+        out.push(geo2d::Contour::new(
+            c.points
+                .iter()
+                .map(|q| geo2d::Point::from_mm(q.x_mm() + dx, q.y_mm() + dy))
+                .collect(),
+        ));
+    }
+    out
+}
+
+/// Anchor band for a bridged hollow: the hollow swept ±`reach` ALONG the bridge
+/// line direction — where the line ENDS need footing on solid — plus half a
+/// bead broadside so the flank strokes fuse with the neighboring ring. An
+/// isotropic dilation over-carves the flanks: on a shallow-crowning bore each
+/// layer's air crescent is thinner than the foothold, so the anchor rind — not
+/// the hollow — became the patch, replacing supported walls with bridge lines
+/// lying on solid.
+fn directional_band(h: &Polygons, angle_deg: f64, reach: f64, lw: f64) -> Polygons {
+    let (vx, vy) = (angle_deg.to_radians().cos(), angle_deg.to_radians().sin());
+    let mut sweep = h.clone();
+    // Union of translates approximates the sweep; steps of half a bead can't
+    // gap on any island that survived the two-bead thin gate.
+    let steps = (reach / (lw * 0.5)).ceil().max(1.0) as usize;
+    for k in 1..=steps {
+        let d = reach * k as f64 / steps as f64;
+        sweep = union(&sweep, &translate_polys(h, vx * d, vy * d));
+        sweep = union(&sweep, &translate_polys(h, -vx * d, -vy * d));
+    }
+    offset(&sweep, lw * 0.5)
 }
 
 /// The direction to run bridge lines across `region` — the angle whose spans are
