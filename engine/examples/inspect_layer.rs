@@ -13,13 +13,13 @@ fn main() {
     let mut s = config::Settings::default();
     // The user's process: walls=99, 0.2/0.4, top 0 bottom 2, lines fill,
     // outer wall first, sharpest seam.
-    s.wall_count = 99;
+    s.wall_count = 4;
     s.layer_height_mm = 0.2;
     s.first_layer_height_mm = 0.2;
     s.line_width_mm = 0.4;
-    s.top_layers = 1;
-    s.bottom_layers = 1;
-    s.infill_density = 0.15;
+    s.top_layers = 0;
+    s.bottom_layers = 0;
+    s.infill_density = 1.0;
     s.outer_wall_first = false;
     s.seam_mode = config::SeamMode::Sharpest;
     s.skirt_loops = 0;
@@ -57,6 +57,8 @@ fn main() {
             outline_area,
             covered
         );
+        let (oa, unc) = engine::debug_uncovered(l, s.line_width_mm);
+        println!("  UNCOVERED: {unc:.1}mm2 of {oa:.0}mm2 outline");
         let mut by_kind: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
         for p in &l.paths {
             let len: f64 = p

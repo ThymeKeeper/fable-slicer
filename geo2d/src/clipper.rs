@@ -105,6 +105,20 @@ pub fn normalize_positive(polys: &Polygons) -> Polygons {
         .unwrap_or_else(|_| polys.clone())
 }
 
+/// Normalize by NESTING alone (EvenOdd fill): winding is ignored, so a
+/// contour set with arbitrary orientation — e.g. a marching-squares raster
+/// trace, whose contours all come out one-handed — resolves to proper
+/// outers/holes by containment parity. `normalize_positive` would read the
+/// same input as all-negative winding and return nothing.
+pub fn normalize_evenodd(polys: &Polygons) -> Polygons {
+    let Some(p) = to_paths(polys) else {
+        return Polygons::new();
+    };
+    cl_union(p, Paths::new(Vec::new()), FillRule::EvenOdd)
+        .map(from_paths)
+        .unwrap_or_else(|_| polys.clone())
+}
+
 /// Boolean union (`a ∪ b`).
 pub fn union(a: &Polygons, b: &Polygons) -> Polygons {
     match (to_paths(a), to_paths(b)) {

@@ -580,11 +580,18 @@ impl SliceProgress {
 
 /// Like [`plan_geometry`], but ticks `progress` as the heavy per-layer wall pass
 /// advances, so a background slice can drive a progress bar.
+fn dump_settings_once(settings: &Settings) {
+    if std::env::var("FABLE_DUMP_SETTINGS").is_ok() {
+        eprintln!("=== SETTINGS DUMP ===\n{settings:#?}\n=== END DUMP ===");
+    }
+}
+
 pub fn plan_geometry_tracked(
     parts: &[(&Mesh, PartPaint)],
     settings: &Settings,
     progress: &SliceProgress,
 ) -> GeometryPlan {
+    dump_settings_once(settings);
     plan_geometry_inner(parts, settings, Some(progress))
 }
 
@@ -2177,6 +2184,27 @@ fn plan_part(
                 // bridge reaches one wall-spacing PAST the carve (the foothold band)
                 // so the strands just kiss the innermost kept ring, which sits sp
                 // beyond the carve. `carved_pre` is the pass-1-mirroring carve.
+                if std::env::var("FABLE_DEBUG_OH").is_ok() {
+                    let pa = |q: &Polygons| -> String {
+                        match q.bounds() {
+                            Some(b) => format!(
+                                "{:.1}mm2 ({:.1},{:.1})..({:.1},{:.1})",
+                                q.net_area_mm2(),
+                                geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y),
+                                geo2d::to_mm(b.max.x), geo2d::to_mm(b.max.y)
+                            ),
+                            None => "empty".into(),
+                        }
+                    };
+                    eprintln!(
+                        "oh L{i}: oh={} | oh∩inner={} | spannable={} | carved={} | inner={}",
+                        pa(&oh),
+                        pa(&intersection(&oh, inner)),
+                        pa(spannable),
+                        pa(&carved_pre),
+                        pa(inner)
+                    );
+                }
                 (
                     union(&difference(&intersection(&oh, inner), spannable), &carved_pre),
                     carved_pre,
@@ -2232,6 +2260,21 @@ fn plan_part(
                     // touching material only at the rim — unprintable), so
                     // let it fall through to the fill flow, whose sub-bead
                     // open discards what cannot be printed.
+                    continue;
+                }
+                // At dense intent the solid/sparse split is ONE field, so a
+                // fully SUPPORTED thin solid band — a leaning wall's shell
+                // crescent — needs no separate concentric run: it merges into
+                // the field, whose lines sweep it as part of the region.
+                // Pulling it out CREATES the fragmentation this pass exists
+                // to prevent (a wall-hugging extra bead beside the field).
+                // Islands that span air keep the lintel — the continuous run
+                // IS their anchoring.
+                if settings.infill_density >= 0.999
+                    && settings.sparse_pattern == settings.solid_pattern
+                    && a > 1.0e-9
+                    && over_air / a < 0.05
+                {
                     continue;
                 }
                 cand = union(&cand, &isl);
@@ -2292,8 +2335,44 @@ fn plan_part(
                 }
                 // Decide on the TRUE unsupported span (so the reach below can't inflate
                 // it past max_span), then fill a region grown to reach the walls.
-                let Some(angle) = bridge_angle(&island, &supported_below, lw, settings.max_bridge_span_mm)
-                else {
+                // The span cap guards LONE strands — but an island the cap
+                // rejects would otherwise fall to the fill flow, whose
+                // pattern-angle strokes anchor on NOTHING (a bar between two
+                // towers rung-filled across: the guaranteed failure). Retry
+                // the honest anchoring test with the cap lifted: adjacent
+                // long strands, each side-bonded to the one just laid and
+                // tip-anchored both ends, are the printable cover — the
+                // classic lintel span. Truly unanchorable islands still fall
+                // through as before.
+                let dbg_br = std::env::var("FABLE_DEBUG_BRIDGE").is_ok();
+                let capped =
+                    bridge_angle(&island, &supported_below, lw, settings.max_bridge_span_mm);
+                let relaxed = capped.or_else(|| {
+                    // A long bar's axis straddles the 15-degree grid. Aim
+                    // along the FLANK edge first (strands parallel to it run
+                    // the full span), then the area axis. First passer wins —
+                    // min-max-span selection would prefer an off-axis angle
+                    // whose chords exit the flank early (shorter = "better").
+                    let edge = longest_edge_angle(&island);
+                    let axis = principal_angle(&island);
+                    [edge, edge - 2.0, edge + 2.0, axis, axis - 3.0, axis + 3.0, axis - 6.0, axis + 6.0]
+                        .into_iter()
+                        .find(|&a| {
+                            bridge_angle_among(&island, &supported_below, lw, f64::MAX, &[a])
+                                .is_some()
+                        })
+                });
+                if dbg_br {
+                    let b = island.bounds().unwrap();
+                    eprintln!(
+                        "bridge L{i}: island {:.1}mm2 bbox ({:.1},{:.1})..({:.1},{:.1}) axis={:.0} capped={capped:?} relaxed={relaxed:?}",
+                        island.net_area_mm2(),
+                        geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y),
+                        geo2d::to_mm(b.max.x), geo2d::to_mm(b.max.y),
+                        principal_angle(&island)
+                    );
+                }
+                let Some(angle) = relaxed else {
                     continue;
                 };
                 // Grow the span through the void up to the perimeters that ring it, so
@@ -2324,9 +2403,49 @@ fn plan_part(
                     &offset(&solid_beads, lw * 3.0),
                 );
                 let fill_region = union(&island, &ring);
-                for seg in infill_lines(&fill_region, angle, lw, true, 0.5, false) {
-                    if seg.len() >= 2 {
-                        paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
+                let n_isl = paths.len();
+                // Long-span strands are laid in the island's own frame — the
+                // world-anchored lattice phase otherwise decides, per bed
+                // position, whether the outermost strand exits the flank
+                // (losing a strand to the anchor cull). Normal capped
+                // bridges stay on the world lattice with the fields.
+                if capped.is_none() {
+                    if let Some(b) = fill_region.bounds() {
+                        let (ox, oy) = (geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y));
+                        let canon = translate_polys(&fill_region, -ox, -oy);
+                        for seg in infill_lines(&canon, angle, lw, true, 0.5, false) {
+                            if seg.len() >= 2 {
+                                let seg: Vec<Point> = seg
+                                    .iter()
+                                    .map(|q| Point::from_mm(q.x_mm() + ox, q.y_mm() + oy))
+                                    .collect();
+                                paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
+                            }
+                        }
+                    }
+                } else {
+                    for seg in infill_lines(&fill_region, angle, lw, true, 0.5, false) {
+                        if seg.len() >= 2 {
+                            paths.push(ToolPath::new(PathKind::Bridge, false, lw, seg));
+                        }
+                    }
+                }
+                if capped.is_none() {
+                    // Long-span strands MUST run anchor to anchor: the fill
+                    // region is grown past the voted island, so a chord can
+                    // exit through the flank and end mid-air — a cantilever,
+                    // not a bridge. Keep only strands with both ends on (or
+                    // within a bead of) support.
+                    let ok = offset(&supported_below, lw);
+                    let mut k = n_isl;
+                    while k < paths.len() {
+                        let a = paths[k].points[0];
+                        let b = *paths[k].points.last().unwrap();
+                        if point_in(&ok, a) && point_in(&ok, b) {
+                            k += 1;
+                        } else {
+                            paths.remove(k);
+                        }
                     }
                 }
                 bridged.contours.extend(fill_region.contours);
@@ -2755,11 +2874,23 @@ fn plan_part(
         // footprints are the same either way — spiralize rewires connectivity,
         // not coverage. Spiral vase is intentionally hollow — nothing to fill.
         if !settings.spiral_vase {
-            let dense = difference(&layers[i].polygons, &sparse_for_gaps);
+            // A dense "sparse" field (density ~1.0) is a FULL-COVERAGE intent —
+            // its gaps are not the pattern. Include the field's region and its
+            // beads in the oracle, so the narrow channels the sparse prep
+            // discards (the half-bead inset + open kill ribbons under ~2
+            // beads) get their medial gap beads instead of staying voids.
+            // Real sparse keeps the exclusion: between-line gaps at low
+            // density are intentional.
+            let dense_intent = settings.infill_density >= 0.999;
+            let dense = if dense_intent {
+                layers[i].polygons.clone()
+            } else {
+                difference(&layers[i].polygons, &sparse_for_gaps)
+            };
             if !dense.is_empty() {
                 let beads: Vec<(Vec<Point>, Vec<f64>)> = paths
                     .iter()
-                    .filter(|p| p.kind != PathKind::Infill && p.points.len() >= 2)
+                    .filter(|p| (dense_intent || p.kind != PathKind::Infill) && p.points.len() >= 2)
                     .map(|p| {
                         let mut pts = p.points.clone();
                         let mut ws =
@@ -2778,7 +2909,76 @@ fn plan_part(
                 // channel; a heavier simplify makes it sparse and the clearance
                 // reads low at the few surviving vertices → a too-thin bead). Do
                 // NOT morphologically close (that truncates the tip).
-                let voids = simplify(&raw_voids, lw * 0.15);
+                // Marching squares emits every contour with the SAME winding —
+                // nesting is right, orientation is meaningless. Resolve
+                // outers/holes by containment (EvenOdd) BEFORE any consumer:
+                // orientation-trusting code otherwise misreads an annular
+                // void's hole as solid (islands() finds no outers at all, and
+                // the medial measures clearance across the whole annulus —
+                // the boss-sized monster bead).
+                let voids = simplify(&geo2d::normalize_evenodd(&raw_voids), lw * 0.15);
+                // The dense-intent scan of the sparse region targets the
+                // DISCARDED narrow channels — but it also surfaces hairline
+                // crescents along the wall↔field kiss on curved walls (real,
+                // sub-bead, historically never filled; the wall shoulder owns
+                // them). A bead laid there reads as an extra wall swooping
+                // along the edge. Keep only sparse-region voids that are
+                // meaningfully wide; non-sparse voids keep full sensitivity.
+                // Island KEEP/DROP only — never reconstruct void geometry
+                // with booleans: the marching-squares jaggies make offset/
+                // difference output degenerate contours whose medial then
+                // reads garbage clearances (3.9mm-wide monster beads).
+                let voids = if dense_intent {
+                    let dbg = std::env::var("FABLE_DEBUG_GAPS").is_ok();
+                    let mut kept = Polygons::new();
+                    for isl in islands(&voids) {
+                        let a = isl.net_area_mm2();
+                        let in_sparse = intersection(&isl, &sparse_for_gaps).net_area_mm2();
+                        let peri: f64 = isl
+                            .contours
+                            .iter()
+                            .map(|c| {
+                                let m = c.points.len();
+                                (0..m).map(|k| pt_dist_mm(c.points[k], c.points[(k + 1) % m])).sum::<f64>()
+                            })
+                            .sum();
+                        // Mean ribbon width — jag-tolerant, no reconstruction.
+                        let w_mean = if peri > 1e-9 { 2.0 * a / peri } else { 0.0 };
+                        let keep = in_sparse < a * 0.5 || w_mean >= lw * 0.4;
+                        if dbg {
+                            let b = isl.bounds().unwrap();
+                            let (mut lo, mut hi) = (0.0f64, 2.0f64);
+                            for _ in 0..14 {
+                                let mid = 0.5 * (lo + hi);
+                                if offset(&isl, -mid).is_empty() { hi = mid } else { lo = mid }
+                            }
+                            eprintln!(
+                                "gapvoid L{i}: a={a:.2} w_mean={w_mean:.3} death={:.3} sparse%={:.0} keep={keep} bbox ({:.1},{:.1})..({:.1},{:.1})",
+                                0.5 * (lo + hi),
+                                100.0 * in_sparse / a.max(1e-9),
+                                geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y),
+                                geo2d::to_mm(b.max.x), geo2d::to_mm(b.max.y)
+                            );
+                        }
+                        if keep {
+                            kept.contours.extend(isl.contours);
+                        }
+                    }
+                    kept
+                } else {
+                    voids
+                };
+                // Gap fill heals seams in SUPPORTED material. A bead over
+                // open air — the flank sliver beside a bridge span — has
+                // nothing to sit on and no bridge treatment; over-air
+                // coverage belongs to the span ladder, not the medial healer.
+                let voids = if i > 0 {
+                    let allowance = settings.layer_height_mm
+                        * settings.support_overhang_angle_deg.to_radians().tan();
+                    intersection(&voids, &offset(&phys[i - 1], allowance))
+                } else {
+                    voids
+                };
                 let runts = emit_gap_fill(&voids, lw, sp, &mut paths);
                 // What gap fill declined — sub-length specks, culled ribs —
                 // widens the neighbouring ring instead of staying a pinhole.
@@ -3636,13 +3836,88 @@ fn directional_band(h: &Polygons, angle_deg: f64, reach: f64, lw: f64) -> Polygo
 /// onto the surrounding walls) at the same angle — without the extension inflating
 /// the span check.
 fn bridge_angle(region: &Polygons, supported: &Polygons, lw: f64, max_span: f64) -> Option<f64> {
+    let angles: Vec<f64> = (0..12).map(|k| k as f64 * 15.0).collect();
+    bridge_angle_among(region, supported, lw, max_span, &angles)
+}
+
+/// The island's principal axis (degrees) from area moments — the direction a
+/// long bar actually runs, which a coarse angle grid can straddle and miss.
+fn principal_angle(region: &Polygons) -> f64 {
+    let (mut a2, mut cx, mut cy) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut ixx, mut iyy, mut ixy) = (0.0f64, 0.0f64, 0.0f64);
+    for c in &region.contours {
+        let n = c.points.len();
+        for k in 0..n {
+            let p = c.points[k];
+            let q = c.points[(k + 1) % n];
+            let (x0, y0, x1, y1) = (p.x_mm(), p.y_mm(), q.x_mm(), q.y_mm());
+            let cr = x0 * y1 - x1 * y0;
+            a2 += cr;
+            cx += (x0 + x1) * cr;
+            cy += (y0 + y1) * cr;
+            iyy += (x0 * x0 + x0 * x1 + x1 * x1) * cr;
+            ixx += (y0 * y0 + y0 * y1 + y1 * y1) * cr;
+            ixy += (x0 * y1 + 2.0 * x0 * y0 + 2.0 * x1 * y1 + x1 * y0) * cr;
+        }
+    }
+    let area = a2 * 0.5;
+    if area.abs() < 1e-9 {
+        return 0.0;
+    }
+    let (cx, cy) = (cx / (6.0 * area), cy / (6.0 * area));
+    let sxx = iyy / 12.0 - area * cx * cx;
+    let syy = ixx / 12.0 - area * cy * cy;
+    let sxy = ixy / 24.0 - area * cx * cy;
+    (0.5 * (2.0 * sxy).atan2(sxx - syy)).to_degrees()
+}
+
+/// The direction of the island's longest boundary edge — a straight flank on
+/// a bar/strut. Strands parallel to the flank never exit it mid-span, unlike
+/// the area's principal axis, which end-cuts and anchor feet skew.
+fn longest_edge_angle(region: &Polygons) -> f64 {
+    let (mut best_len, mut best) = (0.0f64, 0.0f64);
+    for c in &region.contours {
+        let n = c.points.len();
+        for k in 0..n {
+            let a = c.points[k];
+            let b = c.points[(k + 1) % n];
+            let (dx, dy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+            let l = dx.hypot(dy);
+            if l > best_len {
+                best_len = l;
+                best = dy.atan2(dx).to_degrees();
+            }
+        }
+    }
+    best
+}
+
+fn bridge_angle_among(
+    region: &Polygons,
+    supported: &Polygons,
+    lw: f64,
+    max_span: f64,
+    angles: &[f64],
+) -> Option<f64> {
     if max_span <= 0.0 {
         return None;
     }
-    // Try a range of line directions; the bridge runs across the shortest spans.
+    // Canonicalize to the region's own frame: the chord sampler's scanlines
+    // are anchored to world coordinates, so the SAME island at a different
+    // bed position sampled a different chord set — and the anchoring vote
+    // (85% both ends) flipped with placement. A bridge-vs-rungs decision
+    // must not depend on where the part sits on the bed.
+    let (region, supported) = match region.bounds() {
+        Some(b) => {
+            let (ox, oy) = (geo2d::to_mm(b.min.x), geo2d::to_mm(b.min.y));
+            (translate_polys(region, -ox, -oy), translate_polys(supported, -ox, -oy))
+        }
+        None => return None,
+    };
+    let (region, supported) = (&region, &supported);
+    // Try the candidate directions; the bridge runs across the shortest spans.
     let mut best: Option<(f64, f64)> = None; // (max line length, angle)
-    for k in 0..12 {
-        let angle = k as f64 * 15.0;
+    for &angle in angles {
         let segs = infill_lines(region, angle, lw, false, 0.5, false);
         let (mut total, mut anchored, mut max_len) = (0usize, 0usize, 0.0f64);
         for seg in &segs {
@@ -3746,8 +4021,17 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
         })
         .map(|c| c.is_ccw())
         .unwrap_or(true);
-    let hole_contours: Vec<&geo2d::Contour> =
-        inside.contours.iter().filter(|c| c.is_ccw() != outer_ccw).collect();
+    // Real holes only: boolean ops leave zero-area sliver contours along
+    // shared boundaries with ARBITRARY winding — half classify as "holes"
+    // lying exactly where turnaround chords run. 50k spurious refusals per
+    // slice knocked out neighbor joins, and min-distance fell through to
+    // lane-skipping hops: the comb combs. A hole smaller than a bead in
+    // both dimensions is unprintable noise; crossing it costs nothing.
+    let hole_contours: Vec<&geo2d::Contour> = inside
+        .contours
+        .iter()
+        .filter(|c| c.is_ccw() != outer_ccw && c.area_mm2() > 0.1)
+        .collect();
     if std::env::var_os("FABLE_DEBUG_CONNECT").is_some() {
         eprintln!(
             "connect: {} contours, {} holes, outer_ccw={}",
@@ -3763,12 +4047,84 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
     // never touches it, and a stair-tooth dip crosses only the outer
     // boundary.
     let crosses_hole = |a: Point, b: Point| -> bool {
+        let chord = pt_dist_mm(a, b);
         for c in &hole_contours {
             let m = c.points.len();
+            // Crossings with their arc position along the ring.
+            let mut arcs: Vec<(f64, f64)> = Vec::new(); // (arc pos, chord t)
+            let mut acc = 0.0f64;
             for j in 0..m {
-                if seg_cross_t(a, b, c.points[j], c.points[(j + 1) % m]).is_some() {
+                let (p, q) = (c.points[j], c.points[(j + 1) % m]);
+                let sl = pt_dist_mm(p, q);
+                if let Some(t) = seg_cross_t(a, b, p, q) {
+                    let (ax, ay) = (a.x_mm(), a.y_mm());
+                    let (cx, cy) =
+                        (ax + t * (b.x_mm() - ax), ay + t * (b.y_mm() - ay));
+                    arcs.push((acc + (cx - p.x_mm()).hypot(cy - p.y_mm()).min(sl), t));
+                }
+                acc += sl;
+            }
+            if arcs.is_empty() {
+                continue;
+            }
+            // Both chord ends are in-region, so honest crossings of a closed
+            // ring come in PAIRS. An ODD count is a grazing artifact — the
+            // ends sit exactly ON the boundary (end-extension put them
+            // there), and a chord skimming a near-parallel edge registers a
+            // single phantom crossing. Refusing those orphaned every stroke
+            // along smooth hole-facing edges (the 20-bead one-sided combs).
+            if arcs.len() % 2 == 1 {
+                // Ill-conditioned grazing (near-parallel chord) — measure
+                // actual PENETRATION. A skim dips microns into the ring; a
+                // stroke ending ON a slot bank and welding across it dips
+                // half the slot width. Depth is robust where the crossing's
+                // chord position is not.
+                let steps = (chord / 0.05).ceil().max(2.0) as usize;
+                let (ax, ay) = (a.x_mm(), a.y_mm());
+                let mut deepest = 0.0f64;
+                for s in 0..=steps {
+                    let t = s as f64 / steps as f64;
+                    let (x, y) = (ax + t * (b.x_mm() - ax), ay + t * (b.y_mm() - ay));
+                    let mut hits = 0usize;
+                    for j in 0..m {
+                        let (p, q) = (c.points[j], c.points[(j + 1) % m]);
+                        let (py, qy) = (p.y_mm(), q.y_mm());
+                        if (py > y) == (qy > y) {
+                            continue;
+                        }
+                        let tt = (y - py) / (qy - py);
+                        if p.x_mm() + tt * (q.x_mm() - p.x_mm()) > x {
+                            hits += 1;
+                        }
+                    }
+                    if hits % 2 == 1 {
+                        let sp = Point::from_mm(x, y);
+                        let mut dmin = f64::MAX;
+                        for j in 0..m {
+                            let (p, q) = (c.points[j], c.points[(j + 1) % m]);
+                            dmin = dmin.min(point_segment_dist_mm(sp, p, q));
+                        }
+                        deepest = deepest.max(dmin);
+                    }
+                }
+                if deepest > 0.08 {
                     return true;
                 }
+                continue;
+            }
+            // A stair-tooth NICK cuts one corner of the ring: two crossings
+            // a short boundary walk apart — zero slack here was the COMB
+            // root cause. A chord that SHORTCUTS across the hole leaves its
+            // crossings far apart along the ring (or pierces 4+ times) —
+            // that erases a real slot and stays refused.
+            if arcs.len() != 2 {
+                return true;
+            }
+            let perim = acc;
+            let walk = (arcs[1].0 - arcs[0].0).abs();
+            let walk = walk.min(perim - walk);
+            if walk > (chord * 2.0).max(1.0) {
+                return true;
             }
         }
         false
@@ -3818,6 +4174,98 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
         };
         beads.sort_by_key(key);
     }
+    // COMB guard: a connector that runs ACROSS the tips of SKIPPED lanes
+    // welds a bar over the row — five strokes hanging off one connector, the
+    // zigzag degenerating into a comb — and the skipped strokes orphan.
+    // Lane-aware: only a tip whose across-line lane lies STRICTLY BETWEEN
+    // the two joined lanes counts (a skipped stroke). The neighboring step's
+    // tip in a staircase sits BESIDE every legitimate turnaround — refusing
+    // on mere proximity shatters the serpentines (21k-toolpath lesson).
+    let across_of = {
+        let d = dominant;
+        move |p: Point| -> f64 {
+            match d {
+                Some((dx, dy)) => -p.x_mm() * dy + p.y_mm() * dx,
+                None => 0.0,
+            }
+        }
+    };
+    let tips: Vec<(Point, f64, f64)> = beads
+        .iter()
+        .filter(|b| !b.closed && b.points.len() >= 2)
+        .flat_map(|b| {
+            let (h, t) = (b.points[0], *b.points.last().unwrap());
+            [(h, b.width_mm, across_of(h)), (t, b.width_mm, across_of(t))]
+        })
+        .collect();
+    // LIVE tips only: a consumed tip is an interior turnaround vertex of a
+    // run — consecutive stair turnarounds nest right beside each other, and
+    // a stale snapshot reads every one as a "skipped stroke" (the shattered
+    // 21k-toolpath serpentines). Joins kill their two endpoints' entries.
+    let tip_alive: Vec<std::cell::Cell<bool>> =
+        tips.iter().map(|_| std::cell::Cell::new(true)).collect();
+    let mut tip_index: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (k, (t, _, _)) in tips.iter().enumerate() {
+        tip_index.entry((t.x, t.y)).or_default().push(k);
+    }
+    let kill_tip = |q: Point| {
+        if let Some(ix) = tip_index.get(&(q.x, q.y)) {
+            for &k in ix {
+                tip_alive[k].set(false);
+            }
+        }
+    };
+    let comb_off = std::env::var_os("FABLE_NO_COMB").is_some();
+    let comb_hits = std::cell::Cell::new(0usize);
+    let grazes_tips = |a: Point, b: Point| -> bool {
+        if comb_off || dominant.is_none() {
+            return false;
+        }
+        let len = pt_dist_mm(a, b);
+        if len < 1.0e-6 {
+            return false;
+        }
+        let (la, lb) = (across_of(a), across_of(b));
+        let (ax, ay) = (a.x_mm(), a.y_mm());
+        let (dx, dy) = ((b.x_mm() - ax) / len, (b.y_mm() - ay) / len);
+        // ONE crossed tip is a stair-corner hop nestling against a terminal
+        // end — normal and printable. The comb is a connector barring a ROW:
+        // two or more skipped strokes hanging off one bead.
+        let mut crossed = 0usize;
+        for (k, &(t, w, lane)) in tips.iter().enumerate() {
+            if len <= w * 1.2 {
+                return false; // a one-spacing hop cannot cross a lane
+            }
+            if !tip_alive[k].get() {
+                continue; // consumed into a run — an interior vertex now
+            }
+            let margin = w * 0.4;
+            if lane <= la.min(lb) + margin || lane >= la.max(lb) - margin {
+                continue; // not strictly between the joined lanes
+            }
+            let guard = w * 0.6;
+            let (px, py) = (t.x_mm() - ax, t.y_mm() - ay);
+            let s = px * dx + py * dy;
+            if s < guard || s > len - guard {
+                continue; // at/near the chord's own endpoints
+            }
+            if (px * dy - py * dx).abs() < guard {
+                crossed += 1;
+                if crossed >= 2 {
+                    comb_hits.set(comb_hits.get() + 1);
+                    if std::env::var_os("FABLE_DEBUG_COMB").is_some() {
+                        eprintln!(
+                            "COMB refuse: chord {:.2}mm lanes {:.2}..{:.2} tip at lane {:.2} ({:.1},{:.1})",
+                            len, la.min(lb), la.max(lb), lane, t.x_mm(), t.y_mm()
+                        );
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    };
     let mut runs: Vec<ToolPath> = Vec::new();
     for bead in beads {
         if bead.closed || bead.points.len() < 2 {
@@ -3891,14 +4339,25 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
                 && best.map_or(true, |(_, _, bd)| d < bd)
                 && join_inside(end, target, &inflated, max_jump)
                 && !crosses_hole(end, target)
+                && !grazes_tips(end, target)
                 && (d <= hug_limit || !seg_touches(end, target, &deep))
             {
                 best = Some((i, flip, d));
             } else if dbg && best.is_none() {
                 let dist_ok = d <= max_jump;
-                let inside_ok = seg_inside(end, if flip { tail } else { head }, &inflated);
+                let inside_ok = seg_inside(end, target, &inflated);
                 if nearest_reject.map_or(true, |(nd, ..)| d < nd) {
                     nearest_reject = Some((d, dist_ok, inside_ok));
+                    eprintln!(
+                        "NEAREST-REJ d={d:.2} adj={} inside={} hole={} comb={} hug={} at ({:.1},{:.1})",
+                        adjacent,
+                        join_inside(end, target, &inflated, max_jump),
+                        crosses_hole(end, target),
+                        grazes_tips(end, target),
+                        d <= hug_limit || !seg_touches(end, target, &deep),
+                        target.x_mm(),
+                        target.y_mm()
+                    );
                 }
             }
         }
@@ -3912,8 +4371,17 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
             }
         }
         match best {
-            Some((i, true, _)) => runs[i].points.extend(bead.points.iter().rev().copied()),
-            Some((i, false, _)) => runs[i].points.extend(bead.points),
+            Some((i, flip, _)) => {
+                let end = *runs[i].points.last().unwrap();
+                let joined = if flip { *bead.points.last().unwrap() } else { bead.points[0] };
+                kill_tip(end);
+                kill_tip(joined);
+                if flip {
+                    runs[i].points.extend(bead.points.iter().rev().copied());
+                } else {
+                    runs[i].points.extend(bead.points);
+                }
+            }
             None => runs.push(bead),
         }
     }
@@ -4233,6 +4701,24 @@ fn emit_gap_fill(
             runts.push(tp);
             continue;
         }
+        // A bead claiming to be wider than the fillable band is a medial
+        // mis-measure (jagged raster blobs defeat the wide-core subtraction;
+        // the width AND the centerline are then suspect). Demote to a runt:
+        // the absorb pass folds its volume into neighbouring rings, clamped
+        // to sane widths — never a monster bead in the print.
+        let wmax = tp.widths.iter().cloned().fold(0.0f64, f64::max);
+        if wmax > max * 1.5 {
+            if std::env::var("FABLE_DEBUG_GAPS").is_ok() {
+                let q = tp.points[0];
+                eprintln!(
+                    "gapmonster: demoting bead wmax={wmax:.2} (cap {max:.2}) at ({:.1},{:.1})",
+                    q.x_mm(),
+                    q.y_mm()
+                );
+            }
+            runts.push(tp);
+            continue;
+        }
         emit_tapered_bead(&tp, lw, out);
     }
     runts
@@ -4295,8 +4781,10 @@ fn absorb_dropped_voids(
         }
     }
     // Match every runt sample to its nearest receiver.
-    let mut assigned: std::collections::HashMap<usize, Vec<([f64; 2], f64)>> =
-        std::collections::HashMap::new();
+    // BTreeMap: iterated below — receiver processing order must not vary
+    // run to run (HashMap's random seed made slices nondeterministic).
+    let mut assigned: std::collections::BTreeMap<usize, Vec<([f64; 2], f64)>> =
+        std::collections::BTreeMap::new();
     for tp in runts {
         let (rp, rw) = resample_thick(&tp.points, &tp.widths, PINCH_STEP_MM);
         for (q, w) in rp.iter().zip(&rw) {

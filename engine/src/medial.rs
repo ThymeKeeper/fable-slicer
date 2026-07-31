@@ -252,9 +252,11 @@ fn reversed(mut tp: ThickPolyline) -> ThickPolyline {
 /// rib made the vertex look like a junction, until the rib was culled). Real
 /// junctions (≥3 ends) and loops (both ends of one polyline) are left intact.
 fn concat_chains(mut polys: Vec<ThickPolyline>) -> Vec<ThickPolyline> {
-    use std::collections::HashMap;
+    // BTreeMap: HashMap's per-process random iteration order made the join
+    // sequence — and with it the final chain endpoints — differ RUN TO RUN.
+    use std::collections::BTreeMap;
     loop {
-        let mut ends: HashMap<(i64, i64), Vec<(usize, bool)>> = HashMap::new();
+        let mut ends: BTreeMap<(i64, i64), Vec<(usize, bool)>> = BTreeMap::new();
         for (i, tp) in polys.iter().enumerate() {
             if tp.points.len() < 2 {
                 continue;
