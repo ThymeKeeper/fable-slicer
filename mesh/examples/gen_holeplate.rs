@@ -35,7 +35,14 @@ fn main() -> std::io::Result<()> {
     wall(&mut t, hi, lo, hi, hi, z0, z1);
     wall(&mut t, hi, hi, lo, hi, z0, z1);
     wall(&mut t, lo, hi, lo, lo, z0, z1);
-    // Hole walls.
+    // Hole walls — deliberately wound the same way as the OUTER walls, i.e.
+    // FLIPPED for a hole (outward-from-material would be the reverse). This
+    // is the fixture's whole value: a consistently mis-wound hole closes
+    // cleanly under directed stitching, which used to slip past the fallback
+    // and print the bore solid (slice.rs now re-orients by nesting parity;
+    // `flipped_hole_walls_still_slice_as_a_hole` guards it). Orca refuses
+    // this mesh outright. Don't "fix" the winding — regenerating a correct
+    // plate would retire the regression fixture.
     wall(&mut t, hl, hl, hh, hl, z0, z1);
     wall(&mut t, hh, hl, hh, hh, z0, z1);
     wall(&mut t, hh, hh, hl, hh, z0, z1);

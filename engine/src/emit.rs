@@ -20,7 +20,7 @@ use gcode::GcodeBuilder;
 use geo2d::{Point, Polygons};
 use rayon::prelude::*;
 
-use crate::plan::{LayerPlan, PathKind, ToolPath, Travel};
+use crate::plan::{LayerPlan, PathKind, SegAttr, ToolPath, Travel};
 
 /// Per-path filament view. On a toolchanger the slot table is authoritative; on
 /// a single-tool machine the flat fields are — `tools[0]` mirrors them only at
@@ -552,13 +552,10 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             let n_segs = if path.closed { n_pts } else { n_pts - 1 };
             // Per-segment attribute lookup: the override when present (an overhang or
             // bridge stretch inside a continuous bead), else the whole-path kind.
-            let seg = |k: usize| -> (PathKind, f32) {
+            let seg = |k: usize| -> SegAttr {
                 match &path.segs {
-                    Some(sa) if !sa.is_empty() => {
-                        let a = sa[k.min(sa.len() - 1)];
-                        (a.kind, a.overhang)
-                    }
-                    _ => (path.kind, path.overhang),
+                    Some(sa) if !sa.is_empty() => sa[k.min(sa.len() - 1)],
+                    _ => SegAttr { kind: path.kind, overhang: path.overhang, flow: 1.0 },
                 }
             };
             // Feature label, acceleration + ATD, pressure advance, and fan for the
@@ -568,9 +565,9 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // Cooling grades by how unsupported the bead is: bridges/bottom skins take
             // the bridge fan, an overhang wall grades toward it, everything else the
             // normal duty.
-            let (fk, fo) = seg(0);
+            let a0 = seg(0);
             set_seg_attrs(
-                &mut g, fk, fo, layer, normal_fan, t, s, &mut cur_type, &mut cur_accel,
+                &mut g, a0.kind, a0.overhang, layer, normal_fan, t, s, &mut cur_type, &mut cur_accel,
                 &mut cur_pa, &mut cur_fan,
                 // PA from the PATH-level kind: base for a mixed wall (its
                 // overhang stretches must not re-issue PA mid-bead), eased for
@@ -602,7 +599,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 (0..n_segs)
                     .map(|k| {
                         let a = seg(k);
-                        feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, t, s)
+                        feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
                             * layer.speed_scale
                     })
                     .fold(f64::INFINITY, f64::min)
@@ -709,10 +706,12 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // path-level value seg(0) already set (pa_src = None here).
                 let worst = (0..n_segs)
                     .map(seg)
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or((path.kind, path.overhang));
+                    .max_by(|a, b| {
+                        a.overhang.partial_cmp(&b.overhang).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(SegAttr { kind: path.kind, overhang: path.overhang, flow: 1.0 });
                 set_seg_attrs(
-                    &mut g, worst.0, worst.1, layer, normal_fan, t, s, &mut cur_type,
+                    &mut g, worst.kind, worst.overhang, layer, normal_fan, t, s, &mut cur_type,
                     &mut cur_accel, &mut cur_pa, &mut cur_fan, None,
                 );
                 // A joined scarf enters via the junction bead — pressure
@@ -774,7 +773,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 let seg_feed: Vec<f64> = (0..n_segs)
                     .map(|k| {
                         let a = seg(k);
-                        feed_for_seg(a.0, a.1, path, layer.index, layer.height_mm, flow_cap, t, s)
+                        feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
                             * layer.speed_scale
                     })
                     .collect();
@@ -805,7 +804,8 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     pf[k] = pf[k].min(pf[nx] + FEED_SLEW_PER_MM * pieces[k].2);
                 }
                 let mut run = seg(0);
-                let mut rcoeff = bead / area * flow_factor_kind(run.0, path.flow, t);
+                let mut rcoeff =
+                    bead / area * flow_factor_kind(run.kind, path.flow, t) * run.flow as f64;
                 // A joined entry lands at the slew-limited first piece's feed —
                 // no commanded step at the seam.
                 emit_junction(&mut g, pf[0]);
@@ -817,12 +817,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     let a = seg(k);
                     if a != run {
                         set_seg_attrs(
-                            &mut g, a.0, a.1, layer, normal_fan, t, s, &mut cur_type,
+                            &mut g, a.kind, a.overhang, layer, normal_fan, t, s, &mut cur_type,
                             &mut cur_accel, &mut cur_pa, &mut cur_fan,
                             // Mid-bead: never touch PA (planner flush = blob).
                             None,
                         );
-                        rcoeff = bead / area * flow_factor_kind(a.0, path.flow, t);
+                        rcoeff =
+                            bead / area * flow_factor_kind(a.kind, path.flow, t) * a.flow as f64;
                         run = a;
                     }
                     let f = pf[i];
@@ -1855,6 +1856,10 @@ fn plan_layer_travels(
 ) {
     let mut last_pos = entry_pos;
     let mut last_tool = entry_tool;
+    // The kind the nozzle last printed — the travel policy needs to know whether
+    // it is leaving a buried bead or a visible surface. `None` at layer entry
+    // (the previous layer's exit) is treated as visible: the conservative side.
+    let mut last_kind: Option<PathKind> = None;
     let mut travels: Vec<Travel> = Vec::with_capacity(plan.paths.len());
     let mut comb: Option<CombGraph> = None;
     for path in &plan.paths {
@@ -1901,37 +1906,52 @@ fn plan_layer_travels(
                 }
             }
             Some(prev) if !travel_blocked(&plan.outline, prev, start) => {
-                // A clear in-material straight glides unretracted — but cap it at
-                // the same length as a combed route: a long straight glide drools
-                // the melt pressure out just as a combed one does, so past the
-                // threshold retract (no hop — it stays over the part). Vase mode is
-                // exempt: its whole point is one continuous unretracted extrusion.
-                Travel {
-                    points: vec![start],
-                    retract: !s.spiral_vase
-                        && dist_mm(prev, start) > COMB_RETRACT_MM
-                        && s.retract_len_mm > 0.0,
-                    hop: false,
-                }
+                // A clear in-material straight: how it travels depends on WHOSE
+                // material it glides over. Between two BURIED beads (internal
+                // fill nobody will ever see) an unretracted glide is free — cap
+                // it only at the melt-pressure drool threshold, no hop. But a
+                // travel that starts or ends on anything VISIBLE — a skin, a
+                // wall, gap fill — drags a pressurized tip at bead height
+                // across a surface that never gets covered again: drool
+                // trails and shear scars (the step-surface glides the audit
+                // reproduced). Those retract past a short floor AND hop clear
+                // of the bead crowns — the reference slicer's known-good
+                // output on this printer retracts + lifts on every one. Vase
+                // mode is exempt: its whole point is one continuous
+                // unretracted extrusion.
+                let d = dist_mm(prev, start);
+                let surface = !(last_kind.is_some_and(buried_kind) && buried_kind(path.kind));
+                let retract = !s.spiral_vase
+                    && s.retract_len_mm > 0.0
+                    && (d > COMB_RETRACT_MM || (surface && d > SURFACE_RETRACT_MM));
+                Travel { points: vec![start], retract, hop: retract && surface && s.z_hop_mm > 0.0 }
             }
             Some(prev) => {
                 let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
                 match graph.route(&plan.outline, prev, start) {
                     Some(route) => {
                         // Combing exists to glide over material unretracted,
-                        // but a long glide still drools the melt pressure out
-                        // and the next bead starts starved — retract past the
-                        // threshold (no hop: the route stays over the part).
+                        // but the same surface rule as the straight glide
+                        // applies: buried-to-buried combs freely (retract only
+                        // past the drool threshold, no hop); a route touching
+                        // visible surfaces retracts past the short floor and
+                        // hops — the route still steers over the part, the
+                        // lift keeps the tip off the finished crowns.
                         let mut len = 0.0;
                         let mut at = prev;
                         for &p in &route {
                             len += dist_mm(at, p);
                             at = p;
                         }
+                        let surface =
+                            !(last_kind.is_some_and(buried_kind) && buried_kind(path.kind));
+                        let retract = s.retract_len_mm > 0.0
+                            && (len > COMB_RETRACT_MM
+                                || (!s.spiral_vase && surface && len > SURFACE_RETRACT_MM));
                         Travel {
                             points: route,
-                            retract: len > COMB_RETRACT_MM && s.retract_len_mm > 0.0,
-                            hop: false,
+                            retract,
+                            hop: retract && surface && s.z_hop_mm > 0.0,
                         }
                     }
                     None => Travel {
@@ -1943,6 +1963,7 @@ fn plan_layer_travels(
             }
         };
         last_pos = Some(path_exit(path, plan.index, s));
+        last_kind = Some(path.kind);
         last_tool = Some(path.tool);
         travels.push(travel);
     }
@@ -2067,15 +2088,33 @@ pub fn format_duration(seconds: f64) -> String {
 /// filament estimate and the heat stats so the preview maps can't disagree
 /// with the totals.
 fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings) -> f64 {
+    let bead = config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale);
+    let n = path.points.len();
+    if n < 2 {
+        return 0.0;
+    }
+    // Per-segment when the attrs channel is present (a bridge stretch or a
+    // derated turnaround chord inside a continuous bead), else one flat factor.
+    if let Some(sa) = path.segs.as_ref().filter(|sa| !sa.is_empty()) {
+        let count = if path.closed { n } else { n - 1 };
+        let mut v = 0.0;
+        for k in 0..count {
+            let a = sa[k.min(sa.len() - 1)];
+            v += dist_mm(path.points[k], path.points[(k + 1) % n])
+                * bead
+                * flow_factor_kind(a.kind, path.flow, tool)
+                * a.flow as f64;
+        }
+        return v;
+    }
     let mut len = 0.0;
     for w in path.points.windows(2) {
         len += dist_mm(w[0], w[1]);
     }
-    if path.closed && path.points.len() >= 2 {
-        len += dist_mm(path.points[path.points.len() - 1], path.points[0]);
+    if path.closed {
+        len += dist_mm(path.points[n - 1], path.points[0]);
     }
-    len * config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale)
-        * flow_factor(path, tool)
+    len * bead * flow_factor(path, tool)
 }
 
 /// Extrusion-only seconds for one path at a total speed multiplier — the
@@ -2194,6 +2233,23 @@ const MIN_TRAVEL_MM: f64 = 0.8;
 /// material is combing's point, but a long enough glide drools the melt
 /// pressure out of the nozzle and the next bead starts starved.
 const COMB_RETRACT_MM: f64 = 30.0;
+
+/// Retract floor for a travel that starts or ends on a VISIBLE surface (see
+/// [`buried_kind`]). Buried-to-buried travels keep the generous
+/// [`COMB_RETRACT_MM`] glide; anything that could scar a finished face
+/// retracts almost immediately instead of dragging a pressurized tip across
+/// it. Above [`MIN_TRAVEL_MM`], so sub-bead repositioning still glides.
+const SURFACE_RETRACT_MM: f64 = 1.5;
+
+/// Is this bead BURIED — swallowed by later layers, so a nozzle gliding over
+/// it leaves nothing anyone will see? Only sparse infill and buried solid
+/// qualify. Everything else is visible on the finished part (walls and skins
+/// obviously; gap fill and bridges sit in or under visible faces; ironing runs
+/// over the top surface by definition), or is laid on bare bed (skirt/brim),
+/// where dragging melt is just as ugly.
+fn buried_kind(kind: PathKind) -> bool {
+    matches!(kind, PathKind::Infill | PathKind::Solid)
+}
 
 fn path_end(p: &ToolPath) -> Point {
     if p.closed {
@@ -2716,7 +2772,7 @@ mod tests {
     };
     use crate::{
         estimate_filament, estimate_filament_per_tool, estimate_seconds, generate, generate_parts,
-        per_layer_stats, to_gcode, LayerPlan, PathKind, ToolPath,
+        per_layer_stats, to_gcode, LayerPlan, PathKind, ToolPath, Travel,
     };
     use config::Settings;
     use geo2d::{Contour, Point, Polygons};
@@ -2818,6 +2874,59 @@ mod tests {
             planned_temp_c: None,
             temp_command_c: None,
         }]
+    }
+
+    #[test]
+    fn travels_touching_a_surface_retract_and_hop_buried_ones_glide() {
+        // The D5 policy. Same geometry, same 10 mm hop, one big solid outline
+        // so every travel is a CLEAR in-material straight — only the KINDS
+        // differ. Buried→buried (sparse infill) glides unretracted: nobody
+        // will ever see that bead. Anything touching a visible surface
+        // retracts AND hops, because a pressurized tip dragged at bead height
+        // across a finished face leaves a drool trail that never gets covered
+        // (the step-surface scars: 11.9/21.5/25.5 mm unretracted glides).
+        let mut s = Settings::default();
+        s.z_hop_mm = 0.4; // the hop half of the policy is profile-gated
+        assert!(s.retract_len_mm > 0.0 && !s.spiral_vase);
+        let hop = |from: PathKind, to: PathKind| -> Travel {
+            let mut l = one_layer(
+                vec![
+                    bead(from, false, vec![Point::from_mm(5.0, 5.0), Point::from_mm(6.0, 5.0)]),
+                    bead(to, false, vec![Point::from_mm(16.0, 5.0), Point::from_mm(17.0, 5.0)]),
+                ],
+                solid_outline(100.0, 100.0),
+            );
+            plan_travels(&mut l, &s);
+            l[0].travels[1].clone()
+        };
+        assert!(dist_mm(Point::from_mm(6.0, 5.0), Point::from_mm(16.0, 5.0)) < COMB_RETRACT_MM);
+        let buried = hop(PathKind::Infill, PathKind::Infill);
+        assert!(!buried.retract, "buried→buried glides: no retract under the drool cap");
+        assert!(!buried.hop, "and no hop");
+        let buried_solid = hop(PathKind::Solid, PathKind::Infill);
+        assert!(!buried_solid.retract, "buried solid is buried too");
+        for (from, to, what) in [
+            (PathKind::TopSkin, PathKind::TopSkin, "skin→skin"),
+            (PathKind::Infill, PathKind::TopSkin, "landing on skin"),
+            (PathKind::TopSkin, PathKind::Infill, "leaving skin"),
+            (PathKind::ExternalPerimeter, PathKind::Infill, "leaving an outer wall"),
+            (PathKind::Infill, PathKind::GapFill, "landing on gap fill"),
+        ] {
+            let t = hop(from, to);
+            assert!(t.retract, "{what} must retract");
+            assert!(t.hop, "{what} must hop clear of the bead crowns");
+        }
+        // Sub-bead repositioning still glides even on a surface: below
+        // MIN_TRAVEL_MM nothing is planned at all.
+        let mut tiny = one_layer(
+            vec![
+                bead(PathKind::TopSkin, false, vec![Point::from_mm(5.0, 5.0), Point::from_mm(6.0, 5.0)]),
+                bead(PathKind::TopSkin, false, vec![Point::from_mm(6.4, 5.0), Point::from_mm(7.0, 5.0)]),
+            ],
+            solid_outline(100.0, 100.0),
+        );
+        plan_travels(&mut tiny, &s);
+        assert!(!tiny[0].travels[1].retract, "a sub-bead reposition still glides");
     }
 
     #[test]
@@ -3299,7 +3408,9 @@ mod tests {
                 if let Some(p) = l.find('F') {
                     f = l[p + 1..].split_whitespace().next().unwrap().parse().unwrap_or(f);
                 }
-                if l.starts_with("G1 X") || l.starts_with("G1 ") && l.contains('E') {
+                // The first real MOTION sets the pace. A stationary retract or
+                // unretract (E-only, at retract speed) is not the skin's feed.
+                if l.starts_with("G1 ") && (l.contains(" X") || l.contains(" Y")) {
                     return f;
                 }
             }
@@ -3827,9 +3938,12 @@ mod tests {
         assert!(!wl[first_ex..].iter().any(|l| l.contains("G1 E-")), "no retraction inside the scarf loop");
 
         // Feathered ends: the first and last extruding moves of the loop carry
-        // near-zero E (a plain loop's are full-width).
+        // near-zero E (a plain loop's are full-width). MOTION moves only — the
+        // lead-in's unretract is a stationary E-only line whose full priming
+        // charge is not a loop deposit.
         let e_vals: Vec<f64> = wl[first_ex..]
             .iter()
+            .filter(|l| l.contains(" X") || l.contains(" Y"))
             .filter(|l| l.starts_with("G1 ") && l.contains(" E") && !l.contains(" E-"))
             .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
             .collect();

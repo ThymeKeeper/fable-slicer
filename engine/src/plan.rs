@@ -62,6 +62,12 @@ pub enum PathKind {
 pub struct SegAttr {
     pub kind: PathKind,
     pub overhang: f32,
+    /// Deposit multiplier for this segment (1.0 = normal). A boustrophedon
+    /// turnaround chord spliced by `connect_fill_runs` crosses a slot the
+    /// neighbouring beads' stadium shares already own, so it deposits at
+    /// [`FILL_JOINT_FLOW`] — same rationale as the emitter's `JUNCTION_FLOW`
+    /// for inter-path junction hops.
+    pub flow: f32,
 }
 
 /// A single continuous extrusion path.
@@ -2087,7 +2093,9 @@ fn plan_part(
         // wall beads (each perimeter loop stamped as a dilate−erode annulus of its
         // width). This is the target each skin line-end is walked out to, per bead, so
         // it meets the real wall edge (built from the beads, not a layer-offset guess).
-        let ftw = {
+        // `wall_band` is the stamped wall coverage itself — the clip tool that keeps
+        // line-pattern skin boundaries at the stadium kiss line (below).
+        let (ftw, wall_band) = {
             let mut band = Polygons::new();
             for wp in &paths {
                 if wp.points.len() < 2 {
@@ -2108,7 +2116,7 @@ fn plan_part(
                 };
                 band = union(&band, &bead);
             }
-            difference(&layers[i].polygons, &band)
+            (difference(&layers[i].polygons, &band), band)
         };
 
         // The sparse-infill region, captured for the gap-fill pass below: its
@@ -2643,6 +2651,25 @@ fn plan_part(
                 // a second bead over the bridge. Holding both the void-grow and the
                 // wall-reach out of `bridged` keeps the two fills from colliding.
                 let ftw_ex = if bridged.is_empty() { ftw.clone() } else { difference(&ftw, &bridged) };
+                // The stadium KISS line for line-pattern skins: a fill scanline's
+                // extreme centerline is anchored on the fill boundary, so that
+                // boundary must sit sp − lw/2 inside the wall bead's PHYSICAL
+                // inner edge (centers a full stadium spacing apart — flush
+                // tiling), minus the configured `infill_overlap` encroachment
+                // for bonding. Clipping at the physical edge itself (the old
+                // behavior) parked the extreme bead's centerline ON the wall
+                // and lapped it by ~half a width — the raised over-extruded
+                // frame around every top surface. Grown from `wall_band` (not
+                // an ftw inset) so only WALL-facing boundaries move: skin over
+                // bridged spans and joints with neighbouring fill stay put.
+                let kiss = (sp - lw * 0.5 - ov).max(0.0);
+                let wall_kiss = if regions.iter().any(|t| {
+                    !t.0.is_empty() && matches!(t.1, PathKind::TopSkin | PathKind::BottomSkin)
+                }) {
+                    offset(&wall_band, kiss)
+                } else {
+                    Polygons::new()
+                };
                 // A wide solid region gets NO concentric perimeter loop: alongside a
                 // wall the loop just doubles the perimeter bead (walls + solid in the
                 // same band, the user's complaint). Its fill pattern extends out to
@@ -2735,7 +2762,15 @@ fn plan_part(
                             &difference(&ftw_ex, inner),
                             &offset(&layers[i].polygons, -lw),
                         );
-                        union(&region, &intersection(&offset(&region, lw * 1.5), &void))
+                        let grown =
+                            union(&region, &intersection(&offset(&region, lw * 1.5), &void));
+                        if pattern == InfillPattern::Concentric {
+                            // Concentric skins inset their outer loop by lw/2
+                            // themselves — the kiss shave would open a gap ring.
+                            grown
+                        } else {
+                            difference(&grown, &wall_kiss)
+                        }
                     } else if pattern == InfillPattern::Concentric {
                         region.clone()
                     } else {
@@ -2757,32 +2792,44 @@ fn plan_part(
                             &fill, pattern, sp, pat_angle(pattern), lw, kind,
                             settings.seam_mode, i, layers[i].z_mm, monotone, &mut paths,
                         );
-                        // PER-BEAD reach: lengthen each line-end along its OWN direction
-                        // until it meets the wall edge (`ftw`) — the few tenths it needs.
-                        // Ends that border a wall extend; ends facing other infill don't
-                        // move. Applies to every solid kind, not just skins. (Targets full
-                        // `ftw`, NOT ftw−bridged: a bridge hole in the target would give a
-                        // solid end a near boundary to reach TO, pulling it onto the span.)
+                        // Connect-when-safe FIRST, while the line ends still sit at
+                        // the fill boundary: stitch the boustrophedon beads of a
+                        // solid/skin surface into continuous runs so the flow never
+                        // stops at a line end — only where the turnaround stays
+                        // inside the walls (a hole or concavity keeps its travel).
+                        // Order matters twice over. Before the END-REACH: connected
+                        // turnaround chords then run at the stadium kiss line —
+                        // half a bead inside the walls, legitimately filling the
+                        // slot between consecutive line ends — instead of splicing
+                        // ends already walked ONTO the wall edge into a full-flow
+                        // chord riding the wall bead (the raised stitched ridge
+                        // that framed every top surface). Before the BRIDGE SPLIT:
+                        // a bead that merely crosses an unsupported gap stays one
+                        // continuous run, and the split below then clips the
+                        // over-air span out of that run — the supported arcs keep
+                        // the turnarounds joining consecutive passes, instead of
+                        // the split fragmenting the surface before connect ever
+                        // sees it. Sparse is left untouched (its ends aren't
+                        // visible and connecting would add material and defeat the
+                        // sparseness).
+                        if matches!(kind, PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin) {
+                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
+                        }
+                        // PER-BEAD reach for the ends still OPEN after connecting —
+                        // run ends and the hole/concavity-facing turnarounds connect
+                        // refused: lengthen each along its OWN direction until it
+                        // meets the wall edge (`ftw`) — the few tenths it needs to
+                        // anchor. Ends that border a wall extend; ends facing other
+                        // infill don't move. Applies to every solid kind, not just
+                        // skins. (Targets full `ftw`, NOT ftw−bridged: a bridge
+                        // hole in the target would give a solid end a near boundary
+                        // to reach TO, pulling it onto the span.)
                         extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &ftw);
                         // Cut each bead at the support boundary: the stretch over open
                         // sparse becomes an internal bridge (bridge flow/speed), the rest
                         // keeps its kind — one continuous fill that steps at the boundary,
                         // not two regions. skin_bottom is over air (a bottom shell), not
                         // sparse, so it's left out.
-                        // Connect-when-safe, BEFORE the bridge split: stitch the
-                        // boustrophedon beads of a solid/skin surface into continuous
-                        // runs so the flow never stops at a line end — only where the
-                        // turnaround stays inside the walls (a hole or concavity keeps
-                        // its travel). Doing it first matters: a bead that merely crosses
-                        // an unsupported gap stays one continuous run, and the split below
-                        // then clips the over-air span out of that run — the supported
-                        // arcs keep the turnarounds joining consecutive passes, instead of
-                        // the split fragmenting the surface before connect ever sees it.
-                        // Sparse is left untouched (its ends aren't visible and connecting
-                        // would add material and defeat the sparseness).
-                        if matches!(kind, PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin) {
-                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
-                        }
                         if !bridge.is_empty() && matches!(kind, PathKind::Solid | PathKind::TopSkin) {
                             split_bridge_beads(&mut paths, n0, &bridge, &supported);
                             // A short solid arc threaded between two bridge spans is a
@@ -2826,29 +2873,36 @@ fn plan_part(
                     &sparse_fill, settings.sparse_pattern, spacing, pat_angle(settings.sparse_pattern), lw, PathKind::Infill,
                     settings.seam_mode, i, layers[i].z_mm, false, &mut paths,
                 );
-                // Same per-bead reach: a sparse line that runs into a WALL anchors to it;
-                // one facing other infill doesn't move. Target the non-solid part of the
-                // inside-walls region (ftw minus everything solid-filled) so an end facing
-                // a solid band stops AT that band — not dragged through it to the wall,
-                // which over-printed sparse across the solid (a line crossing the onion).
+                // Dense "sparse" (a lines cross-section at high density) prints
+                // as one serpentine, not hundreds of strokes — connect runs
+                // whose turnaround is bead-scale. Connect BEFORE the end-reach,
+                // same as solid: the turnaround chords then run at the fill
+                // boundary (half a bead inside `inner`), not spliced between
+                // ends already walked onto the wall edge — at density ~1.0
+                // those wall-riding chords were the same buried overstuff
+                // ridge the skins had. The jump cap IS the sparseness guard:
+                // at real sparse densities consecutive ends sit a full spacing
+                // apart and nothing qualifies, so classic sparse keeps its
+                // travels (its ends aren't visible and connectors would add
+                // unwanted material there). Join against the region the lines
+                // were clipped to (`sparse_fill` — grown by the interior-bond
+                // overlap), not `ftw`: the ends live up to `ov` outside the
+                // raw outline and would fail its test. Cap scales with the
+                // line spacing, so sparse connects at ANY density (connected
+                // rectilinear — the turnaround along the boundary bonds the
+                // ends and quiets hundreds of travels); the sp-based floor
+                // keeps dense staircase gaps stitching.
+                connect_fill_runs(&mut paths, n0, &sparse_fill, CONNECT_MAX_MM);
+                // Same per-bead reach, for the ends still open after connecting:
+                // a sparse line that runs into a WALL anchors to it; one facing
+                // other infill doesn't move. Target the non-solid part of the
+                // inside-walls region (ftw minus everything solid-filled) so an
+                // end facing a solid band stops AT that band — not dragged
+                // through it to the wall, which over-printed sparse across the
+                // solid (a line crossing the onion).
                 let sparse_anchor =
                     difference(&difference(&difference(&ftw, &solid), &narrow_lintel), &bridged);
                 extend_ends_to_wall(&mut paths[n0..], lw * 3.0, &sparse_anchor);
-                // Dense "sparse" (a lines cross-section at high density) prints
-                // as one serpentine, not hundreds of strokes — connect runs
-                // whose turnaround is bead-scale. The jump cap IS the
-                // sparseness guard: at real sparse densities consecutive ends
-                // sit a full spacing apart and nothing qualifies, so classic
-                // sparse keeps its travels (its ends aren't visible and
-                // connectors would add unwanted material there). Join against
-                // the region the lines were clipped to (`sparse_fill` — grown
-                // by the interior-bond overlap), not `ftw`: the ends live up
-                // to `ov` outside the raw outline and would fail its test.
-                // Cap scales with the line spacing, so sparse connects at ANY
-                // density (connected rectilinear — the turnaround along the
-                // boundary bonds the ends and quiets hundreds of travels);
-                // the sp-based floor keeps dense staircase gaps stitching.
-                connect_fill_runs(&mut paths, n0, &sparse_fill, CONNECT_MAX_MM);
                 // Beads sweeping an ABSORBED tiny void get the airborne
                 // treatment mid-bead: cut at the void boundary, the crossing
                 // stretch re-kinded to bridge flow/speed/cooling — one
@@ -3216,6 +3270,14 @@ fn is_annular(region: &Polygons) -> bool {
 /// the extra bead, whatever the geometry.
 const CONNECT_MAX_MM: f64 = 4.0;
 
+/// Deposit multiplier for a boustrophedon turnaround chord spliced by
+/// [`connect_fill_runs`]: the slot it crosses sits between two beads whose
+/// stadium shares already own it, so full flow there is pure extra material
+/// (the stitched over-extruded frame the audit measured on every solid
+/// surface). 0.30 mirrors the emitter's `JUNCTION_FLOW` for inter-path
+/// junction hops — enough to bond the ends, not enough to ridge.
+const FILL_JOINT_FLOW: f32 = 0.30;
+
 /// A region is a NARROW ring-band (worth filling concentric) when it vanishes once
 /// eroded by a ring-band's half-width (`NARROW_FILL_BEADS`) — i.e. it's thin enough
 /// everywhere that a scanline across it would be short stubs dead-ending at the wall
@@ -3531,6 +3593,8 @@ fn merge_bridge_connectors(paths: &mut [ToolPath], cap: f64) {
             && (at_bridge(tp.points[0]) || at_bridge(*tp.points.last().unwrap()))
         {
             tp.kind = PathKind::InternalBridge;
+            // Whole-path re-kind: stale per-seg kinds would override it in emit.
+            tp.segs = None;
         }
     }
 }
@@ -3578,6 +3642,9 @@ fn split_bridge_beads(paths: &mut Vec<ToolPath>, start: usize, bridge: &Polygons
         if solid_total < MIN_BRIDGE_SPAN_MM {
             let mut tp = bead;
             tp.kind = PathKind::InternalBridge;
+            // The whole bead re-kinds: stale per-seg kinds (from a connect
+            // splice) would override the bridge flow/speed in emit — drop them.
+            tp.segs = None;
             paths.push(tp);
             continue;
         }
@@ -3602,6 +3669,12 @@ fn split_bridge_beads(paths: &mut Vec<ToolPath>, start: usize, bridge: &Polygons
                 tp.kind = kind;
                 tp.points = points;
                 tp.closed = closed;
+                // The clip re-vertexed the piece: the cloned per-point/per-seg
+                // channels no longer line up — drop them (each piece is
+                // uniform-kind; the re-connect after the split splices fresh
+                // derated turnaround chords where they belong).
+                tp.segs = None;
+                tp.widths = None;
                 paths.push(tp);
             }
         }
@@ -3733,12 +3806,12 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
         // (see ToolPath::segs), so it prints as one continuous bead with a single seam
         // instead of a pile of split arcs — cohesion without losing the per-stretch
         // overhang treatment.
-        let mut attrs = vec![SegAttr { kind: path.kind, overhang: 0.0 }; segs];
+        let mut attrs = vec![SegAttr { kind: path.kind, overhang: 0.0, flow: 1.0 }; segs];
         for (deg_run, idxs, _) in &merged {
             let a = if *deg_run > 0.0 {
-                SegAttr { kind: PathKind::OverhangWall, overhang: *deg_run }
+                SegAttr { kind: PathKind::OverhangWall, overhang: *deg_run, flow: 1.0 }
             } else {
-                SegAttr { kind: path.kind, overhang: 0.0 }
+                SegAttr { kind: path.kind, overhang: 0.0, flow: 1.0 }
             };
             for &k in idxs {
                 attrs[k] = a;
@@ -3995,9 +4068,11 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
     if paths.len() < start + 2 {
         return;
     }
-    // The bead ends sit ON the wall edge (extend_ends_to_wall stopped them there), so
-    // test joins against the walls grown a hair — otherwise an on-edge sample reads as
-    // "outside" and every flat-wall turnaround is wrongly rejected.
+    // Bead ends can sit ON the wall edge (the post-split and sparse calls run after
+    // extend_ends_to_wall walked them there; first-pass solid ends sit inside, at the
+    // fill boundary), so test joins against the walls grown a hair — otherwise an
+    // on-edge sample reads as "outside" and every flat-wall turnaround is wrongly
+    // rejected.
     // Slack scales with the jump cap (~half a bead at dense fill): a
     // turnaround chord between two staircase step-ends dips outside the
     // region between the teeth by up to the stair depth — a bead edge
@@ -4376,11 +4451,36 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
                 let joined = if flip { *bead.points.last().unwrap() } else { bead.points[0] };
                 kill_tip(end);
                 kill_tip(joined);
-                if flip {
-                    runs[i].points.extend(bead.points.iter().rev().copied());
-                } else {
-                    runs[i].points.extend(bead.points);
+                // Splice the turnaround chord DERATED: the slot it crosses is
+                // already owned by the two joined beads' stadium shares, so a
+                // full-flow chord is pure extra material — measured as the
+                // stitched over-extruded frame on every solid surface. The
+                // segs channel carries the derate (emit reads seg.flow); both
+                // sides materialize their default attrs so the channel stays
+                // in lockstep with the points.
+                let r = &mut runs[i];
+                let mut segs: Vec<SegAttr> = r.segs.take().unwrap_or_else(|| {
+                    vec![
+                        SegAttr { kind: r.kind, overhang: r.overhang, flow: 1.0 };
+                        r.points.len() - 1
+                    ]
+                });
+                segs.push(SegAttr { kind: r.kind, overhang: r.overhang, flow: FILL_JOINT_FLOW });
+                match &bead.segs {
+                    Some(bs) if flip => segs.extend(bs.iter().rev().copied()),
+                    Some(bs) => segs.extend(bs.iter().copied()),
+                    None => segs.extend(std::iter::repeat_n(
+                        SegAttr { kind: bead.kind, overhang: bead.overhang, flow: 1.0 },
+                        bead.points.len() - 1,
+                    )),
                 }
+                if flip {
+                    r.points.extend(bead.points.iter().rev().copied());
+                } else {
+                    r.points.extend(bead.points);
+                }
+                debug_assert_eq!(segs.len(), r.points.len() - 1);
+                r.segs = Some(segs);
             }
             None => runs.push(bead),
         }
@@ -4529,7 +4629,7 @@ fn spiral_to_toolpath(points: Vec<Point>, kinds: &[PathKind], lw: f64) -> ToolPa
     let base = kinds.first().copied().unwrap_or(PathKind::Perimeter);
     let mut tp = ToolPath::new(base, false, lw, points);
     if kinds.iter().any(|&k| k != base) {
-        tp.segs = Some(kinds.iter().map(|&k| SegAttr { kind: k, overhang: 0.0 }).collect());
+        tp.segs = Some(kinds.iter().map(|&k| SegAttr { kind: k, overhang: 0.0, flow: 1.0 }).collect());
     }
     tp
 }
@@ -6512,7 +6612,7 @@ mod tests {
                 .map(|&(x, y)| Point::from_mm(x, y))
                 .collect(),
         );
-        let mut segs = vec![SegAttr { kind: PathKind::Perimeter, overhang: 0.0 }; 4];
+        let mut segs = vec![SegAttr { kind: PathKind::Perimeter, overhang: 0.0, flow: 1.0 }; 4];
         segs[0].overhang = 0.5; // the stroke's FIRST segment, pre-reversal
         donor.segs = Some(segs);
         let ext = ring(
@@ -6791,8 +6891,13 @@ mod tests {
         // OverhangWall paths and no overhang segments.
         let next = plans.iter().find(|p| p.print_z_mm > first_slab.print_z_mm).unwrap();
         assert_eq!(count(next, PathKind::OverhangWall), 0, "supported layer must not slow");
+        // Fill runs may carry segs (turnaround-chord derates) — what a supported
+        // layer must NOT carry is any OverhangWall segment.
         assert!(
-            next.paths.iter().all(|p| p.segs.is_none()),
+            next.paths.iter().all(|p| p
+                .segs
+                .as_ref()
+                .is_none_or(|sa| sa.iter().all(|a| a.kind != PathKind::OverhangWall))),
             "a fully-supported layer has no overhang segments"
         );
     }
@@ -7608,6 +7713,79 @@ mod tests {
 
     fn path_len_mm(p: &ToolPath) -> f64 {
         p.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum()
+    }
+
+    /// Deposited volume of one path: per-segment length × stadium bead area,
+    /// honoring the per-point width profile, closure, and the flow multiplier —
+    /// the same accounting the emitter uses for E.
+    fn path_volume_mm3(p: &ToolPath, h: f64) -> f64 {
+        let n = p.points.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let m = if p.closed { n } else { n - 1 };
+        let mut v = 0.0;
+        for j in 0..m {
+            let len = pt_dist_mm(p.points[j], p.points[(j + 1) % n]);
+            let w = match &p.widths {
+                Some(ws) if ws.len() == n => (ws[j] + ws[(j + 1) % n]) * 0.5,
+                _ => p.width_mm,
+            };
+            let seg_flow = match &p.segs {
+                Some(sa) if !sa.is_empty() => sa[j.min(sa.len() - 1)].flow as f64,
+                _ => 1.0,
+            };
+            v += len * config::bead_area_mm2(w, h * p.height_scale) * p.flow * seg_flow;
+        }
+        v
+    }
+
+    #[test]
+    fn solid_layers_tile_without_overstuffing() {
+        // The audit's headline metric as a regression: on a fully solid part,
+        // walls + fill must TILE each layer — deposited volume ≈ slice area ×
+        // layer height. The old order clipped skin at the wall bead's physical
+        // edge and walked every line end onto it BEFORE connecting, so the
+        // turnaround chords re-deposited full-flow along the wall junction
+        // (~+2.5% per visible layer — the raised stitched frame on every top
+        // surface). Same mechanism buried, via density-1.0 sparse.
+        let mesh =
+            mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 20.0, 20.0, 2.0]]));
+        let mut s = Settings::default();
+        s.wall_count = 3;
+        s.top_layers = 3;
+        s.bottom_layers = 2;
+        s.infill_density = 1.0;
+        s.skirt_loops = 0;
+        s.sparse_pattern = InfillPattern::Lines;
+        s.solid_pattern = InfillPattern::Lines;
+        s.top_pattern = InfillPattern::Lines;
+        s.bottom_pattern = InfillPattern::Lines;
+        let plans = generate(&mesh, &s);
+        let h = s.layer_height_mm;
+        let expect = 20.0 * 20.0 * h;
+        // Skip layer 0 (its height/flow legitimately differ). The top layer is
+        // the visible-skin case; the middle one is the buried density-1.0 case.
+        for l in [&plans[plans.len() / 2], &plans[plans.len() - 1]] {
+            let vol: f64 = l.paths.iter().map(|p| path_volume_mm3(p, h)).sum();
+            assert!(
+                vol <= expect * 1.015,
+                "layer {} overstuffed: {:.2} vs {:.2} mm³ (+{:.1}%) — fill is \
+                 lapping the walls or splicing full-flow chords along them",
+                l.index,
+                vol,
+                expect,
+                (vol / expect - 1.0) * 100.0
+            );
+            assert!(
+                vol >= expect * 0.94,
+                "layer {} underfilled: {:.2} vs {:.2} mm³ ({:.1}%)",
+                l.index,
+                vol,
+                expect,
+                (vol / expect - 1.0) * 100.0
+            );
+        }
     }
 
     #[test]

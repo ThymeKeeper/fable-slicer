@@ -29,6 +29,13 @@ first_layer_speed_mm_s = 55.0
 
 retract_speed_mm_s = 40.0
 
+# Lift on every retracted travel. The retract policy (emit.rs) now retracts
+# whenever a travel starts or ends on a VISIBLE bead; the hop is what keeps the
+# tip off the finished crowns on the way. Orca's known-good Sovol profile lifts
+# 0.4 on effectively every travel (retract_lift_below 150 = the whole machine),
+# and a direct-drive Klipper toolhead pays almost nothing for it.
+z_hop_mm = 0.4
+
 # Beyond the toolhead part fan: an auxiliary side fan and a chamber exhaust,
 # driven Orca/Bambu-style as M106 P2 / M106 P3 (Sovol's Klipper maps them).
 # Duties live in the filament tier (aux_fan_speed / exhaust_fan_speed).
@@ -41,7 +48,9 @@ exhaust_fan = true
 chamber_sensor = "chamber_temp"
 
 # Printer connection (Moonraker): uncomment to enable Send / Send & print.
-# host_url = "sovol-zero.local"
+# Static IP set on the machine itself, outside the router's DHCP pool — .133
+# was static-inside-the-pool and collided with the TV, which cost an evening.
+host_url = "192.168.1.240"
 # api_key = ""
 
 # Stock firmware defines bare START_PRINT / END_PRINT macros that take no
