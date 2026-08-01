@@ -451,6 +451,40 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             }
         }
 
+        // LAYER CHANGE — retract BEFORE lifting to the new layer. The nozzle is
+        // parked on the last bead of the previous layer still under melt
+        // pressure, and that last bead is normally the outer wall's seam: a Z
+        // move with a charged nozzle bleeds pressure straight down onto it, and
+        // because the seam sits at the same XY every layer the ooze stacks into
+        // a blob column — the seam defect a scarf can't touch, because the
+        // scarf has already finished feathering by the time this happens.
+        // This is the same retract the first path's travel was going to do; it
+        // just has to happen on this side of the lift, so the loop below skips
+        // it (`hoisted_retract`) and only unretracts on arrival.
+        let first_printable = layer
+            .paths
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.points.len() >= 2)
+            .map(|(i, p)| (i, p.tool));
+        let mut hoisted_retract: Option<usize> = None;
+        if let Some((i0, tool0)) = first_printable {
+            let rlen = tools.get(cur_tool).retract_len_mm;
+            // Not on a tool boundary: the toolchange block runs its own
+            // pre-dock retract with the outgoing tool's distance.
+            let toolchange = multi && tool0 != cur_tool;
+            if layer.travels[i0].retract && rlen > 0.0 && !toolchange {
+                g.retract(rlen, retract_f);
+                if s.wipe_mm > 0.0 {
+                    if let Some(tail) = &wipe_tail {
+                        for p in tail {
+                            g.travel(p.x_mm(), p.y_mm(), travel_f);
+                        }
+                    }
+                }
+                hoisted_retract = Some(i0);
+            }
+        }
         g.move_z(layer.print_z_mm, travel_f);
         let mut cur_z = layer.print_z_mm;
 
@@ -460,7 +494,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 continue;
             }
             let tr = &layer.travels[i];
-            let mut retract_done = false;
+            let mut retract_done = hoisted_retract == Some(i);
             let mut force_z = false;
             // Tool boundary: swap heads before the lead-in travel. The planned
             // travel already carries retract+hop (plan_travels is tool-aware);
@@ -2874,6 +2908,40 @@ mod tests {
             planned_temp_c: None,
             temp_command_c: None,
         }]
+    }
+
+    #[test]
+    fn layer_change_retracts_before_lifting_off_the_seam() {
+        // The seam blob column. A layer ends on the outer wall's seam with the
+        // nozzle charged; if Z rises before the retract, melt pressure bleeds
+        // straight down onto that seam, and since the seam sits at the same XY
+        // every layer the ooze stacks into a visible column. The scarf can't
+        // help — it has finished feathering by then. So on every layer change
+        // that retracts at all, the retract must come FIRST.
+        let mut s = Settings::default();
+        s.wall_count = 3;
+        s.top_layers = 2;
+        s.bottom_layers = 2;
+        s.skirt_loops = 0;
+        s.z_hop_mm = 0.4;
+        let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
+        let mut checked = 0;
+        for n in 2..12 {
+            let chunk = layer_chunk(&g, n);
+            let retract = chunk.lines().position(|l| l.starts_with("G1 E-"));
+            let lift = chunk
+                .lines()
+                .position(|l| l.starts_with("G1 Z") && !l.contains(" X") && !l.contains(" E"));
+            if let (Some(r), Some(z)) = (retract, lift) {
+                assert!(
+                    r < z,
+                    "layer {n}: Z lifted at line {z} before the retract at line {r} — \
+                     the nozzle bleeds pressure onto the seam it just closed"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 5, "expected several layer changes to exercise this, got {checked}");
     }
 
     #[test]
