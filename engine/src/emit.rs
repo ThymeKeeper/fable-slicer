@@ -1293,23 +1293,18 @@ fn nominal_speed_mm_s(
         // Internal bridge: the first buried solid layer over low-density sparse,
         // spanning mostly air between the infill lines — print it at bridge speed.
         PathKind::InternalBridge => tool.bridge_speed_mm_s,
-        // Wall stretches past the layer below print at overhang tiers, matched
-        // to the reference profile (50/30/20 mm/s as the bead goes from a
-        // quarter unsupported to fully airborne). The old continuous ramp let
-        // moderately-unsupported beads coast at 78-113 mm/s — the melt has to
-        // freeze onto whatever support it has before the nozzle drags it, and
-        // that takes a hard slowdown, not a graded one.
+        // Wall stretches past the layer below print at overhang tiers matched
+        // to the reference profile: a fired degree means at least half the
+        // bead is on air — 30 mm/s there (the reference's 50-75% tier), the
+        // floor once three quarters hang (its 75-100% tier). The old
+        // continuous ramp let those beads coast at 78-113 mm/s — the melt
+        // has to freeze onto whatever support it has before the nozzle drags
+        // it, and that takes a hard slowdown, not a graded one.
         PathKind::OverhangWall => {
             let ceiling = s.external_perimeter_speed_mm_s;
             let floor = s.overhang_speed_mm_s;
             let d = (overhang as f64).clamp(0.0, 1.0);
-            let tier = if d <= 0.25 {
-                50.0
-            } else if d <= 0.5 {
-                30.0
-            } else {
-                floor
-            };
+            let tier = if d <= 0.5 { 30.0 } else { floor };
             tier.clamp(floor, ceiling)
         }
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
@@ -1610,7 +1605,7 @@ fn pa_for_kind(kind: PathKind, overhang: f32, tool: &ToolSettings) -> f64 {
 fn set_seg_attrs(
     g: &mut GcodeBuilder,
     kind: PathKind,
-    _overhang: f32,
+    overhang: f32,
     layer: &LayerPlan,
     normal_fan: u32,
     tool: &ToolSettings,
@@ -1646,14 +1641,16 @@ fn set_seg_attrs(
     let want_fan = if layer.index < tool.fan_off_layers {
         normal_fan
     } else {
-        // A bead over air gets the full cooling ceiling outright — the melt
-        // must freeze the moment it lands or it sags. Grading the boost by
-        // overhang degree left drooping mid-tier overhangs (and churned an
-        // M106 per degree step); the reference prints run flat-out here.
+        // A bead laid mostly onto AIR gets the full cooling ceiling outright
+        // — the melt must freeze the moment it lands or it sags. A bead that
+        // merely leans past its support does NOT: blasting 80% on every
+        // gently-sloped outer wall from layer 3 up chilled an ASA part into
+        // lifting off the bed (the reference print's bursts are confined to
+        // its truly airborne ceiling rings, and brief). Mild overhang keeps
+        // the tier speeds and the layer-time ladder duty via the max() below.
         let frac = match kind {
-            PathKind::Bridge | PathKind::BottomSkin | PathKind::OverhangWall => {
-                tool.bridge_fan_speed
-            }
+            PathKind::Bridge | PathKind::BottomSkin => tool.bridge_fan_speed,
+            PathKind::OverhangWall if overhang as f64 > 0.5 => tool.bridge_fan_speed,
             _ => tool.fan_speed,
         };
         ((frac.clamp(0.0, 1.0) * 255.0).round() as u32).max(normal_fan)
@@ -4195,17 +4192,17 @@ mod tests {
         {
             let at =
                 |deg: f32| super::nominal_speed_mm_s(PathKind::OverhangWall, deg, 1, &tool, &s);
-            assert_eq!(at(0.25), 50.0, "quarter-unsupported tier");
-            assert_eq!(at(0.5), 30.0, "half-unsupported tier");
+            assert_eq!(at(0.25), 30.0, "half-the-bead-on-air tier");
+            assert_eq!(at(0.5), 30.0, "half-to-three-quarters tier");
             assert_eq!(at(0.75), 20.0, "airborne floor");
             assert_eq!(at(1.0), 20.0, "airborne floor");
             assert!(at(0.25) >= at(0.5) && at(0.5) >= at(1.0), "monotone");
         }
         // A slow outer wall caps the tiers; a slower floor still wins below.
-        s.external_perimeter_speed_mm_s = 40.0;
+        s.external_perimeter_speed_mm_s = 25.0;
         let tool = s.flat_tool("x".into());
         let at = |deg: f32| super::nominal_speed_mm_s(PathKind::OverhangWall, deg, 1, &tool, &s);
-        assert_eq!(at(0.25), 40.0, "tier clamped to the wall ceiling");
+        assert_eq!(at(0.25), 25.0, "tier clamped to the wall ceiling");
         assert_eq!(at(1.0), 20.0, "floor unaffected by the ceiling clamp");
     }
 

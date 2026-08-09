@@ -2019,15 +2019,19 @@ fn plan_part(
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
             let mut walls = if layer.index > 0 && !settings.spiral_vase {
-                // Shrink the support reference a quarter bead inside the layer
-                // below: a wall counts as overhanging once ~25% of its width
-                // rides on air (the reference slicer's threshold), not only
-                // after its centerline has left the support entirely. The
-                // elephant-foot inset is a command-side trim of a first-layer
-                // bead that physically squishes back out — undo it for layer
-                // 1's reference so the whole wall isn't misread as overhang.
+                // Support reference: the layer below grown by a jitter guard.
+                // A wall classifies as overhang only once its CENTERLINE is
+                // past the support — i.e. at least half the bead on air.
+                // (A quarter-bead-inside reference sounded like the reference
+                // slicer's configured 25% tier, but measurement shows that
+                // tier never fires there: the gold print leaves 25-50%-
+                // unsupported stretches at full wall pace, and firing on them
+                // pulsed 80% fan at the part rim every layer — enough chill
+                // to lift ASA off the bed. The elephant-foot inset is a
+                // command-side trim of a first-layer bead that physically
+                // squishes back out — undo it for layer 1's reference.)
                 let ef = if layer.index == 1 { settings.elephant_foot_mm.max(0.0) } else { 0.0 };
-                let below = offset(&phys[layer.index - 1], ef - lw * 0.25);
+                let below = offset(&phys[layer.index - 1], ef + 0.05);
                 let unsupported = difference(&layer.polygons, &below);
                 if unsupported.is_empty() {
                     walls
@@ -3727,16 +3731,14 @@ fn in_polys(polys: &Polygons, p: Point) -> bool {
     inside
 }
 
-/// Mark wall stretches past their support as `OverhangWall`. `below` arrives
-/// SHRUNK a quarter line width inside the previous layer's outline, so a bead
-/// counts as overhanging as soon as ~a quarter of its width hangs over air —
-/// not only once its centerline has already left the support (which waited
-/// until half the bead dangled and let near-threshold stretches coast at full
-/// wall speed). The degree is quantized to quarter steps aligned with the
-/// overhang speed tiers, rounding UP: when a stretch straddles a tier edge,
-/// the slower tier wins. Runs shorter than a few mm dissolve into whichever
-/// neighbour hangs harder — a crumb absorbed by the slower band prints safe;
-/// absorbed by the faster band it droops.
+/// Mark wall stretches whose centerline is past their support (at least half
+/// the bead on air) as `OverhangWall`. The degree is the distance past the
+/// support edge over the line width — so a fired degree d means ~(50 + d/2·
+/// 100)% of the bead is unsupported — quantized to quarter steps aligned
+/// with the overhang speed tiers, rounding UP: when a stretch straddles a
+/// tier edge, the slower tier wins. Runs shorter than a few mm dissolve into
+/// whichever neighbour hangs harder — a crumb absorbed by the slower band
+/// prints safe; absorbed by the faster band it droops.
 fn slow_overhanging_walls(
     walls: Vec<ToolPath>,
     below: &Polygons,
@@ -3744,10 +3746,11 @@ fn slow_overhanging_walls(
     bridge_flow: f64,
 ) -> Vec<ToolPath> {
     let min_run_mm = 3.0_f64.max(lw * 2.0);
-    // Degree ≈ (unsupported fraction of the bead) − 0.25, in quarter steps:
-    // 0.25 → a quarter to half the bead over air, … , 0.75+ → fully airborne.
-    // Distance is computed only for the few beads actually outside support;
-    // supported beads short-circuit to 0 (the common case).
+    // Degree = distance past the support edge / line width, in quarter
+    // steps: 0.25 → just past the centerline (~half the bead on air), 1.0 →
+    // a full line width out (fully airborne, and then some). Distance is
+    // computed only for the few beads actually outside support; supported
+    // beads short-circuit to 0 (the common case).
     let degree_at = |p: Point| -> f32 {
         if in_polys(below, p) {
             return 0.0;
@@ -3767,8 +3770,9 @@ fn slow_overhanging_walls(
     };
     // A bead most of whose width rides on air needs a round strand's worth of
     // plastic (a bridge bead), not a squished stadium's — ramp the flow up as
-    // the support disappears so airborne rings have the stiffness and shoulder
-    // contact to span. Supported and lightly-overhanging beads are untouched.
+    // the support disappears (degree 0.5 ≈ three quarters of the bead on air)
+    // so airborne rings have the stiffness and shoulder contact to span.
+    // Supported and lightly-overhanging beads are untouched.
     let flow_for = |deg: f32| -> f32 {
         let d = deg as f64;
         if d <= 0.5 { 1.0 } else { (1.0 + (bridge_flow - 1.0) * ((d - 0.5) / 0.5)) as f32 }
