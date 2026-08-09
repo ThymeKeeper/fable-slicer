@@ -168,13 +168,15 @@ fn medial_axis_inner(
     }
 
     // --- post: twig cull + endpoint extension ------------------------------
-    // Split off polylines that dangle (a free end) and are shorter than two
-    // max widths — spurious ribs the Voronoi grows into corners, plus
+    // Split off polylines that dangle (a free end) and are shorter than one
+    // max width — spurious ribs the Voronoi grows into corners, plus
     // genuinely sub-bead specks. They return separately so the caller can
     // absorb the real ones into neighbouring beads instead of leaving pinholes.
+    // (Two max widths also culled every legitimate short wedge bead before
+    // the emit gate ever measured it.)
     let (out, runts): (Vec<_>, Vec<_>) = out
         .into_iter()
-        .partition(|tp| !((tp.endpoints.0 || tp.endpoints.1) && tp.length_mm() < 2.0 * max_w_mm));
+        .partition(|tp| !((tp.endpoints.0 || tp.endpoints.1) && tp.length_mm() < max_w_mm));
     // Culling ribs drops their junctions to degree 2; rejoin the through-runs so
     // a curved sliver is one bead, not a string of short fragments.
     let mut out = concat_chains(out);

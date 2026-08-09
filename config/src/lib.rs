@@ -112,12 +112,18 @@ impl Material {
         }
     }
     /// Part-fan duty (1.0 = 100%) and the layers to keep it off.
+    ///
+    /// The bridge duty doubles as the cooling ceiling: overhangs/bridges get
+    /// it outright, and short layers ramp the base duty toward it (see
+    /// engine cooling). ABS/ASA at 0.5 left overhangs drooping that the
+    /// reference Orca print rescues at 0.8 — draft-sensitive materials are
+    /// protected by the low BASE duty, not by capping the ceiling.
     pub fn fan(self) -> (f64, f64, usize) {
         // (fan, bridge fan, fan-off layers)
         match self {
             Self::Pla => (1.0, 1.0, 1),
             Self::Petg => (0.5, 0.8, 3),
-            Self::Abs => (0.15, 0.5, 3),
+            Self::Abs => (0.15, 0.8, 3),
             Self::Tpu => (0.7, 1.0, 1),
             Self::Other => (1.0, 1.0, 1),
         }
@@ -141,11 +147,14 @@ impl Material {
         }
     }
     /// Aux-fan and chamber-exhaust duties (machines that declare them).
+    /// ABS/ASA keeps both OFF: bleeding a warm chamber and blowing air
+    /// across the part costs layer adhesion and invites warp — the sealed
+    /// still chamber is part of what makes the reference prints work.
     pub fn aux_exhaust(self) -> (f64, f64) {
         match self {
             Self::Pla => (0.75, 0.8),
             Self::Petg => (0.4, 0.4),
-            Self::Abs => (0.1, 0.1),
+            Self::Abs => (0.0, 0.0),
             Self::Tpu => (0.3, 0.5),
             Self::Other => (0.5, 0.5),
         }
@@ -724,14 +733,17 @@ impl Default for Settings {
             external_perimeter_speed_mm_s: 25.0,
             solid_speed_mm_s: 40.0,
             support_speed_mm_s: 45.0,
-            bridge_speed_mm_s: 10.0,
-            overhang_speed_mm_s: derived_overhang_speed_mm_s(50.0),
+            bridge_speed_mm_s: 25.0,
+            overhang_speed_mm_s: derived_overhang_speed_mm_s(25.0),
             min_layer_time_s: 8.0,
             min_print_speed_mm_s: 10.0,
             max_volumetric_speed_mm3_s: 15.0,
             max_flow_derate_per_c: 0.3,
             extrusion_multiplier: 1.0,
-            bridge_flow: 1.5,
+            // ~ the round-strand area over the stadium bead at 0.4/0.2: a
+            // bead laid onto air needs a full round cross-section to have
+            // the stiffness and shoulder contact to span without drooping.
+            bridge_flow: 1.75,
             bridge_foothold_mm: 0.9,
             pressure_advance: 0.0,
             fan_speed: 1.0,
@@ -1201,9 +1213,11 @@ pub fn derived_support_speed_mm_s(print_speed_mm_s: f64, flow_cap_mm_s: f64) -> 
     (print_speed_mm_s * 0.9).min(flow_cap_mm_s)
 }
 
-/// Auto overhang-wall speed: same as bridges — both lay beads onto air.
+/// Auto overhang-wall speed floor for a fully-floating bead. 20 mm/s is the
+/// pace the reference prints use for their worst overhangs; it only drops
+/// below that if the user slows bridges further still.
 pub fn derived_overhang_speed_mm_s(bridge_speed_mm_s: f64) -> f64 {
-    bridge_speed_mm_s
+    bridge_speed_mm_s.min(20.0)
 }
 
 /// Auto outer-wall acceleration: half the main acceleration — gentle direction

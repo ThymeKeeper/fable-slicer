@@ -4,10 +4,13 @@
 # chamber sensor. The density below is ASA's (the class default is ABS's).
 material = "asa"
 filament_diameter_mm = 1.75
-nozzle_temp_c = 255
+# 260 matches the OrcaSlicer ASA profile that produces the reference-quality
+# print on the Sovol Zero (255 printed visibly duller/weaker interlayer welds).
+nozzle_temp_c = 260
 bed_temp_c = 100
-# Retraction distance (mm); direct-drive short pull.
-retract_len_mm = 0.5
+# Retraction distance (mm); direct-drive. 0.5 left ooze zits at every loop
+# end next to Orca's 0.8 on the same machine — match the known-good pull.
+retract_len_mm = 0.8
 
 # --- calibration ---
 density_g_cm3 = 1.07

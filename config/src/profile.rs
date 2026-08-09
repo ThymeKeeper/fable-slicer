@@ -1080,12 +1080,14 @@ mod tests {
         let s = p.resolve("sovol-zero", "asa", "standard").unwrap();
         // The card's operating temp; density is ASA's own (the class default
         // would be ABS's 1.04).
-        assert_eq!(s.nozzle_temp_c, 255);
+        assert_eq!(s.nozzle_temp_c, 260);
         assert_eq!(s.bed_temp_c, 100);
         assert_eq!(s.filament_density_g_cm3, 1.07);
-        // Class-derived cooling: near-off — moving air cracks ABS/ASA.
+        // Class-derived cooling: low base duty (moving air cracks ABS/ASA)
+        // with the aux/exhaust fans fully off — the sealed still chamber is
+        // part of what makes ABS/ASA prints hold together.
         assert_eq!(s.fan_speed, 0.15);
-        assert_eq!(s.aux_fan_speed, 0.1);
+        assert_eq!(s.aux_fan_speed, 0.0);
         // The chamber pre-soak pairing: the printer declares the sensor (its
         // Klipper name, verified live on the machine), the class supplies
         // the 50 °C soak.
@@ -1355,7 +1357,7 @@ mod tests {
         assert_eq!(s.bed_temp_c, 100); // asa's bed
         assert_eq!(s.chamber_temp_c, 50); // asa's soak
         let s = p.resolve_tools("sovol-zero", &["asa", "pla"], "standard").unwrap();
-        assert_eq!(s.nozzle_temp_c, 255); // flat = asa (tool 0)
+        assert_eq!(s.nozzle_temp_c, 260); // flat = asa (tool 0)
         assert_eq!(s.bed_temp_c, 100);
         assert_eq!(s.chamber_temp_c, 50);
     }

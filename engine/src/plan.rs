@@ -264,6 +264,12 @@ pub struct LayerPlan {
     /// Speed multiplier (≤1) applied to this layer by min-layer-time cooling
     /// (what the g-code and estimates use).
     pub speed_scale: f64,
+    /// How far (0..1) the part fan climbs from the filament's base duty
+    /// toward its ceiling (bridge duty) on this layer. Short layers get no
+    /// time to solidify before the next bead lands, so the fan makes up the
+    /// difference — 0 for layers at or above the cooling window, 1 for
+    /// instant layers.
+    pub fan_boost: f64,
     /// A per-layer nozzle °C override for this layer (None = the profile
     /// temperature). Drives the deposited-energy model and the flow ceiling.
     pub planned_temp_c: Option<f64>,
@@ -899,6 +905,7 @@ fn stamp_and_finish(
                     travels: Vec::new(),
                     outline,
                     speed_scale: 1.0,
+            fan_boost: 0.0,
                     planned_temp_c: None,
                     temp_command_c: None,
                 }
@@ -1704,21 +1711,27 @@ fn plan_part(
     let surface_per_layer: Vec<Polygons> = (0..n)
         .into_par_iter()
         .map(|i| {
+            // Vase mode: the wall is one unbroken spiral — no face is ever
+            // reserved or skinned, whatever it exposes.
+            if settings.spiral_vase {
+                return Polygons::new();
+            }
             let here = &layers[i].polygons;
             // A face is only reserved (carved out of the walls, skinned) if it will
             // actually be skinned — gate each on its own shell count. With top and
             // bottom layers both 0 there is no surface at all, so the walls fill the
             // cross-section solid with no infill or shells anywhere.
-            let top = if settings.top_layers == 0 {
-                Polygons::new()
-            } else if i + 1 < n {
+            // Exposure is computed regardless of the shell counts: a face the
+            // wall stack consumed still shows, and it must skin even at zero
+            // configured shells — the reservation gates (buried AND
+            // wide-enough) are what scope this to wall-swallowed faces, so
+            // thin rims and intentionally-open hollow prints keep their walls.
+            let top = if i + 1 < n {
                 difference(here, &offset(&layers[i + 1].polygons, 0.05))
             } else {
                 here.clone()
             };
-            let bot = if settings.bottom_layers == 0 {
-                Polygons::new()
-            } else if i > 0 {
+            let bot = if i > 0 {
                 difference(here, &offset(&layers[i - 1].polygons, 0.05))
             } else {
                 here.clone()
@@ -1789,7 +1802,7 @@ fn plan_part(
         .collect();
 
     // Pass 1: walls + the infill region (inside the innermost wall) per layer.
-    let per_layer: Vec<(Vec<ToolPath>, Polygons)> = layers
+    let per_layer: Vec<(Vec<ToolPath>, Polygons, Polygons)> = layers
         .par_iter()
         .map(|layer| {
             // Adjacent beads are placed at the stadium spacing: rounded
@@ -2006,7 +2019,15 @@ fn plan_part(
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
             let mut walls = if layer.index > 0 && !settings.spiral_vase {
-                let below = offset(&phys[layer.index - 1], 0.05);
+                // Shrink the support reference a quarter bead inside the layer
+                // below: a wall counts as overhanging once ~25% of its width
+                // rides on air (the reference slicer's threshold), not only
+                // after its centerline has left the support entirely. The
+                // elephant-foot inset is a command-side trim of a first-layer
+                // bead that physically squishes back out — undo it for layer
+                // 1's reference so the whole wall isn't misread as overhang.
+                let ef = if layer.index == 1 { settings.elephant_foot_mm.max(0.0) } else { 0.0 };
+                let below = offset(&phys[layer.index - 1], ef - lw * 0.25);
                 let unsupported = difference(&layer.polygons, &below);
                 if unsupported.is_empty() {
                     walls
@@ -2018,7 +2039,7 @@ fn plan_part(
                     // instead of diluting across the whole run.
                     let mut walls = walls;
                     split_walls_at_region(&mut walls, &spannable_per_layer[layer.index]);
-                    slow_overhanging_walls(walls, &below, lw)
+                    slow_overhanging_walls(walls, &below, lw, settings.bridge_flow)
                 }
             } else {
                 walls
@@ -2035,7 +2056,7 @@ fn plan_part(
             // Inner walls stay CLOSED rings here — they are spiralized in Pass 2
             // (spiralize_shells), together with the concentric fill they ring, so the
             // wall stack and cavity fill become one continuous stroke.
-            (walls, opened)
+            (walls, opened, surf_reserved)
         })
         // Tick once per layer as its walls finish — this pass is ~all of a
         // high-wall-count slice's time, so it drives the progress bar.
@@ -2047,9 +2068,11 @@ fn plan_part(
         .collect();
     let mut walls_per_layer: Vec<Vec<ToolPath>> = Vec::with_capacity(n);
     let mut inner_per_layer: Vec<Polygons> = Vec::with_capacity(n);
-    for (w, inner) in per_layer {
+    let mut reserved_per_layer: Vec<Polygons> = Vec::with_capacity(n);
+    for (w, inner, reserved) in per_layer {
         walls_per_layer.push(w);
         inner_per_layer.push(inner);
+        reserved_per_layer.push(reserved);
     }
 
     // Solid shells per layer (exposed to air above/below unless covered by the
@@ -2072,7 +2095,12 @@ fn plan_part(
             } else {
                 Polygons::new()
             };
-            union(&solid_top, &solid_bottom)
+            // A reserved exposed face (surface-overrides-wall) is solid no
+            // matter the shell counts: it was carved out of the wall stack
+            // precisely so the visible face could close and skin — at zero
+            // shells it would otherwise fall to sparse and print holes.
+            let faces = intersection(&reserved_per_layer[i], inner);
+            union(&union(&solid_top, &solid_bottom), &faces)
         })
         .collect();
 
@@ -2558,7 +2586,13 @@ fn plan_part(
                 } else {
                     buried.clone()
                 };
-                let mut internal = difference(&buried, &skin_top);
+                // Open the buried remainder the same way the skins are opened:
+                // the coverage differences leave hair-thin ribbons along the
+                // skin boundary (the 0.05 neighbour-growth plus the open's
+                // shave), and a phantom ribbon that borders a face makes the
+                // pattern-matched absorb below swallow the whole exposed face
+                // into Solid — demoting its monotonic finish-pace skin.
+                let mut internal = open(difference(&buried, &skin_top));
                 // Blanket surface→solid merge (opt-in via matching fill pattern):
                 // a top/bottom surface that borders buried solid and shares its
                 // pattern joins it as ONE region — the shared-angle lines run
@@ -3080,6 +3114,7 @@ fn plan_part(
             // separate islands that then can't be combed.
             outline: simplify(&layers[i].polygons, 0.1),
             speed_scale: 1.0,
+            fan_boost: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }
@@ -3692,25 +3727,27 @@ fn in_polys(polys: &Polygons, p: Point) -> bool {
     inside
 }
 
-/// Mark wall stretches inside `unsupported` (the part of this layer with no
-/// material below) as `OverhangWall`: a bead whose centerline is past the
-/// previous outline hangs by more than half its width, and prints badly at
-/// wall speed — it gets the overhang speed and bridge-grade cooling instead.
-/// Loops are split into consecutive open pieces (no travel in between), with
-/// runs shorter than ~2 line widths merged into their neighbour so the speed
-/// doesn't chatter at classification borders.
-fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Vec<ToolPath> {
-    let min_run_mm = lw * 2.0;
-    // How far past the support below each bead sits, as a 0→1 overhang degree:
-    // 0 on solid, rising to 1 a full line width out (fully airborne). Measured as
-    // the real distance to the support boundary and quantized to 0.1, so the
-    // graduated speed eases in ten small steps instead of the old three hard
-    // bands. Each hard band was a speed jump that — at constant pressure advance —
-    // printed a visible flow line, worst where a closing arch slows hardest. Any
-    // bead past the edge gets at least 0.1 so it's still flagged overhanging.
+/// Mark wall stretches past their support as `OverhangWall`. `below` arrives
+/// SHRUNK a quarter line width inside the previous layer's outline, so a bead
+/// counts as overhanging as soon as ~a quarter of its width hangs over air —
+/// not only once its centerline has already left the support (which waited
+/// until half the bead dangled and let near-threshold stretches coast at full
+/// wall speed). The degree is quantized to quarter steps aligned with the
+/// overhang speed tiers, rounding UP: when a stretch straddles a tier edge,
+/// the slower tier wins. Runs shorter than a few mm dissolve into whichever
+/// neighbour hangs harder — a crumb absorbed by the slower band prints safe;
+/// absorbed by the faster band it droops.
+fn slow_overhanging_walls(
+    walls: Vec<ToolPath>,
+    below: &Polygons,
+    lw: f64,
+    bridge_flow: f64,
+) -> Vec<ToolPath> {
+    let min_run_mm = 3.0_f64.max(lw * 2.0);
+    // Degree ≈ (unsupported fraction of the bead) − 0.25, in quarter steps:
+    // 0.25 → a quarter to half the bead over air, … , 0.75+ → fully airborne.
     // Distance is computed only for the few beads actually outside support;
-    // supported beads short-circuit to 0 (the common case, and cheaper than the
-    // two polygon offsets this replaces).
+    // supported beads short-circuit to 0 (the common case).
     let degree_at = |p: Point| -> f32 {
         if in_polys(below, p) {
             return 0.0;
@@ -3726,7 +3763,15 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
             }
         }
         let frac = (best / lw).clamp(0.0, 1.0);
-        ((frac * 10.0).round().max(1.0) / 10.0) as f32
+        (((frac * 4.0).ceil().max(1.0)) / 4.0) as f32
+    };
+    // A bead most of whose width rides on air needs a round strand's worth of
+    // plastic (a bridge bead), not a squished stadium's — ramp the flow up as
+    // the support disappears so airborne rings have the stiffness and shoulder
+    // contact to span. Supported and lightly-overhanging beads are untouched.
+    let flow_for = |deg: f32| -> f32 {
+        let d = deg as f64;
+        if d <= 0.5 { 1.0 } else { (1.0 + (bridge_flow - 1.0) * ((d - 0.5) / 0.5)) as f32 }
     };
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
@@ -3750,6 +3795,7 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
             if d0 > 0.0 {
                 p.kind = PathKind::OverhangWall;
                 p.overhang = d0;
+                p.flow *= flow_for(d0) as f64;
             }
             out.push(p);
             continue;
@@ -3773,29 +3819,60 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
                 _ => runs.push((deg[k], vec![k], len)),
             }
         }
-        // Dissolve sub-threshold runs into the previous (sound) one.
-        let mut merged: Vec<(f32, Vec<usize>, f64)> = Vec::new();
-        for run in runs {
-            match merged.last_mut() {
-                Some((c, idxs, l)) if *c == run.0 || run.2 < min_run_mm => {
+        // Dissolve sub-threshold runs, shortest first, each into whichever
+        // neighbour hangs harder (ties go to the previous). Absorbing into the
+        // more-overhanging side means a crumb prints at the cautious pace.
+        let mut merged = runs;
+        while merged.len() > 1 {
+            let mut pick: Option<usize> = None;
+            for i in 0..merged.len() {
+                if merged[i].2 < min_run_mm
+                    && pick.is_none_or(|j| merged[i].2 < merged[j].2)
+                {
+                    pick = Some(i);
+                }
+            }
+            let Some(i) = pick else { break };
+            let len = merged.len();
+            let prev = if i > 0 { Some(i - 1) } else { path.closed.then_some(len - 1) };
+            let next = if i + 1 < len { Some(i + 1) } else { path.closed.then_some(0) };
+            let target = match (prev, next) {
+                (Some(p), Some(n)) if p != n => {
+                    if merged[p].0 >= merged[n].0 { p } else { n }
+                }
+                (Some(p), _) => p,
+                (None, Some(n)) => n,
+                (None, None) => break,
+            };
+            let run = merged.remove(i);
+            let t = if target > i { target - 1 } else { target };
+            merged[t].1.extend(run.1);
+            merged[t].2 += run.2;
+        }
+        // Re-coalesce equal-degree neighbours (including the cyclic seam).
+        let mut co: Vec<(f32, Vec<usize>, f64)> = Vec::new();
+        for run in merged {
+            match co.last_mut() {
+                Some((c, idxs, l)) if *c == run.0 => {
                     idxs.extend(run.1);
                     *l += run.2;
                 }
-                _ => merged.push(run),
+                _ => co.push(run),
             }
         }
-        // A short leading run may now belong with the trailing one (cyclic).
-        if path.closed && merged.len() > 1 && merged[0].2 < min_run_mm {
-            let first = merged.remove(0);
-            let last = merged.last_mut().unwrap();
+        if path.closed && co.len() > 1 && co[0].0 == co.last().unwrap().0 {
+            let first = co.remove(0);
+            let last = co.last_mut().unwrap();
             last.1.extend(first.1);
             last.2 += first.2;
         }
+        let merged = co;
         if merged.len() == 1 {
             let mut p = path;
             if merged[0].0 > 0.0 {
                 p.kind = PathKind::OverhangWall;
                 p.overhang = merged[0].0;
+                p.flow *= flow_for(merged[0].0) as f64;
             }
             out.push(p);
             continue;
@@ -3809,7 +3886,11 @@ fn slow_overhanging_walls(walls: Vec<ToolPath>, below: &Polygons, lw: f64) -> Ve
         let mut attrs = vec![SegAttr { kind: path.kind, overhang: 0.0, flow: 1.0 }; segs];
         for (deg_run, idxs, _) in &merged {
             let a = if *deg_run > 0.0 {
-                SegAttr { kind: PathKind::OverhangWall, overhang: *deg_run, flow: 1.0 }
+                SegAttr {
+                    kind: PathKind::OverhangWall,
+                    overhang: *deg_run,
+                    flow: flow_for(*deg_run),
+                }
             } else {
                 SegAttr { kind: path.kind, overhang: 0.0, flow: 1.0 }
             };
@@ -4643,10 +4724,12 @@ fn spiral_to_toolpath(points: Vec<Point>, kinds: &[PathKind], lw: f64) -> ToolPa
 /// set) and bridged/overhang runs (open, or already segmented) never qualify; and an
 /// island carrying ANY overhang opts out wholesale so its rings stay closed for the
 /// enclosed-void / cantilever ordering ([`order_unsupported_rings_outer_in`]).
-/// Minimum worthwhile gap bead. A seam speck's dab is mostly travel for
-/// negligible fill, and a dash of micro-beads strings the nozzle across the
-/// part — skip anything shorter.
-const GAP_BEAD_MIN_MM: f64 = 2.0;
+/// Minimum worthwhile gap bead. At 2.0 this left every ring-taper wedge
+/// shorter than 2mm as a void — and at high wall counts the whole part is
+/// rings, so those wedges pepper faces with pinholes (the reference slicer
+/// fills wedges down to ~0.2mm and its dabs print clean). Keep only true
+/// specks out.
+const GAP_BEAD_MIN_MM: f64 = 0.5;
 
 /// Ignore ring neighbourhood closer than this along the ring itself when
 /// probing for an opposing side — a corner's own flanks are spatially close
@@ -6522,6 +6605,7 @@ mod tests {
             travels: Vec::new(),
             outline,
             speed_scale: 1.0,
+            fan_boost: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }

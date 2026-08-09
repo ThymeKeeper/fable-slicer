@@ -148,6 +148,11 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
     let layer0_tools = first_layer_tools(layers);
     let init = tools.get(init_tool);
     let travel_f = s.travel_speed_mm_s * 60.0;
+    // The wipe backtrack shears residual ooze off against the printed bead —
+    // that takes contact TIME. At travel speed the 2mm pass lasts ~3ms and
+    // wipes nothing; pace it like the wall it retraces (the reference prints
+    // wipe at roughly their wall speed).
+    let wipe_f = s.external_perimeter_speed_mm_s.max(1.0) * 60.0;
     let retract_f = s.retract_speed_mm_s * 60.0;
     // Hopped travels lift by this much.
     let hop_mm = s.z_hop_mm;
@@ -407,10 +412,16 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             in_standby.remove(&n);
         }
         // Part cooling: off for the first `fan_off_layers`, then the normal duty
-        // — both from the tool in hand; bridges may override per path below.
+        // climbed toward the ceiling on short layers (fan_boost) — both from the
+        // tool in hand; bridges may override per path below.
         let active = tools.get(cur_tool);
-        let mut normal_fan =
-            if layer.index < active.fan_off_layers { 0 } else { fan_duty(active.fan_speed) };
+        let mut normal_fan = if layer.index < active.fan_off_layers {
+            0
+        } else {
+            let duty = active.fan_speed
+                + (active.bridge_fan_speed - active.fan_speed).max(0.0) * layer.fan_boost;
+            fan_duty(duty)
+        };
         if normal_fan != cur_fan {
             g.fan(normal_fan);
             cur_fan = normal_fan;
@@ -478,7 +489,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 if s.wipe_mm > 0.0 {
                     if let Some(tail) = &wipe_tail {
                         for p in tail {
-                            g.travel(p.x_mm(), p.y_mm(), travel_f);
+                            g.travel(p.x_mm(), p.y_mm(), wipe_f);
                         }
                     }
                 }
@@ -510,7 +521,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     if s.wipe_mm > 0.0 {
                         if let Some(tail) = &wipe_tail {
                             for p in tail {
-                                g.travel(p.x_mm(), p.y_mm(), travel_f);
+                                g.travel(p.x_mm(), p.y_mm(), wipe_f);
                             }
                         }
                     }
@@ -557,8 +568,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 cur_pa = -1.0;
                 cur_fan = u32::MAX;
                 let tn = tools.get(cur_tool);
-                normal_fan =
-                    if layer.index < tn.fan_off_layers { 0 } else { fan_duty(tn.fan_speed) };
+                normal_fan = if layer.index < tn.fan_off_layers {
+                    0
+                } else {
+                    let duty = tn.fan_speed
+                        + (tn.bridge_fan_speed - tn.fan_speed).max(0.0) * layer.fan_boost;
+                    fan_duty(duty)
+                };
                 if s.has_aux_fan {
                     let aux = if layer.index < tn.fan_off_layers {
                         0
@@ -603,19 +619,22 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             set_seg_attrs(
                 &mut g, a0.kind, a0.overhang, layer, normal_fan, t, s, &mut cur_type, &mut cur_accel,
                 &mut cur_pa, &mut cur_fan,
-                // PA from the PATH-level kind: base for a mixed wall (its
-                // overhang stretches must not re-issue PA mid-bead), eased for
-                // a uniform overhang loop or bridge. A JOINED path arrives
-                // extruding — never touch PA there (planner flush = blob on
-                // the wall); its donor's base value is already correct, since
-                // joins only pair base-PA kinds (Perimeter → ExternalPerimeter).
-                if path.joined { None } else { Some((path.kind, path.overhang)) },
+                // PA is deliberately NOT set here: a SET_PRESSURE_ADVANCE
+                // flushes Klipper's queue, and at this point the nozzle is
+                // still parked unretracted on the path just printed — the
+                // flush dwell prints a blob on the finished wall. It's issued
+                // at the travel's destination instead (below), where any
+                // dwell mark lands on the point the new bead immediately
+                // overprints.
+                None,
             );
 
             let z = layer.print_z_mm;
+            let small = small_loop_factor(path);
             let feed =
                 feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
-                    * layer.speed_scale;
+                    * layer.speed_scale
+                    * small;
             let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
                 * flow_factor(path, t);
             let start = path.points[0];
@@ -635,6 +654,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                         let a = seg(k);
                         feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
                             * layer.speed_scale
+                            * small
                     })
                     .fold(f64::INFINITY, f64::min)
             } else {
@@ -676,23 +696,51 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     if s.wipe_mm > 0.0 {
                         if let Some(tail) = &wipe_tail {
                             for p in tail {
-                                g.travel(p.x_mm(), p.y_mm(), travel_f);
+                                g.travel(p.x_mm(), p.y_mm(), wipe_f);
                             }
                         }
                     }
                 }
-                if tr.hop && hop_mm > 0.0 {
-                    g.move_z(z + hop_mm, travel_f);
-                } else if force_z || (z - cur_z).abs() > 1.0e-9 {
+                if tr.hop && hop_mm > 0.0 && !tr.points.is_empty() {
+                    // Slant the lift into the first travel leg: the nozzle
+                    // leaves the just-finished seam already moving instead of
+                    // dwelling over it at zero XY velocity while Z climbs
+                    // (that dwell radiates heat straight onto the seam). The
+                    // drop at the destination stays a plain Z move — that
+                    // point is overprinted by the bead about to start.
+                    let first = tr.points[0];
+                    g.travel_z(first.x_mm(), first.y_mm(), z + hop_mm, travel_f);
+                    for pt in &tr.points[1..] {
+                        g.travel(pt.x_mm(), pt.y_mm(), travel_f);
+                    }
                     g.move_z(z, travel_f);
-                }
-                for pt in &tr.points {
-                    g.travel(pt.x_mm(), pt.y_mm(), travel_f);
-                }
-                if tr.hop && hop_mm > 0.0 {
-                    g.move_z(z, travel_f);
+                } else {
+                    if tr.hop && hop_mm > 0.0 {
+                        g.move_z(z + hop_mm, travel_f);
+                    } else if force_z || (z - cur_z).abs() > 1.0e-9 {
+                        g.move_z(z, travel_f);
+                    }
+                    for pt in &tr.points {
+                        g.travel(pt.x_mm(), pt.y_mm(), travel_f);
+                    }
+                    if tr.hop && hop_mm > 0.0 {
+                        g.move_z(z, travel_f);
+                    }
                 }
                 cur_z = z;
+                // PA from the PATH-level kind: base for a mixed wall (its
+                // overhang stretches must not re-issue PA mid-bead), eased for
+                // a uniform overhang loop or bridge. Issued at the travel's
+                // destination so the queue-flush stall parks over the point
+                // the new bead overprints, not on the finished wall. (A
+                // JOINED path never reaches here — its PA is untouched, the
+                // donor's base value is already correct since joins only pair
+                // base-PA kinds.)
+                set_seg_attrs(
+                    &mut g, a0.kind, a0.overhang, layer, normal_fan, t, s, &mut cur_type,
+                    &mut cur_accel, &mut cur_pa, &mut cur_fan,
+                    Some((path.kind, path.overhang)),
+                );
                 if tr.retract && rlen > 0.0 {
                     g.unretract(restart_mm, retract_f);
                 }
@@ -766,14 +814,28 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // ring): E per segment from the local width, so the bead tapers
                 // continuously. Arc fitting assumes a constant width, so it's
                 // skipped here.
+                //
+                // The path-level feed was flow-capped against the MEAN width;
+                // a segment wider than the mean would exceed the melt ceiling
+                // at that feed (the extruder skips, then the pressure spike
+                // blobs downstream) — re-clamp per segment from its own width.
                 let h = layer.height_mm * path.height_scale;
                 let ff = flow_factor(path, t);
+                let flow_cap = layer_flow_cap_mm3_s(layer, t);
+                let seg_feed = |w: f64| -> f64 {
+                    if flow_cap > 0.0 {
+                        let mm3_per_mm = config::bead_area_mm2(w, h) * ff;
+                        feed.min(60.0 * flow_cap / mm3_per_mm.max(1.0e-9))
+                    } else {
+                        feed
+                    }
+                };
                 let mut prev = start;
                 for k in 0..n_pts - 1 {
                     let w = (ws[k] + ws[k + 1]) * 0.5;
                     let c = config::bead_area_mm2(w, h) / area * ff;
                     let p = path.points[k + 1];
-                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feed);
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, seg_feed(w));
                     prev = p;
                 }
                 if path.closed {
@@ -781,7 +843,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     // segment unextruded.
                     let w = (ws[n_pts - 1] + ws[0]) * 0.5;
                     let c = config::bead_area_mm2(w, h) / area * ff;
-                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * c, feed);
+                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * c, seg_feed(w));
                 }
             } else if path.segs.is_some() {
                 // Per-segment attributes: sub-block the bead into runs of equal
@@ -809,6 +871,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                         let a = seg(k);
                         feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
                             * layer.speed_scale
+                            * small
                     })
                     .collect();
                 // (piece end x/y mm, piece len mm, parent segment)
@@ -1230,17 +1293,24 @@ fn nominal_speed_mm_s(
         // Internal bridge: the first buried solid layer over low-density sparse,
         // spanning mostly air between the infill lines — print it at bridge speed.
         PathKind::InternalBridge => tool.bridge_speed_mm_s,
-        // Wall stretches past the layer below slow by how far they overhang:
-        // graduated from the outer-wall pace (a barely-unsupported bead) down to
-        // the overhang floor (bridge speed) when the bead is fully airborne.
-        // The graduation is concave (see OVERHANG_SPEED_GAMMA) so even a lightly
-        // unsupported bead — which has no material under part of it and droops —
-        // slows meaningfully instead of coasting near wall speed.
+        // Wall stretches past the layer below print at overhang tiers, matched
+        // to the reference profile (50/30/20 mm/s as the bead goes from a
+        // quarter unsupported to fully airborne). The old continuous ramp let
+        // moderately-unsupported beads coast at 78-113 mm/s — the melt has to
+        // freeze onto whatever support it has before the nozzle drags it, and
+        // that takes a hard slowdown, not a graded one.
         PathKind::OverhangWall => {
             let ceiling = s.external_perimeter_speed_mm_s;
             let floor = s.overhang_speed_mm_s;
-            let d = (overhang as f64).clamp(0.0, 1.0).powf(OVERHANG_SPEED_GAMMA);
-            ceiling + (floor - ceiling) * d
+            let d = (overhang as f64).clamp(0.0, 1.0);
+            let tier = if d <= 0.25 {
+                50.0
+            } else if d <= 0.5 {
+                30.0
+            } else {
+                floor
+            };
+            tier.clamp(floor, ceiling)
         }
         // Skirt is layer-0 only (handled above); listed for exhaustiveness.
         PathKind::Skirt | PathKind::Perimeter | PathKind::Infill => s.print_speed_mm_s,
@@ -1292,6 +1362,36 @@ fn layer_flow_cap_mm3_s(layer: &LayerPlan, tool: &ToolSettings) -> f64 {
     } else {
         cap
     }
+}
+
+/// Circumference below which a closed wall loop slows: the loop finishes
+/// before its previous pass has solidified, so the bead lands on remelt and
+/// the feature ovalizes and rings. Matches the reference profile's
+/// small-perimeter rule (50% speed on small loops).
+const SMALL_LOOP_MM: f64 = 40.0;
+
+/// Pace factor (≤1) for small closed wall loops, fading linearly from full
+/// speed at [`SMALL_LOOP_MM`] down to half speed. Applied at emission (and to
+/// the scarf/segment feeds), not inside `feed_for` — the flow-clamp audit
+/// reads `feed_for` and must not report thermal pacing as a flow limit.
+fn small_loop_factor(path: &ToolPath) -> f64 {
+    if !path.closed
+        || !matches!(
+            path.kind,
+            PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
+        )
+    {
+        return 1.0;
+    }
+    let n = path.points.len();
+    let mut circ = 0.0;
+    for k in 0..n {
+        circ += dist_mm(path.points[k], path.points[(k + 1) % n]);
+        if circ >= SMALL_LOOP_MM {
+            return 1.0;
+        }
+    }
+    (circ / SMALL_LOOP_MM).clamp(0.5, 1.0)
 }
 
 /// Feed rate (mm/min) for a path: the per-feature speed, clamped so the
@@ -1445,15 +1545,6 @@ fn atd_cmd(accel: f64, s: &Settings) -> Option<String> {
 /// flow blip where a fast supported wall steps down to a slow overhang/bridge.
 const OVERHANG_PA_FLOOR: f64 = 0.5;
 
-/// Exponent bending the overhang speed ramp concave (< 1). A linear ramp (1.0)
-/// slows a bead in proportion to how far it hangs, so a 20%-overhanging bead —
-/// the bulk of a smoothly curved shell — gives up only 20% of the wall→floor
-/// drop and still prints near wall speed, fast enough that the unsupported
-/// edge droops before it sets (PLA curls upward as it cools and the next
-/// layer's nozzle then shears the curl into a void). At 0.5 (√degree) that
-/// same bead gives up √0.2 ≈ 45% of the drop; the fully-airborne floor and the
-/// supported ceiling are both unchanged, so only the mid-range slows.
-const OVERHANG_SPEED_GAMMA: f64 = 0.5;
 
 /// Cap on how fast the commanded feed may change along a segmented bead
 /// (mm/min of feed per mm of path). Pressure advance swings filament in
@@ -1519,7 +1610,7 @@ fn pa_for_kind(kind: PathKind, overhang: f32, tool: &ToolSettings) -> f64 {
 fn set_seg_attrs(
     g: &mut GcodeBuilder,
     kind: PathKind,
-    overhang: f32,
+    _overhang: f32,
     layer: &LayerPlan,
     normal_fan: u32,
     tool: &ToolSettings,
@@ -1555,10 +1646,13 @@ fn set_seg_attrs(
     let want_fan = if layer.index < tool.fan_off_layers {
         normal_fan
     } else {
+        // A bead over air gets the full cooling ceiling outright — the melt
+        // must freeze the moment it lands or it sags. Grading the boost by
+        // overhang degree left drooping mid-tier overhangs (and churned an
+        // M106 per degree step); the reference prints run flat-out here.
         let frac = match kind {
-            PathKind::Bridge | PathKind::BottomSkin => tool.bridge_fan_speed,
-            PathKind::OverhangWall => {
-                tool.fan_speed + (tool.bridge_fan_speed - tool.fan_speed) * overhang as f64
+            PathKind::Bridge | PathKind::BottomSkin | PathKind::OverhangWall => {
+                tool.bridge_fan_speed
             }
             _ => tool.fan_speed,
         };
@@ -2004,12 +2098,16 @@ fn plan_layer_travels(
     plan.travels = travels;
 }
 
-/// Slow down layers that print faster than `min_layer_time_s` (down to a floor
-/// speed) so they have time to cool before the next layer.
+/// Layer time below which the part fan starts climbing from the filament's
+/// base duty toward its ceiling. A layer shorter than this hasn't solidified
+/// when the next bead lands, so airflow has to carry the heat away instead
+/// of time doing it.
+const FAN_COOL_LAYER_TIME_S: f64 = 35.0;
+
+/// Per-layer cooling: slow layers that print faster than `min_layer_time_s`
+/// (down to a floor speed), and ramp the fan on layers shorter than the
+/// cooling window so they solidify before the next layer lands.
 pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
-    if s.min_layer_time_s <= 0.0 {
-        return;
-    }
     let tools = Tools::new(s);
     let floor = s.min_print_speed_mm_s / s.print_speed_mm_s.max(1.0);
     // The toolchange dwell counts as cooling time here (it's inside
@@ -2018,7 +2116,10 @@ pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
     let entries = entry_tools(plans);
     plans.par_iter_mut().zip(entries).for_each(|(plan, entry)| {
         let t = layer_print_seconds(plan, s, &tools, 1.0, entry);
-        if t > 0.0 && t < s.min_layer_time_s {
+        if t > 0.0 {
+            plan.fan_boost = (1.0 - t / FAN_COOL_LAYER_TIME_S).clamp(0.0, 1.0);
+        }
+        if s.min_layer_time_s > 0.0 && t > 0.0 && t < s.min_layer_time_s {
             plan.speed_scale = (t / s.min_layer_time_s).clamp(floor, 1.0);
         }
     });
@@ -2905,6 +3006,7 @@ mod tests {
             travels: Vec::new(),
             outline,
             speed_scale: 1.0,
+            fan_boost: 0.0,
             planned_temp_c: None,
             temp_command_c: None,
         }]
@@ -3565,6 +3667,9 @@ mod tests {
         let m = mesh::Mesh::cube(10.0);
         let mut s = Settings::default();
         s.fan_speed = 0.8; // 204/255
+        // Ceiling == base: the short-layer cooling ramp has no headroom, so
+        // the emitted duty is exactly the base (this test pins base + off-layers).
+        s.bridge_fan_speed = 0.8;
         s.fan_off_layers = 2;
         s.pressure_advance = 0.045;
         let g = to_gcode(&generate(&m, &s), &s);
@@ -4077,28 +4182,31 @@ mod tests {
     }
 
     #[test]
-    fn overhang_speed_ramp_is_concave() {
-        // The linear ramp left moderate overhangs near wall speed — fast
-        // enough for PLA to curl and the next layer to shear it into a void.
-        // A moderate (20%) overhang must now slow well past the linear
-        // midpoint, while the supported ceiling and airborne floor are exact.
+    fn overhang_speed_uses_reference_tiers() {
+        // Tier table matched to the reference profile: 50 / 30 / floor mm/s
+        // as the bead goes from a quarter unsupported to fully airborne. The
+        // old graded ramp let moderately-unsupported beads coast at 78-113
+        // mm/s — the melt has to freeze onto whatever support it has before
+        // the nozzle drags it, and that takes a hard slowdown.
         let mut s = Settings::default();
         s.external_perimeter_speed_mm_s = 160.0;
-        s.overhang_speed_mm_s = 10.0;
+        s.overhang_speed_mm_s = 20.0;
+        let tool = s.flat_tool("x".into());
+        {
+            let at =
+                |deg: f32| super::nominal_speed_mm_s(PathKind::OverhangWall, deg, 1, &tool, &s);
+            assert_eq!(at(0.25), 50.0, "quarter-unsupported tier");
+            assert_eq!(at(0.5), 30.0, "half-unsupported tier");
+            assert_eq!(at(0.75), 20.0, "airborne floor");
+            assert_eq!(at(1.0), 20.0, "airborne floor");
+            assert!(at(0.25) >= at(0.5) && at(0.5) >= at(1.0), "monotone");
+        }
+        // A slow outer wall caps the tiers; a slower floor still wins below.
+        s.external_perimeter_speed_mm_s = 40.0;
         let tool = s.flat_tool("x".into());
         let at = |deg: f32| super::nominal_speed_mm_s(PathKind::OverhangWall, deg, 1, &tool, &s);
-        let (ceil, floor) = (160.0_f64, 10.0_f64);
-        let linear = |deg: f64| ceil + (floor - ceil) * deg;
-        assert!((at(1.0) - floor).abs() < 1e-9, "airborne floor unchanged: {}", at(1.0));
-        assert!(at(0.001) > ceil - 6.0, "supported ceiling ~unchanged: {}", at(0.001));
-        assert!(
-            at(0.2) < linear(0.2) - 20.0,
-            "a 20% overhang slows hard: {:.0} vs linear {:.0}",
-            at(0.2),
-            linear(0.2)
-        );
-        // Monotonic decreasing across the range.
-        assert!(at(0.1) > at(0.3) && at(0.3) > at(0.6) && at(0.6) > at(1.0), "monotone");
+        assert_eq!(at(0.25), 40.0, "tier clamped to the wall ceiling");
+        assert_eq!(at(1.0), 20.0, "floor unaffected by the ceiling clamp");
     }
 
     #[test]
