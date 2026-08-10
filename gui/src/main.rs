@@ -440,14 +440,14 @@ impl FilamentBaseline {
 }
 
 /// The App-side state the guided flow-calibration row drives: arming the
-/// comb print, the (possibly fractional) tooth number whose wall calipers
-/// at the line width, and the status line it reports to. The comb prints
-/// its ladder at ABSOLUTE flow values, so "apply" pins the tooth's value
-/// verbatim — no snapshot bookkeeping, idempotent by construction.
+/// comb print, the winning tooth's underside LABEL (percent, mod-100 as
+/// printed), and the status line it reports to. The comb prints its
+/// ladder at ABSOLUTE flow values, so "apply" pins the label verbatim —
+/// no snapshot bookkeeping, idempotent by construction.
 struct FlowCalUi<'a> {
     host_ready: bool,
     start: &'a mut bool,
-    tooth: &'a mut f64,
+    label_pct: &'a mut f64,
     status: &'a mut String,
 }
 
@@ -522,18 +522,19 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
             "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-comb print.");
     });
-    // Guided flow calibration: print the flow comb (one tooth per absolute
-    // flow value), find the tooth whose wall calipers at the line width,
-    // enter its number → pin that value verbatim.
+    // Guided flow calibration: print the radial comb (one tooth per
+    // absolute flow value, labeled on the underside), enter the winning
+    // tooth's label → pin that value verbatim.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow comb"))
             .on_hover_text(format!(
-                "Prints a {}-tooth comb; each tooth is a single wall at its own ABSOLUTE \
-                 flow — {:.2} at the handle end down to {:.2}, 2% per tooth (table in \
-                 the g-code header). Caliper the teeth mid-face with the full jaw \
-                 flats and enter the tooth number that reads exactly {:.2} mm. \
-                 Halves are fine: 7.5 reads between tooth 7 and 8.",
+                "Prints a ring of {} teeth, each a single wall at its own ABSOLUTE \
+                 flow — {:.2} down to {:.2} in exact 1% steps, values recessed into \
+                 the underside as percent mod 100 (96 = 0.96, 04 = 1.04). Caliper \
+                 along the ring (full jaw flats, mid-face) for the teeth reading \
+                 exactly {:.2} mm; 1% neighbours read alike, so take the middle of \
+                 the matching run, tie toward 00. Enter that tooth's label below.",
                 engine::COMB_TEETH,
                 engine::COMB_FLOW_FAT,
                 engine::COMB_FLOW_THIN,
@@ -545,27 +546,34 @@ fn filament_card_rows(
             *cal.start = true;
         }
         ui.add(
-            egui::DragValue::new(cal.tooth)
-                .speed(0.05)
-                .range(0.0..=engine::COMB_TEETH as f64)
-                .fixed_decimals(1)
-                .prefix("tooth "),
+            egui::DragValue::new(cal.label_pct)
+                .speed(0.2)
+                .range(0.0..=130.0)
+                .fixed_decimals(0)
+                .suffix(" %"),
         )
-        .on_hover_text(format!(
-            "Tooth number, counted from the HANDLE end, that calipers at {line_width_mm:.2} mm."
-        ));
+        .on_hover_text("The winning tooth's underside label. Two-digit labels are percent mod 100: enter 96 for 96, and 4 (or 104) for 04.");
         if ui
             .button("apply")
-            .on_hover_text("Pin that tooth's absolute flow value as the spool's extrusion multiplier.")
+            .on_hover_text("Pin that label's absolute flow value as the spool's extrusion multiplier.")
             .clicked()
-            && *cal.tooth >= 1.0
         {
-            let before = *flow;
-            *flow = engine::flow_from_comb_tooth(*cal.tooth);
-            *cal.status = format!(
-                "flow × {before:.3} → {:.3} (tooth {:.1})",
-                *flow, *cal.tooth
-            );
+            // Two-digit labels wrap at 100: an entry below the ladder's
+            // bottom must mean the 1xx side (04 → 104).
+            let pct =
+                if *cal.label_pct < engine::COMB_FLOW_THIN * 100.0 - 0.5 && *cal.label_pct >= 0.0 {
+                    *cal.label_pct + 100.0
+                } else {
+                    *cal.label_pct
+                };
+            if let Some(m) = engine::flow_from_comb_label(pct) {
+                let before = *flow;
+                *flow = m;
+                *cal.status =
+                    format!("flow × {before:.3} → {:.3} (comb label {:.0})", *flow, *cal.label_pct);
+            } else {
+                *cal.status = format!("comb label {:.0} isn't on the ladder", *cal.label_pct);
+            }
         }
     });
     let mf_hint = format!(
@@ -1788,11 +1796,11 @@ struct App {
     /// Flow calibration: the Filament-panel button arms this; the dispatch
     /// generates the flow comb and sends it to the printer.
     start_flow_cal: bool,
-    /// The (possibly fractional) comb tooth whose wall calipers at the line
-    /// width; "apply" pins that tooth's ABSOLUTE flow value verbatim — the
-    /// comb prints its ladder at flow 1.0, so nothing compounds and no
-    /// dispatch snapshot is needed.
-    flow_cal_tooth: f64,
+    /// The winning comb tooth's underside label (percent, mod-100 as
+    /// printed); "apply" pins that ABSOLUTE flow verbatim — the comb prints
+    /// its ladder at flow 1.0, so nothing compounds and no dispatch
+    /// snapshot is needed.
+    flow_cal_label_pct: f64,
     /// Pressure-advance calibration: the Filament-panel button arms this; the
     /// dispatch generates the PA tower and sends it to the printer.
     start_pa_cal: bool,
@@ -2128,7 +2136,7 @@ impl App {
             baseline,
             profile_dialog: None,
             start_flow_cal: false,
-            flow_cal_tooth: 0.0,
+            flow_cal_label_pct: 0.0,
             start_pa_cal: false,
             pa_cal_mm: 0.0,
             pending_switch: None,
@@ -5031,7 +5039,7 @@ impl eframe::App for App {
                     let cal = FlowCalUi {
                         host_ready: host_set && !host_busy,
                         start: &mut self.start_flow_cal,
-                        tooth: &mut self.flow_cal_tooth,
+                        label_pct: &mut self.flow_cal_label_pct,
                         status: &mut self.status,
                     };
                     // The PA row reports through a local: `cal` above already
@@ -6952,7 +6960,7 @@ impl eframe::App for App {
                 match c.upload("flow-comb.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the flow comb — caliper the teeth and enter the number of the one that reads {lw:.2} mm (counted from the handle end) in the Filament panel."),
+                        msg: format!("Printing the flow comb — caliper around the ring for the teeth that read {lw:.2} mm, flip it over, and enter the winning tooth's label in the Filament panel (labels are percent mod 100)."),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-comb upload failed: {e}") },
                 }

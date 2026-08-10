@@ -57,41 +57,44 @@ pub const PA_TOWER_START: f64 = 0.0;
 pub const PA_STEP_SLOW_FRAC: f64 = 0.4;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
-/// Flow-comb FAT tooth multiplier (× the profile flow) — the tooth at the
-/// handle end. The comb replaced the old continuous flow-swept tower: its
-/// ramp's thickness gradient was ~0.002 mm per mm of height, so locating
-/// the wall == line-width equality demanded caliper-TIP readings, and a
-/// ±0.02 mm error mislocated it by ~10 mm (~6% of flow). A comb tooth is
-/// UNIFORM — one flow per tooth, measured mid-face with the jaws' full
-/// flats, no localization anywhere — and the teeth pin the real system's
-/// measured thickness-vs-flow line, which the read-out solves for the
-/// line-width crossing (~±1.5% from the same calipers). The middle teeth
-/// are a built-in linearity check: their thicknesses must step evenly, and
-/// a tooth off the line exposes its own bad measurement.
+/// Flow-comb FAT tooth value — the ladder's top, an ABSOLUTE extrusion
+/// multiplier. 25 radial teeth step in EXACT 1% increments down to
+/// [`COMB_FLOW_THIN`], so the middle tooth is exactly 1.00 and every
+/// label is a round percent. The caliper can't tell 1% neighbours apart —
+/// that's the point: find the RUN of teeth that read right and take its
+/// middle (tie toward 100); the run structure itself is the interpolation.
 pub const COMB_FLOW_FAT: f64 = 1.12;
-/// Flow-comb THIN tooth multiplier — the tooth at the far end.
+/// Flow-comb THIN tooth value — the ladder's bottom.
 pub const COMB_FLOW_THIN: f64 = 0.88;
-/// Teeth on the comb; flow steps evenly from fat to thin along the spine —
-/// 13 teeth make the step an exact 2%, fine enough to land the setting in
-/// ONE print (and the read-out takes fractional teeth for the walls that
-/// caliper right between two).
-pub const COMB_TEETH: usize = 13;
-/// Tooth length (mm) past the spine. Long enough that the mid-face
-/// measurement zone sits several PA-smoothing-window travel distances from
-/// the corner transients at both ends.
+/// Teeth on the comb, radially around an annular hub. 25 at 10 mm hub
+/// pitch = hub radius ~39.8 mm, footprint ~120 mm — a 1%-step ladder that
+/// could never fit a small bed as a straight comb. Gaps between teeth
+/// WIDEN outward (4 mm at the root, ~9 mm at the tips), so jaw access
+/// beats the straight layout everywhere.
+pub const COMB_TEETH: usize = 25;
+/// Tooth length (mm) past the hub. Long enough that the mid-face
+/// measurement zone sits clear of the junction fillets and the tip round.
 pub const COMB_TOOTH_LEN_MM: f64 = 20.0;
 /// Tooth footprint width (mm): the ring cavity takes a caliper's inner jaw.
 pub const COMB_TOOTH_W_MM: f64 = 6.0;
-/// Tooth-to-tooth pitch (mm): a 4 mm gap between teeth for the outer jaw
-/// blade; the end teeth have fully open outer faces.
+/// Tooth-to-tooth pitch (mm) measured along the hub circle.
 pub const COMB_TOOTH_PITCH_MM: f64 = 10.0;
-/// Spine depth (mm): the bar joining the teeth, printed at true flow.
-pub const COMB_SPINE_D_MM: f64 = 4.0;
-/// Spine overhang past the fat tooth (mm) — the handle. Its one job is to
-/// label orientation: the handle end is the FAT end.
-pub const COMB_HANDLE_MM: f64 = 8.0;
+/// Radial width (mm) of the annular hub joining the teeth (true flow).
+pub const COMB_HUB_RING_MM: f64 = 4.0;
 /// Comb height (mm): tall enough for full caliper-jaw flats on any tooth.
 pub const COMB_H_MM: f64 = 12.0;
+
+/// Hub outer radius: the circle the teeth stand on.
+pub fn comb_hub_r_mm() -> f64 {
+    COMB_TEETH as f64 * COMB_TOOTH_PITCH_MM / (2.0 * std::f64::consts::PI)
+}
+
+/// Center angle (radians) of tooth `k`. Tooth 0 (the fat end of the
+/// ladder) sits at the rear; labels ascend counterclockwise viewed from
+/// the top — which is clockwise from the underside, where they're read.
+pub fn comb_tooth_angle(k: usize) -> f64 {
+    std::f64::consts::FRAC_PI_2 - k as f64 * 2.0 * std::f64::consts::PI / COMB_TEETH as f64
+}
 
 /// Strip a copy of the settings down to the calibration tower: one bare wall
 /// above a solid three-layer base plate, printed as a seamless helix, at the
@@ -396,17 +399,19 @@ const SEVEN_SEG: [u8; 10] = [
 const DIGIT_SEG_LEN_MM: f64 = 1.8;
 const DIGIT_SEG_W_MM: f64 = 0.8;
 
-/// The lit segment rectangles (comb coordinates, already MIRRORED in X so
-/// the recesses read correctly from the underside) for tooth `k`'s number.
-/// Single digits sit low in the tooth cavity; two-digit numbers stack along
-/// the tooth, tens digit nearer the spine, reading spine→tip.
-fn comb_digit_segs(k: usize) -> Vec<(f64, f64, f64, f64)> {
-    let (l, w) = (DIGIT_SEG_LEN_MM, DIGIT_SEG_W_MM);
+/// The lit seven-segment strokes of tooth `k`'s LABEL as quads in centered
+/// comb coordinates, recessed through the base plate inside the tooth
+/// ring. The label is the tooth's flow as a percent MOD 100 — two digits,
+/// leading zero ("96" = 0.96, "04" = 1.04, "00" = 1.00; no real spool is
+/// ambiguous between 12% and 112%). Two digits is what fits a 6 mm tooth
+/// at the 0.8 mm stroke width the bottom-skin machinery provably respects
+/// (its line-end reach jumps narrower slots). Digits stand upright,
+/// stacked hub→tip (tens digit nearer the hub), and the whole label is
+/// mirrored so it reads from the underside. Shared by generator and tests.
+fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
+    let (l, w) = (1.5_f64, 0.8_f64);
     let dw = l + 2.0 * w;
     let dh = 2.0 * l + 3.0 * w;
-    // Segment rects in digit-local coords (origin bottom-left, y toward the
-    // tooth tip): a top, b upper-right, c lower-right, d bottom,
-    // e lower-left, f upper-left, g middle.
     let local: [(f64, f64, f64, f64); 7] = [
         (w, 2.0 * l + 2.0 * w, w + l, dh),
         (w + l, l + 2.0 * w, dw, 2.0 * l + 2.0 * w),
@@ -416,97 +421,107 @@ fn comb_digit_segs(k: usize) -> Vec<(f64, f64, f64, f64)> {
         (0.0, l + 2.0 * w, w, 2.0 * l + 2.0 * w),
         (w, l + w, w + l, l + 2.0 * w),
     ];
-    let n = k + 1;
-    let digits: Vec<usize> = if n < 10 { vec![n] } else { vec![n / 10, n % 10] };
-    let cx = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM / 2.0;
+    let pct = (comb_tooth_flow(k) * 100.0).round() as usize % 100;
+    let chars = [pct / 10, pct % 10];
+    let theta = comb_tooth_angle(k) - std::f64::consts::FRAC_PI_2;
+    let (rc, rs) = (theta.cos(), theta.sin());
+    let base_y = comb_hub_r_mm() + 2.0;
     let mut out = Vec::new();
-    for (di, &d) in digits.iter().enumerate() {
-        let y_base = COMB_SPINE_D_MM + 3.0 + di as f64 * (dh + 1.0);
+    for (ci, &d) in chars.iter().enumerate() {
         for (si, r) in local.iter().enumerate() {
             if SEVEN_SEG[d] & (1 << si) == 0 {
                 continue;
             }
-            // Mirror in X about the digit center, then place.
-            let x0 = cx + dw / 2.0 - r.2;
-            let x1 = cx + dw / 2.0 - r.0;
-            out.push((x0, y_base + r.1, x1, y_base + r.3));
+            let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+            let mut quad = [[0.0_f64; 2]; 4];
+            for (qi, &(cx_, cy_)) in corners.iter().enumerate() {
+                // Char-local, centered across the tooth, mirrored in x for
+                // underside reading, stacked hub→tip.
+                let tx = -(cx_ - dw / 2.0);
+                let ty = base_y + ci as f64 * (dh + 0.8) + cy_;
+                quad[qi] = [tx * rc - ty * rs, tx * rs + ty * rc];
+            }
+            out.push(quad);
         }
     }
     out
 }
 
-/// G-code for the flow comb: a spine bar with [`COMB_TEETH`] hollow
-/// rectangular teeth, each a single-bead ring printed at its own flow
-/// multiplier — [`COMB_FLOW_FAT`] at the handle end stepping evenly to
-/// [`COMB_FLOW_THIN`] at the far end — while PA holds the profile value.
-/// The multiplier is baked into E through the per-segment attribute
-/// channel, so there is no M221 anywhere and nothing to restore. Caliper
-/// the two END teeth mid-face with the full jaw flats (their outer faces
-/// are completely open) and feed both thicknesses to
-/// [`flow_from_comb_teeth`]; the middle teeth must step evenly — a tooth
-/// off that line is a bad measurement telling on itself. Flow changes ride
-/// the travel between teeth, so every tooth face is pure steady state.
+/// G-code for the flow comb: [`COMB_TEETH`] single-wall ring teeth radial
+/// around an annular hub, each printed at its own ABSOLUTE flow —
+/// [`COMB_FLOW_FAT`] stepping an exact 1% per tooth to [`COMB_FLOW_THIN`],
+/// middle tooth exactly 1.00 — while PA holds the profile value. The whole
+/// file prints at extrusion multiplier 1.0 with the ladder baked into E
+/// (no M221), and every tooth carries its VALUE as a round percent
+/// recessed into the underside plate: the label you read is the setting
+/// you pin, verbatim. Caliper along the ring; several 1% neighbours will
+/// read alike — take the middle of that run (tie toward 100). Stadium
+/// tips and true junction fillets keep the loop from ever slowing near a
+/// measured face (the comb prints before PA is calibrated); one bump on
+/// the hub edge mid-gap is the only sharp feature, and the seam column
+/// snaps to it, away from every tooth.
 pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     let mut s = tower_settings(settings);
     // Ordinary closed loops, not a helix: the per-tooth flow rides the
-    // per-segment attribute channel, which the vase spiral bypasses. The
-    // seam lands on silhouette vertices (corners), never mid-face — the
-    // measurement zones stay clean.
+    // per-segment attribute channel, which the vase spiral bypasses.
     s.spiral_vase = false;
     // ABSOLUTE, not cumulative: the whole print runs at extrusion
     // multiplier 1.0, so each tooth's ladder value IS the candidate
-    // `extrusion_multiplier` — the tooth you pick is the setting you pin,
-    // verbatim. A comb that rode the current profile flow would compound:
-    // every re-print's ladder would be relative to the last pin, and the
-    // same physical wall would read a different number each time.
+    // setting. A comb that rode the current profile flow would compound —
+    // every re-print's ladder relative to the last pin.
     s.extrusion_multiplier = 1.0;
     for t in &mut s.tools {
         t.extrusion_multiplier = 1.0;
     }
     // The fat tooth extrudes 12% over nominal — derate the melt ceiling so
-    // it stays within the filament's real melt rate (a cap-riding profile
-    // would starve it, thinning the wall and biasing the solve high).
+    // it stays within the filament's real melt rate.
     s.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
     for t in &mut s.tools {
         t.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
     }
-    let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
-    let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
-    let rect = |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
-    let rect_cw =
-        |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x0, y1], [x1, y1], [x1, y0]];
+    let rh = comb_hub_r_mm();
     let mut tris = Vec::new();
-    prism(&rect(0.0, 0.0, w, COMB_SPINE_D_MM), 0.0, COMB_H_MM, &mut tris);
-    // A tooth is a stadium, not a rectangle: semicircular tip, and true
-    // concave fillets where it meets the spine. The loop then never slows
-    // hard anywhere near the measured faces — the comb prints BEFORE the
-    // PA calibration, and with PA far off every sharp corner sheds a blob
-    // or a starve that reaches into the adjacent face. Rounded, the wall
-    // is steady state whatever PA is. (The handle keeps the only sharp
-    // corners: the aligned seam snaps there, away from every tooth.)
-    let tooth_fp = |x0: f64| {
-        let r = COMB_TOOTH_W_MM / 2.0;
-        let (xc, tip_c) = (x0 + r, d - r);
-        let mut fp = vec![[x0, COMB_SPINE_D_MM - 1.0], [x0 + COMB_TOOTH_W_MM, COMB_SPINE_D_MM - 1.0]];
-        for i in 0..=18 {
-            let a = f64::from(i) * 10.0_f64.to_radians();
-            fp.push([xc + r * a.cos(), tip_c + r * a.sin()]);
+    // Annular hub: a CCW disc with a REVERSED (CW) disc cut from it.
+    let disc = |r: f64, ccw: bool| {
+        let n = 180;
+        let mut fp: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = f64::from(i) * 2.0 * std::f64::consts::PI / f64::from(n);
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        if !ccw {
+            fp.reverse();
         }
         fp
     };
-    // Concave fillet filler at a tooth-spine corner: the region between the
-    // two 2 mm legs and the quarter arc bulging toward the corner. Fanned
-    // from the corner vertex, which sees the whole region (prism() fans
-    // from its first point, so non-convexity along the arc is fine).
-    let fillet_fp = |corner_x: f64, sx: f64| {
+    prism(&disc(rh, true), 0.0, COMB_H_MM, &mut tris);
+    prism(&disc(rh - COMB_HUB_RING_MM, false), 0.0, COMB_H_MM, &mut tris);
+    // Teeth: stadium footprints in tooth-local coords (x across the width,
+    // y radial), rotated into place. The 1 mm root overlap into the hub and
+    // the 0.5 mm fillet padding keep every prism buried in solid — no
+    // knife-edge coincident walls.
+    let hw = COMB_TOOTH_W_MM / 2.0;
+    let place = |k: usize, fp: &[[f64; 2]]| -> Vec<[f64; 2]> {
+        let a = comb_tooth_angle(k) - std::f64::consts::FRAC_PI_2;
+        let (rc, rs) = (a.cos(), a.sin());
+        fp.iter().map(|p| [p[0] * rc - p[1] * rs, p[0] * rs + p[1] * rc]).collect()
+    };
+    let tooth_fp = {
+        let tip_c = rh + COMB_TOOTH_LEN_MM - hw;
+        let mut fp = vec![[-hw, rh - 1.0], [hw, rh - 1.0]];
+        for i in 0..=18 {
+            let a = f64::from(i) * 10.0_f64.to_radians();
+            fp.push([hw * a.cos(), tip_c + hw * a.sin()]);
+        }
+        fp
+    };
+    // Concave junction fillet in tooth-local coords: quarter arc bulging
+    // toward the corner, legs padded 0.5 mm into hub and tooth. The hub
+    // edge is locally straight to within 0.05 mm over the 2 mm fillet.
+    let fillet_fp = |sx: f64| {
         let r = 2.0;
-        let cy = COMB_SPINE_D_MM;
-        // Arc center sits diagonally off the corner; the quarter arc runs
-        // from the spine-side leg to the tooth-side leg, bulging TOWARD the
-        // corner. The straight edges are PADDED 0.5 mm into the spine and
-        // tooth so the filler overlaps solid material like the teeth
-        // overlap the spine — knife-edge coincident walls are the one thing
-        // the triangle-soup union has no robust answer for.
+        let (corner_x, cy) = (sx * hw, rh);
         let (ccx, ccy) = (corner_x + sx * r, cy + r);
         let pad = 0.5;
         let mut fp = vec![[corner_x - sx * pad, cy - pad], [ccx, cy - pad]];
@@ -515,8 +530,6 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
             fp.push([ccx + r * a.cos(), ccy + r * a.sin()]);
         }
         fp.push([corner_x - sx * pad, ccy]);
-        // CCW with the buried corner vertex first (prism() fans from it,
-        // and it sees the whole concave-arc region).
         let area: f64 = fp
             .windows(2)
             .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
@@ -529,32 +542,49 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
         fp
     };
     for k in 0..COMB_TEETH {
-        let x0 = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
-        // Overlap one mm into the spine so the prisms union into one comb.
-        prism(&tooth_fp(x0), 0.0, COMB_H_MM, &mut tris);
-        // Fillet only corners that exist: the LAST tooth's right face is
-        // flush with the spine's end — one straight edge, no concave corner
-        // — and a fillet there pokes past the part, growing the mesh bbox
-        // and shifting the bed-centered print a millimeter sideways.
-        prism(&fillet_fp(x0, -1.0), 0.0, COMB_H_MM, &mut tris);
-        if k + 1 < COMB_TEETH {
-            prism(&fillet_fp(x0 + COMB_TOOTH_W_MM, 1.0), 0.0, COMB_H_MM, &mut tris);
+        prism(&place(k, &tooth_fp), 0.0, COMB_H_MM, &mut tris);
+        prism(&place(k, &fillet_fp(-1.0)), 0.0, COMB_H_MM, &mut tris);
+        prism(&place(k, &fillet_fp(1.0)), 0.0, COMB_H_MM, &mut tris);
+        // The label: REVERSED-winding prisms cut the value through the
+        // base plate (above it the ring cavity is empty, so the tall cut
+        // costs nothing).
+        for quad in comb_label_quads(k) {
+            let mut fp: Vec<[f64; 2]> = quad.to_vec();
+            let area: f64 = fp
+                .windows(2)
+                .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+                .sum::<f64>()
+                + fp.last().unwrap()[0] * fp[0][1]
+                - fp[0][0] * fp.last().unwrap()[1];
+            if area > 0.0 {
+                fp.reverse(); // holes are CW
+            }
+            prism(&fp, 0.0, 2.0, &mut tris);
         }
-        // Tooth number, recessed through the base plate inside the ring:
-        // REVERSED-winding prisms cut holes (positive-fill slicing), and
-        // the digits are pre-mirrored so they read from the underside.
-        // Above the plate the ring cavity is empty anyway, so the tall cut
-        // costs nothing.
-        for (sx0, sy0, sx1, sy1) in comb_digit_segs(k) {
-            prism(&rect_cw(sx0, sy0, sx1, sy1), 0.0, 2.0, &mut tris);
-        }
+    }
+    // Seam magnet: the one sharp feature — a small bump on the hub edge in
+    // the mid-gap behind tooth 0. The aligned seam column snaps to the
+    // sharpest corner in reach; give it one, away from every tooth.
+    {
+        let a = comb_tooth_angle(0) + std::f64::consts::PI / COMB_TEETH as f64;
+        let (rc, rs) = ((a - std::f64::consts::FRAC_PI_2).cos(), (a - std::f64::consts::FRAC_PI_2).sin());
+        let tri = [[0.0, rh + 1.6], [-0.9, rh - 0.8], [0.9, rh - 0.8]];
+        let fp: Vec<[f64; 2]> =
+            tri.iter().map(|p| [p[0] * rc - p[1] * rs, p[0] * rs + p[1] * rc]).collect();
+        let area: f64 = fp
+            .windows(2)
+            .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+            .sum::<f64>()
+            + fp.last().unwrap()[0] * fp[0][1]
+            - fp[0][0] * fp.last().unwrap()[1];
+        let fp = if area < 0.0 { vec![fp[0], fp[2], fp[1]] } else { fp };
+        prism(&fp, 0.0, COMB_H_MM, &mut tris);
     }
     let mesh = mesh::Mesh::from_triangle_soup(&tris);
     let mut plans = generate_parts(&[(&mesh, tool)], &s);
-    // The plans are bed-centered (auto_center_on_bed); map back to comb
-    // coordinates to decide which tooth a wall segment belongs to.
-    let ox = s.bed_size_x_mm / 2.0 - w / 2.0;
-    let oy = s.bed_size_y_mm / 2.0 - d / 2.0;
+    // The mesh is built about the origin and the bbox is symmetric, so the
+    // bed-centered frame is just a translation to bed center.
+    let (ox, oy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
     for plan in &mut plans {
         for p in &mut plan.paths {
             if !matches!(
@@ -581,50 +611,43 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
                     }
                 })
                 .collect();
-            // Only carry the channel where a tooth actually changes flow —
-            // spine-only loops (and the base plate) stay plain paths.
             if attrs.iter().any(|a| (f64::from(a.flow) - 1.0).abs() > 1.0e-3) {
                 p.segs = Some(attrs);
             }
         }
     }
-    let ladder: String = (0..COMB_TEETH)
-        .map(|k| format!("; tooth {:>2} (from the handle) = flow {:.2}\n", k + 1, comb_tooth_flow(k)))
-        .collect();
     let header = format!(
-        "; flow comb: {COMB_TEETH} teeth, each a single-wall ring at its own ABSOLUTE flow —\n\
-         ; tooth 1 at the HANDLE end = {COMB_FLOW_FAT}, stepping evenly to {COMB_FLOW_THIN} at the far end.\n\
-         ; the whole file prints at extrusion multiplier 1.0 with the ladder baked into E\n\
-         ; (no M221), so a tooth's value IS the setting: find the tooth whose wall\n\
-         ; calipers at exactly {:.2} mm (the line width — full jaw flats, mid-face,\n\
-         ; any position on the tooth) and pin that tooth's flow, verbatim. If the\n\
-         ; right wall lies between two teeth, split the difference (tooth 7.5 is\n\
-         ; halfway between tooth 7 and 8). PA stays at the profile value.\n\
-         ; teeth are NUMBERED on the underside — flip the comb over; two-digit\n\
-         ; numbers read spine-to-tip.\n\
-{ladder}",
+        "; flow comb: {COMB_TEETH} teeth radial around the hub, each a single-wall ring at\n\
+         ; its own ABSOLUTE flow — 1% per tooth, {COMB_FLOW_FAT} down to {COMB_FLOW_THIN}, and every tooth\n\
+         ; carries its VALUE recessed into the UNDERSIDE as percent MOD 100, two\n\
+         ; digits (96 = 0.96, 04 = 1.04, 00 = 1.00) — flip the comb over to read.\n\
+         ; the whole file prints at extrusion multiplier 1.0 with the ladder baked\n\
+         ; into E (no M221): the label you read IS the setting you pin, verbatim.\n\
+         ; caliper along the ring for the teeth that read exactly {:.2} mm (the line\n\
+         ; width — full jaw flats, mid-face); 1% neighbours will read alike, so take\n\
+         ; the MIDDLE of the matching run, tie toward 100. PA stays at the profile\n\
+         ; value. the hub prints at true flow.\n",
         s.line_width_mm
     );
     format!("{header}{}", to_gcode(&plans, &s))
 }
 
-/// Flow multiplier for a point of the comb (comb coordinates): on a tooth,
-/// that tooth's step of the fat→thin ladder; on the spine, the junction
-/// band, or anywhere unexpected, true flow.
+/// Flow multiplier at a point (centered comb coordinates): the owning
+/// tooth's ladder value outside the hub, true flow on the hub and in the
+/// junction band (the transition rides the fillet zone, below every
+/// measured face).
 fn comb_flow_at(x: f64, y: f64) -> f64 {
-    if y <= COMB_SPINE_D_MM + 1.5 {
+    let rh = comb_hub_r_mm();
+    if x.hypot(y) < rh + 0.5 {
         return 1.0;
     }
-    for k in 0..COMB_TEETH {
-        let x0 = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
-        if (x0 - 1.0..=x0 + COMB_TOOTH_W_MM + 1.0).contains(&x) {
-            return comb_tooth_flow(k);
-        }
-    }
-    1.0
+    let step = 2.0 * std::f64::consts::PI / COMB_TEETH as f64;
+    let k = ((std::f64::consts::FRAC_PI_2 - y.atan2(x)) / step).rem_euclid(COMB_TEETH as f64);
+    comb_tooth_flow(k.round() as usize % COMB_TEETH)
 }
 
-/// The flow multiplier of tooth `k` (0 = the fat tooth at the handle end).
+/// The flow multiplier of tooth `k` (0 = the fat tooth at the rear; an
+/// exact 1% per step, so every label is a round percent).
 pub fn comb_tooth_flow(k: usize) -> f64 {
     COMB_FLOW_FAT + (COMB_FLOW_THIN - COMB_FLOW_FAT) * k as f64 / (COMB_TEETH - 1) as f64
 }
@@ -638,17 +661,15 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// The ABSOLUTE flow multiplier of a (possibly fractional) 1-based tooth
-/// number: tooth 1 is the fat tooth at the handle end, tooth
-/// [`COMB_TEETH`] the thin one, and 7.5 reads halfway between teeth 7 and
-/// 8 — for the wall that calipers right between two teeth. The comb prints
-/// at extrusion multiplier 1.0, so this value is pinned verbatim: nothing
-/// is multiplied into the current setting, and re-printing the comb always
-/// reproduces the identical ladder. Out-of-range entries clamp to the end
-/// teeth.
-pub fn flow_from_comb_tooth(tooth: f64) -> f64 {
-    let k = (tooth - 1.0).clamp(0.0, (COMB_TEETH - 1) as f64);
-    COMB_FLOW_FAT + (COMB_FLOW_THIN - COMB_FLOW_FAT) * k / (COMB_TEETH - 1) as f64
+/// The winning tooth's LABEL — the percent recessed into its underside —
+/// as the absolute flow multiplier to pin, verbatim. The comb prints at
+/// extrusion multiplier 1.0, so nothing is multiplied into the current
+/// setting and re-printing always reproduces the identical ladder.
+/// Implausible labels (outside any real spool) leave the value alone by
+/// returning 1.0-per-cent semantics only in range.
+pub fn flow_from_comb_label(percent: f64) -> Option<f64> {
+    let m = percent / 100.0;
+    (0.7..=1.3).contains(&m).then_some(m)
 }
 
 /// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
@@ -980,116 +1001,30 @@ mod tests {
     fn flow_comb_bakes_per_tooth_flow() {
         let s = Settings::default();
         let g = flow_comb_gcode(&s, 0);
-        // No M221 anywhere beyond the preamble hygiene guard — the
-        // multipliers are baked into E.
         assert!(
             g.lines().filter(|l| l.starts_with("M221")).all(|l| l.trim() == "M221 S100"),
             "comb must not sweep firmware flow"
         );
-        // Measure E-per-mm of wall extrusions bucketed by tooth, on layers
-        // above the base plate, away from corners: the fat and thin end
-        // teeth must carry their multipliers relative to the spine.
-        let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
-        let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
-        let (ox, oy) = (s.bed_size_x_mm / 2.0 - w / 2.0, s.bed_size_y_mm / 2.0 - d / 2.0);
-        let tooth_x = |k: usize| COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
+        // Bucket wall E-per-mm by the shared classifier: the fat and thin
+        // teeth must carry their ladder values relative to the hub.
+        let (ox, oy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+        let rh = comb_hub_r_mm();
         let (mut x, mut y) = (0.0_f64, 0.0_f64);
         let (mut layer, mut wall) = (0usize, false);
-        // (sum E, sum len) per bucket: fat tooth, thin tooth, spine.
-        let mut buckets = [(0.0_f64, 0.0_f64); 3];
+        let mut buckets = [(0.0_f64, 0.0_f64); 3]; // fat, thin, hub
         for l in g.lines() {
             if l.starts_with("; LAYER ") {
                 layer += 1;
                 continue;
             }
             if let Some(t) = l.strip_prefix(";TYPE:") {
-                wall = t.trim() == "Outer wall";
+                wall = matches!(t.trim(), "Outer wall" | "Inner wall");
                 continue;
             }
-            if !(l.starts_with("G1 ") || l.starts_with("G0 ")) {
-                continue;
-            }
-            let mut nx = x;
-            let mut ny = y;
-            let mut e = 0.0_f64;
-            for tok in l.split_whitespace() {
-                if let Some(v) = tok.strip_prefix('X').and_then(|v| v.parse::<f64>().ok()) {
-                    nx = v;
-                }
-                if let Some(v) = tok.strip_prefix('Y').and_then(|v| v.parse::<f64>().ok()) {
-                    ny = v;
-                }
-                if let Some(v) = tok.strip_prefix('E').and_then(|v| v.parse::<f64>().ok()) {
-                    e = v;
-                }
-            }
-            let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
-            let (mx, my) = ((x + nx) / 2.0 - ox, (y + ny) / 2.0 - oy);
-            x = nx;
-            y = ny;
-            // Above the base plate, real extrusions, long straight strokes
-            // only (corner pieces carry concave trims).
-            if layer <= 4 || !wall || e <= 1.0e-6 || len < 3.0 {
-                continue;
-            }
-            let mid_tooth = |k: usize| {
-                let x0 = tooth_x(k);
-                (x0 - 0.5..=x0 + COMB_TOOTH_W_MM + 0.5).contains(&mx)
-                    && my > COMB_SPINE_D_MM + 4.0
-                    && my < d - 2.0
-            };
-            let b = if mid_tooth(0) {
-                0
-            } else if mid_tooth(COMB_TEETH - 1) {
-                1
-            } else if my < COMB_SPINE_D_MM {
-                2
-            } else {
-                continue;
-            };
-            buckets[b].0 += e;
-            buckets[b].1 += len;
-        }
-        let epmm = |b: (f64, f64)| {
-            assert!(b.1 > 20.0, "bucket has enough wall to judge, got {} mm", b.1);
-            b.0 / b.1
-        };
-        let (fat, thin, spine) = (epmm(buckets[0]), epmm(buckets[1]), epmm(buckets[2]));
-        assert!(
-            (fat / spine - COMB_FLOW_FAT).abs() < 0.02,
-            "fat tooth at {COMB_FLOW_FAT}x, got {:.3}",
-            fat / spine
-        );
-        assert!(
-            (thin / spine - COMB_FLOW_THIN).abs() < 0.02,
-            "thin tooth at {COMB_FLOW_THIN}x, got {:.3}",
-            thin / spine
-        );
-    }
-
-    #[test]
-    fn flow_comb_numbers_the_teeth_on_the_underside() {
-        // Every tooth's number must slice as real voids in the base plate:
-        // no layer-0 extrusion inside a lit segment slot, while the plate
-        // right beside the digit block stays covered.
-        let s = Settings::default();
-        let g = flow_comb_gcode(&s, 0);
-        let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
-        let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
-        let (ox, oy) = (s.bed_size_x_mm / 2.0 - w / 2.0, s.bed_size_y_mm / 2.0 - d / 2.0);
-        // Collect layer-0 extrusion segment midpoints (comb coords).
-        let (mut x, mut y) = (0.0_f64, 0.0_f64);
-        let mut layer = -1_i64;
-        let mut pts: Vec<(f64, f64)> = Vec::new();
-        for l in g.lines() {
-            if l.starts_with("; LAYER ") {
-                layer += 1;
-                continue;
-            }
-            if layer > 0 {
-                break;
-            }
-            if !(l.starts_with("G0 ") || l.starts_with("G1 ")) {
+            // Arcs (G2/G3 — the un-annotated hub circle and skirt arc-fit)
+            // must still advance the position or every later midpoint lies.
+            let arc = l.starts_with("G2 ") || l.starts_with("G3 ");
+            if !(l.starts_with("G1 ") || l.starts_with("G0 ") || arc) {
                 continue;
             }
             let (mut nx, mut ny, mut e) = (x, y, 0.0_f64);
@@ -1104,8 +1039,89 @@ mod tests {
                     }
                 }
             }
-            if layer == 0 && e > 0.0 {
-                // Sample the segment densely so long fill strokes register.
+            let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            let (mx, my) = ((x + nx) / 2.0 - ox, (y + ny) / 2.0 - oy);
+            x = nx;
+            y = ny;
+            // Chord geometry only judges straight moves; 1 mm keeps the hub
+            // circle's ~1.4 mm facets while excluding fillet and tip bits.
+            if arc || layer <= 4 || !wall || e <= 1.0e-6 || len < 1.0 {
+                continue;
+            }
+            let r = mx.hypot(my);
+            let f = comb_flow_at(mx, my);
+            // Teeth: mid-face band only, clear of fillets and tip rounds.
+            let b = if (f - COMB_FLOW_FAT).abs() < 1e-9 && r > rh + 4.0 && r < rh + 16.0 {
+                0
+            } else if (f - COMB_FLOW_THIN).abs() < 1e-9 && r > rh + 4.0 && r < rh + 16.0 {
+                1
+            } else if (f - 1.0).abs() < 1e-9 && r > rh + 4.0 && r < rh + 16.0 {
+                // The middle tooth prints at exactly 1.00 — the comb's own
+                // built-in reference. (The hub itself offers no straight
+                // reference wall: the fillets consume the inter-tooth arcs
+                // and the inner circle is arc-fit.)
+                2
+            } else {
+                continue;
+            };
+            buckets[b].0 += e;
+            buckets[b].1 += len;
+        }
+        let epmm = |b: (f64, f64)| {
+            assert!(b.1 > 20.0, "bucket has enough wall to judge, got {} mm", b.1);
+            b.0 / b.1
+        };
+        let (fat, thin, mid) = (epmm(buckets[0]), epmm(buckets[1]), epmm(buckets[2]));
+        assert!(
+            (fat / mid - COMB_FLOW_FAT).abs() < 0.02,
+            "fat tooth at {COMB_FLOW_FAT}x the 100% tooth, got {:.3}",
+            fat / mid
+        );
+        assert!(
+            (thin / mid - COMB_FLOW_THIN).abs() < 0.02,
+            "thin tooth at {COMB_FLOW_THIN}x the 100% tooth, got {:.3}",
+            thin / mid
+        );
+    }
+
+    #[test]
+    fn flow_comb_labels_the_teeth_on_the_underside() {
+        // Every sampled tooth's percent label must slice as real voids in
+        // the base plate, while the plate tipward of the label stays
+        // covered.
+        let s = Settings::default();
+        let g = flow_comb_gcode(&s, 0);
+        let (ox, oy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let mut layer = -1_i64;
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                layer += 1;
+                continue;
+            }
+            if layer > 0 {
+                break;
+            }
+            let arc = l.starts_with("G2 ") || l.starts_with("G3 ");
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ") || arc) {
+                continue;
+            }
+            let (mut nx, mut ny, mut e) = (x, y, 0.0_f64);
+            for tok in l.split_whitespace().skip(1) {
+                let (c, v) = tok.split_at(1);
+                if let Ok(v) = v.parse::<f64>() {
+                    match c {
+                        "X" => nx = v,
+                        "Y" => ny = v,
+                        "E" => e = v,
+                        _ => {}
+                    }
+                }
+            }
+            // Arc chords would place samples off the true path — skip their
+            // interiors but keep the endpoint so tracking stays honest.
+            if layer == 0 && e > 0.0 && !arc {
                 let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
                 let n = (len / 0.2).ceil().max(1.0) as usize;
                 for i in 0..=n {
@@ -1117,33 +1133,36 @@ mod tests {
             y = ny;
         }
         assert!(pts.len() > 1000, "layer 0 parsed, got {} samples", pts.len());
-        for k in [0, 7, COMB_TEETH - 1] {
-            let segs = comb_digit_segs(k);
-            assert!(!segs.is_empty());
-            for (sx0, sy0, sx1, sy1) in &segs {
-                // Shrink by the wall half-bead: the hole's own wall loop
-                // rides just inside the slot edge.
-                let m = 0.25;
+        for k in [0, 12, COMB_TEETH - 1] {
+            let quads = comb_label_quads(k);
+            assert!(!quads.is_empty());
+            for q in &quads {
+                // Clearance around each stroke's centroid: the slot is
+                // 0.65 mm wide, so a 0.28 mm-radius void at its heart
+                // proves the hole survived slicing and fill.
+                let (cx_, cy_) = (
+                    (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4.0,
+                    (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0,
+                );
                 let hits = pts
                     .iter()
-                    .filter(|(px, py)| {
-                        *px > sx0 + m && *px < sx1 - m && *py > sy0 + m && *py < sy1 - m
-                    })
+                    .filter(|(px, py)| (px - cx_).hypot(py - cy_) < 0.28)
                     .count();
                 assert_eq!(
                     hits, 0,
-                    "tooth {} digit slot [{sx0:.1},{sy0:.1}-{sx1:.1},{sy1:.1}] must be void",
+                    "tooth {} label stroke at ({cx_:.1},{cy_:.1}) must be void",
                     k + 1
                 );
             }
-            // The plate just tipward of the digit block is solid.
-            let cx = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM / 2.0;
-            let probe_y = COMB_SPINE_D_MM + 3.0 + 2.0 * (2.0 * DIGIT_SEG_LEN_MM + 3.0 * DIGIT_SEG_W_MM) + 3.0;
+            // The plate tipward of the label stays covered.
+            let a = comb_tooth_angle(k);
+            let r = comb_hub_r_mm() + 16.0;
+            let (px, py) = (r * a.cos(), r * a.sin());
             let near = pts
                 .iter()
-                .filter(|(px, py)| (px - cx).abs() < 1.5 && (py - probe_y).abs() < 1.5)
+                .filter(|(qx, qy)| (qx - px).hypot(qy - py) < 1.5)
                 .count();
-            assert!(near > 0, "plate beside tooth {}'s digits stays covered", k + 1);
+            assert!(near > 0, "plate tipward of tooth {}'s label stays covered", k + 1);
         }
     }
 
@@ -1301,22 +1320,23 @@ mod tests {
     }
 
     #[test]
-    fn flow_from_comb_tooth_is_absolute() {
-        // Tooth 1 = the fat end, the last tooth = the thin end, the middle
-        // tooth = exactly 1.00, and fractional teeth interpolate — all
-        // ABSOLUTE values, nothing multiplied into a current setting.
-        assert!((flow_from_comb_tooth(1.0) - COMB_FLOW_FAT).abs() < 1e-9);
-        assert!((flow_from_comb_tooth(COMB_TEETH as f64) - COMB_FLOW_THIN).abs() < 1e-9);
-        assert!((flow_from_comb_tooth(7.0) - 1.0).abs() < 1e-9);
-        assert!((flow_from_comb_tooth(7.5) - 0.99).abs() < 1e-9);
-        // The ladder steps an exact 2% per tooth.
-        assert!((flow_from_comb_tooth(1.0) - flow_from_comb_tooth(2.0) - 0.02).abs() < 1e-9);
-        // Out-of-range entries clamp to the end teeth.
-        assert_eq!(flow_from_comb_tooth(0.0), COMB_FLOW_FAT);
-        assert_eq!(flow_from_comb_tooth(99.0), COMB_FLOW_THIN);
-        // Generator and read-out agree tooth by tooth.
-        for k in 0..COMB_TEETH {
-            assert!((comb_tooth_flow(k) - flow_from_comb_tooth((k + 1) as f64)).abs() < 1e-9);
+    fn flow_comb_ladder_and_labels_are_absolute() {
+        // Exact 1% steps, round-percent labels, middle tooth exactly 1.00.
+        assert!((comb_tooth_flow(0) - COMB_FLOW_FAT).abs() < 1e-12);
+        assert!((comb_tooth_flow(COMB_TEETH - 1) - COMB_FLOW_THIN).abs() < 1e-12);
+        assert!((comb_tooth_flow(12) - 1.0).abs() < 1e-12, "middle tooth is 100%");
+        for k in 1..COMB_TEETH {
+            assert!(
+                (comb_tooth_flow(k - 1) - comb_tooth_flow(k) - 0.01).abs() < 1e-12,
+                "exact 1% per tooth"
+            );
         }
+        // The label IS the setting: percent in, multiplier out, verbatim.
+        assert_eq!(flow_from_comb_label(98.0), Some(0.98));
+        assert_eq!(flow_from_comb_label(112.0), Some(1.12));
+        assert_eq!(flow_from_comb_label(100.0), Some(1.0));
+        // Implausible labels are rejected, not clamped.
+        assert_eq!(flow_from_comb_label(0.98), None);
+        assert_eq!(flow_from_comb_label(500.0), None);
     }
 }
