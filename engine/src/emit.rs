@@ -2101,6 +2101,50 @@ fn plan_layer_travels(
 /// of time doing it.
 const FAN_COOL_LAYER_TIME_S: f64 = 35.0;
 
+/// The cooling clock: NAIVE commanded time — path length over commanded
+/// feed plus travels at travel speed plus retract strokes, with no junction
+/// or acceleration modeling. Deliberately not `layer_print_seconds`: the
+/// 35s window is calibrated against this clock (reconstructed from the
+/// reference print's emitted fan to ~2 duty-points per layer across all
+/// 159 layers), and the junction-aware time reads up to ~2x longer on
+/// micro-segmented layers — which silently halves the boost and leaves
+/// short layers semi-molten (the shrink band above a shelf).
+fn layer_naive_seconds(plan: &LayerPlan, s: &Settings, tools: &Tools) -> f64 {
+    let mut t = 0.0;
+    for (i, path) in plan.paths.iter().enumerate() {
+        if let Some(tr) = plan.travels.get(i) {
+            let mut d = 0.0;
+            for w in tr.points.windows(2) {
+                d += dist_mm(w[0], w[1]);
+            }
+            t += d / s.travel_speed_mm_s.max(1.0);
+            if tr.retract {
+                let tool = tools.get(path.tool);
+                t += 2.0 * tool.retract_len_mm / s.retract_speed_mm_s.max(1.0);
+            }
+        }
+        if path.points.len() < 2 {
+            continue;
+        }
+        let tool = tools.get(path.tool);
+        let feed =
+            feed_for(path, plan.index, plan.height_mm, layer_flow_cap_mm3_s(plan, tool), tool, s)
+                * small_loop_factor(path)
+                / 60.0;
+        if feed > 1.0e-6 {
+            let mut len = 0.0;
+            for w in path.points.windows(2) {
+                len += dist_mm(w[0], w[1]);
+            }
+            if path.closed {
+                len += dist_mm(*path.points.last().unwrap(), path.points[0]);
+            }
+            t += len / feed;
+        }
+    }
+    t
+}
+
 /// Per-layer cooling: slow layers that print faster than `min_layer_time_s`
 /// (down to a floor speed), and ramp the fan on layers shorter than the
 /// cooling window so they solidify before the next layer lands.
@@ -2112,10 +2156,14 @@ pub(crate) fn apply_min_layer_time(plans: &mut [LayerPlan], s: &Settings) {
     // less slowing.
     let entries = entry_tools(plans);
     plans.par_iter_mut().zip(entries).for_each(|(plan, entry)| {
-        let t = layer_print_seconds(plan, s, &tools, 1.0, entry);
-        if t > 0.0 {
-            plan.fan_boost = (1.0 - t / FAN_COOL_LAYER_TIME_S).clamp(0.0, 1.0);
+        // Fan rides the naive clock (see `layer_naive_seconds`); the
+        // min-layer-time slowdown keeps the junction-aware real seconds —
+        // its floor is about how long the machine actually dwells.
+        let tn = layer_naive_seconds(plan, s, &tools);
+        if tn > 0.0 {
+            plan.fan_boost = (1.0 - tn / FAN_COOL_LAYER_TIME_S).clamp(0.0, 1.0);
         }
+        let t = layer_print_seconds(plan, s, &tools, 1.0, entry);
         if s.min_layer_time_s > 0.0 && t > 0.0 && t < s.min_layer_time_s {
             plan.speed_scale = (t / s.min_layer_time_s).clamp(floor, 1.0);
         }
