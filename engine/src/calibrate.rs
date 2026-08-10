@@ -64,17 +64,20 @@ pub const PA_TOWER_FACTOR: f64 = 0.002;
 pub const COMB_FLOW_FAT: f64 = 1.12;
 /// Flow-comb THIN tooth multiplier — the tooth at the far end.
 pub const COMB_FLOW_THIN: f64 = 0.88;
-/// Teeth on the comb; flow steps evenly from fat to thin along the spine.
-pub const COMB_TEETH: usize = 7;
+/// Teeth on the comb; flow steps evenly from fat to thin along the spine —
+/// 13 teeth make the step an exact 2%, fine enough to land the setting in
+/// ONE print (and the read-out takes fractional teeth for the walls that
+/// caliper right between two).
+pub const COMB_TEETH: usize = 13;
 /// Tooth length (mm) past the spine. Long enough that the mid-face
 /// measurement zone sits several PA-smoothing-window travel distances from
 /// the corner transients at both ends.
 pub const COMB_TOOTH_LEN_MM: f64 = 20.0;
 /// Tooth footprint width (mm): the ring cavity takes a caliper's inner jaw.
 pub const COMB_TOOTH_W_MM: f64 = 6.0;
-/// Tooth-to-tooth pitch (mm): a 6 mm gap between teeth for the outer jaw —
-/// though the two teeth that matter (the ends) have fully open outer faces.
-pub const COMB_TOOTH_PITCH_MM: f64 = 12.0;
+/// Tooth-to-tooth pitch (mm): a 4 mm gap between teeth for the outer jaw
+/// blade; the end teeth have fully open outer faces.
+pub const COMB_TOOTH_PITCH_MM: f64 = 10.0;
 /// Spine depth (mm): the bar joining the teeth, printed at true flow.
 pub const COMB_SPINE_D_MM: f64 = 4.0;
 /// Spine overhang past the fat tooth (mm) — the handle. Its one job is to
@@ -264,6 +267,16 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     // seam lands on silhouette vertices (corners), never mid-face — the
     // measurement zones stay clean.
     s.spiral_vase = false;
+    // ABSOLUTE, not cumulative: the whole print runs at extrusion
+    // multiplier 1.0, so each tooth's ladder value IS the candidate
+    // `extrusion_multiplier` — the tooth you pick is the setting you pin,
+    // verbatim. A comb that rode the current profile flow would compound:
+    // every re-print's ladder would be relative to the last pin, and the
+    // same physical wall would read a different number each time.
+    s.extrusion_multiplier = 1.0;
+    for t in &mut s.tools {
+        t.extrusion_multiplier = 1.0;
+    }
     // The fat tooth extrudes 12% over nominal — derate the melt ceiling so
     // it stays within the filament's real melt rate (a cap-riding profile
     // would starve it, thinning the wall and biasing the solve high).
@@ -325,15 +338,19 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
             }
         }
     }
+    let ladder: String = (0..COMB_TEETH)
+        .map(|k| format!("; tooth {:>2} (from the handle) = flow {:.2}\n", k + 1, comb_tooth_flow(k)))
+        .collect();
     let header = format!(
-        "; flow comb: {COMB_TEETH} teeth, each a single-wall ring at its own flow x profile flow —\n\
-         ; {COMB_FLOW_FAT} at the HANDLE end stepping evenly to {COMB_FLOW_THIN} at the far end. no M221:\n\
-         ; the multipliers are baked into E, and PA stays at the profile value.\n\
-         ; caliper the two END teeth mid-face with the FULL jaw flats (their outer faces\n\
-         ; are open; each tooth is uniform, so position on the tooth does not matter),\n\
-         ; then enter both thicknesses in the Filament panel — it solves for the flow\n\
-         ; where the wall would read exactly {:.2} mm (the line width). the middle teeth\n\
-         ; must step evenly between them: a tooth off the line is a bad measurement.\n",
+        "; flow comb: {COMB_TEETH} teeth, each a single-wall ring at its own ABSOLUTE flow —\n\
+         ; tooth 1 at the HANDLE end = {COMB_FLOW_FAT}, stepping evenly to {COMB_FLOW_THIN} at the far end.\n\
+         ; the whole file prints at extrusion multiplier 1.0 with the ladder baked into E\n\
+         ; (no M221), so a tooth's value IS the setting: find the tooth whose wall\n\
+         ; calipers at exactly {:.2} mm (the line width — full jaw flats, mid-face,\n\
+         ; any position on the tooth) and pin that tooth's flow, verbatim. If the\n\
+         ; right wall lies between two teeth, split the difference (tooth 7.5 is\n\
+         ; halfway between tooth 7 and 8). PA stays at the profile value.\n\
+{ladder}",
         s.line_width_mm
     );
     format!("{header}{}", to_gcode(&plans, &s))
@@ -369,30 +386,17 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// New flow multiplier from the comb's two END tooth thicknesses (mm): the
-/// fat (handle-end) and thin (far-end) teeth, each measured mid-face with
-/// the jaws' full flats. The two points pin the real system's
-/// thickness-vs-flow line; solving it for the line-width crossing locates
-/// the multiplier that makes the wall exactly right — no bead model in the
-/// loop, and extrusion is volumetric, so the line really is a line.
-/// Multiplicative on the current value — the teeth rode on top of it.
-/// Readings that can't be a real comb (thin >= fat, non-positive, or a
-/// solve outside a plausible spool) leave the value untouched.
-pub fn flow_from_comb_teeth(
-    current_flow: f64,
-    line_width_mm: f64,
-    fat_mm: f64,
-    thin_mm: f64,
-) -> f64 {
-    if thin_mm <= 0.0 || fat_mm <= thin_mm {
-        return current_flow;
-    }
-    let slope = (COMB_FLOW_FAT - COMB_FLOW_THIN) / (fat_mm - thin_mm);
-    let m = COMB_FLOW_THIN + (line_width_mm - thin_mm) * slope;
-    if !(0.5..=1.5).contains(&m) {
-        return current_flow;
-    }
-    current_flow * m
+/// The ABSOLUTE flow multiplier of a (possibly fractional) 1-based tooth
+/// number: tooth 1 is the fat tooth at the handle end, tooth
+/// [`COMB_TEETH`] the thin one, and 7.5 reads halfway between teeth 7 and
+/// 8 — for the wall that calipers right between two teeth. The comb prints
+/// at extrusion multiplier 1.0, so this value is pinned verbatim: nothing
+/// is multiplied into the current setting, and re-printing the comb always
+/// reproduces the identical ladder. Out-of-range entries clamp to the end
+/// teeth.
+pub fn flow_from_comb_tooth(tooth: f64) -> f64 {
+    let k = (tooth - 1.0).clamp(0.0, (COMB_TEETH - 1) as f64);
+    COMB_FLOW_FAT + (COMB_FLOW_THIN - COMB_FLOW_FAT) * k / (COMB_TEETH - 1) as f64
 }
 
 /// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
@@ -718,6 +722,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flow_comb_is_absolute_not_cumulative() {
+        // The ladder must be identical whatever flow the profile currently
+        // pins — the comb prints at extrusion multiplier 1.0 so a tooth's
+        // value IS the setting, and re-printing after an apply reproduces
+        // the same physical walls (nothing compounds).
+        let base = flow_comb_gcode(&Settings::default(), 0);
+        let mut s = Settings::default();
+        s.extrusion_multiplier = 0.9;
+        for t in &mut s.tools {
+            t.extrusion_multiplier = 0.9;
+        }
+        let pinned = flow_comb_gcode(&s, 0);
+        // Compare only the motion+extrusion body (headers echo settings).
+        let body = |g: &str| {
+            g.lines()
+                .filter(|l| l.starts_with("G1 ") || l.starts_with("G0 "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(body(&base), body(&pinned), "ladder independent of the pinned flow");
+    }
+
     /// Most-frequent feedrate on outer-wall extrusions (mm/min, rounded).
     fn dominant_wall_feed(g: &str) -> i64 {
         // Judge only the wall itself — the base plate's dense first-layer skin
@@ -849,28 +876,22 @@ mod tests {
     }
 
     #[test]
-    fn flow_from_comb_teeth_solves_and_guards() {
-        // Synthetic linear wall: thickness = 0.357*m + 0.043 (a stadium-ish
-        // response). The true multiplier for a 0.40 wall is
-        // (0.40 - 0.043)/0.357 = 1.0 — the solve must recover it from the
-        // two end-tooth readings alone.
-        let (fat, thin) = (0.357 * COMB_FLOW_FAT + 0.043, 0.357 * COMB_FLOW_THIN + 0.043);
-        assert!((flow_from_comb_teeth(1.0, 0.40, fat, thin) - 1.0).abs() < 1e-9);
-        // Compounds multiplicatively on an already-pinned value: the teeth
-        // rode on top of the current flow, so the solve multiplies in.
-        let m =
-            COMB_FLOW_THIN + (0.40 - thin) * (COMB_FLOW_FAT - COMB_FLOW_THIN) / (fat - thin);
-        assert!((flow_from_comb_teeth(0.95, 0.40, fat, thin) - 0.95 * m).abs() < 1e-9);
-        // An over-extruding spool reads fat: both teeth thicker, solve < 1.
-        assert!(flow_from_comb_teeth(1.0, 0.40, fat + 0.04, thin + 0.04) < 1.0);
-        // Nonsense readings are a no-op: inverted teeth, zero, or a solve
-        // outside any plausible spool.
-        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.34, 0.45), 0.95);
-        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.45, 0.0), 0.95);
-        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.401, 0.399), 0.95);
-        // The tooth ladder steps evenly from fat to thin.
-        assert!((comb_tooth_flow(0) - COMB_FLOW_FAT).abs() < 1e-9);
-        assert!((comb_tooth_flow(COMB_TEETH - 1) - COMB_FLOW_THIN).abs() < 1e-9);
-        assert!((comb_tooth_flow(3) - 1.0).abs() < 1e-9);
+    fn flow_from_comb_tooth_is_absolute() {
+        // Tooth 1 = the fat end, the last tooth = the thin end, the middle
+        // tooth = exactly 1.00, and fractional teeth interpolate — all
+        // ABSOLUTE values, nothing multiplied into a current setting.
+        assert!((flow_from_comb_tooth(1.0) - COMB_FLOW_FAT).abs() < 1e-9);
+        assert!((flow_from_comb_tooth(COMB_TEETH as f64) - COMB_FLOW_THIN).abs() < 1e-9);
+        assert!((flow_from_comb_tooth(7.0) - 1.0).abs() < 1e-9);
+        assert!((flow_from_comb_tooth(7.5) - 0.99).abs() < 1e-9);
+        // The ladder steps an exact 2% per tooth.
+        assert!((flow_from_comb_tooth(1.0) - flow_from_comb_tooth(2.0) - 0.02).abs() < 1e-9);
+        // Out-of-range entries clamp to the end teeth.
+        assert_eq!(flow_from_comb_tooth(0.0), COMB_FLOW_FAT);
+        assert_eq!(flow_from_comb_tooth(99.0), COMB_FLOW_THIN);
+        // Generator and read-out agree tooth by tooth.
+        for k in 0..COMB_TEETH {
+            assert!((comb_tooth_flow(k) - flow_from_comb_tooth((k + 1) as f64)).abs() < 1e-9);
+        }
     }
 }

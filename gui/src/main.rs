@@ -440,18 +440,14 @@ impl FilamentBaseline {
 }
 
 /// The App-side state the guided flow-calibration row drives: arming the
-/// comb print, the two end-tooth thicknesses the calipers read, and the
-/// status line it reports to.
+/// comb print, the (possibly fractional) tooth number whose wall calipers
+/// at the line width, and the status line it reports to. The comb prints
+/// its ladder at ABSOLUTE flow values, so "apply" pins the tooth's value
+/// verbatim — no snapshot bookkeeping, idempotent by construction.
 struct FlowCalUi<'a> {
     host_ready: bool,
     start: &'a mut bool,
-    fat_mm: &'a mut f64,
-    thin_mm: &'a mut f64,
-    /// Flow the tower was PRINTED with (snapshotted at dispatch). The tower's
-    /// sweep multiplies THAT value, so "apply" must too — applying against
-    /// the live multiplier would compound on a second click or a refined
-    /// re-read. None = no tower printed this session; fall back to live.
-    printed_flow: Option<f64>,
+    tooth: &'a mut f64,
     status: &'a mut String,
 }
 
@@ -526,26 +522,24 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
             "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-comb print.");
     });
-    // Guided flow calibration: print the flow comb (one tooth per flow
-    // multiplier), caliper the two end teeth mid-face, enter both → pin
-    // flow × (the active tab's multiplier on a toolchanger).
+    // Guided flow calibration: print the flow comb (one tooth per absolute
+    // flow value), find the tooth whose wall calipers at the line width,
+    // enter its number → pin that value verbatim.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow comb"))
             .on_hover_text(format!(
-                "Print a comb: {} single-wall teeth, each 2 cm long at its own flow \
-                 — {:.2}× your current flow at the HANDLE end stepping evenly to \
-                 {:.2}× at the far end — at your real speeds, with pressure advance \
-                 untouched (flow is steady-state; PA only acts on speed changes, so \
-                 either can be calibrated first — flow first is best). Caliper the \
-                 two END teeth mid-face with the FULL jaw flats (their outer faces \
-                 are open; each tooth is uniform, so nothing depends on where you \
-                 clamp) and enter both thicknesses below. The solve finds the flow \
-                 where the wall would read exactly {:.2} mm (your line width) from \
-                 your machine's own measured response — no bead model, no \
-                 correction loop, no caliper tips. The middle teeth must step \
-                 evenly: a tooth off the line is a bad measurement telling on \
-                 itself. Clear the bed first.",
+                "Print a comb: {} single-wall teeth, each 2 cm long at its own \
+                 ABSOLUTE flow — tooth 1 at the HANDLE end = {:.2}, stepping an \
+                 exact 2% per tooth down to {:.2} at the far end — at your real \
+                 speeds, with pressure advance untouched. The whole file prints at \
+                 flow 1.0 with the ladder baked in, so a tooth's value IS the \
+                 setting: caliper along the teeth (full jaw flats, mid-face — \
+                 nothing depends on where you clamp) to the one that reads exactly \
+                 {:.2} mm (your line width), and enter its number below. Between \
+                 two teeth? Enter the half-step (7.5). One print, one absolute \
+                 answer — re-printing the comb always reproduces the identical \
+                 ladder. Clear the bed first.",
                 engine::COMB_TEETH,
                 engine::COMB_FLOW_FAT,
                 engine::COMB_FLOW_THIN,
@@ -557,46 +551,26 @@ fn filament_card_rows(
             *cal.start = true;
         }
         ui.add(
-            egui::DragValue::new(cal.fat_mm)
-                .speed(0.005)
-                .range(0.0..=2.0)
-                .fixed_decimals(3)
-                .prefix("fat ")
-                .suffix(" mm"),
+            egui::DragValue::new(cal.tooth)
+                .speed(0.05)
+                .range(0.0..=engine::COMB_TEETH as f64)
+                .fixed_decimals(1)
+                .prefix("tooth "),
         )
         .on_hover_text(format!(
-            "Wall thickness of the FAT end tooth (handle end, {:.2}×), calipered mid-face with the full jaw flats.",
-            engine::COMB_FLOW_FAT
-        ));
-        ui.add(
-            egui::DragValue::new(cal.thin_mm)
-                .speed(0.005)
-                .range(0.0..=2.0)
-                .fixed_decimals(3)
-                .prefix("thin ")
-                .suffix(" mm"),
-        )
-        .on_hover_text(format!(
-            "Wall thickness of the THIN end tooth (far end, {:.2}×).",
-            engine::COMB_FLOW_THIN
+            "The tooth (counted from the HANDLE end) whose wall calipers at exactly {line_width_mm:.2} mm. Halves are fine: 7.5 reads between tooth 7 and 8."
         ));
         if ui
             .button("apply")
-            .on_hover_text(format!(
-                "Solve the two readings for the flow where the wall reads {line_width_mm:.2} mm, and pin it."
-            ))
+            .on_hover_text("Pin that tooth's absolute flow value as the spool's extrusion multiplier.")
             .clicked()
-            && *cal.fat_mm > *cal.thin_mm
-            && *cal.thin_mm > 0.0
+            && *cal.tooth >= 1.0
         {
-            // Apply against the flow the comb PRINTED with, not the live
-            // value — idempotent under double-clicks and refined re-reads.
             let before = *flow;
-            let base = cal.printed_flow.unwrap_or(before);
-            *flow = engine::flow_from_comb_teeth(base, line_width_mm, *cal.fat_mm, *cal.thin_mm);
+            *flow = engine::flow_from_comb_tooth(*cal.tooth);
             *cal.status = format!(
-                "flow × {before:.3} → {:.3} (teeth {:.3}/{:.3} mm, target {:.2} mm)",
-                *flow, *cal.fat_mm, *cal.thin_mm, line_width_mm
+                "flow × {before:.3} → {:.3} (tooth {:.1})",
+                *flow, *cal.tooth
             );
         }
     });
@@ -1823,16 +1797,13 @@ struct App {
     /// Open save/delete-profile dialog, if any.
     profile_dialog: Option<ProfileDialog>,
     /// Flow calibration: the Filament-panel button arms this; the dispatch
-    /// generates the flow-swept teardrop tower and sends it to the printer.
+    /// generates the flow comb and sends it to the printer.
     start_flow_cal: bool,
-    /// The two flow-comb end-tooth thicknesses (mm) the calipers read — fat
-    /// (handle end) and thin (far end); "apply" solves them for the
-    /// filament's `extrusion_multiplier`.
-    flow_cal_fat_mm: f64,
-    flow_cal_thin_mm: f64,
-    /// Flow the last-dispatched tower was printed with — "apply" multiplies
-    /// this snapshot, keeping repeat clicks and re-reads idempotent.
-    flow_cal_printed_flow: Option<f64>,
+    /// The (possibly fractional) comb tooth whose wall calipers at the line
+    /// width; "apply" pins that tooth's ABSOLUTE flow value verbatim — the
+    /// comb prints its ladder at flow 1.0, so nothing compounds and no
+    /// dispatch snapshot is needed.
+    flow_cal_tooth: f64,
     /// Pressure-advance calibration: the Filament-panel button arms this; the
     /// dispatch generates the PA tower and sends it to the printer.
     start_pa_cal: bool,
@@ -2168,9 +2139,7 @@ impl App {
             baseline,
             profile_dialog: None,
             start_flow_cal: false,
-            flow_cal_fat_mm: 0.0,
-            flow_cal_thin_mm: 0.0,
-            flow_cal_printed_flow: None,
+            flow_cal_tooth: 0.0,
             start_pa_cal: false,
             pa_cal_mm: 0.0,
             pending_switch: None,
@@ -5073,9 +5042,7 @@ impl eframe::App for App {
                     let cal = FlowCalUi {
                         host_ready: host_set && !host_busy,
                         start: &mut self.start_flow_cal,
-                        fat_mm: &mut self.flow_cal_fat_mm,
-                        thin_mm: &mut self.flow_cal_thin_mm,
-                        printed_flow: self.flow_cal_printed_flow,
+                        tooth: &mut self.flow_cal_tooth,
                         status: &mut self.status,
                     };
                     // The PA row reports through a local: `cal` above already
@@ -6990,22 +6957,13 @@ impl eframe::App for App {
         if std::mem::take(&mut self.start_flow_cal) {
             let tool = self.active_tool_tab as u32;
             let gcode = engine::flow_comb_gcode(&self.settings, tool);
-            // Snapshot the flow the tower bakes in: "apply" multiplies THIS,
-            // so repeat clicks and refined re-reads stay idempotent.
-            self.flow_cal_printed_flow = Some(
-                self.settings
-                    .tools
-                    .get(self.active_tool_tab)
-                    .map(|t| t.extrusion_multiplier)
-                    .unwrap_or(self.settings.extrusion_multiplier),
-            );
             let lw = self.settings.line_width_mm;
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
                 match c.upload("flow-comb.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the flow comb — when it's done, caliper the two END teeth mid-face with the full jaw flats (fat tooth = handle end) and enter both thicknesses in the Filament panel; it solves for the flow where the wall reads exactly {lw:.2} mm. The middle teeth should step evenly between them."),
+                        msg: format!("Printing the flow comb — when it's done, caliper along the teeth (full jaw flats, mid-face) to the one whose wall reads exactly {lw:.2} mm, counting from the HANDLE end, and enter its number in the Filament panel (halves are fine: 7.5). That tooth's absolute flow value is the setting."),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-comb upload failed: {e}") },
                 }
