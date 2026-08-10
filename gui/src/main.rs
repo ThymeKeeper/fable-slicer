@@ -440,12 +440,13 @@ impl FilamentBaseline {
 }
 
 /// The App-side state the guided flow-calibration row drives: arming the
-/// tower print, the height where the wall calipers at exactly the line
-/// width, and the status line it reports to.
+/// comb print, the two end-tooth thicknesses the calipers read, and the
+/// status line it reports to.
 struct FlowCalUi<'a> {
     host_ready: bool,
     start: &'a mut bool,
-    height_mm: &'a mut f64,
+    fat_mm: &'a mut f64,
+    thin_mm: &'a mut f64,
     /// Flow the tower was PRINTED with (snapshotted at dispatch). The tower's
     /// sweep multiplies THAT value, so "apply" must too — applying against
     /// the live multiplier would compound on a second click or a refined
@@ -517,34 +518,37 @@ fn filament_card_rows(
     });
     // Measured calibration — the slicer is blind to the true output, so
     // these are pinned from a test, not derived (default 1.0 / conservative;
-    // nudge after a flow tower or a pressure-advance tower). Density,
+    // nudge after a flow comb or a pressure-advance tower). Density,
     // flow-derate and the heat ceiling are material physics —
     // class-derived, not knobs.
     let flow = f.extrusion_multiplier;
     revert_row(ui, &mut *flow, &base.extrusion_multiplier, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
-            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-tower print.");
+            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-comb print.");
     });
-    // Guided flow calibration: print the flow tower (the PA teardrop's twin,
-    // sweeping flow with height), find the height where the wall calipers at
-    // exactly the line width, enter it → pin flow × (the active tab's
-    // multiplier on a toolchanger).
+    // Guided flow calibration: print the flow comb (one tooth per flow
+    // multiplier), caliper the two end teeth mid-face, enter both → pin
+    // flow × (the active tab's multiplier on a toolchanger).
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow tower"))
+            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow comb"))
             .on_hover_text(format!(
-                "Print a single-wall teardrop tower ({:.0} mm wide) whose flow \
-                 multiplier ramps {:.2}× → {:.2}× of your current flow with height, \
-                 as a seamless helix at your real speeds. Slide a caliper (jaw TIPS — \
-                 the flats span several layers and read the fattest one) up a flat \
-                 front leg to the height where the wall reads exactly {:.2} mm (your \
-                 line width) and enter that height below — no correction loop, the \
-                 tower locates the right flow directly. The front corner doubles as a \
-                 check of your pressure advance: it should be crisp the whole way up. \
-                 Clear the bed first.",
-                2.0 * engine::TOWER_R_MM,
-                engine::FLOW_TOWER_START,
-                engine::FLOW_TOWER_START + engine::FLOW_TOWER_FACTOR * engine::TOWER_H_MM,
+                "Print a comb: {} single-wall teeth, each 2 cm long at its own flow \
+                 — {:.2}× your current flow at the HANDLE end stepping evenly to \
+                 {:.2}× at the far end — at your real speeds, with pressure advance \
+                 untouched (flow is steady-state; PA only acts on speed changes, so \
+                 either can be calibrated first — flow first is best). Caliper the \
+                 two END teeth mid-face with the FULL jaw flats (their outer faces \
+                 are open; each tooth is uniform, so nothing depends on where you \
+                 clamp) and enter both thicknesses below. The solve finds the flow \
+                 where the wall would read exactly {:.2} mm (your line width) from \
+                 your machine's own measured response — no bead model, no \
+                 correction loop, no caliper tips. The middle teeth must step \
+                 evenly: a tooth off the line is a bad measurement telling on \
+                 itself. Clear the bed first.",
+                engine::COMB_TEETH,
+                engine::COMB_FLOW_FAT,
+                engine::COMB_FLOW_THIN,
                 line_width_mm,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
@@ -553,31 +557,46 @@ fn filament_card_rows(
             *cal.start = true;
         }
         ui.add(
-            egui::DragValue::new(cal.height_mm)
-                .speed(0.1)
-                .range(0.0..=engine::TOWER_H_MM)
-                .fixed_decimals(1)
+            egui::DragValue::new(cal.fat_mm)
+                .speed(0.005)
+                .range(0.0..=2.0)
+                .fixed_decimals(3)
+                .prefix("fat ")
                 .suffix(" mm"),
         )
-        .on_hover_text(format!("Height up the flow tower where the wall calipers at exactly {line_width_mm:.2} mm (your line width). Lower = the spool was over-extruding, higher = under."));
+        .on_hover_text(format!(
+            "Wall thickness of the FAT end tooth (handle end, {:.2}×), calipered mid-face with the full jaw flats.",
+            engine::COMB_FLOW_FAT
+        ));
+        ui.add(
+            egui::DragValue::new(cal.thin_mm)
+                .speed(0.005)
+                .range(0.0..=2.0)
+                .fixed_decimals(3)
+                .prefix("thin ")
+                .suffix(" mm"),
+        )
+        .on_hover_text(format!(
+            "Wall thickness of the THIN end tooth (far end, {:.2}×).",
+            engine::COMB_FLOW_THIN
+        ));
         if ui
             .button("apply")
             .on_hover_text(format!(
-                "Pin flow × = current × ({} + {} × height).",
-                engine::FLOW_TOWER_START,
-                engine::FLOW_TOWER_FACTOR
+                "Solve the two readings for the flow where the wall reads {line_width_mm:.2} mm, and pin it."
             ))
             .clicked()
-            && *cal.height_mm > 0.0
+            && *cal.fat_mm > *cal.thin_mm
+            && *cal.thin_mm > 0.0
         {
-            // Apply against the flow the tower PRINTED with, not the live
+            // Apply against the flow the comb PRINTED with, not the live
             // value — idempotent under double-clicks and refined re-reads.
             let before = *flow;
             let base = cal.printed_flow.unwrap_or(before);
-            *flow = engine::flow_from_tower_height(base, *cal.height_mm);
+            *flow = engine::flow_from_comb_teeth(base, line_width_mm, *cal.fat_mm, *cal.thin_mm);
             *cal.status = format!(
-                "flow × {before:.3} → {:.3} (wall at target {:.2} mm at height {:.1} mm)",
-                *flow, line_width_mm, *cal.height_mm
+                "flow × {before:.3} → {:.3} (teeth {:.3}/{:.3} mm, target {:.2} mm)",
+                *flow, *cal.fat_mm, *cal.thin_mm, line_width_mm
             );
         }
     });
@@ -1806,9 +1825,11 @@ struct App {
     /// Flow calibration: the Filament-panel button arms this; the dispatch
     /// generates the flow-swept teardrop tower and sends it to the printer.
     start_flow_cal: bool,
-    /// Height (mm) where the flow-tower wall calipers at the line width; "apply"
-    /// turns it into the filament's `extrusion_multiplier`.
-    flow_cal_height_mm: f64,
+    /// The two flow-comb end-tooth thicknesses (mm) the calipers read — fat
+    /// (handle end) and thin (far end); "apply" solves them for the
+    /// filament's `extrusion_multiplier`.
+    flow_cal_fat_mm: f64,
+    flow_cal_thin_mm: f64,
     /// Flow the last-dispatched tower was printed with — "apply" multiplies
     /// this snapshot, keeping repeat clicks and re-reads idempotent.
     flow_cal_printed_flow: Option<f64>,
@@ -2147,7 +2168,8 @@ impl App {
             baseline,
             profile_dialog: None,
             start_flow_cal: false,
-            flow_cal_height_mm: 0.0,
+            flow_cal_fat_mm: 0.0,
+            flow_cal_thin_mm: 0.0,
             flow_cal_printed_flow: None,
             start_pa_cal: false,
             pa_cal_mm: 0.0,
@@ -5051,7 +5073,8 @@ impl eframe::App for App {
                     let cal = FlowCalUi {
                         host_ready: host_set && !host_busy,
                         start: &mut self.start_flow_cal,
-                        height_mm: &mut self.flow_cal_height_mm,
+                        fat_mm: &mut self.flow_cal_fat_mm,
+                        thin_mm: &mut self.flow_cal_thin_mm,
                         printed_flow: self.flow_cal_printed_flow,
                         status: &mut self.status,
                     };
@@ -6966,7 +6989,7 @@ impl eframe::App for App {
         // the reading pins.
         if std::mem::take(&mut self.start_flow_cal) {
             let tool = self.active_tool_tab as u32;
-            let gcode = engine::flow_tower_gcode(&self.settings, tool);
+            let gcode = engine::flow_comb_gcode(&self.settings, tool);
             // Snapshot the flow the tower bakes in: "apply" multiplies THIS,
             // so repeat clicks and refined re-reads stay idempotent.
             self.flow_cal_printed_flow = Some(
@@ -6979,12 +7002,12 @@ impl eframe::App for App {
             let lw = self.settings.line_width_mm;
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
-                match c.upload("flow-tower.gcode", gcode.as_bytes(), true) {
+                match c.upload("flow-comb.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the flow tower — when it's done, slide a caliper (jaw tips) up a flat front leg to the height where the wall reads exactly {lw:.2} mm and enter that height in the Filament panel. The front corner should be crisp the whole way up — it double-checks your pressure advance."),
+                        msg: format!("Printing the flow comb — when it's done, caliper the two END teeth mid-face with the full jaw flats (fat tooth = handle end) and enter both thicknesses in the Filament panel; it solves for the flow where the wall reads exactly {lw:.2} mm. The middle teeth should step evenly between them."),
                     },
-                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-tower upload failed: {e}") },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-comb upload failed: {e}") },
                 }
             });
         }

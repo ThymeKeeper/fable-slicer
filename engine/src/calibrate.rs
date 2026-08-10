@@ -8,13 +8,22 @@
 //! filament profile (`extrusion_multiplier` / `pressure_advance`); see
 //! config::profile.
 //!
-//! Both calibrations share one instrument — a single-wall teardrop tube
-//! printed as a seamless helix — and one philosophy: sweep the parameter
-//! with height, find the height where the print is *right*, and read the
-//! value off that height. Locating an equality beats measuring-and-
-//! correcting: a correction inherits the bead model's error plus the
-//! measurement's and has to be iterated; the height where the wall IS right
-//! identifies the value that makes it right, whatever the true physics.
+//! Each calibration gets the instrument its physics wants. Pressure advance
+//! is a TRANSIENT phenomenon: a single-wall teardrop helix sweeps PA with
+//! height and the one corner is judged where the transient reads clean.
+//! Flow is a STEADY-STATE phenomenon: a comb prints one tooth per flow
+//! multiplier and each tooth is calipered mid-face with the full jaw flats.
+//! One philosophy joins them: vary the parameter and locate where the print
+//! is *right*, instead of measuring an error and correcting it (a
+//! correction inherits the bead model's error plus the measurement's and
+//! has to be iterated). The PA tower reads the equality off a height; the
+//! comb solves two measured teeth for the line-width crossing — no bead
+//! model in either loop. The tests are independent in the right order:
+//! PA adds E only while extruder velocity CHANGES, so it cannot touch a
+//! mid-tooth steady-state reading (calibrate flow with any PA); flow scales
+//! demand and compensation together, so the PA optimum barely moves with a
+//! mis-pinned spool — but judge the corner on a right-flow wall anyway:
+//! flow first, then PA.
 
 use crate::{generate_parts, to_gcode};
 use config::Settings;
@@ -41,12 +50,38 @@ pub const TOWER_H_MM: f64 = 50.0;
 pub const PA_TOWER_START: f64 = 0.0;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
-/// Flow-tower multiplier at the bed (× the profile flow).
-pub const FLOW_TOWER_START: f64 = 0.85;
-/// Flow-tower multiplier added per mm of height: 0.85× → 1.15× across the
-/// tower, exactly neutral at mid-height. ±15% covers any plausibly
-/// mis-pinned spool; 1 mm of height reads as 0.6% of flow.
-pub const FLOW_TOWER_FACTOR: f64 = 0.006;
+/// Flow-comb FAT tooth multiplier (× the profile flow) — the tooth at the
+/// handle end. The comb replaced the old continuous flow-swept tower: its
+/// ramp's thickness gradient was ~0.002 mm per mm of height, so locating
+/// the wall == line-width equality demanded caliper-TIP readings, and a
+/// ±0.02 mm error mislocated it by ~10 mm (~6% of flow). A comb tooth is
+/// UNIFORM — one flow per tooth, measured mid-face with the jaws' full
+/// flats, no localization anywhere — and the teeth pin the real system's
+/// measured thickness-vs-flow line, which the read-out solves for the
+/// line-width crossing (~±1.5% from the same calipers). The middle teeth
+/// are a built-in linearity check: their thicknesses must step evenly, and
+/// a tooth off the line exposes its own bad measurement.
+pub const COMB_FLOW_FAT: f64 = 1.12;
+/// Flow-comb THIN tooth multiplier — the tooth at the far end.
+pub const COMB_FLOW_THIN: f64 = 0.88;
+/// Teeth on the comb; flow steps evenly from fat to thin along the spine.
+pub const COMB_TEETH: usize = 7;
+/// Tooth length (mm) past the spine. Long enough that the mid-face
+/// measurement zone sits several PA-smoothing-window travel distances from
+/// the corner transients at both ends.
+pub const COMB_TOOTH_LEN_MM: f64 = 20.0;
+/// Tooth footprint width (mm): the ring cavity takes a caliper's inner jaw.
+pub const COMB_TOOTH_W_MM: f64 = 6.0;
+/// Tooth-to-tooth pitch (mm): a 6 mm gap between teeth for the outer jaw —
+/// though the two teeth that matter (the ends) have fully open outer faces.
+pub const COMB_TOOTH_PITCH_MM: f64 = 12.0;
+/// Spine depth (mm): the bar joining the teeth, printed at true flow.
+pub const COMB_SPINE_D_MM: f64 = 4.0;
+/// Spine overhang past the fat tooth (mm) — the handle. Its one job is to
+/// label orientation: the handle end is the FAT end.
+pub const COMB_HANDLE_MM: f64 = 8.0;
+/// Comb height (mm): tall enough for full caliper-jaw flats on any tooth.
+pub const COMB_H_MM: f64 = 12.0;
 
 /// Strip a copy of the settings down to the calibration tower: one bare wall
 /// above a solid three-layer base plate, printed as a seamless helix, at the
@@ -211,60 +246,118 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
     )
 }
 
-/// G-code for the flow tower: the same teardrop helix, but the sweep is
-/// `M221` — the flow multiplier climbs 0.85× → 1.15× of the profile flow
-/// with height while PA holds the profile value. The wall's thickness sweeps
-/// with it: slide a caliper up a flat front leg to the height where it reads
-/// exactly the line width, and [`flow_from_tower_height`] turns that height
-/// into the profile flow. Measure with the caliper jaw TIPS — the flats span
-/// several mm of height and would read the fattest layer in reach. Finding
-/// the equality is model-free: whatever shape the bead really takes, the
-/// height where the wall IS right identifies the multiplier that makes it
-/// right — no correction loop. And since PA is constant here, the corner
-/// column should be uniformly crisp top to bottom: a free verification
-/// stripe for the value the PA tower pinned.
-pub fn flow_tower_gcode(settings: &Settings, tool: u32) -> String {
+/// G-code for the flow comb: a spine bar with [`COMB_TEETH`] hollow
+/// rectangular teeth, each a single-bead ring printed at its own flow
+/// multiplier — [`COMB_FLOW_FAT`] at the handle end stepping evenly to
+/// [`COMB_FLOW_THIN`] at the far end — while PA holds the profile value.
+/// The multiplier is baked into E through the per-segment attribute
+/// channel, so there is no M221 anywhere and nothing to restore. Caliper
+/// the two END teeth mid-face with the full jaw flats (their outer faces
+/// are completely open) and feed both thicknesses to
+/// [`flow_from_comb_teeth`]; the middle teeth must step evenly — a tooth
+/// off that line is a bad measurement telling on itself. Flow changes ride
+/// the travel between teeth, so every tooth face is pure steady state.
+pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     let mut s = tower_settings(settings);
-    // The file's feedrates respect the melt-rate ceiling at NOMINAL flow, but
-    // the sweep's top band extrudes 15% more — a profile riding the
-    // volumetric cap would starve the hotend up there, thinning the wall and
-    // silently biasing the reading high. Derate the cap so even the 1.15×
-    // band stays within the filament's real melt rate; this only slows
-    // cap-riding profiles.
-    let top = FLOW_TOWER_START + FLOW_TOWER_FACTOR * TOWER_H_MM;
-    s.max_volumetric_speed_mm3_s /= top;
+    // Ordinary closed loops, not a helix: the per-tooth flow rides the
+    // per-segment attribute channel, which the vase spiral bypasses. The
+    // seam lands on silhouette vertices (corners), never mid-face — the
+    // measurement zones stay clean.
+    s.spiral_vase = false;
+    // The fat tooth extrudes 12% over nominal — derate the melt ceiling so
+    // it stays within the filament's real melt rate (a cap-riding profile
+    // would starve it, thinning the wall and biasing the solve high).
+    s.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
     for t in &mut s.tools {
-        t.max_volumetric_speed_mm3_s /= top;
+        t.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
+    }
+    let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
+    let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
+    let rect = |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+    let mut tris = Vec::new();
+    prism(&rect(0.0, 0.0, w, COMB_SPINE_D_MM), 0.0, COMB_H_MM, &mut tris);
+    for k in 0..COMB_TEETH {
+        let x0 = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
+        // Overlap one mm into the spine so the prisms union into one comb.
+        prism(
+            &rect(x0, COMB_SPINE_D_MM - 1.0, x0 + COMB_TOOTH_W_MM, d),
+            0.0,
+            COMB_H_MM,
+            &mut tris,
+        );
+    }
+    let mesh = mesh::Mesh::from_triangle_soup(&tris);
+    let mut plans = generate_parts(&[(&mesh, tool)], &s);
+    // The plans are bed-centered (auto_center_on_bed); map back to comb
+    // coordinates to decide which tooth a wall segment belongs to.
+    let ox = s.bed_size_x_mm / 2.0 - w / 2.0;
+    let oy = s.bed_size_y_mm / 2.0 - d / 2.0;
+    for plan in &mut plans {
+        for p in &mut plan.paths {
+            if !matches!(
+                p.kind,
+                crate::plan::PathKind::ExternalPerimeter | crate::plan::PathKind::Perimeter
+            ) || p.segs.is_some()
+                || p.widths.is_some()
+                || p.points.len() < 2
+            {
+                continue;
+            }
+            let n = p.points.len();
+            let n_segs = if p.closed { n } else { n - 1 };
+            let attrs: Vec<crate::plan::SegAttr> = (0..n_segs)
+                .map(|k| {
+                    let a = p.points[k];
+                    let b = p.points[(k + 1) % n];
+                    let mx = (a.x_mm() + b.x_mm()) / 2.0 - ox;
+                    let my = (a.y_mm() + b.y_mm()) / 2.0 - oy;
+                    crate::plan::SegAttr {
+                        kind: p.kind,
+                        overhang: 0.0,
+                        flow: comb_flow_at(mx, my) as f32,
+                    }
+                })
+                .collect();
+            // Only carry the channel where a tooth actually changes flow —
+            // spine-only loops (and the base plate) stay plain paths.
+            if attrs.iter().any(|a| (f64::from(a.flow) - 1.0).abs() > 1.0e-3) {
+                p.segs = Some(attrs);
+            }
+        }
     }
     let header = format!(
-        "; flow tower: flow = ({FLOW_TOWER_START} + {FLOW_TOWER_FACTOR} * z_mm) x profile flow\n\
-         ; wall thickness sweeps with height; pressure advance stays at the profile value\n\
-         ; and the base plate prints at true flow (the sweep starts above it).\n\
-         ; slide a caliper (jaw TIPS) up a flat front leg to the height where the wall\n\
-         ; reads exactly {:.2} mm — the line width — and enter that height in the\n\
-         ; Filament panel (or flow x= {FLOW_TOWER_START} + {FLOW_TOWER_FACTOR} * height by hand).\n\
-         ; the front corner should be uniformly crisp — it verifies your PA setting.\n\
-         M221 S100\n",
+        "; flow comb: {COMB_TEETH} teeth, each a single-wall ring at its own flow x profile flow —\n\
+         ; {COMB_FLOW_FAT} at the HANDLE end stepping evenly to {COMB_FLOW_THIN} at the far end. no M221:\n\
+         ; the multipliers are baked into E, and PA stays at the profile value.\n\
+         ; caliper the two END teeth mid-face with the FULL jaw flats (their outer faces\n\
+         ; are open; each tooth is uniform, so position on the tooth does not matter),\n\
+         ; then enter both thicknesses in the Filament panel — it solves for the flow\n\
+         ; where the wall would read exactly {:.2} mm (the line width). the middle teeth\n\
+         ; must step evenly between them: a tooth off the line is a bad measurement.\n",
         s.line_width_mm
     );
-    // The sweep begins with the helix — the 3-layer base plate prints at true
-    // flow (an 0.85× first layer would grip the bed badly), guaranteed by the
-    // header's M221 S100 even if a previously canceled tower left the machine
-    // dirty. Skip by marker count, not z: layer heights are profile-dependent.
-    let mut marker = 0u32;
-    sweep(
-        &teardrop_gcode(&s, tool),
-        &header,
-        |z| {
-            marker += 1;
-            if marker <= 3 {
-                String::new()
-            } else {
-                format!("M221 S{:.1}\n", 100.0 * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * z))
-            }
-        },
-        "M221 S100\n",
-    )
+    format!("{header}{}", to_gcode(&plans, &s))
+}
+
+/// Flow multiplier for a point of the comb (comb coordinates): on a tooth,
+/// that tooth's step of the fat→thin ladder; on the spine, the junction
+/// band, or anywhere unexpected, true flow.
+fn comb_flow_at(x: f64, y: f64) -> f64 {
+    if y <= COMB_SPINE_D_MM + 1.5 {
+        return 1.0;
+    }
+    for k in 0..COMB_TEETH {
+        let x0 = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
+        if (x0 - 1.0..=x0 + COMB_TOOTH_W_MM + 1.0).contains(&x) {
+            return comb_tooth_flow(k);
+        }
+    }
+    1.0
+}
+
+/// The flow multiplier of tooth `k` (0 = the fat tooth at the handle end).
+pub fn comb_tooth_flow(k: usize) -> f64 {
+    COMB_FLOW_FAT + (COMB_FLOW_THIN - COMB_FLOW_FAT) * k as f64 / (COMB_TEETH - 1) as f64
 }
 
 /// Pressure advance from the measured best-corner height on the PA tower.
@@ -276,14 +369,30 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// New flow multiplier from the flow-tower height where the wall calipers at
-/// exactly the line width. Multiplicative on the current value — the sweep
-/// rode on top of it. A height off the tower leaves the value untouched.
-pub fn flow_from_tower_height(current_flow: f64, height_mm: f64) -> f64 {
-    if height_mm <= 0.0 || height_mm > TOWER_H_MM {
+/// New flow multiplier from the comb's two END tooth thicknesses (mm): the
+/// fat (handle-end) and thin (far-end) teeth, each measured mid-face with
+/// the jaws' full flats. The two points pin the real system's
+/// thickness-vs-flow line; solving it for the line-width crossing locates
+/// the multiplier that makes the wall exactly right — no bead model in the
+/// loop, and extrusion is volumetric, so the line really is a line.
+/// Multiplicative on the current value — the teeth rode on top of it.
+/// Readings that can't be a real comb (thin >= fat, non-positive, or a
+/// solve outside a plausible spool) leave the value untouched.
+pub fn flow_from_comb_teeth(
+    current_flow: f64,
+    line_width_mm: f64,
+    fat_mm: f64,
+    thin_mm: f64,
+) -> f64 {
+    if thin_mm <= 0.0 || fat_mm <= thin_mm {
         return current_flow;
     }
-    current_flow * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * height_mm)
+    let slope = (COMB_FLOW_FAT - COMB_FLOW_THIN) / (fat_mm - thin_mm);
+    let m = COMB_FLOW_THIN + (line_width_mm - thin_mm) * slope;
+    if !(0.5..=1.5).contains(&m) {
+        return current_flow;
+    }
+    current_flow * m
 }
 
 /// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
@@ -380,7 +489,7 @@ mod tests {
         s.auto_center_on_bed = false;
         s.bed_size_x_mm = 152.4;
         s.bed_size_y_mm = 152.4;
-        for g in [pa_tower_gcode(&s, 0), flow_tower_gcode(&s, 0)] {
+        for g in [pa_tower_gcode(&s, 0), flow_comb_gcode(&s, 0)] {
             assert!(!g.contains(" X-"), "no off-bed negative X moves");
             assert!(!g.contains(" Y-"), "no off-bed negative Y moves");
         }
@@ -442,7 +551,7 @@ mod tests {
         s.fan_speed = 0.15;
         s.bridge_fan_speed = 0.8;
         s.fan_off_layers = 3;
-        for g in [pa_tower_gcode(&s, 0), flow_tower_gcode(&s, 0)] {
+        for g in [pa_tower_gcode(&s, 0), flow_comb_gcode(&s, 0)] {
             let max_fan = g
                 .lines()
                 .filter(|l| l.starts_with("M106 S"))
@@ -487,11 +596,13 @@ mod tests {
     }
 
     #[test]
-    fn flow_tower_base_plate_is_guarded_against_a_dirty_machine() {
-        // The base plate's "true flow" premise must not depend on machine
-        // state: a previously canceled tower leaves M221 at 85–115%, so the
-        // file normalizes to S100 BEFORE anything prints.
-        let g = flow_tower_gcode(&Settings::default(), 0);
+    fn flow_comb_is_guarded_against_a_dirty_machine() {
+        // The comb bakes its multipliers into E, so a stale firmware M221
+        // (say 85% left by an old canceled sweep) would silently scale every
+        // tooth AND the spine — the solve would then pin a flow that's only
+        // right under that stale scale. The preamble's M221 S100 hygiene
+        // guard must land BEFORE anything prints.
+        let g = flow_comb_gcode(&Settings::default(), 0);
         let first_m221 = g.find("M221 S").unwrap();
         assert!(g[first_m221..].starts_with("M221 S100"), "file opens at neutral flow");
         assert!(first_m221 < g.find("; LAYER").unwrap(), "normalized before any layer");
@@ -511,43 +622,100 @@ mod tests {
         s.tools = vec![s.flat_tool("a".into()), s.flat_tool("b".into())];
         s.tools[0].pressure_advance = 0.033;
         s.tools[1].pressure_advance = 0.077;
-        let g = flow_tower_gcode(&s, 1);
+        let g = flow_comb_gcode(&s, 1);
         assert!(g.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0770"), "tower prints with tool 1's profile");
         assert!(!g.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0330"), "not tool 0's");
     }
 
     #[test]
-    fn flow_tower_sweeps_flow_and_restores() {
-        // One M221 directly after each helix layer marker (the base plate
-        // prints at true flow — an 0.85× first layer would grip the bed
-        // badly), climbing ~85% → 115%, and a final M221 S100 so the extrude
-        // factor never leaks into the next print. PA is NOT swept here — it
-        // stays the profile's value.
-        let g = flow_tower_gcode(&Settings::default(), 0);
-        let lines: Vec<&str> = g.lines().collect();
-        let ramp: Vec<f64> = lines
-            .windows(2)
-            .filter(|w| w[0].starts_with("; LAYER "))
-            .filter_map(|w| w[1].strip_prefix("M221 S"))
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        let layers = g.matches("; LAYER ").count();
-        assert!(layers > 200, "a 50 mm tower is ~250 layers, got {layers}");
-        assert_eq!(ramp.len(), layers - 3, "one M221 per layer above the base plate");
-        assert!(ramp.windows(2).all(|w| w[1] >= w[0]), "the sweep is monotonic");
-        assert!(ramp[0] < 100.0 * FLOW_TOWER_START + 1.0, "starts at the bottom");
+    fn flow_comb_bakes_per_tooth_flow() {
+        let s = Settings::default();
+        let g = flow_comb_gcode(&s, 0);
+        // No M221 anywhere beyond the preamble hygiene guard — the
+        // multipliers are baked into E.
         assert!(
-            (100.0 * (FLOW_TOWER_START + FLOW_TOWER_FACTOR * TOWER_H_MM) - ramp.last().unwrap())
-                .abs()
-                < 0.5,
-            "ends at the top of the range"
+            g.lines().filter(|l| l.starts_with("M221")).all(|l| l.trim() == "M221 S100"),
+            "comb must not sweep firmware flow"
         );
-        assert_eq!(lines.last().unwrap().trim(), "M221 S100", "restores flow to 100%");
-        let pa_steps = lines
-            .windows(2)
-            .filter(|w| w[0].starts_with("; LAYER ") && w[1].starts_with("SET_PRESSURE_ADVANCE"))
-            .count();
-        assert_eq!(pa_steps, 0, "flow tower holds PA constant");
+        // Measure E-per-mm of wall extrusions bucketed by tooth, on layers
+        // above the base plate, away from corners: the fat and thin end
+        // teeth must carry their multipliers relative to the spine.
+        let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
+        let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
+        let (ox, oy) = (s.bed_size_x_mm / 2.0 - w / 2.0, s.bed_size_y_mm / 2.0 - d / 2.0);
+        let tooth_x = |k: usize| COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let (mut layer, mut wall) = (0usize, false);
+        // (sum E, sum len) per bucket: fat tooth, thin tooth, spine.
+        let mut buckets = [(0.0_f64, 0.0_f64); 3];
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                layer += 1;
+                continue;
+            }
+            if let Some(t) = l.strip_prefix(";TYPE:") {
+                wall = t.trim() == "Outer wall";
+                continue;
+            }
+            if !(l.starts_with("G1 ") || l.starts_with("G0 ")) {
+                continue;
+            }
+            let mut nx = x;
+            let mut ny = y;
+            let mut e = 0.0_f64;
+            for tok in l.split_whitespace() {
+                if let Some(v) = tok.strip_prefix('X').and_then(|v| v.parse::<f64>().ok()) {
+                    nx = v;
+                }
+                if let Some(v) = tok.strip_prefix('Y').and_then(|v| v.parse::<f64>().ok()) {
+                    ny = v;
+                }
+                if let Some(v) = tok.strip_prefix('E').and_then(|v| v.parse::<f64>().ok()) {
+                    e = v;
+                }
+            }
+            let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            let (mx, my) = ((x + nx) / 2.0 - ox, (y + ny) / 2.0 - oy);
+            x = nx;
+            y = ny;
+            // Above the base plate, real extrusions, long straight strokes
+            // only (corner pieces carry concave trims).
+            if layer <= 4 || !wall || e <= 1.0e-6 || len < 3.0 {
+                continue;
+            }
+            let mid_tooth = |k: usize| {
+                let x0 = tooth_x(k);
+                (x0 - 0.5..=x0 + COMB_TOOTH_W_MM + 0.5).contains(&mx)
+                    && my > COMB_SPINE_D_MM + 4.0
+                    && my < d - 2.0
+            };
+            let b = if mid_tooth(0) {
+                0
+            } else if mid_tooth(COMB_TEETH - 1) {
+                1
+            } else if my < COMB_SPINE_D_MM {
+                2
+            } else {
+                continue;
+            };
+            buckets[b].0 += e;
+            buckets[b].1 += len;
+        }
+        let epmm = |b: (f64, f64)| {
+            assert!(b.1 > 20.0, "bucket has enough wall to judge, got {} mm", b.1);
+            b.0 / b.1
+        };
+        let (fat, thin, spine) = (epmm(buckets[0]), epmm(buckets[1]), epmm(buckets[2]));
+        assert!(
+            (fat / spine - COMB_FLOW_FAT).abs() < 0.02,
+            "fat tooth at {COMB_FLOW_FAT}x, got {:.3}",
+            fat / spine
+        );
+        assert!(
+            (thin / spine - COMB_FLOW_THIN).abs() < 0.02,
+            "thin tooth at {COMB_FLOW_THIN}x, got {:.3}",
+            thin / spine
+        );
     }
 
     /// Most-frequent feedrate on outer-wall extrusions (mm/min, rounded).
@@ -681,15 +849,28 @@ mod tests {
     }
 
     #[test]
-    fn flow_from_tower_height_maps_and_guards() {
-        // Mid-tower is exactly neutral: the sweep is 1.00× at 25 mm.
-        assert!((flow_from_tower_height(1.0, 25.0) - 1.0).abs() < 1e-9);
-        // Compounds multiplicatively on an already-pinned value: the sweep
-        // rode on top of the current flow, so the read multiplies in.
-        assert!((flow_from_tower_height(0.95, 37.5) - 0.95 * 1.075).abs() < 1e-9);
-        assert!((flow_from_tower_height(1.0, 10.0) - 0.91).abs() < 1e-9);
-        // Off-tower nonsense is a no-op.
-        assert_eq!(flow_from_tower_height(0.95, 0.0), 0.95);
-        assert_eq!(flow_from_tower_height(0.95, 99.0), 0.95);
+    fn flow_from_comb_teeth_solves_and_guards() {
+        // Synthetic linear wall: thickness = 0.357*m + 0.043 (a stadium-ish
+        // response). The true multiplier for a 0.40 wall is
+        // (0.40 - 0.043)/0.357 = 1.0 — the solve must recover it from the
+        // two end-tooth readings alone.
+        let (fat, thin) = (0.357 * COMB_FLOW_FAT + 0.043, 0.357 * COMB_FLOW_THIN + 0.043);
+        assert!((flow_from_comb_teeth(1.0, 0.40, fat, thin) - 1.0).abs() < 1e-9);
+        // Compounds multiplicatively on an already-pinned value: the teeth
+        // rode on top of the current flow, so the solve multiplies in.
+        let m =
+            COMB_FLOW_THIN + (0.40 - thin) * (COMB_FLOW_FAT - COMB_FLOW_THIN) / (fat - thin);
+        assert!((flow_from_comb_teeth(0.95, 0.40, fat, thin) - 0.95 * m).abs() < 1e-9);
+        // An over-extruding spool reads fat: both teeth thicker, solve < 1.
+        assert!(flow_from_comb_teeth(1.0, 0.40, fat + 0.04, thin + 0.04) < 1.0);
+        // Nonsense readings are a no-op: inverted teeth, zero, or a solve
+        // outside any plausible spool.
+        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.34, 0.45), 0.95);
+        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.45, 0.0), 0.95);
+        assert_eq!(flow_from_comb_teeth(0.95, 0.40, 0.401, 0.399), 0.95);
+        // The tooth ladder steps evenly from fat to thin.
+        assert!((comb_tooth_flow(0) - COMB_FLOW_FAT).abs() < 1e-9);
+        assert!((comb_tooth_flow(COMB_TEETH - 1) - COMB_FLOW_THIN).abs() < 1e-9);
+        assert!((comb_tooth_flow(3) - 1.0).abs() < 1e-9);
     }
 }
