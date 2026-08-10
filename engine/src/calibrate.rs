@@ -108,6 +108,18 @@ fn tower_settings(settings: &Settings) -> Settings {
     const TOWER_ACCEL_CAP: f64 = 1200.0;
     s.acceleration_mm_s2 = s.acceleration_mm_s2.min(TOWER_ACCEL_CAP);
     s.outer_wall_accel_mm_s2 = s.outer_wall_accel_mm_s2.min(TOWER_ACCEL_CAP);
+    // Pin the part fan to the filament's BASE duty: the tower's ~2 s layers
+    // would ride the short-layer cooling ladder to the ceiling (80% for
+    // ABS/ASA), but most of a real print's flow mass lands on large layers
+    // at the base duty — and the flow reading that cross-checked against
+    // the reference print to 0.25% was taken at base fan. A colder bead
+    // spreads less and calipers narrower, which would bias the flow read
+    // high. Setting the ceiling equal to the base leaves the ladder no
+    // headroom without touching the duty the user actually prints with.
+    s.bridge_fan_speed = s.fan_speed;
+    for t in &mut s.tools {
+        t.bridge_fan_speed = t.fan_speed;
+    }
     s
 }
 
@@ -417,6 +429,31 @@ mod tests {
             max_m204 <= 1200.0,
             "tower accel capped past the PA smoothing window, got M204 S{max_m204}"
         );
+    }
+
+    #[test]
+    fn towers_hold_the_base_fan_duty() {
+        // The tower's ~2 s layers would ride the short-layer cooling ladder
+        // to the ceiling (80% for ABS/ASA) — a regime unlike the large
+        // layers most of a print's flow mass lands on, and a colder bead
+        // calipers narrower (flow read biased high). Both towers must print
+        // at the filament's BASE duty.
+        let mut s = Settings::default();
+        s.fan_speed = 0.15;
+        s.bridge_fan_speed = 0.8;
+        s.fan_off_layers = 3;
+        for g in [pa_tower_gcode(&s, 0), flow_tower_gcode(&s, 0)] {
+            let max_fan = g
+                .lines()
+                .filter(|l| l.starts_with("M106 S"))
+                .filter_map(|l| l[6..].trim().parse::<u32>().ok())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_fan <= 39,
+                "tower fan must stay at the base duty (S38), got S{max_fan}"
+            );
+        }
     }
 
     #[test]
