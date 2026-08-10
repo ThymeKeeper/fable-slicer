@@ -590,11 +590,11 @@ fn filament_card_rows(
     // the calibration-suite row above.)
     ui.horizontal(|ui| {
         ui.label("PA tower reading:").on_hover_text(format!(
-            "From the suite's teardrop tower (PA ramps 0 \u{2192} {:.2}, {} per mm of \
-             height). Judge the two vertical bands mid-face on the flats beside \
-             the corner: too little PA = fat ridge on one, starved streak on the \
-             other; too much = they swap. Enter the height where they vanish or \
-             trade places. Ignore the corner itself — it carries the seam.",
+            "From the suite's cylinder tower (PA ramps 0 \u{2192} {:.2}, {} per mm of \
+             height). Judge the two vertical bands flanking the FRONT (the seam \
+             column marks the rear): too little PA = fat ridge on one, starved \
+             streak on the other; too much = they swap. Enter the height where \
+             they vanish or trade places.",
             engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
             engine::PA_TOWER_FACTOR,
         ));
