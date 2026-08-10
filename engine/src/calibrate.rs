@@ -377,6 +377,64 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
     )
 }
 
+/// Seven-segment masks for digits 0-9 (bits a,b,c,d,e,f,g = 0..6): the
+/// tooth numbers recessed into the comb's underside.
+const SEVEN_SEG: [u8; 10] = [
+    0b011_1111, // 0
+    0b000_0110, // 1
+    0b101_1011, // 2
+    0b100_1111, // 3
+    0b110_0110, // 4
+    0b110_1101, // 5
+    0b111_1101, // 6
+    0b000_0111, // 7
+    0b111_1111, // 8
+    0b110_1111, // 9
+];
+/// Digit stroke length / width (mm). 0.8 mm slots stay two beads wide —
+/// safely above the sub-bead hole healing that erases slice slivers.
+const DIGIT_SEG_LEN_MM: f64 = 1.8;
+const DIGIT_SEG_W_MM: f64 = 0.8;
+
+/// The lit segment rectangles (comb coordinates, already MIRRORED in X so
+/// the recesses read correctly from the underside) for tooth `k`'s number.
+/// Single digits sit low in the tooth cavity; two-digit numbers stack along
+/// the tooth, tens digit nearer the spine, reading spine→tip.
+fn comb_digit_segs(k: usize) -> Vec<(f64, f64, f64, f64)> {
+    let (l, w) = (DIGIT_SEG_LEN_MM, DIGIT_SEG_W_MM);
+    let dw = l + 2.0 * w;
+    let dh = 2.0 * l + 3.0 * w;
+    // Segment rects in digit-local coords (origin bottom-left, y toward the
+    // tooth tip): a top, b upper-right, c lower-right, d bottom,
+    // e lower-left, f upper-left, g middle.
+    let local: [(f64, f64, f64, f64); 7] = [
+        (w, 2.0 * l + 2.0 * w, w + l, dh),
+        (w + l, l + 2.0 * w, dw, 2.0 * l + 2.0 * w),
+        (w + l, w, dw, w + l),
+        (w, 0.0, w + l, w),
+        (0.0, w, w, w + l),
+        (0.0, l + 2.0 * w, w, 2.0 * l + 2.0 * w),
+        (w, l + w, w + l, l + 2.0 * w),
+    ];
+    let n = k + 1;
+    let digits: Vec<usize> = if n < 10 { vec![n] } else { vec![n / 10, n % 10] };
+    let cx = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM / 2.0;
+    let mut out = Vec::new();
+    for (di, &d) in digits.iter().enumerate() {
+        let y_base = COMB_SPINE_D_MM + 3.0 + di as f64 * (dh + 1.0);
+        for (si, r) in local.iter().enumerate() {
+            if SEVEN_SEG[d] & (1 << si) == 0 {
+                continue;
+            }
+            // Mirror in X about the digit center, then place.
+            let x0 = cx + dw / 2.0 - r.2;
+            let x1 = cx + dw / 2.0 - r.0;
+            out.push((x0, y_base + r.1, x1, y_base + r.3));
+        }
+    }
+    out
+}
+
 /// G-code for the flow comb: a spine bar with [`COMB_TEETH`] hollow
 /// rectangular teeth, each a single-bead ring printed at its own flow
 /// multiplier — [`COMB_FLOW_FAT`] at the handle end stepping evenly to
@@ -415,6 +473,8 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
     let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
     let rect = |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+    let rect_cw =
+        |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x0, y1], [x1, y1], [x1, y0]];
     let mut tris = Vec::new();
     prism(&rect(0.0, 0.0, w, COMB_SPINE_D_MM), 0.0, COMB_H_MM, &mut tris);
     for k in 0..COMB_TEETH {
@@ -426,6 +486,14 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
             COMB_H_MM,
             &mut tris,
         );
+        // Tooth number, recessed through the base plate inside the ring:
+        // REVERSED-winding prisms cut holes (positive-fill slicing), and
+        // the digits are pre-mirrored so they read from the underside.
+        // Above the plate the ring cavity is empty anyway, so the tall cut
+        // costs nothing.
+        for (sx0, sy0, sx1, sy1) in comb_digit_segs(k) {
+            prism(&rect_cw(sx0, sy0, sx1, sy1), 0.0, 2.0, &mut tris);
+        }
     }
     let mesh = mesh::Mesh::from_triangle_soup(&tris);
     let mut plans = generate_parts(&[(&mesh, tool)], &s);
@@ -478,6 +546,8 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
          ; any position on the tooth) and pin that tooth's flow, verbatim. If the\n\
          ; right wall lies between two teeth, split the difference (tooth 7.5 is\n\
          ; halfway between tooth 7 and 8). PA stays at the profile value.\n\
+         ; teeth are NUMBERED on the underside — flip the comb over; two-digit\n\
+         ; numbers read spine-to-tip.\n\
 {ladder}",
         s.line_width_mm
     );
@@ -941,6 +1011,86 @@ mod tests {
             "thin tooth at {COMB_FLOW_THIN}x, got {:.3}",
             thin / spine
         );
+    }
+
+    #[test]
+    fn flow_comb_numbers_the_teeth_on_the_underside() {
+        // Every tooth's number must slice as real voids in the base plate:
+        // no layer-0 extrusion inside a lit segment slot, while the plate
+        // right beside the digit block stays covered.
+        let s = Settings::default();
+        let g = flow_comb_gcode(&s, 0);
+        let w = COMB_HANDLE_MM + (COMB_TEETH - 1) as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM;
+        let d = COMB_SPINE_D_MM + COMB_TOOTH_LEN_MM;
+        let (ox, oy) = (s.bed_size_x_mm / 2.0 - w / 2.0, s.bed_size_y_mm / 2.0 - d / 2.0);
+        // Collect layer-0 extrusion segment midpoints (comb coords).
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let mut layer = -1_i64;
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                layer += 1;
+                continue;
+            }
+            if layer > 0 {
+                break;
+            }
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ")) {
+                continue;
+            }
+            let (mut nx, mut ny, mut e) = (x, y, 0.0_f64);
+            for tok in l.split_whitespace().skip(1) {
+                let (c, v) = tok.split_at(1);
+                if let Ok(v) = v.parse::<f64>() {
+                    match c {
+                        "X" => nx = v,
+                        "Y" => ny = v,
+                        "E" => e = v,
+                        _ => {}
+                    }
+                }
+            }
+            if layer == 0 && e > 0.0 {
+                // Sample the segment densely so long fill strokes register.
+                let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+                let n = (len / 0.2).ceil().max(1.0) as usize;
+                for i in 0..=n {
+                    let t = i as f64 / n as f64;
+                    pts.push((x + (nx - x) * t - ox, y + (ny - y) * t - oy));
+                }
+            }
+            x = nx;
+            y = ny;
+        }
+        assert!(pts.len() > 1000, "layer 0 parsed, got {} samples", pts.len());
+        for k in [0, 7, COMB_TEETH - 1] {
+            let segs = comb_digit_segs(k);
+            assert!(!segs.is_empty());
+            for (sx0, sy0, sx1, sy1) in &segs {
+                // Shrink by the wall half-bead: the hole's own wall loop
+                // rides just inside the slot edge.
+                let m = 0.25;
+                let hits = pts
+                    .iter()
+                    .filter(|(px, py)| {
+                        *px > sx0 + m && *px < sx1 - m && *py > sy0 + m && *py < sy1 - m
+                    })
+                    .count();
+                assert_eq!(
+                    hits, 0,
+                    "tooth {} digit slot [{sx0:.1},{sy0:.1}-{sx1:.1},{sy1:.1}] must be void",
+                    k + 1
+                );
+            }
+            // The plate just tipward of the digit block is solid.
+            let cx = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM + COMB_TOOTH_W_MM / 2.0;
+            let probe_y = COMB_SPINE_D_MM + 3.0 + 2.0 * (2.0 * DIGIT_SEG_LEN_MM + 3.0 * DIGIT_SEG_W_MM) + 3.0;
+            let near = pts
+                .iter()
+                .filter(|(px, py)| (px - cx).abs() < 1.5 && (py - probe_y).abs() < 1.5)
+                .count();
+            assert!(near > 0, "plate beside tooth {}'s digits stays covered", k + 1);
+        }
     }
 
     #[test]

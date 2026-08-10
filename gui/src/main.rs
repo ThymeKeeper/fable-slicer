@@ -529,17 +529,11 @@ fn filament_card_rows(
         if ui
             .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow comb"))
             .on_hover_text(format!(
-                "Print a comb: {} single-wall teeth, each 2 cm long at its own \
-                 ABSOLUTE flow — tooth 1 at the HANDLE end = {:.2}, stepping an \
-                 exact 2% per tooth down to {:.2} at the far end — at your real \
-                 speeds, with pressure advance untouched. The whole file prints at \
-                 flow 1.0 with the ladder baked in, so a tooth's value IS the \
-                 setting: caliper along the teeth (full jaw flats, mid-face — \
-                 nothing depends on where you clamp) to the one that reads exactly \
-                 {:.2} mm (your line width), and enter its number below. Between \
-                 two teeth? Enter the half-step (7.5). One print, one absolute \
-                 answer — re-printing the comb always reproduces the identical \
-                 ladder. Clear the bed first.",
+                "Prints a {}-tooth comb; each tooth is a single wall at its own ABSOLUTE \
+                 flow — {:.2} at the handle end down to {:.2}, 2% per tooth (table in \
+                 the g-code header). Caliper the teeth mid-face with the full jaw \
+                 flats and enter the tooth number that reads exactly {:.2} mm. \
+                 Halves are fine: 7.5 reads between tooth 7 and 8.",
                 engine::COMB_TEETH,
                 engine::COMB_FLOW_FAT,
                 engine::COMB_FLOW_THIN,
@@ -558,7 +552,7 @@ fn filament_card_rows(
                 .prefix("tooth "),
         )
         .on_hover_text(format!(
-            "The tooth (counted from the HANDLE end) whose wall calipers at exactly {line_width_mm:.2} mm. Halves are fine: 7.5 reads between tooth 7 and 8."
+            "Tooth number, counted from the HANDLE end, that calipers at {line_width_mm:.2} mm."
         ));
         if ui
             .button("apply")
@@ -593,20 +587,14 @@ fn filament_card_rows(
         if ui
             .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
             .on_hover_text(format!(
-                "Print a single-wall teardrop tower ({:.0} mm wide) whose pressure \
-                 advance ramps 0 → {:.2} with height, with a TWO-SPEED pattern: the \
-                 wall cruises at your real wall speed, drops to {:.0}% inside a \
-                 {:.0} mm zone around the front corner, and speeds back up. The two \
-                 speed-step BANDS land mid-face on the flat legs — THEY are the \
-                 judge, not the corner (a corner always drags dwell ooze that PA \
-                 cannot cancel; judging it reads high). Too little PA: the slow-down \
-                 band is a fat ridge, the speed-up band a starved streak. Too much: \
-                 they trade places. Read the LOWEST height where the two bands \
-                 balance out or vanish, and enter it below. Clear the bed first.",
+                "Prints a {:.0} mm teardrop tower; PA ramps 0 \u{2192} {:.2} with height \
+                 ({} per mm). Judge the two vertical bands mid-face on the flats \
+                 beside the corner: too little PA = fat ridge on one, starved streak \
+                 on the other; too much = they swap. Enter the height where the \
+                 bands vanish or trade places. (Ignore the corner itself.)",
                 2.0 * engine::TOWER_R_MM,
                 engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
-                engine::PA_STEP_SLOW_FRAC * 100.0,
-                engine::TOWER_R_MM * 0.5,
+                engine::PA_TOWER_FACTOR,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()
@@ -620,7 +608,7 @@ fn filament_card_rows(
                 .fixed_decimals(1)
                 .suffix(" mm"),
         )
-        .on_hover_text("The LOWEST height where the two mid-face speed-step bands balance out or vanish (ignore the corner — it always drags a little ooze at speed).");
+        .on_hover_text("Height (mm from the bed) where the two bands vanish or trade places.");
         if ui
             .button("apply")
             .on_hover_text(format!(
@@ -6964,7 +6952,7 @@ impl eframe::App for App {
                 match c.upload("flow-comb.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the flow comb — when it's done, caliper along the teeth (full jaw flats, mid-face) to the one whose wall reads exactly {lw:.2} mm, counting from the HANDLE end, and enter its number in the Filament panel (halves are fine: 7.5). That tooth's absolute flow value is the setting."),
+                        msg: format!("Printing the flow comb — caliper the teeth and enter the number of the one that reads {lw:.2} mm (counted from the handle end) in the Filament panel."),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-comb upload failed: {e}") },
                 }
@@ -6989,7 +6977,7 @@ impl eframe::App for App {
                 match c.upload("pa-tower.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the PA tower — when it's done, judge the two speed-step BANDS mid-face on the flat legs (not the corner): too little PA = fat ridge at the slow-down band and starved streak at the speed-up band; too much = they trade places. Read the lowest height where the bands balance out, measure from the bed, and enter it in the Filament panel.{pa_note}"),
+                        msg: format!("Printing the PA tower — find the height where the two mid-face bands vanish or trade places, and enter it in the Filament panel.{pa_note}"),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("PA-tower upload failed: {e}") },
                 }
