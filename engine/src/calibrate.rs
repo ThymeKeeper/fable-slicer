@@ -83,6 +83,10 @@ pub const COMB_TOOTH_PITCH_MM: f64 = 10.0;
 pub const COMB_HUB_RING_MM: f64 = 4.0;
 /// Comb height (mm): tall enough for full caliper-jaw flats on any tooth.
 pub const COMB_H_MM: f64 = 12.0;
+/// PA tower radius inside the calibration suite (mm): the teardrop's
+/// enclosing circle (radius ~1.207r) must sit in the comb's hub hole with
+/// ~3 mm of clearance. The standalone tower keeps [`TOWER_R_MM`].
+pub const SUITE_TOWER_R_MM: f64 = 27.0;
 
 /// Hub outer radius: the circle the teeth stand on.
 pub fn comb_hub_r_mm() -> f64 {
@@ -168,26 +172,87 @@ fn tower_settings(settings: &Settings) -> Settings {
     s
 }
 
-/// Slice the teardrop tower with the given (already tower-stripped) settings,
-/// printing with `tool` — on a toolchanger the tower must run on the spool
-/// whose profile the reading will be pinned into, not whatever tool 0 holds.
-fn teardrop_gcode(s: &Settings, tool: u32) -> String {
-    // Teardrop footprint, apex toward the front (-Y) so the corner faces the
-    // user: circle of radius r at the origin, apex at (0, -r√2) — the two
-    // tangents from that point meet at exactly 90°, touching the circle at
-    // -45° and 225°. 1.5° facets keep the chord error (~0.003 mm) under the
-    // slicer's contour resolution, and land a vertex exactly at the rear
-    // (90°) for the seam column to seed on.
-    let r = TOWER_R_MM;
-    let mut fp = vec![[0.0, -r * std::f64::consts::SQRT_2]];
+/// The teardrop tower's triangle soup: apex toward the front (-Y), circle
+/// of radius `r` at local (0, y_shift), apex at (0, y_shift - r√2) — the
+/// two tangents from the apex meet at exactly 90°, touching the circle at
+/// -45° and 225°. 1.5° facets keep the chord error (~0.003 mm) under the
+/// slicer's contour resolution, and land a vertex exactly at the rear
+/// (90°) for the seam column to seed on. `pa_label` recesses "PA" through
+/// the base plate (mirrored, read from the underside) — the suite prints
+/// two instruments at once and the tower must say which it is.
+fn teardrop_mesh(r: f64, y_shift: f64, pa_label_top_z: Option<f64>) -> mesh::Mesh {
+    let mut fp = vec![[0.0, y_shift - r * std::f64::consts::SQRT_2]];
     let steps = 180;
     for i in 0..=steps {
         let a = (-45.0 + 270.0 * f64::from(i) / f64::from(steps)).to_radians();
-        fp.push([r * a.cos(), r * a.sin()]);
+        fp.push([r * a.cos(), y_shift + r * a.sin()]);
     }
     let mut tris = Vec::new();
     prism(&fp, 0.0, TOWER_H_MM, &mut tris);
-    let mesh = mesh::Mesh::from_triangle_soup(&tris);
+    if let Some(z1) = pa_label_top_z {
+        for quad in pa_label_quads(y_shift) {
+            let mut q = quad.to_vec();
+            let area: f64 = q
+                .windows(2)
+                .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+                .sum::<f64>()
+                + q.last().unwrap()[0] * q[0][1]
+                - q[0][0] * q.last().unwrap()[1];
+            if area > 0.0 {
+                q.reverse(); // holes are CW
+            }
+            // Base plate only — see comb_mesh's label note.
+            prism(&q, 0.0, z1, &mut tris);
+        }
+    }
+    mesh::Mesh::from_triangle_soup(&tris)
+}
+
+/// The "PA" letters as seven-segment stroke quads (centered coordinates,
+/// mirrored in X so they read from the underside), sized for the tower's
+/// roomy base plate at a stroke width the bottom-skin machinery respects.
+fn pa_label_quads(y_shift: f64) -> Vec<[[f64; 2]; 4]> {
+    // P = a,b,e,f,g ; A = a,b,c,e,f,g in the a..g = bit 0..6 encoding.
+    let masks = [0b111_0011_u8, 0b111_0111_u8];
+    let (l, w) = (3.0_f64, 1.2_f64);
+    let dw = l + 2.0 * w;
+    let dh = 2.0 * l + 3.0 * w;
+    let local: [(f64, f64, f64, f64); 7] = [
+        (w, 2.0 * l + 2.0 * w, w + l, dh),
+        (w + l, l + 2.0 * w, dw, 2.0 * l + 2.0 * w),
+        (w + l, w, dw, w + l),
+        (w, 0.0, w + l, w),
+        (0.0, w, w, w + l),
+        (0.0, l + 2.0 * w, w, 2.0 * l + 2.0 * w),
+        (w, l + w, w + l, l + 2.0 * w),
+    ];
+    let gap = 1.6;
+    let total_w = 2.0 * dw + gap;
+    let mut out = Vec::new();
+    for (ci, &mask) in masks.iter().enumerate() {
+        for (si, r) in local.iter().enumerate() {
+            if mask & (1 << si) == 0 {
+                continue;
+            }
+            let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+            let mut quad = [[0.0_f64; 2]; 4];
+            for (qi, &(cx_, cy_)) in corners.iter().enumerate() {
+                // Mirror in X about the label center for underside reading.
+                let x = total_w / 2.0 - (ci as f64 * (dw + gap) + cx_);
+                quad[qi] = [x, y_shift - dh / 2.0 + cy_];
+            }
+            out.push(quad);
+        }
+    }
+    out
+}
+
+/// Slice the standalone teardrop tower with the given (already
+/// tower-stripped) settings, printing with `tool` — on a toolchanger the
+/// tower must run on the spool whose profile the reading will be pinned
+/// into, not whatever tool 0 holds.
+fn teardrop_gcode(s: &Settings, tool: u32) -> String {
+    let mesh = teardrop_mesh(TOWER_R_MM, 0.0, None);
     to_gcode(&generate_parts(&[(&mesh, tool)], s), s)
 }
 
@@ -220,13 +285,15 @@ fn sweep(g: &str, header: &str, mut per_layer: impl FnMut(f64) -> String, tail: 
 /// Moves crossing the boundary are split at the exact crossing (X/Y/Z/E
 /// interpolated), so E-per-mm is conserved and the commanded step is
 /// abrupt — the transient pressure advance must answer for.
-fn speed_step_pass(g: &str, bed_x_mm: f64, bed_y_mm: f64) -> String {
-    let r = TOWER_R_MM;
-    // The tower is bed-centered; the apex sits below the bbox center by
-    // half the footprint depth (arc top at +r, apex at -r*sqrt(2)).
-    let ax = bed_x_mm / 2.0;
-    let ay = bed_y_mm / 2.0 - r * (1.0 + std::f64::consts::SQRT_2) / 2.0;
-    let rz = r * 0.5;
+fn speed_step_pass(
+    g: &str,
+    ax: f64,
+    ay: f64,
+    tower_r: f64,
+    gate_center: (f64, f64),
+    gate_r: f64,
+) -> String {
+    let rz = tower_r * 0.5;
     let mut out = String::with_capacity(g.len() * 2);
     let (mut x, mut y, mut z) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut have_pos = false;
@@ -256,11 +323,14 @@ fn speed_step_pass(g: &str, bed_x_mm: f64, bed_y_mm: f64) -> String {
                 }
             }
         }
-        // Only the helix (above the 3 base-plate layers) gets the pattern.
-        let vase = markers > 3;
+        // Only tower wall above the 3 base-plate layers gets the pattern —
+        // in the suite, comb moves outside the gate pass through untouched.
+        let above_plate = markers > 3;
+        let in_tower = (x - gate_center.0).hypot(y - gate_center.1) < gate_r
+            && (nx - gate_center.0).hypot(ny - gate_center.1) < gate_r;
         let extruding =
             have_pos && e.is_some_and(|e| e > 0.0) && ((nx - x).abs() > 1e-9 || (ny - y).abs() > 1e-9);
-        if !(vase && extruding) {
+        if !(above_plate && in_tower && extruding) {
             if let Some(fv) = f {
                 cur_f = fv;
             }
@@ -324,28 +394,14 @@ fn speed_step_pass(g: &str, bed_x_mm: f64, bed_y_mm: f64) -> String {
 /// after it — the crispest band wins, and [`pa_from_height`] turns its
 /// height (measured from the bed) into the profile value. Flow is constant
 /// here, so the flat legs double as a caliper check of the pinned flow.
-pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
-    let s = tower_settings(settings);
-    let mut header = format!(
-        "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
-         ; teardrop helix with a TWO-SPEED pattern: the wall cruises fast, drops to\n\
-         ; {:.0}% speed inside a {:.0} mm zone around the front corner, and speeds back\n\
-         ; up on the way out. The two SPEED-STEP BANDS land mid-face on the flat legs\n\
-         ; — THEY are the judge, not the corner (a corner always drags dwell ooze that\n\
-         ; pressure advance cannot cancel; judging it is what read 0.044+ on a 0.032\n\
-         ; machine). Too little PA: the slow-down band is a fat ridge and the speed-up\n\
-         ; band a starved streak. Too much: they trade places. Read the LOWEST height\n\
-         ; where the two bands balance out / vanish, measured from the BED, and apply\n\
-         ; it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
-        PA_STEP_SLOW_FRAC * 100.0,
-        TOWER_R_MM * 0.5,
-    );
-    // Leave the machine on the profile's PA, not the sweep's top. (A profile
-    // value of 0 means "the printer's own config value", which g-code cannot
-    // read back — no restore is possible, so say so; applying the measured
-    // height re-pins PA on every later print.)
-    let tail = if settings.pressure_advance > 0.0 {
-        format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}\n", settings.pressure_advance)
+/// Wrap calibration g-code with the per-millimeter PA sweep: `header`
+/// first, one SET_PRESSURE_ADVANCE per mm of height (each is a Klipper
+/// queue-flush stall — sub-mm steps are below reading resolution anyway),
+/// and a tail restoring the profile PA so the sweep's top value never
+/// leaks into the next print.
+fn pa_sweep_wrap(g: &str, profile_pa: f64, mut header: String) -> String {
+    let tail = if profile_pa > 0.0 {
+        format!("SET_PRESSURE_ADVANCE ADVANCE={profile_pa:.4}\n")
     } else {
         header.push_str(
             "; NOTE: no profile PA is pinned, so after this print the machine keeps the\n\
@@ -353,16 +409,9 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
         );
         String::new()
     };
-    // The sweep steps once per MILLIMETER of height, not per layer: Klipper
-    // flushes its motion queue on every SET_PRESSURE_ADVANCE — a stall
-    // mid-extrusion at the rear column — and per-layer steps of
-    // FACTOR×layer_height are far below the ±0.5 mm reading resolution
-    // anyway. One step per mm keeps the height→PA map exact at every band
-    // edge while cutting the stall count (and the blip column's exposure to
-    // a badly-timed host hiccup) five-fold.
     let mut last_band = f64::NEG_INFINITY;
     sweep(
-        &speed_step_pass(&teardrop_gcode(&s, tool), s.bed_size_x_mm, s.bed_size_y_mm),
+        g,
         &header,
         move |z| {
             let band = z.floor();
@@ -378,6 +427,100 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
         },
         &tail,
     )
+}
+
+/// One print, both instruments: the PA teardrop (shrunk to fit) nested
+/// inside the flow comb's hub, sharing the plate and the sweep. The comb
+/// reads flow mid-face at steady state, where pressure advance contributes
+/// exactly zero — so the global per-layer PA sweep can run while the comb
+/// prints below it. Vase mode is gone (it is single-loop by nature); the
+/// tower prints as ordinary seamed layers with the seam chasing the apex
+/// (Sharpest — deterministic, and the corner was already not the judge),
+/// while the comb's seam snaps to its hub bump. The tower says "PA" on
+/// its underside; the comb's teeth say their values.
+pub fn calibration_suite_gcode(settings: &Settings, tool: u32) -> String {
+    let mut s = tower_settings(settings);
+    s.spiral_vase = false;
+    // Deterministic seams for BOTH objects: the comb's bump and the
+    // teardrop's apex are each their object's sharpest corner.
+    s.seam_mode = config::SeamMode::Sharpest;
+    // The comb ladder is absolute (multiplier 1.0); the tower's judged
+    // artifact is speed-transient, not flow, so it reads the same.
+    s.extrusion_multiplier = 1.0;
+    for t in &mut s.tools {
+        t.extrusion_multiplier = 1.0;
+    }
+    s.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
+    for t in &mut s.tools {
+        t.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
+    }
+    // Shrink the tower so its enclosing circle (radius ~1.207r) sits in
+    // the hub hole with ~3 mm of clearance, and lift it so that circle is
+    // centered — the suite's bbox stays symmetric about the origin.
+    let tr = SUITE_TOWER_R_MM;
+    let y_shift = tr * (std::f64::consts::SQRT_2 - 1.0) / 2.0;
+    let plate_top = s.first_layer_height_mm + 2.0 * s.layer_height_mm;
+    let comb = comb_mesh(plate_top);
+    let tower = teardrop_mesh(tr, y_shift, Some(plate_top));
+    let mut plans = generate_parts(&[(&comb, tool), (&tower, tool)], &s);
+    let (cx, cy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+    comb_annotate(&mut plans, cx, cy);
+    let g = to_gcode(&plans, &s);
+    // Two-speed pattern on the tower only: gate the pass to the hub hole.
+    let (ax, ay) = (cx, cy + y_shift - tr * std::f64::consts::SQRT_2);
+    let g = speed_step_pass(
+        &g,
+        ax,
+        ay,
+        tr,
+        (cx, cy),
+        comb_hub_r_mm() - COMB_HUB_RING_MM - 0.5,
+    );
+    let header = format!(
+        "; CALIBRATION SUITE: the flow comb with the PA tower inside its hub — one\n\
+         ; plate, both instruments. flip the finished parts over: the comb's teeth\n\
+         ; are labeled with their flow (percent mod 100), the tower says PA.\n\
+         ; FLOW: caliper along the ring for teeth reading exactly {:.2} mm mid-face;\n\
+         ; take the middle of the matching run (tie toward 00) and pin its label.\n\
+         ; PA (= {} + {} * height): judge the two speed-step bands mid-face on the\n\
+         ; tower's flat legs — fat ridge on one + starved streak on the other = too\n\
+         ; little, swapped = too much; read the LOWEST height where they balance.\n\
+         ; the tower's corner carries its seam — it is NOT the judge.\n",
+        s.line_width_mm, PA_TOWER_START, PA_TOWER_FACTOR
+    );
+    pa_sweep_wrap(&g, s.pressure_advance, header)
+}
+
+pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
+    let s = tower_settings(settings);
+    let header = format!(
+        "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
+         ; teardrop helix with a TWO-SPEED pattern: the wall cruises fast, drops to\n\
+         ; {:.0}% speed inside a {:.0} mm zone around the front corner, and speeds back\n\
+         ; up on the way out. The two SPEED-STEP BANDS land mid-face on the flat legs\n\
+         ; — THEY are the judge, not the corner (a corner always drags dwell ooze that\n\
+         ; pressure advance cannot cancel; judging it is what read 0.044+ on a 0.032\n\
+         ; machine). Too little PA: the slow-down band is a fat ridge and the speed-up\n\
+         ; band a starved streak. Too much: they trade places. Read the LOWEST height\n\
+         ; where the two bands balance out / vanish, measured from the BED, and apply\n\
+         ; it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
+        PA_STEP_SLOW_FRAC * 100.0,
+        TOWER_R_MM * 0.5,
+    );
+    // Standalone tower: bed-centered, apex below the bbox center by half
+    // the footprint depth (arc top at +r, apex at -r*sqrt(2)); no region
+    // gate — the tower is the only object.
+    let ax = s.bed_size_x_mm / 2.0;
+    let ay = s.bed_size_y_mm / 2.0 - TOWER_R_MM * (1.0 + std::f64::consts::SQRT_2) / 2.0;
+    let g = speed_step_pass(
+        &teardrop_gcode(&s, tool),
+        ax,
+        ay,
+        TOWER_R_MM,
+        (ax, ay),
+        f64::INFINITY,
+    );
+    pa_sweep_wrap(&g, settings.pressure_advance, header)
 }
 
 /// Seven-segment masks for digits 0-9 (bits a,b,c,d,e,f,g = 0..6): the
@@ -447,38 +590,11 @@ fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
     out
 }
 
-/// G-code for the flow comb: [`COMB_TEETH`] single-wall ring teeth radial
-/// around an annular hub, each printed at its own ABSOLUTE flow —
-/// [`COMB_FLOW_FAT`] stepping an exact 1% per tooth to [`COMB_FLOW_THIN`],
-/// middle tooth exactly 1.00 — while PA holds the profile value. The whole
-/// file prints at extrusion multiplier 1.0 with the ladder baked into E
-/// (no M221), and every tooth carries its VALUE as a round percent
-/// recessed into the underside plate: the label you read is the setting
-/// you pin, verbatim. Caliper along the ring; several 1% neighbours will
-/// read alike — take the middle of that run (tie toward 100). Stadium
-/// tips and true junction fillets keep the loop from ever slowing near a
-/// measured face (the comb prints before PA is calibrated); one bump on
-/// the hub edge mid-gap is the only sharp feature, and the seam column
-/// snaps to it, away from every tooth.
-pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
-    let mut s = tower_settings(settings);
-    // Ordinary closed loops, not a helix: the per-tooth flow rides the
-    // per-segment attribute channel, which the vase spiral bypasses.
-    s.spiral_vase = false;
-    // ABSOLUTE, not cumulative: the whole print runs at extrusion
-    // multiplier 1.0, so each tooth's ladder value IS the candidate
-    // setting. A comb that rode the current profile flow would compound —
-    // every re-print's ladder relative to the last pin.
-    s.extrusion_multiplier = 1.0;
-    for t in &mut s.tools {
-        t.extrusion_multiplier = 1.0;
-    }
-    // The fat tooth extrudes 12% over nominal — derate the melt ceiling so
-    // it stays within the filament's real melt rate.
-    s.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
-    for t in &mut s.tools {
-        t.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
-    }
+/// The radial comb's triangle soup (centered at the origin): annular hub,
+/// stadium teeth with true junction fillets, underside value labels, and
+/// the seam-magnet bump. Shared by the standalone comb print and the
+/// calibration suite.
+fn comb_mesh(label_top_z: f64) -> mesh::Mesh {
     let rh = comb_hub_r_mm();
     let mut tris = Vec::new();
     // Annular hub: a CCW disc with a REVERSED (CW) disc cut from it.
@@ -497,10 +613,6 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     };
     prism(&disc(rh, true), 0.0, COMB_H_MM, &mut tris);
     prism(&disc(rh - COMB_HUB_RING_MM, false), 0.0, COMB_H_MM, &mut tris);
-    // Teeth: stadium footprints in tooth-local coords (x across the width,
-    // y radial), rotated into place. The 1 mm root overlap into the hub and
-    // the 0.5 mm fillet padding keep every prism buried in solid — no
-    // knife-edge coincident walls.
     let hw = COMB_TOOTH_W_MM / 2.0;
     let place = |k: usize, fp: &[[f64; 2]]| -> Vec<[f64; 2]> {
         let a = comb_tooth_angle(k) - std::f64::consts::FRAC_PI_2;
@@ -517,8 +629,9 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
         fp
     };
     // Concave junction fillet in tooth-local coords: quarter arc bulging
-    // toward the corner, legs padded 0.5 mm into hub and tooth. The hub
-    // edge is locally straight to within 0.05 mm over the 2 mm fillet.
+    // toward the corner, legs padded 0.5 mm into hub and tooth (knife-edge
+    // coincident walls are the one thing the soup union can't resolve).
+    // The hub edge is locally straight to within 0.05 mm over 2 mm.
     let fillet_fp = |sx: f64| {
         let r = 2.0;
         let (corner_x, cy) = (sx * hw, rh);
@@ -546,8 +659,9 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
         prism(&place(k, &fillet_fp(-1.0)), 0.0, COMB_H_MM, &mut tris);
         prism(&place(k, &fillet_fp(1.0)), 0.0, COMB_H_MM, &mut tris);
         // The label: REVERSED-winding prisms cut the value through the
-        // base plate (above it the ring cavity is empty, so the tall cut
-        // costs nothing).
+        // base plate ONLY — a taller cut leaves hole contours in the solid
+        // slice above the plate, which print as floating wall rings
+        // hovering over the voids.
         for quad in comb_label_quads(k) {
             let mut fp: Vec<[f64; 2]> = quad.to_vec();
             let area: f64 = fp
@@ -559,15 +673,16 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
             if area > 0.0 {
                 fp.reverse(); // holes are CW
             }
-            prism(&fp, 0.0, 2.0, &mut tris);
+            prism(&fp, 0.0, label_top_z, &mut tris);
         }
     }
     // Seam magnet: the one sharp feature — a small bump on the hub edge in
-    // the mid-gap behind tooth 0. The aligned seam column snaps to the
-    // sharpest corner in reach; give it one, away from every tooth.
+    // the mid-gap behind tooth 0; the seam column snaps to it, away from
+    // every tooth.
     {
         let a = comb_tooth_angle(0) + std::f64::consts::PI / COMB_TEETH as f64;
-        let (rc, rs) = ((a - std::f64::consts::FRAC_PI_2).cos(), (a - std::f64::consts::FRAC_PI_2).sin());
+        let (rc, rs) =
+            ((a - std::f64::consts::FRAC_PI_2).cos(), (a - std::f64::consts::FRAC_PI_2).sin());
         let tri = [[0.0, rh + 1.6], [-0.9, rh - 0.8], [0.9, rh - 0.8]];
         let fp: Vec<[f64; 2]> =
             tri.iter().map(|p| [p[0] * rc - p[1] * rs, p[0] * rs + p[1] * rc]).collect();
@@ -580,12 +695,15 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
         let fp = if area < 0.0 { vec![fp[0], fp[2], fp[1]] } else { fp };
         prism(&fp, 0.0, COMB_H_MM, &mut tris);
     }
-    let mesh = mesh::Mesh::from_triangle_soup(&tris);
-    let mut plans = generate_parts(&[(&mesh, tool)], &s);
-    // The mesh is built about the origin and the bbox is symmetric, so the
-    // bed-centered frame is just a translation to bed center.
-    let (ox, oy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
-    for plan in &mut plans {
+    mesh::Mesh::from_triangle_soup(&tris)
+}
+
+/// Bake the comb's per-tooth ladder into wall E via the per-segment flow
+/// channel. Position-based, so it is naturally suite-safe: anything inside
+/// the hub (the nested PA tower included) classifies as flow 1.0 and stays
+/// a plain path.
+fn comb_annotate(plans: &mut [crate::plan::LayerPlan], ox: f64, oy: f64) {
+    for plan in plans.iter_mut() {
         for p in &mut plan.paths {
             if !matches!(
                 p.kind,
@@ -616,6 +734,44 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
             }
         }
     }
+}
+
+/// G-code for the flow comb: [`COMB_TEETH`] single-wall ring teeth radial
+/// around an annular hub, each printed at its own ABSOLUTE flow —
+/// [`COMB_FLOW_FAT`] stepping an exact 1% per tooth to [`COMB_FLOW_THIN`],
+/// middle tooth exactly 1.00 — while PA holds the profile value. The whole
+/// file prints at extrusion multiplier 1.0 with the ladder baked into E
+/// (no M221), and every tooth carries its VALUE as a round percent
+/// recessed into the underside plate: the label you read is the setting
+/// you pin, verbatim. Caliper along the ring; several 1% neighbours will
+/// read alike — take the middle of that run (tie toward 100). Stadium
+/// tips and true junction fillets keep the loop from ever slowing near a
+/// measured face (the comb prints before PA is calibrated); one bump on
+/// the hub edge mid-gap is the only sharp feature, and the seam column
+/// snaps to it, away from every tooth.
+pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
+    let mut s = tower_settings(settings);
+    // Ordinary closed loops, not a helix: the per-tooth flow rides the
+    // per-segment attribute channel, which the vase spiral bypasses.
+    s.spiral_vase = false;
+    // ABSOLUTE, not cumulative: the whole print runs at extrusion
+    // multiplier 1.0, so each tooth's ladder value IS the candidate
+    // setting.
+    s.extrusion_multiplier = 1.0;
+    for t in &mut s.tools {
+        t.extrusion_multiplier = 1.0;
+    }
+    // The fat tooth extrudes 12% over nominal — derate the melt ceiling.
+    s.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
+    for t in &mut s.tools {
+        t.max_volumetric_speed_mm3_s /= COMB_FLOW_FAT;
+    }
+    let plate_top = s.first_layer_height_mm + 2.0 * s.layer_height_mm;
+    let mesh = comb_mesh(plate_top);
+    let mut plans = generate_parts(&[(&mesh, tool)], &s);
+    // Built about the origin with a symmetric bbox: the bed-centered frame
+    // is a pure translation to bed center.
+    comb_annotate(&mut plans, s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
     let header = format!(
         "; flow comb: {COMB_TEETH} teeth radial around the hub, each a single-wall ring at\n\
          ; its own ABSOLUTE flow — 1% per tooth, {COMB_FLOW_FAT} down to {COMB_FLOW_THIN}, and every tooth\n\
@@ -625,7 +781,7 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
          ; into E (no M221): the label you read IS the setting you pin, verbatim.\n\
          ; caliper along the ring for the teeth that read exactly {:.2} mm (the line\n\
          ; width — full jaw flats, mid-face); 1% neighbours will read alike, so take\n\
-         ; the MIDDLE of the matching run, tie toward 100. PA stays at the profile\n\
+         ; the MIDDLE of the matching run, tie toward 00. PA stays at the profile\n\
          ; value. the hub prints at true flow.\n",
         s.line_width_mm
     );
@@ -1164,6 +1320,161 @@ mod tests {
                 .count();
             assert!(near > 0, "plate tipward of tooth {}'s label stays covered", k + 1);
         }
+    }
+
+    #[test]
+    fn calibration_suite_prints_both_instruments() {
+        let s = Settings::default();
+        let g = calibration_suite_gcode(&s, 0);
+        let (cx, cy) = (s.bed_size_x_mm / 2.0, s.bed_size_y_mm / 2.0);
+        let rh = comb_hub_r_mm();
+        let tr = SUITE_TOWER_R_MM;
+        let (ax, ay) = (0.0, tr * (std::f64::consts::SQRT_2 - 1.0) / 2.0 - tr * std::f64::consts::SQRT_2);
+        // Walk the file: track position (arcs included), classify wall
+        // extrusions by region on layers above the plate.
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let mut f = 0.0_f64;
+        let (mut layer, mut wall) = (0usize, false);
+        let mut tower_len = 0.0;
+        let mut comb_len = 0.0;
+        let mut tower_feeds: std::collections::BTreeMap<i64, f64> = Default::default();
+        let mut step_crossings: Vec<f64> = Vec::new();
+        let mut last_f = 0.0_f64;
+        let mut pa_steps = 0usize;
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                layer += 1;
+                continue;
+            }
+            if l.starts_with("SET_PRESSURE_ADVANCE") {
+                pa_steps += 1;
+                continue;
+            }
+            if let Some(t) = l.strip_prefix(";TYPE:") {
+                wall = matches!(t.trim(), "Outer wall" | "Inner wall");
+                continue;
+            }
+            let arc = l.starts_with("G2 ") || l.starts_with("G3 ");
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ") || arc) {
+                continue;
+            }
+            let (mut nx, mut ny, mut e) = (x, y, 0.0_f64);
+            for tok in l.split_whitespace().skip(1) {
+                let (c, v) = tok.split_at(1);
+                if let Ok(v) = v.parse::<f64>() {
+                    match c {
+                        "X" => nx = v,
+                        "Y" => ny = v,
+                        "E" => e = v,
+                        "F" => f = v,
+                        _ => {}
+                    }
+                }
+            }
+            let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            let (mx, my) = ((x + nx) / 2.0 - cx, (y + ny) / 2.0 - cy);
+            let prev = (x - cx, y - cy);
+            x = nx;
+            y = ny;
+            if arc || layer <= 4 || !wall || e <= 1.0e-6 {
+                continue;
+            }
+            let r = mx.hypot(my);
+            if r < rh - COMB_HUB_RING_MM - 0.5 {
+                tower_len += len;
+                *tower_feeds.entry(f.round() as i64).or_insert(0.0) += len;
+                if last_f > 0.0 && (f - last_f).abs() > 0.5 && len > 0.01 {
+                    step_crossings.push((prev.0 - ax).hypot(prev.1 - ay));
+                }
+                last_f = f;
+            } else if r > rh - 1.0 {
+                comb_len += len;
+            }
+        }
+        assert!(tower_len > 3000.0, "tower walls present, got {tower_len:.0} mm");
+        assert!(comb_len > 3000.0, "comb walls present, got {comb_len:.0} mm");
+        // Two-speed pattern confined to the tower: two dominant wall feeds
+        // at the slow fraction.
+        let major: Vec<i64> = tower_feeds
+            .iter()
+            .filter(|(_, l)| **l > 100.0)
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(major.len(), 2, "two tower wall speeds, got {tower_feeds:?}");
+        let ratio = major[0] as f64 / major[1] as f64;
+        assert!(
+            (ratio - PA_STEP_SLOW_FRAC).abs() < 0.02,
+            "slow zone at {PA_STEP_SLOW_FRAC}x, got {ratio:.3}"
+        );
+        // The speed steps land at the slow-zone boundary around the apex.
+        assert!(!step_crossings.is_empty(), "speed steps present");
+        for d in &step_crossings {
+            // Feed changes live at the zone boundary (the bands) or right
+            // at the apex (the seam entry, arriving slow into the slow
+            // zone — Sharpest parks the seam on the corner by design).
+            assert!(
+                (d - tr * 0.5).abs() < 1.5 || *d < 3.0,
+                "step at the zone boundary (r/2 = {}) or the apex seam, got {d:.2}",
+                tr * 0.5
+            );
+        }
+        // The per-mm PA sweep runs over the full tower height.
+        assert!(
+            (45..=60).contains(&pa_steps),
+            "one PA step per mm of height, got {pa_steps}"
+        );
+        // The tower's underside says PA: strokes void on layer 0.
+        let y_shift = tr * (std::f64::consts::SQRT_2 - 1.0) / 2.0;
+        let quads = pa_label_quads(y_shift);
+        assert!(!quads.is_empty());
+        let (mut px, mut py) = (0.0_f64, 0.0_f64);
+        let mut lay = -1_i64;
+        let mut hits = 0usize;
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                lay += 1;
+                continue;
+            }
+            if lay > 0 {
+                break;
+            }
+            let arc = l.starts_with("G2 ") || l.starts_with("G3 ");
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ") || arc) {
+                continue;
+            }
+            let (mut nx, mut ny, mut e) = (px, py, 0.0_f64);
+            for tok in l.split_whitespace().skip(1) {
+                let (c, v) = tok.split_at(1);
+                if let Ok(v) = v.parse::<f64>() {
+                    match c {
+                        "X" => nx = v,
+                        "Y" => ny = v,
+                        "E" => e = v,
+                        _ => {}
+                    }
+                }
+            }
+            if lay == 0 && e > 0.0 && !arc {
+                let len = ((nx - px).powi(2) + (ny - py).powi(2)).sqrt();
+                let n = (len / 0.2).ceil().max(1.0) as usize;
+                for i in 0..=n {
+                    let t = i as f64 / n as f64;
+                    let (sx, sy) = (px + (nx - px) * t - cx, py + (ny - py) * t - cy);
+                    for q in &quads {
+                        let (qx, qy) = (
+                            (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4.0,
+                            (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0,
+                        );
+                        if (sx - qx).hypot(sy - qy) < 0.35 {
+                            hits += 1;
+                        }
+                    }
+                }
+            }
+            px = nx;
+            py = ny;
+        }
+        assert_eq!(hits, 0, "the tower's PA label strokes stay void");
     }
 
     #[test]

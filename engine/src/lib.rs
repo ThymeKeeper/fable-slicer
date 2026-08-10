@@ -19,9 +19,10 @@ mod plan;
 mod slice;
 
 pub use calibrate::{
-    comb_hub_r_mm, comb_tooth_angle, comb_tooth_flow, flow_comb_gcode, flow_from_comb_label,
-    pa_from_height, pa_tower_gcode, COMB_FLOW_FAT, COMB_FLOW_THIN, COMB_H_MM, COMB_TEETH,
-    COMB_TOOTH_LEN_MM, PA_STEP_SLOW_FRAC, PA_TOWER_FACTOR, PA_TOWER_START, TOWER_H_MM, TOWER_R_MM,
+    calibration_suite_gcode, comb_hub_r_mm, comb_tooth_angle, comb_tooth_flow, flow_comb_gcode,
+    flow_from_comb_label, pa_from_height, pa_tower_gcode, COMB_FLOW_FAT, COMB_FLOW_THIN,
+    COMB_H_MM, COMB_TEETH, COMB_TOOTH_LEN_MM, PA_STEP_SLOW_FRAC, PA_TOWER_FACTOR, PA_TOWER_START,
+    SUITE_TOWER_R_MM, TOWER_H_MM, TOWER_R_MM,
 };
 
 pub use emit::{

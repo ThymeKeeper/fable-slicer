@@ -454,8 +454,6 @@ struct FlowCalUi<'a> {
 /// Same shape for the guided pressure-advance tower: arm the print, take the
 /// measured best-corner height, report to the status line.
 struct PaCalUi<'a> {
-    host_ready: bool,
-    start: &'a mut bool,
     height_mm: &'a mut f64,
     status: &'a mut String,
 }
@@ -527,17 +525,15 @@ fn filament_card_rows(
     // tooth's label → pin that value verbatim.
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(cal.host_ready, egui::Button::new("⟲ print flow comb"))
+            .add_enabled(cal.host_ready, egui::Button::new("⟲ print calibration suite"))
             .on_hover_text(format!(
-                "Prints a ring of {} teeth, each a single wall at its own ABSOLUTE \
-                 flow — {:.2} down to {:.2} in exact 1% steps, values recessed into \
-                 the underside as percent mod 100 (96 = 0.96, 04 = 1.04). Caliper \
-                 along the ring (full jaw flats, mid-face) for the teeth reading \
-                 exactly {:.2} mm; 1% neighbours read alike, so take the middle of \
-                 the matching run, tie toward 00. Enter that tooth's label below.",
+                "One plate, both instruments: the {}-tooth flow comb with the PA \
+                 tower inside its hub. FLOW: caliper the ring for teeth reading \
+                 {:.2} mm mid-face, take the middle of the matching run, and enter \
+                 the winning tooth's underside label below (percent mod 100: 96 = \
+                 0.96, 04 = 1.04). PA: judge the tower's two mid-face bands and \
+                 enter the height where they balance in the row below.",
                 engine::COMB_TEETH,
-                engine::COMB_FLOW_FAT,
-                engine::COMB_FLOW_THIN,
                 line_width_mm,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
@@ -589,26 +585,19 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
     });
-    // Guided PA calibration: print the two-speed teardrop tower, read the
-    // height where the speed-step bands balance out, enter it → pin PA.
+    // The suite's PA reading: enter the height where the tower's two
+    // speed-step bands balance out → pin PA. (The print button lives on
+    // the calibration-suite row above.)
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
-            .on_hover_text(format!(
-                "Prints a {:.0} mm teardrop tower; PA ramps 0 \u{2192} {:.2} with height \
-                 ({} per mm). Judge the two vertical bands mid-face on the flats \
-                 beside the corner: too little PA = fat ridge on one, starved streak \
-                 on the other; too much = they swap. Enter the height where the \
-                 bands vanish or trade places. (Ignore the corner itself.)",
-                2.0 * engine::TOWER_R_MM,
-                engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
-                engine::PA_TOWER_FACTOR,
-            ))
-            .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
-            .clicked()
-        {
-            *pa_cal.start = true;
-        }
+        ui.label("PA tower reading:").on_hover_text(format!(
+            "From the suite's teardrop tower (PA ramps 0 \u{2192} {:.2}, {} per mm of \
+             height). Judge the two vertical bands mid-face on the flats beside \
+             the corner: too little PA = fat ridge on one, starved streak on the \
+             other; too much = they swap. Enter the height where they vanish or \
+             trade places. Ignore the corner itself — it carries the seam.",
+            engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
+            engine::PA_TOWER_FACTOR,
+        ));
         ui.add(
             egui::DragValue::new(pa_cal.height_mm)
                 .speed(0.1)
@@ -1801,9 +1790,7 @@ struct App {
     /// its ladder at flow 1.0, so nothing compounds and no dispatch
     /// snapshot is needed.
     flow_cal_label_pct: f64,
-    /// Pressure-advance calibration: the Filament-panel button arms this; the
-    /// dispatch generates the PA tower and sends it to the printer.
-    start_pa_cal: bool,
+
     /// Best-corner height (mm) entered after the PA tower print; "apply"
     /// turns it into the filament's `pressure_advance`.
     pa_cal_mm: f64,
@@ -2137,7 +2124,7 @@ impl App {
             profile_dialog: None,
             start_flow_cal: false,
             flow_cal_label_pct: 0.0,
-            start_pa_cal: false,
+
             pa_cal_mm: 0.0,
             pending_switch: None,
             pending_slot: None,
@@ -5047,8 +5034,6 @@ impl eframe::App for App {
                     // plenty — copied back after the card renders).
                     let mut pa_cal_status = String::new();
                     let pa_cal = PaCalUi {
-                        host_ready: host_set && !host_busy,
-                        start: &mut self.start_pa_cal,
                         height_mm: &mut self.pa_cal_mm,
                         status: &mut pa_cal_status,
                     };
@@ -6945,49 +6930,30 @@ impl eframe::App for App {
             }
         }
 
-        // Flow calibration: the Filament-panel button armed `start_flow_cal`.
-        // Generate the flow-swept tower from the current settings and send it;
-        // the user finds the height where the wall calipers at the line width
-        // and applies that height back in the panel. On a toolchanger the
-        // tower prints with the ACTIVE tab's tool — the spool whose profile
-        // the reading pins.
+        // Calibration suite: the Filament-panel button armed `start_flow_cal`.
+        // One print, both instruments — the comb ring with the PA tower in
+        // its hub, generated from the current settings. On a toolchanger it
+        // prints with the ACTIVE tab's tool — the spool whose profile the
+        // readings pin.
         if std::mem::take(&mut self.start_flow_cal) {
             let tool = self.active_tool_tab as u32;
-            let gcode = engine::flow_comb_gcode(&self.settings, tool);
+            let gcode = engine::calibration_suite_gcode(&self.settings, tool);
             let lw = self.settings.line_width_mm;
-            let ctx = ui.ctx().clone();
-            self.spawn_host_op(&ctx, false, move |c| {
-                match c.upload("flow-comb.gcode", gcode.as_bytes(), true) {
-                    Ok(()) => HostReply::SendDone {
-                        ok: true,
-                        msg: format!("Printing the flow comb — caliper around the ring for the teeth that read {lw:.2} mm, flip it over, and enter the winning tooth's label in the Filament panel (labels are percent mod 100)."),
-                    },
-                    Err(e) => HostReply::SendDone { ok: false, msg: format!("flow-comb upload failed: {e}") },
-                }
-            });
-        }
-
-        // PA calibration: the Filament-panel button armed `start_pa_cal`.
-        // Generate the ramped tower from the current settings and send it; the
-        // user reads off the best-corner height and applies it in the panel.
-        if std::mem::take(&mut self.start_pa_cal) {
-            let tool = self.active_tool_tab as u32;
-            let gcode = engine::pa_tower_gcode(&self.settings, tool);
             // With no profile PA pinned there is nothing to restore to — the
             // machine keeps the sweep's top until a height is applied.
             let pa_note = if self.settings.pressure_advance > 0.0 {
                 ""
             } else {
-                " (Until you apply, the printer keeps the sweep's top PA — apply promptly.)"
+                " (Until you apply a PA height, the printer keeps the sweep's top PA — apply promptly.)"
             };
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
-                match c.upload("pa-tower.gcode", gcode.as_bytes(), true) {
+                match c.upload("calibration-suite.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the PA tower — find the height where the two mid-face bands vanish or trade places, and enter it in the Filament panel.{pa_note}"),
+                        msg: format!("Printing the calibration suite — flow: caliper the ring for teeth reading {lw:.2} mm and enter the winning tooth's underside label; PA: enter the height where the tower's two mid-face bands balance. Both go in the Filament panel.{pa_note}"),
                     },
-                    Err(e) => HostReply::SendDone { ok: false, msg: format!("PA-tower upload failed: {e}") },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("calibration-suite upload failed: {e}") },
                 }
             });
         }
