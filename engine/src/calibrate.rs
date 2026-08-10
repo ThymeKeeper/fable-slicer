@@ -477,15 +477,69 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
         |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x0, y1], [x1, y1], [x1, y0]];
     let mut tris = Vec::new();
     prism(&rect(0.0, 0.0, w, COMB_SPINE_D_MM), 0.0, COMB_H_MM, &mut tris);
+    // A tooth is a stadium, not a rectangle: semicircular tip, and true
+    // concave fillets where it meets the spine. The loop then never slows
+    // hard anywhere near the measured faces — the comb prints BEFORE the
+    // PA calibration, and with PA far off every sharp corner sheds a blob
+    // or a starve that reaches into the adjacent face. Rounded, the wall
+    // is steady state whatever PA is. (The handle keeps the only sharp
+    // corners: the aligned seam snaps there, away from every tooth.)
+    let tooth_fp = |x0: f64| {
+        let r = COMB_TOOTH_W_MM / 2.0;
+        let (xc, tip_c) = (x0 + r, d - r);
+        let mut fp = vec![[x0, COMB_SPINE_D_MM - 1.0], [x0 + COMB_TOOTH_W_MM, COMB_SPINE_D_MM - 1.0]];
+        for i in 0..=18 {
+            let a = f64::from(i) * 10.0_f64.to_radians();
+            fp.push([xc + r * a.cos(), tip_c + r * a.sin()]);
+        }
+        fp
+    };
+    // Concave fillet filler at a tooth-spine corner: the region between the
+    // two 2 mm legs and the quarter arc bulging toward the corner. Fanned
+    // from the corner vertex, which sees the whole region (prism() fans
+    // from its first point, so non-convexity along the arc is fine).
+    let fillet_fp = |corner_x: f64, sx: f64| {
+        let r = 2.0;
+        let cy = COMB_SPINE_D_MM;
+        // Arc center sits diagonally off the corner; the quarter arc runs
+        // from the spine-side leg to the tooth-side leg, bulging TOWARD the
+        // corner. The straight edges are PADDED 0.5 mm into the spine and
+        // tooth so the filler overlaps solid material like the teeth
+        // overlap the spine — knife-edge coincident walls are the one thing
+        // the triangle-soup union has no robust answer for.
+        let (ccx, ccy) = (corner_x + sx * r, cy + r);
+        let pad = 0.5;
+        let mut fp = vec![[corner_x - sx * pad, cy - pad], [ccx, cy - pad]];
+        for i in 0..=9 {
+            let a = (-90.0 - f64::from(i) * 10.0 * sx).to_radians();
+            fp.push([ccx + r * a.cos(), ccy + r * a.sin()]);
+        }
+        fp.push([corner_x - sx * pad, ccy]);
+        // CCW with the buried corner vertex first (prism() fans from it,
+        // and it sees the whole concave-arc region).
+        let area: f64 = fp
+            .windows(2)
+            .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+            .sum::<f64>()
+            + fp.last().unwrap()[0] * fp[0][1]
+            - fp[0][0] * fp.last().unwrap()[1];
+        if area < 0.0 {
+            fp[1..].reverse();
+        }
+        fp
+    };
     for k in 0..COMB_TEETH {
         let x0 = COMB_HANDLE_MM + k as f64 * COMB_TOOTH_PITCH_MM;
         // Overlap one mm into the spine so the prisms union into one comb.
-        prism(
-            &rect(x0, COMB_SPINE_D_MM - 1.0, x0 + COMB_TOOTH_W_MM, d),
-            0.0,
-            COMB_H_MM,
-            &mut tris,
-        );
+        prism(&tooth_fp(x0), 0.0, COMB_H_MM, &mut tris);
+        // Fillet only corners that exist: the LAST tooth's right face is
+        // flush with the spine's end — one straight edge, no concave corner
+        // — and a fillet there pokes past the part, growing the mesh bbox
+        // and shifting the bed-centered print a millimeter sideways.
+        prism(&fillet_fp(x0, -1.0), 0.0, COMB_H_MM, &mut tris);
+        if k + 1 < COMB_TEETH {
+            prism(&fillet_fp(x0 + COMB_TOOTH_W_MM, 1.0), 0.0, COMB_H_MM, &mut tris);
+        }
         // Tooth number, recessed through the base plate inside the ring:
         // REVERSED-winding prisms cut holes (positive-fill slicing), and
         // the digits are pre-mirrored so they read from the underside.
