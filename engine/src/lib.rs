@@ -20,8 +20,8 @@ mod slice;
 
 pub use calibrate::{
     comb_tooth_flow, flow_comb_gcode, flow_from_comb_tooth, pa_from_height, pa_tower_gcode,
-    COMB_FLOW_FAT, COMB_FLOW_THIN, COMB_H_MM, COMB_TEETH, COMB_TOOTH_LEN_MM, PA_TOWER_FACTOR,
-    PA_TOWER_START, TOWER_H_MM, TOWER_R_MM,
+    COMB_FLOW_FAT, COMB_FLOW_THIN, COMB_H_MM, COMB_TEETH, COMB_TOOTH_LEN_MM, PA_STEP_SLOW_FRAC,
+    PA_TOWER_FACTOR, PA_TOWER_START, TOWER_H_MM, TOWER_R_MM,
 };
 
 pub use emit::{

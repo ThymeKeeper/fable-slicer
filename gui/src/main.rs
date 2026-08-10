@@ -587,25 +587,26 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
     });
-    // Guided PA calibration: print a single-wall teardrop tower whose PA ramps
-    // with height, find the LOWEST bulge-free corner band, enter that height → pin PA.
+    // Guided PA calibration: print the two-speed teardrop tower, read the
+    // height where the speed-step bands balance out, enter it → pin PA.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
             .on_hover_text(format!(
                 "Print a single-wall teardrop tower ({:.0} mm wide) whose pressure \
-                 advance ramps 0 → {:.2} with height, at your real outer-wall speed \
-                 with the corner transient slowed past Klipper's PA smoothing window \
-                 (the sweep is baked into the g-code — nothing to run on the printer). \
-                 One 90° corner faces the front; above the base the wall prints as a \
-                 seamless helix (vase mode), so that corner is the only transient. \
-                 Judge it under raking light and read the LOWEST height where the \
-                 corner bulge is gone. Higher bands often look even sharper — that \
-                 sharpness is over-advance, already starving the stretch after the \
-                 corner (matte, thin), and every seam of a real print pays for it. \
-                 Torn between two heights: pick the LOWER. Clear the bed first.",
+                 advance ramps 0 → {:.2} with height, with a TWO-SPEED pattern: the \
+                 wall cruises at your real wall speed, drops to {:.0}% inside a \
+                 {:.0} mm zone around the front corner, and speeds back up. The two \
+                 speed-step BANDS land mid-face on the flat legs — THEY are the \
+                 judge, not the corner (a corner always drags dwell ooze that PA \
+                 cannot cancel; judging it reads high). Too little PA: the slow-down \
+                 band is a fat ridge, the speed-up band a starved streak. Too much: \
+                 they trade places. Read the LOWEST height where the two bands \
+                 balance out or vanish, and enter it below. Clear the bed first.",
                 2.0 * engine::TOWER_R_MM,
                 engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
+                engine::PA_STEP_SLOW_FRAC * 100.0,
+                engine::TOWER_R_MM * 0.5,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()
@@ -619,7 +620,7 @@ fn filament_card_rows(
                 .fixed_decimals(1)
                 .suffix(" mm"),
         )
-        .on_hover_text("The LOWEST height where the front corner's bulge is gone (not the 'crispest-looking' band — that reads over-advanced).");
+        .on_hover_text("The LOWEST height where the two mid-face speed-step bands balance out or vanish (ignore the corner — it always drags a little ooze at speed).");
         if ui
             .button("apply")
             .on_hover_text(format!(
@@ -633,7 +634,7 @@ fn filament_card_rows(
             let before = *pa;
             *pa = engine::pa_from_height(before, *pa_cal.height_mm);
             *pa_cal.status = format!(
-                "pressure advance {before:.4} → {:.4} (bulge-free from {:.1} mm)",
+                "pressure advance {before:.4} → {:.4} (bands balanced at {:.1} mm)",
                 *pa, *pa_cal.height_mm
             );
         }
@@ -6988,7 +6989,7 @@ impl eframe::App for App {
                 match c.upload("pa-tower.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the PA tower — when it's done, find the height where the front corner looks crispest (bulged = PA too low, a matte starved stretch right after it = too high), measure it from the bed, and enter it in the Filament panel.{pa_note}"),
+                        msg: format!("Printing the PA tower — when it's done, judge the two speed-step BANDS mid-face on the flat legs (not the corner): too little PA = fat ridge at the slow-down band and starved streak at the speed-up band; too much = they trade places. Read the lowest height where the bands balance out, measure from the bed, and enter it in the Filament panel.{pa_note}"),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("PA-tower upload failed: {e}") },
                 }

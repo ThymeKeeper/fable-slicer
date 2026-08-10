@@ -48,6 +48,13 @@ pub const TOWER_R_MM: f64 = 30.0;
 pub const TOWER_H_MM: f64 = 50.0;
 /// Pressure advance at the bed.
 pub const PA_TOWER_START: f64 = 0.0;
+/// Wall-speed fraction inside the PA tower's apex slow zone. The judged
+/// artifact is the pair of SPEED-STEP bands where the wall crosses the
+/// zone boundary mid-leg: 0.4x keeps the step large enough to read while
+/// the slow side still moves fast enough (~60+ mm/s on a fast profile)
+/// that dwell ooze — which pressure advance cannot cancel, and which made
+/// every corner-judged read sit high — never enters the measurement.
+pub const PA_STEP_SLOW_FRAC: f64 = 0.4;
 /// Pressure advance added per mm of tower height.
 pub const PA_TOWER_FACTOR: f64 = 0.002;
 /// Flow-comb FAT tooth multiplier (× the profile flow) — the tooth at the
@@ -201,6 +208,108 @@ fn sweep(g: &str, header: &str, mut per_layer: impl FnMut(f64) -> String, tail: 
     out
 }
 
+/// Bake the two-speed pattern into the vase helix: the wall cruises at its
+/// file speed, drops to [`PA_STEP_SLOW_FRAC`] inside a circle of radius
+/// half the teardrop radius around the apex, and speeds back up on the way
+/// out. The circle crosses the wall exactly mid-leg on BOTH flat faces —
+/// the two speed-step bands land on readable flat wall, far from the
+/// corner and the rear seam column, whichever direction the loop runs.
+/// Moves crossing the boundary are split at the exact crossing (X/Y/Z/E
+/// interpolated), so E-per-mm is conserved and the commanded step is
+/// abrupt — the transient pressure advance must answer for.
+fn speed_step_pass(g: &str, bed_x_mm: f64, bed_y_mm: f64) -> String {
+    let r = TOWER_R_MM;
+    // The tower is bed-centered; the apex sits below the bbox center by
+    // half the footprint depth (arc top at +r, apex at -r*sqrt(2)).
+    let ax = bed_x_mm / 2.0;
+    let ay = bed_y_mm / 2.0 - r * (1.0 + std::f64::consts::SQRT_2) / 2.0;
+    let rz = r * 0.5;
+    let mut out = String::with_capacity(g.len() * 2);
+    let (mut x, mut y, mut z) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let mut have_pos = false;
+    let mut markers = 0usize;
+    let mut f_hi: Option<f64> = None;
+    let mut cur_f = f64::NAN;
+    for line in g.lines() {
+        if line.starts_with("; LAYER ") {
+            markers += 1;
+        }
+        if !(line.starts_with("G0 ") || line.starts_with("G1 ")) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let (mut nx, mut ny, mut nz, mut e, mut f) = (x, y, z, None::<f64>, None::<f64>);
+        for tok in line.split(';').next().unwrap_or("").split_whitespace().skip(1) {
+            let (c, v) = tok.split_at(1);
+            if let Ok(v) = v.parse::<f64>() {
+                match c {
+                    "X" => nx = v,
+                    "Y" => ny = v,
+                    "Z" => nz = v,
+                    "E" => e = Some(v),
+                    "F" => f = Some(v),
+                    _ => {}
+                }
+            }
+        }
+        // Only the helix (above the 3 base-plate layers) gets the pattern.
+        let vase = markers > 3;
+        let extruding =
+            have_pos && e.is_some_and(|e| e > 0.0) && ((nx - x).abs() > 1e-9 || (ny - y).abs() > 1e-9);
+        if !(vase && extruding) {
+            if let Some(fv) = f {
+                cur_f = fv;
+            }
+            out.push_str(line);
+            out.push('\n');
+            (x, y, z) = (nx, ny, nz);
+            have_pos = true;
+            continue;
+        }
+        let fh = *f_hi.get_or_insert(f.unwrap_or(cur_f));
+        let fl = (fh * PA_STEP_SLOW_FRAC).round();
+        // Split at the slow-zone boundary crossings along this move.
+        let (dx, dy) = (nx - x, ny - y);
+        let (px, py) = (x - ax, y - ay);
+        let a = dx * dx + dy * dy;
+        let b = 2.0 * (px * dx + py * dy);
+        let c = px * px + py * py - rz * rz;
+        let mut ts = vec![0.0_f64];
+        let disc = b * b - 4.0 * a * c;
+        if disc > 0.0 && a > 1e-12 {
+            let sq = disc.sqrt();
+            for t in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+                if t > 1e-6 && t < 1.0 - 1e-6 {
+                    ts.push(t);
+                }
+            }
+        }
+        ts.push(1.0);
+        ts.sort_by(|q, w| q.partial_cmp(w).unwrap());
+        let e_total = e.unwrap_or(0.0);
+        for w in ts.windows(2) {
+            let (t0, t1) = (w[0], w[1]);
+            if t1 - t0 < 1e-9 {
+                continue;
+            }
+            let tm = (t0 + t1) / 2.0;
+            let (mx, my) = (x + dx * tm - ax, y + dy * tm - ay);
+            let want = if (mx * mx + my * my) < rz * rz { fl } else { fh };
+            let (ex, ey, ez) = (x + dx * t1, y + dy * t1, z + (nz - z) * t1);
+            let ee = e_total * (t1 - t0);
+            if (want - cur_f).abs() > 0.5 {
+                out.push_str(&format!("G1 X{ex:.3} Y{ey:.3} Z{ez:.3} E{ee:.5} F{want:.0}\n"));
+                cur_f = want;
+            } else {
+                out.push_str(&format!("G1 X{ex:.3} Y{ey:.3} Z{ez:.3} E{ee:.5}\n"));
+            }
+        }
+        (x, y, z) = (nx, ny, nz);
+    }
+    out
+}
+
 /// G-code for the pressure-advance tower: the teardrop helix with PA ramping
 /// with height — Klipper's `TUNING_TOWER` sweep, but baked into the file per
 /// layer, so there is no console incantation to run. The head enters the one
@@ -216,14 +325,17 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
     let s = tower_settings(settings);
     let mut header = format!(
         "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
-         ; teardrop with one 90° corner at the front, printed as a seamless helix\n\
-         ; (vase mode) above the base — judge ONLY that corner.\n\
-         ; find the LOWEST height where the corner bulge is gone and read THERE,\n\
-         ; measured from the BED. Higher layers often look even 'sharper' — that\n\
-         ; sharpness is over-advance already starving the stretch after the corner\n\
-         ; (matte, thin), and every seam and band of a real print pays for it.\n\
-         ; When torn between two heights, pick the LOWER.\n\
-         ; apply it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n"
+         ; teardrop helix with a TWO-SPEED pattern: the wall cruises fast, drops to\n\
+         ; {:.0}% speed inside a {:.0} mm zone around the front corner, and speeds back\n\
+         ; up on the way out. The two SPEED-STEP BANDS land mid-face on the flat legs\n\
+         ; — THEY are the judge, not the corner (a corner always drags dwell ooze that\n\
+         ; pressure advance cannot cancel; judging it is what read 0.044+ on a 0.032\n\
+         ; machine). Too little PA: the slow-down band is a fat ridge and the speed-up\n\
+         ; band a starved streak. Too much: they trade places. Read the LOWEST height\n\
+         ; where the two bands balance out / vanish, measured from the BED, and apply\n\
+         ; it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n",
+        PA_STEP_SLOW_FRAC * 100.0,
+        TOWER_R_MM * 0.5,
     );
     // Leave the machine on the profile's PA, not the sweep's top. (A profile
     // value of 0 means "the printer's own config value", which g-code cannot
@@ -247,7 +359,7 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
     // a badly-timed host hiccup) five-fold.
     let mut last_band = f64::NEG_INFINITY;
     sweep(
-        &teardrop_gcode(&s, tool),
+        &speed_step_pass(&teardrop_gcode(&s, tool), s.bed_size_x_mm, s.bed_size_y_mm),
         &header,
         move |z| {
             let band = z.floor();
@@ -590,6 +702,92 @@ mod tests {
                 "tower fan must stay at the base duty (S38), got S{max_fan}"
             );
         }
+    }
+
+    #[test]
+    fn pa_tower_two_speed_bands() {
+        // The judged artifact is the speed-step pair: fast wall, 40% slow
+        // zone around the apex, fast again — with the steps landing at the
+        // slow-zone boundary (half the teardrop radius from the apex),
+        // mid-leg on the flat faces. E-per-mm must be conserved across the
+        // splits: the pattern changes speed, never flow.
+        let s = Settings::default();
+        let g = pa_tower_gcode(&s, 0);
+        let (ax, ay) = (
+            s.bed_size_x_mm / 2.0,
+            s.bed_size_y_mm / 2.0 - TOWER_R_MM * (1.0 + std::f64::consts::SQRT_2) / 2.0,
+        );
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let mut f = 0.0_f64;
+        let mut markers = 0usize;
+        let mut feeds: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+        let mut crossings: Vec<f64> = Vec::new();
+        let mut epmm: Vec<f64> = Vec::new();
+        let mut last_f = 0.0_f64;
+        for l in g.lines() {
+            if l.starts_with("; LAYER ") {
+                markers += 1;
+            }
+            if !(l.starts_with("G0 ") || l.starts_with("G1 ")) {
+                continue;
+            }
+            let (mut nx, mut ny, mut e) = (x, y, 0.0_f64);
+            for tok in l.split_whitespace().skip(1) {
+                let (c, v) = tok.split_at(1);
+                if let Ok(v) = v.parse::<f64>() {
+                    match c {
+                        "X" => nx = v,
+                        "Y" => ny = v,
+                        "E" => e = v,
+                        "F" => f = v,
+                        _ => {}
+                    }
+                }
+            }
+            let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            if markers > 4 && markers < 20 && e > 0.0 && len > 1e-6 {
+                *feeds.entry(f.round() as i64).or_insert(0.0) += len;
+                if len > 0.05 {
+                    epmm.push(e / len);
+                }
+                // A feed change on an extruding move = a band edge: record
+                // the step point's distance to the apex.
+                if last_f > 0.0 && (f - last_f).abs() > 0.5 {
+                    crossings.push(((x - ax).powi(2) + (y - ay).powi(2)).sqrt());
+                }
+                last_f = f;
+            }
+            x = nx;
+            y = ny;
+        }
+        // Exactly two wall speeds, 0.4x apart.
+        let major: Vec<i64> = feeds
+            .iter()
+            .filter(|(_, l)| **l > 20.0)
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(major.len(), 2, "two wall speeds, got {feeds:?}");
+        let ratio = major[0] as f64 / major[1] as f64;
+        assert!(
+            (ratio - PA_STEP_SLOW_FRAC).abs() < 0.02,
+            "slow zone at {PA_STEP_SLOW_FRAC}x, got {ratio:.3}"
+        );
+        // Steps land at the slow-zone boundary: r/2 from the apex.
+        assert!(!crossings.is_empty(), "speed steps present on every loop");
+        for d in &crossings {
+            assert!(
+                (d - TOWER_R_MM * 0.5).abs() < 1.0,
+                "step at the zone boundary (r/2 = {}), got {d:.2}",
+                TOWER_R_MM * 0.5
+            );
+        }
+        // Speed changes, flow does not: E-per-mm uniform across the splits.
+        epmm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (p5, p95) = (epmm[epmm.len() / 20], epmm[epmm.len() * 19 / 20]);
+        assert!(
+            (p95 - p5) / p5 < 0.02,
+            "E-per-mm conserved across splits: p5={p5:.5} p95={p95:.5}"
+        );
     }
 
     #[test]
