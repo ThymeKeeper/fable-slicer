@@ -91,6 +91,23 @@ fn tower_settings(settings: &Settings) -> Settings {
     // up to ~200 mm/s anyway, so cooling only thins out where the user
     // genuinely prints faster than that.)
     s.min_layer_time_s = 0.0;
+    // Speed alone wasn't enough: pressure advance acts through Klipper's
+    // smoothing window (~40 ms), and at full wall accel the corner decel
+    // finishes inside it (160→5 mm/s at 6000 = ~26 ms). The compensation
+    // smears wider than the event, a residual bulge survives at the TRUE
+    // coefficient, and nulling it visually demands more advance — the same
+    // clipping that made the throttled run read 0.070 read ~0.044 at full
+    // accel for a true ~0.032 (the value the reference prints run, and the
+    // one real prints look best at). Cap the tower's accel so the decel
+    // spans several windows: the coefficient is then measured in the regime
+    // where the linear model fully acts — which is where the emitted g-code
+    // lives anyway (feed steps are slew-limited over 40-60 ms+, seams enter
+    // through join/scarf ramps). Real prints' own hard corners share the
+    // machine accel, but under-correcting a 26 ms residual beats starving
+    // every seam and band with a 35% over-read.
+    const TOWER_ACCEL_CAP: f64 = 1200.0;
+    s.acceleration_mm_s2 = s.acceleration_mm_s2.min(TOWER_ACCEL_CAP);
+    s.outer_wall_accel_mm_s2 = s.outer_wall_accel_mm_s2.min(TOWER_ACCEL_CAP);
     s
 }
 
@@ -154,8 +171,11 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
         "; PA tower: pressure advance = {PA_TOWER_START} + {PA_TOWER_FACTOR} * z_mm\n\
          ; teardrop with one 90° corner at the front, printed as a seamless helix\n\
          ; (vase mode) above the base — judge ONLY that corner.\n\
-         ; find the height where the corner is crispest (bulged = PA too low, a matte\n\
-         ; starved stretch right after it = too high), measure that height from the BED,\n\
+         ; find the LOWEST height where the corner bulge is gone and read THERE,\n\
+         ; measured from the BED. Higher layers often look even 'sharper' — that\n\
+         ; sharpness is over-advance already starving the stretch after the corner\n\
+         ; (matte, thin), and every seam and band of a real print pays for it.\n\
+         ; When torn between two heights, pick the LOWER.\n\
          ; apply it in the Filament panel (or PA = {PA_TOWER_START} + {PA_TOWER_FACTOR} * height by hand).\n"
     );
     // Leave the machine on the profile's PA, not the sweep's top. (A profile
@@ -382,6 +402,20 @@ mod tests {
         assert!(
             g.lines().filter(|l| l.starts_with("M221")).all(|l| l.trim() == "M221 S100"),
             "PA tower holds flow constant"
+        );
+        // The instrument property that keeps the read TRUE: every wall accel
+        // stays under the tower cap, so the corner decel spans several PA
+        // smoothing windows (full machine accel clips the transient inside
+        // the window and the tower reads ~35% high — measured against the
+        // reference prints' known-good value).
+        let max_m204 = g
+            .lines()
+            .filter_map(|l| l.strip_prefix("M204 S"))
+            .filter_map(|v| v.trim().parse::<f64>().ok())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_m204 <= 1200.0,
+            "tower accel capped past the PA smoothing window, got M204 S{max_m204}"
         );
     }
 

@@ -595,20 +595,22 @@ fn filament_card_rows(
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
     });
     // Guided PA calibration: print a single-wall teardrop tower whose PA ramps
-    // with height, find where its corner is crispest, enter that height → pin PA.
+    // with height, find the LOWEST bulge-free corner band, enter that height → pin PA.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(pa_cal.host_ready, egui::Button::new("⟲ print PA tower"))
             .on_hover_text(format!(
                 "Print a single-wall teardrop tower ({:.0} mm wide) whose pressure \
                  advance ramps 0 → {:.2} with height, at your real outer-wall speed \
+                 with the corner transient slowed past Klipper's PA smoothing window \
                  (the sweep is baked into the g-code — nothing to run on the printer). \
                  One 90° corner faces the front; above the base the wall prints as a \
                  seamless helix (vase mode), so that corner is the only transient. \
-                 Judge it under raking light: bulged = PA too low, a matte \
-                 starved stretch right after it = too high — when in doubt pick the \
-                 LOWER band. Measure the height of the crispest band from the BED and \
-                 enter it below. Clear the bed first.",
+                 Judge it under raking light and read the LOWEST height where the \
+                 corner bulge is gone. Higher bands often look even sharper — that \
+                 sharpness is over-advance, already starving the stretch after the \
+                 corner (matte, thin), and every seam of a real print pays for it. \
+                 Torn between two heights: pick the LOWER. Clear the bed first.",
                 2.0 * engine::TOWER_R_MM,
                 engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
             ))
@@ -624,7 +626,7 @@ fn filament_card_rows(
                 .fixed_decimals(1)
                 .suffix(" mm"),
         )
-        .on_hover_text("Height up the tower where the front corner looks crispest — neither bulged nor starved.");
+        .on_hover_text("The LOWEST height where the front corner's bulge is gone (not the 'crispest-looking' band — that reads over-advanced).");
         if ui
             .button("apply")
             .on_hover_text(format!(
@@ -638,7 +640,7 @@ fn filament_card_rows(
             let before = *pa;
             *pa = engine::pa_from_height(before, *pa_cal.height_mm);
             *pa_cal.status = format!(
-                "pressure advance {before:.4} → {:.4} (best corner at {:.1} mm)",
+                "pressure advance {before:.4} → {:.4} (bulge-free from {:.1} mm)",
                 *pa, *pa_cal.height_mm
             );
         }
