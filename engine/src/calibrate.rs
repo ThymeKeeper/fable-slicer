@@ -129,23 +129,20 @@ fn tower_settings(settings: &Settings) -> Settings {
     // up to ~200 mm/s anyway, so cooling only thins out where the user
     // genuinely prints faster than that.)
     s.min_layer_time_s = 0.0;
-    // Speed alone wasn't enough: pressure advance acts through Klipper's
-    // smoothing window (~40 ms), and at full wall accel the corner decel
-    // finishes inside it (160→5 mm/s at 6000 = ~26 ms). The compensation
-    // smears wider than the event, a residual bulge survives at the TRUE
-    // coefficient, and nulling it visually demands more advance — the same
-    // clipping that made the throttled run read 0.070 read ~0.044 at full
-    // accel for a true ~0.032 (the value the reference prints run, and the
-    // one real prints look best at). Cap the tower's accel so the decel
-    // spans several windows: the coefficient is then measured in the regime
-    // where the linear model fully acts — which is where the emitted g-code
-    // lives anyway (feed steps are slew-limited over 40-60 ms+, seams enter
-    // through join/scarf ramps). Real prints' own hard corners share the
-    // machine accel, but under-correcting a 26 ms residual beats starving
-    // every seam and band with a 35% over-read.
-    const TOWER_ACCEL_CAP: f64 = 1200.0;
-    s.acceleration_mm_s2 = s.acceleration_mm_s2.min(TOWER_ACCEL_CAP);
-    s.outer_wall_accel_mm_s2 = s.outer_wall_accel_mm_s2.min(TOWER_ACCEL_CAP);
+    // The corner prints at the machine's REAL cornering regime — the
+    // profile's outer-wall accel and square-corner velocity, exactly as
+    // production walls corner. An accel cap here (tried at 1200 to out-run
+    // Klipper's PA smoothing window) made the reading dramatically WORSE:
+    // the measured over-read across three prints tracks TIME SPENT SLOW at
+    // the corner (throttled run: read 0.070; full speed at accel 6000:
+    // 0.044; full speed at accel 1200: transition near the tower top,
+    // ~0.08+ — for a machine whose true value is ~0.032). A slow approach
+    // parks the nozzle at the apex while die swell and gravity deposit
+    // ooze that pressure advance cannot cancel, so the bulge survives to
+    // absurd PA values and the judge reads high. The fastest transient the
+    // machine actually uses is the least dwell-contaminated instrument;
+    // the residual over-read at full accel is what the lowest-bulge-free
+    // reading instruction (not "crispest") corrects for.
     // Pin the part fan to the filament's BASE duty: the tower's ~2 s layers
     // would ride the short-layer cooling ladder to the ceiling (80% for
     // ABS/ASA), but most of a real print's flow mass lands on large layers
@@ -554,19 +551,19 @@ mod tests {
             g.lines().filter(|l| l.starts_with("M221")).all(|l| l.trim() == "M221 S100"),
             "PA tower holds flow constant"
         );
-        // The instrument property that keeps the read TRUE: every wall accel
-        // stays under the tower cap, so the corner decel spans several PA
-        // smoothing windows (full machine accel clips the transient inside
-        // the window and the tower reads ~35% high — measured against the
-        // reference prints' known-good value).
+        // The corner must print at the machine's REAL cornering accel — a
+        // slowed corner dwells at the apex and measures ooze instead of
+        // pressure advance (a 1200 cap pushed the read from 0.044 to
+        // ~0.08+ against a true 0.032). The profile's wall accels must
+        // reach the file unclamped.
         let max_m204 = g
             .lines()
             .filter_map(|l| l.strip_prefix("M204 S"))
             .filter_map(|v| v.trim().parse::<f64>().ok())
             .fold(0.0_f64, f64::max);
         assert!(
-            max_m204 <= 1200.0,
-            "tower accel capped past the PA smoothing window, got M204 S{max_m204}"
+            max_m204 >= 1500.0,
+            "tower corners at the real machine accel, got M204 S{max_m204}"
         );
     }
 
