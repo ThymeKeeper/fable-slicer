@@ -241,10 +241,29 @@ pub fn pa_tower_gcode(settings: &Settings, tool: u32) -> String {
         );
         String::new()
     };
+    // The sweep steps once per MILLIMETER of height, not per layer: Klipper
+    // flushes its motion queue on every SET_PRESSURE_ADVANCE — a stall
+    // mid-extrusion at the rear column — and per-layer steps of
+    // FACTOR×layer_height are far below the ±0.5 mm reading resolution
+    // anyway. One step per mm keeps the height→PA map exact at every band
+    // edge while cutting the stall count (and the blip column's exposure to
+    // a badly-timed host hiccup) five-fold.
+    let mut last_band = f64::NEG_INFINITY;
     sweep(
         &teardrop_gcode(&s, tool),
         &header,
-        |z| format!("SET_PRESSURE_ADVANCE ADVANCE={:.4}\n", PA_TOWER_START + PA_TOWER_FACTOR * z),
+        move |z| {
+            let band = z.floor();
+            if band > last_band {
+                last_band = band;
+                format!(
+                    "SET_PRESSURE_ADVANCE ADVANCE={:.4}\n",
+                    PA_TOWER_START + PA_TOWER_FACTOR * band
+                )
+            } else {
+                String::new()
+            }
+        },
         &tail,
     )
 }
@@ -512,12 +531,19 @@ mod tests {
             .collect();
         let layers = g.matches("; LAYER ").count();
         assert!(layers > 200, "a 50 mm tower is ~250 layers, got {layers}");
-        assert_eq!(ramp.len(), layers, "one injected PA step per layer");
+        // One step per MILLIMETER band, not per layer: each step is a
+        // Klipper queue-flush stall on the wall, and sub-mm steps are far
+        // below reading resolution.
+        assert!(
+            (TOWER_H_MM as usize - 2..=TOWER_H_MM as usize + 2).contains(&ramp.len()),
+            "one PA step per mm of height, got {}",
+            ramp.len()
+        );
         assert!(ramp.windows(2).all(|w| w[1] >= w[0]), "the sweep is monotonic");
         assert!(ramp[0] < 0.002, "starts at the bottom of the range");
         let top = ramp.last().unwrap();
         assert!(
-            (PA_TOWER_START + PA_TOWER_FACTOR * TOWER_H_MM - top).abs() < 0.003,
+            (PA_TOWER_START + PA_TOWER_FACTOR * TOWER_H_MM - top).abs() < 0.005,
             "ends at the top of the range, got {top}"
         );
         // Single wall: no interior features to muddy the corner. And no flow
