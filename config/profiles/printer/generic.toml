@@ -7,10 +7,14 @@ bed_size_z_mm = 250.0
 nozzle_diameter_mm = 0.4
 travel_speed_mm_s = 120.0
 acceleration = 3000.0
-jerk = 10.0
+# Jerk maps onto Klipper's square_corner_velocity; 5 is the Klipper default,
+# so the emitted SET_VELOCITY_LIMIT agrees with an untuned machine instead of
+# doubling its corner speed. (Marlin ignores the command entirely.)
+jerk = 5.0
 # Retraction distance is a filament property (see the filament profiles);
-# speed and z-hop are machine mechanics.
-retract_speed_mm_s = 35.0
+# speed and z-hop are machine mechanics. 40 is comfortable for direct drive
+# and bowden alike, and is the reference-print value.
+retract_speed_mm_s = 40.0
 # Lift over voids on travels that can't be combed.
 z_hop_mm = 0.4
 

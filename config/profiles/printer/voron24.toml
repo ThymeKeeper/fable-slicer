@@ -14,12 +14,20 @@ bed_size_z_mm = 340.0
 # adhesion. Klipper additionally clamps every M204 to printer.cfg max_accel —
 # if your config still has the stock 3000, raise it (or lower this) so the
 # two agree.
+#
+# Rated speed 300: a 2.4 is a fast CoreXY and the filament's melt ceiling is
+# what actually limits wall speed (the derived speeds flow-cap themselves) —
+# understating the machine here just slows travel-adjacent pacing for nothing.
+# Jerk maps straight onto Klipper's square_corner_velocity; 5 is the Klipper
+# default and the Voron stock value, so the emitted SET_VELOCITY_LIMIT agrees
+# with the machine's tuning instead of doubling corner speed (measured against
+# the reference prints: SCV 10 was a ringing source, never a time saver).
 acceleration = 10000.0
 outer_wall_accel = 3000.0
-jerk = 10.0
-travel_speed_mm_s = 350.0
-print_speed_mm_s = 150.0
-first_layer_speed_mm_s = 30.0
+jerk = 5.0
+travel_speed_mm_s = 500.0
+print_speed_mm_s = 300.0
+first_layer_speed_mm_s = 50.0
 
 # Direct-drive extruder: fast retraction. Distance is filament-tier now.
 retract_speed_mm_s = 40.0
@@ -37,14 +45,17 @@ chamber_sensor = "chamber"
 # host_url = "voron24.local"
 # api_key = ""
 
-# The whole start is delegated to PRINT_START (homing, QGL, mesh, purge, heat),
-# so there's no in-line sequence to slot the soak into — {chamber_soak} lands
-# right after it. For ABS/ASA that wait then sits after the macro already heated
-# the nozzle; fold the soak into PRINT_START (chamber before nozzle) if you want
-# it ooze-free. PLA expands {chamber_soak} to nothing.
+# Bed first, then the chamber soak, then the macro: the nozzle stays cold for
+# the whole soak (a hot nozzle drools ABS/ASA for the entire wait — the ooze
+# lands in the purge/first layer), and PRINT_START's QGL then runs on a
+# heat-soaked frame, which is the order a 2.4 wants anyway. The macro's own
+# bed heat is a no-op since M190 already holds it. PLA expands {chamber_soak}
+# to nothing.
 start_gcode = """
-PRINT_START EXTRUDER={first_layer_nozzle_temp} BED={bed_temp}
+M140 S{bed_temp}
+M190 S{bed_temp}
 {chamber_soak}
+PRINT_START EXTRUDER={first_layer_nozzle_temp} BED={bed_temp}
 """
 
 end_gcode = """
