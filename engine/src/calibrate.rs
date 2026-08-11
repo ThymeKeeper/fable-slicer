@@ -74,10 +74,15 @@ pub const COMB_TEETH: usize = 25;
 pub const COMB_TOOTH_LEN_MM: f64 = 20.0;
 /// Tooth footprint width (mm): the ring cavity takes a caliper's inner jaw.
 pub const COMB_TOOTH_W_MM: f64 = 6.0;
-/// Tooth-to-tooth pitch (mm) measured along the hub circle.
-pub const COMB_TOOTH_PITCH_MM: f64 = 10.0;
-/// Radial width (mm) of the annular hub joining the teeth (true flow).
-pub const COMB_HUB_RING_MM: f64 = 4.0;
+/// Tooth-to-tooth pitch (mm) measured along the hub circle. 11 mm buys
+/// the wider label ring below without shrinking the hub hole the PA tower
+/// nests in.
+pub const COMB_TOOTH_PITCH_MM: f64 = 11.0;
+/// Radial width (mm) of the annular hub joining the teeth (true flow) —
+/// wide enough to carry each tooth's VALUE LABEL tangentially, coin-style,
+/// with clearance to BOTH of the ring's wall beads (the label lives
+/// between the hub hole's wall and the scalloped outer wall).
+pub const COMB_HUB_RING_MM: f64 = 9.0;
 /// Comb height (mm): tall enough for full caliper-jaw flats on any tooth.
 pub const COMB_H_MM: f64 = 12.0;
 
@@ -534,16 +539,19 @@ const SEVEN_SEG: [u8; 10] = [
     0b110_1111, // 9
 ];
 /// The lit seven-segment strokes of tooth `k`'s LABEL as quads in centered
-/// comb coordinates, recessed through the base plate inside the tooth
-/// ring. The label is the tooth's flow as a percent MOD 100 — two digits,
-/// leading zero ("96" = 0.96, "04" = 1.04, "00" = 1.00; no real spool is
-/// ambiguous between 12% and 112%). Two digits is what fits a 6 mm tooth
-/// at the 0.8 mm stroke width the bottom-skin machinery provably respects
-/// (its line-end reach jumps narrower slots). Digits stand upright,
-/// stacked hub→tip (tens digit nearer the hub), and the whole label is
-/// mirrored so it reads from the underside. Shared by generator and tests.
+/// comb coordinates, recessed through the base plate of the HUB RING
+/// directly under the tooth: the flow as percent MOD 100, lying
+/// TANGENTIALLY like text around a coin. Flip the comb and rotate it as
+/// you read — each label is upright and left-to-right when its tooth sits
+/// at the top. An underline tick below the digits marks the baseline
+/// (7-seg sixes and nines are 180° rotations of each other). Mirrored in
+/// the reading axis so the underside view reads true. Shared by the mesh
+/// generator and the tests.
 fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
-    let (l, w) = (1.5_f64, 0.8_f64);
+    // Digit size is set by the radial budget: between the hub hole's wall
+    // bead and the tooth-root overlap band (teeth bite 1 mm into the ring)
+    // there are ~6.9 mm; the tick takes its share below the baseline.
+    let (l, w) = (1.65_f64, 0.8_f64);
     let dw = l + 2.0 * w;
     let dh = 2.0 * l + 3.0 * w;
     let local: [(f64, f64, f64, f64); 7] = [
@@ -557,11 +565,39 @@ fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
     ];
     let pct = (comb_tooth_flow(k) * 100.0).round() as usize % 100;
     let chars = [pct / 10, pct % 10];
-    let theta = comb_tooth_angle(k) - std::f64::consts::FRAC_PI_2;
-    let (rc, rs) = (theta.cos(), theta.sin());
-    let base_y = comb_hub_r_mm() + 2.0;
+    let theta = comb_tooth_angle(k);
+    // Radial (outward) and tangential (reading) unit vectors; the reading
+    // axis is mirrored so the label reads left-to-right FROM THE UNDERSIDE
+    // when its tooth points up.
+    let (ux, uy) = (theta.cos(), theta.sin());
+    let (tx, ty) = (-theta.sin(), theta.cos());
+    let rh = comb_hub_r_mm();
+    // Digit baseline clears the hub hole's wall bead; the digit tops stop
+    // short of the scalloped outer wall's bead (both beads are ~0.45 wide
+    // with their centerlines a half-bead inside their edges).
+    let r_base = rh - COMB_HUB_RING_MM + 1.8;
+    let gap = 0.7;
+    let total_w = 2.0 * dw + gap;
+    let place = |a: f64, b: f64| {
+        // a: along the reading direction, b: radially outward. The +tangent
+        // IS the underside reading direction: flipping the part to read the
+        // recesses mirrors world X, and advancing along +t at the top of
+        // the ring comes out left-to-right in that flipped view — glyph
+        // chirality included. (Negating `a` here felt like "mirroring for
+        // the underside" but composed with the tangent's own sign into an
+        // unmirrored top label that read as garbage.)
+        [a * tx + b * ux, a * ty + b * uy]
+    };
     let mut out = Vec::new();
+    // Baseline tick spanning the label, radially inside the digits.
+    out.push([
+        place(-total_w / 2.0, r_base - 1.0),
+        place(total_w / 2.0, r_base - 1.0),
+        place(total_w / 2.0, r_base - 0.35),
+        place(-total_w / 2.0, r_base - 0.35),
+    ]);
     for (ci, &d) in chars.iter().enumerate() {
+        let a0 = -total_w / 2.0 + ci as f64 * (dw + gap);
         for (si, r) in local.iter().enumerate() {
             if SEVEN_SEG[d] & (1 << si) == 0 {
                 continue;
@@ -569,11 +605,7 @@ fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
             let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
             let mut quad = [[0.0_f64; 2]; 4];
             for (qi, &(cx_, cy_)) in corners.iter().enumerate() {
-                // Char-local, centered across the tooth, mirrored in x for
-                // underside reading, stacked hub→tip.
-                let tx = -(cx_ - dw / 2.0);
-                let ty = base_y + ci as f64 * (dh + 0.8) + cy_;
-                quad[qi] = [tx * rc - ty * rs, tx * rs + ty * rc];
+                quad[qi] = place(a0 + cx_, r_base + cy_);
             }
             out.push(quad);
         }
