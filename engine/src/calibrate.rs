@@ -74,15 +74,15 @@ pub const COMB_TEETH: usize = 25;
 pub const COMB_TOOTH_LEN_MM: f64 = 20.0;
 /// Tooth footprint width (mm): the ring cavity takes a caliper's inner jaw.
 pub const COMB_TOOTH_W_MM: f64 = 6.0;
-/// Tooth-to-tooth pitch (mm) measured along the hub circle. 11 mm buys
-/// the wider label ring below without shrinking the hub hole the PA tower
-/// nests in.
-pub const COMB_TOOTH_PITCH_MM: f64 = 11.0;
+/// Tooth-to-tooth pitch (mm) measured along the hub circle. 12.5 mm buys
+/// the label ring below without shrinking the hub hole the PA tower nests
+/// in (hole radius ~34.7, tower clearance ~4.7 mm).
+pub const COMB_TOOTH_PITCH_MM: f64 = 12.5;
 /// Radial width (mm) of the annular hub joining the teeth (true flow) —
-/// wide enough to carry each tooth's VALUE LABEL tangentially, coin-style,
-/// with clearance to BOTH of the ring's wall beads (the label lives
-/// between the hub hole's wall and the scalloped outer wall).
-pub const COMB_HUB_RING_MM: f64 = 9.0;
+/// deep enough to carry each tooth's VALUE as a full decimal ("0.96",
+/// "1.04") in ONE radial line of glyphs, with clearance to both of the
+/// ring's wall beads and the tooth-root overlap band.
+pub const COMB_HUB_RING_MM: f64 = 15.0;
 /// Comb height (mm): tall enough for full caliper-jaw flats on any tooth.
 pub const COMB_H_MM: f64 = 12.0;
 
@@ -538,20 +538,22 @@ const SEVEN_SEG: [u8; 10] = [
     0b111_1111, // 8
     0b110_1111, // 9
 ];
-/// The lit seven-segment strokes of tooth `k`'s LABEL as quads in centered
-/// comb coordinates, recessed through the base plate of the HUB RING
-/// directly under the tooth: the flow as percent MOD 100, lying
-/// TANGENTIALLY like text around a coin. Flip the comb and rotate it as
-/// you read — each label is upright and left-to-right when its tooth sits
-/// at the top. An underline tick below the digits marks the baseline
-/// (7-seg sixes and nines are 180° rotations of each other). Mirrored in
-/// the reading axis so the underside view reads true. Shared by the mesh
-/// generator and the tests.
+/// The strokes of tooth `k`'s LABEL as quads in centered comb coordinates,
+/// recessed through the base plate of the hub ring under the tooth: the
+/// flow as its LITERAL decimal value — "0.96", "1.00", "1.12" — one radial
+/// line of seven-segment glyphs reading hub→tip, no stacking, no mod-100
+/// convention: the label is exactly the number to type. The decimal point
+/// doubles as the orientation cue (it sits low, after the first digit — 
+/// unmistakable at any rotation). Mirrored so the underside view reads
+/// true. Shared by the mesh generator and the tests.
 fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
-    // Digit size is set by the radial budget: between the hub hole's wall
-    // bead and the tooth-root overlap band (teeth bite 1 mm into the ring)
-    // there are ~6.9 mm; the tick takes its share below the baseline.
-    let (l, w) = (1.65_f64, 0.8_f64);
+    // Glyph and gap sizes obey two hard rules learned from failed slices:
+    // strokes are 0.8 mm (narrower heals shut, wider grows a wall ring the
+    // skin reach jumps voids to land on), and INTER-CELL gaps exceed two
+    // wall beads (~1.1 mm) — a slimmer plate ribbon between neighbouring
+    // holes cannot host both holes' perimeter beads, and the overflow
+    // spills into the recesses.
+    let (l, w) = (1.25_f64, 0.8_f64);
     let dw = l + 2.0 * w;
     let dh = 2.0 * l + 3.0 * w;
     let local: [(f64, f64, f64, f64); 7] = [
@@ -563,51 +565,58 @@ fn comb_label_quads(k: usize) -> Vec<[[f64; 2]; 4]> {
         (0.0, l + 2.0 * w, w, 2.0 * l + 2.0 * w),
         (w, l + w, w + l, l + 2.0 * w),
     ];
-    let pct = (comb_tooth_flow(k) * 100.0).round() as usize % 100;
-    let chars = [pct / 10, pct % 10];
+    let pct = (comb_tooth_flow(k) * 100.0).round() as usize;
+    // Glyph cells advancing radially outward: units digit, decimal point,
+    // then the two fraction digits. (88..112% → "0.88".."1.12".)
+    enum Cell {
+        Digit(usize),
+        Point,
+    }
+    let cells =
+        [Cell::Digit(pct / 100), Cell::Point, Cell::Digit(pct / 10 % 10), Cell::Digit(pct % 10)];
     let theta = comb_tooth_angle(k);
-    // Radial (outward) and tangential (reading) unit vectors; the reading
-    // axis is mirrored so the label reads left-to-right FROM THE UNDERSIDE
-    // when its tooth points up.
     let (ux, uy) = (theta.cos(), theta.sin());
     let (tx, ty) = (-theta.sin(), theta.cos());
+    // Reading advances radially OUTWARD; glyph-up points against the
+    // tangent. That bakes exactly one mirror into the mesh, so the flipped
+    // part reads left-to-right, hub to tip, glyphs upright, when its tooth
+    // points toward the reader's right. (Verified by underside render —
+    // sign conventions here have burned us before.)
+    let place = |a: f64, b: f64| [a * ux - b * tx, a * uy - b * ty];
     let rh = comb_hub_r_mm();
-    // Digit baseline clears the hub hole's wall bead; the digit tops stop
-    // short of the scalloped outer wall's bead (both beads are ~0.45 wide
-    // with their centerlines a half-bead inside their edges).
-    let r_base = rh - COMB_HUB_RING_MM + 1.8;
-    let gap = 0.7;
-    let total_w = 2.0 * dw + gap;
-    let place = |a: f64, b: f64| {
-        // a: along the reading direction, b: radially outward. The +tangent
-        // IS the underside reading direction: flipping the part to read the
-        // recesses mirrors world X, and advancing along +t at the top of
-        // the ring comes out left-to-right in that flipped view — glyph
-        // chirality included. (Negating `a` here felt like "mirroring for
-        // the underside" but composed with the tangent's own sign into an
-        // unmirrored top label that read as garbage.)
-        [a * tx + b * ux, a * ty + b * uy]
-    };
+    // Start clear of the hub hole's wall bead; the last glyph stops short
+    // of the tooth-root overlap band at rh - 1.
+    let mut a = rh - COMB_HUB_RING_MM + 0.75 + 0.3;
+    let gap = 1.15;
+    let b0 = -dh / 2.0;
     let mut out = Vec::new();
-    // Baseline tick spanning the label, radially inside the digits.
-    out.push([
-        place(-total_w / 2.0, r_base - 1.0),
-        place(total_w / 2.0, r_base - 1.0),
-        place(total_w / 2.0, r_base - 0.35),
-        place(-total_w / 2.0, r_base - 0.35),
-    ]);
-    for (ci, &d) in chars.iter().enumerate() {
-        let a0 = -total_w / 2.0 + ci as f64 * (dw + gap);
-        for (si, r) in local.iter().enumerate() {
-            if SEVEN_SEG[d] & (1 << si) == 0 {
-                continue;
+    for cell in &cells {
+        match cell {
+            Cell::Point => {
+                out.push([
+                    place(a, b0),
+                    place(a + w, b0),
+                    place(a + w, b0 + w),
+                    place(a, b0 + w),
+                ]);
+                a += w + gap;
             }
-            let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
-            let mut quad = [[0.0_f64; 2]; 4];
-            for (qi, &(cx_, cy_)) in corners.iter().enumerate() {
-                quad[qi] = place(a0 + cx_, r_base + cy_);
+            Cell::Digit(d) => {
+                for (si, r) in local.iter().enumerate() {
+                    if SEVEN_SEG[*d] & (1 << si) == 0 {
+                        continue;
+                    }
+                    // Glyph-local x runs along the reading direction (a),
+                    // glyph-local y up (b).
+                    let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+                    let mut quad = [[0.0_f64; 2]; 4];
+                    for (qi, &(cx_, cy_)) in corners.iter().enumerate() {
+                        quad[qi] = place(a + cx_, b0 + cy_);
+                    }
+                    out.push(quad);
+                }
+                a += dw + gap;
             }
-            out.push(quad);
         }
     }
     out
@@ -779,8 +788,9 @@ pub fn flow_comb_gcode(settings: &Settings, tool: u32) -> String {
     let header = format!(
         "; flow comb: {COMB_TEETH} teeth radial around the hub, each a single-wall ring at\n\
          ; its own ABSOLUTE flow — 1% per tooth, {COMB_FLOW_FAT} down to {COMB_FLOW_THIN}, and every tooth\n\
-         ; carries its VALUE recessed into the UNDERSIDE as percent MOD 100, two\n\
-         ; digits (96 = 0.96, 04 = 1.04, 00 = 1.00) — flip the comb over to read.\n\
+         ; carries its VALUE recessed into the UNDERSIDE of the hub ring as the\n\
+         ; literal decimal (0.96, 1.04) — flip the comb over; each label reads\n\
+         ; upright when its tooth points to your right.\n\
          ; the whole file prints at extrusion multiplier 1.0 with the ladder baked\n\
          ; into E (no M221): the label you read IS the setting you pin, verbatim.\n\
          ; caliper along the ring for the teeth that read exactly {:.2} mm (the line\n\
@@ -821,15 +831,14 @@ pub fn pa_from_height(current_pa: f64, height_mm: f64) -> f64 {
     PA_TOWER_START + PA_TOWER_FACTOR * height_mm
 }
 
-/// The winning tooth's LABEL — the percent recessed into its underside —
-/// as the absolute flow multiplier to pin, verbatim. The comb prints at
-/// extrusion multiplier 1.0, so nothing is multiplied into the current
-/// setting and re-printing always reproduces the identical ladder.
-/// Implausible labels (outside any real spool) leave the value alone by
-/// returning 1.0-per-cent semantics only in range.
-pub fn flow_from_comb_label(percent: f64) -> Option<f64> {
-    let m = percent / 100.0;
-    (0.7..=1.3).contains(&m).then_some(m)
+/// The winning tooth's LABEL — the literal decimal recessed into the hub
+/// under it ("0.96", "1.04") — validated as the absolute flow multiplier
+/// to pin, verbatim. The comb prints at extrusion multiplier 1.0, so
+/// nothing is multiplied into the current setting and re-printing always
+/// reproduces the identical ladder. Values outside any plausible spool
+/// are rejected, not clamped.
+pub fn flow_from_comb_value(value: f64) -> Option<f64> {
+    (0.7..=1.3).contains(&value).then_some(value)
 }
 
 /// Append a vertical prism over a CONVEX CCW footprint (fan triangulation) —
@@ -1655,12 +1664,12 @@ mod tests {
                 "exact 1% per tooth"
             );
         }
-        // The label IS the setting: percent in, multiplier out, verbatim.
-        assert_eq!(flow_from_comb_label(98.0), Some(0.98));
-        assert_eq!(flow_from_comb_label(112.0), Some(1.12));
-        assert_eq!(flow_from_comb_label(100.0), Some(1.0));
-        // Implausible labels are rejected, not clamped.
-        assert_eq!(flow_from_comb_label(0.98), None);
-        assert_eq!(flow_from_comb_label(500.0), None);
+        // The label IS the setting: the printed decimal in, verbatim out.
+        assert_eq!(flow_from_comb_value(0.98), Some(0.98));
+        assert_eq!(flow_from_comb_value(1.12), Some(1.12));
+        assert_eq!(flow_from_comb_value(1.0), Some(1.0));
+        // Implausible values are rejected, not clamped.
+        assert_eq!(flow_from_comb_value(98.0), None);
+        assert_eq!(flow_from_comb_value(0.2), None);
     }
 }
