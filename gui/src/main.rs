@@ -318,6 +318,7 @@ struct FilamentFields<'a> {
     bridge_speed_mm_s: &'a mut f64,
     fan_speed: &'a mut f64,
     bridge_fan_speed: &'a mut f64,
+    fan_max: &'a mut f64,
     fan_off_layers: &'a mut usize,
     aux_fan_speed: &'a mut f64,
     exhaust_fan_speed: &'a mut f64,
@@ -341,6 +342,7 @@ impl<'a> FilamentFields<'a> {
             bridge_speed_mm_s: &mut s.bridge_speed_mm_s,
             fan_speed: &mut s.fan_speed,
             bridge_fan_speed: &mut s.bridge_fan_speed,
+            fan_max: &mut s.fan_max,
             fan_off_layers: &mut s.fan_off_layers,
             aux_fan_speed: &mut s.aux_fan_speed,
             exhaust_fan_speed: &mut s.exhaust_fan_speed,
@@ -364,6 +366,7 @@ impl<'a> FilamentFields<'a> {
             bridge_speed_mm_s: &mut t.bridge_speed_mm_s,
             fan_speed: &mut t.fan_speed,
             bridge_fan_speed: &mut t.bridge_fan_speed,
+            fan_max: &mut t.fan_max,
             fan_off_layers: &mut t.fan_off_layers,
             aux_fan_speed: &mut t.aux_fan_speed,
             exhaust_fan_speed: &mut t.exhaust_fan_speed,
@@ -388,6 +391,7 @@ struct FilamentBaseline {
     bridge_speed_mm_s: f64,
     fan_speed: f64,
     bridge_fan_speed: f64,
+    fan_max: f64,
     fan_off_layers: usize,
     aux_fan_speed: f64,
     exhaust_fan_speed: f64,
@@ -410,6 +414,7 @@ impl FilamentBaseline {
             bridge_speed_mm_s: s.bridge_speed_mm_s,
             fan_speed: s.fan_speed,
             bridge_fan_speed: s.bridge_fan_speed,
+            fan_max: s.fan_max,
             fan_off_layers: s.fan_off_layers,
             aux_fan_speed: s.aux_fan_speed,
             exhaust_fan_speed: s.exhaust_fan_speed,
@@ -432,6 +437,7 @@ impl FilamentBaseline {
             bridge_speed_mm_s: t.bridge_speed_mm_s,
             fan_speed: t.fan_speed,
             bridge_fan_speed: t.bridge_fan_speed,
+            fan_max: t.fan_max,
             fan_off_layers: t.fan_off_layers,
             aux_fan_speed: t.aux_fan_speed,
             exhaust_fan_speed: t.exhaust_fan_speed,
@@ -515,24 +521,38 @@ fn filament_card_rows(
     // nudge after a flow comb or a pressure-advance tower). Density,
     // flow-derate and the heat ceiling are material physics —
     // class-derived, not knobs.
+    let mf_hint = format!(
+        "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
+        flow_ceiling_parts_text(*f.max_volumetric_speed_mm3_s, line_width_mm, layer_height_mm)
+    );
+    revert_row(ui, f.max_volumetric_speed_mm3_s, &base.max_volumetric_speed_mm3_s, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 0.0..=80.0), "max flow mm³/s",
+            mf_hint);
+    });
     let flow = f.extrusion_multiplier;
     revert_row(ui, &mut *flow, &base.extrusion_multiplier, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
             "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-comb print.");
     });
-    // Guided flow calibration: print the radial comb (one tooth per
-    // absolute flow value, labeled on the underside), enter the winning
-    // tooth's label → pin that value verbatim.
+    let pa = f.pressure_advance;
+    revert_row(ui, &mut *pa, &base.pressure_advance, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
+            "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
+    });
+    // Guided calibration: ONE print carries both instruments (the radial
+    // flow comb with the PA tower nested in its hub), so the print button
+    // stands alone, above the two reading rows it feeds — comb → flow ×,
+    // tower → pressure advance.
     ui.horizontal(|ui| {
         if ui
             .add_enabled(cal.host_ready, egui::Button::new("⟲ print calibration suite"))
             .on_hover_text(format!(
                 "One plate, both instruments: the {}-tooth flow comb with the PA \
-                 tower inside its hub. FLOW: caliper the ring for teeth reading \
-                 {:.2} mm mid-face, take the middle of the matching run, and enter \
-                 the winning tooth's underside label below, exactly as printed \
-                 (0.96). PA: judge the tower's two front bands and enter the \
-                 height where they balance in the row below.",
+                 tower inside its hub. Read each instrument into its row below — \
+                 FLOW: caliper the ring for teeth reading {:.2} mm mid-face, take \
+                 the middle of the matching run, enter the winning tooth's \
+                 underside label. PA: judge the tower's two front bands and enter \
+                 the height where they balance.",
                 engine::COMB_TEETH,
                 line_width_mm,
             ))
@@ -541,6 +561,12 @@ fn filament_card_rows(
         {
             *cal.start = true;
         }
+    });
+    // The suite's flow reading: the winning tooth's underside label, pinned
+    // verbatim (the comb prints its ladder at ABSOLUTE flow values).
+    ui.horizontal(|ui| {
+        ui.label("flow comb reading:")
+            .on_hover_text("The winning tooth's underside label, exactly as printed (e.g. 0.96). Applies to flow × above.");
         ui.add(
             egui::DragValue::new(cal.label)
                 .speed(0.002)
@@ -563,22 +589,8 @@ fn filament_card_rows(
             }
         }
     });
-    let mf_hint = format!(
-        "The filament's measured melt-rate ceiling (mm³/s). The class default is deliberately conservative; a flow-test value belongs here. Right now: {}.",
-        flow_ceiling_parts_text(*f.max_volumetric_speed_mm3_s, line_width_mm, layer_height_mm)
-    );
-    revert_row(ui, f.max_volumetric_speed_mm3_s, &base.max_volumetric_speed_mm3_s, |ui, v| {
-        hslider(ui, true, egui::Slider::new(v, 0.0..=80.0), "max flow mm³/s",
-            mf_hint);
-    });
-    let pa = f.pressure_advance;
-    revert_row(ui, &mut *pa, &base.pressure_advance, |ui, v| {
-        hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
-            "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
-    });
     // The suite's PA reading: enter the height where the tower's two
-    // speed-step bands balance out → pin PA. (The print button lives on
-    // the calibration-suite row above.)
+    // speed-step bands balance out → pin PA.
     ui.horizontal(|ui| {
         ui.label("PA tower reading:").on_hover_text(format!(
             "From the suite's cylinder tower (PA ramps 0 \u{2192} {:.2}, {} per mm of \
@@ -642,6 +654,10 @@ fn cooling_rows(
     revert_row(ui, f.bridge_fan_speed, &base.bridge_fan_speed, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.0..=1.0), "bridge fan",
             "Fan duty on bridges and arc overhangs.");
+    });
+    revert_row(ui, f.fan_max, &base.fan_max, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 0.0..=1.0), "fan max",
+            "Ceiling for the short-layer cooling ramp on plain walls. Warp-prone materials (PETG/ABS) want this well under the bridge fan. Auto: the bridge fan duty.");
     });
     revert_row(ui, f.fan_off_layers, &base.fan_off_layers, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0..=5), "fan off layers",
@@ -3445,6 +3461,7 @@ impl App {
             s.bridge_speed_mm_s = t0.bridge_speed_mm_s;
             s.fan_speed = t0.fan_speed;
             s.bridge_fan_speed = t0.bridge_fan_speed;
+            s.fan_max = t0.fan_max;
             s.fan_off_layers = t0.fan_off_layers;
             s.aux_fan_speed = t0.aux_fan_speed;
             s.exhaust_fan_speed = t0.exhaust_fan_speed;

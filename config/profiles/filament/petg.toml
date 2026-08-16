@@ -1,11 +1,36 @@
-# Generic PETG packaging card. The class supplies density, cooling, and the
-# heat ceiling; the melt ceiling below is a measured-conservative value.
+# Bambu Lab PETG Basic, as a packaging card — modelled on what a Voron
+# running OrcaSlicer actually loads for this spool. Orca's Voron vendor never
+# shipped a Bambu PETG profile of its own (and since v2.0 ships no filament
+# profiles at all); a Voron gets the shared "Bambu PETG Basic @System" card,
+# whose flattened chain is mirrored here. Box side: 255 °C nozzle, Bambu's
+# stated range 230–270 (first layer runs flat — the PETG class has no bump;
+# hotter first layers shred). Bed: 80 °C — Orca's card says 70 for Bambu's smooth PEI, but the
+# textured-plate value is 80 and 70 lifted a corner on the first long-thin
+# PETG print here; 80 matches the generic petg card.
 material = "petg"
 filament_diameter_mm = 1.75
-nozzle_temp_c = 240
+nozzle_temp_c = 255
 bed_temp_c = 80
-# Retraction distance (mm). PETG oozes/strings more than PLA — a touch more.
+# Retraction distance (mm). Orca defers this to the printer profile; here it
+# rides the filament tier — the same touch-more-than-PLA pull as generic PETG.
 retract_len_mm = 0.6
 
-# --- calibration ---
-max_volumetric_speed_mm3_s = 11.0
+# --- from the Orca card, locally adjusted ---
+# Orca's filament_flow_ratio is 0.95; 0.93 set 2026-08-16 (with PA 0.05)
+# against the shredded-wall prints. Comb/tower readings should replace both.
+extrusion_multiplier = 0.93
+pressure_advance = 0.05
+density_g_cm3 = 1.25
+# Orca's card says 13 — a Bambu-hotend rating. On the Sovol Zero, PETG walls
+# sustained at 13 shred (2026-08-16, every geometry tried); 9 derives walls
+# to ~112 mm/s. Deliberate deviation, under test; raise only against a clean
+# print at the higher value.
+max_volumetric_speed_mm3_s = 9.0
+# Cooling: Orca's card runs 10% base ramping to 40% on short layers, 90% on
+# overhangs/bridges. Base DELIBERATELY deviates to 40% flat: dense wall-field
+# prints (walls-99) on long layers never trigger the short-layer ramp, and at
+# 10% the 255 °C beads heat-soak their neighbors into ragged walls (2026-08-16
+# untitled1 print — PLA/ASA clean on the identical toolpath). Under test.
+fan_speed = 0.4
+fan_max = 0.4
+bridge_fan_speed = 0.9

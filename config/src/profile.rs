@@ -139,6 +139,11 @@ pub struct FilamentProfile {
     pub fan_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_fan_speed: Option<f64>,
+    /// Ceiling of the short-layer cooling ramp — the most fan this spool
+    /// tolerates on plain walls (warp-prone materials cap it well under the
+    /// bridge duty). Auto: `bridge_fan_speed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_max: Option<f64>,
     /// Flow multiplier for bridge strands (and arc overhangs). Auto: 1.5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_flow: Option<f64>,
@@ -288,7 +293,7 @@ impl Tier for FilamentProfile {
             nozzle_temp_c, bed_temp_c,
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             pressure_advance, retract_len_mm, retract_restart_extra_mm,
-            fan_speed, bridge_fan_speed, bridge_flow, bridge_speed_mm_s,
+            fan_speed, bridge_fan_speed, fan_max, bridge_flow, bridge_speed_mm_s,
             fan_off_layers, aux_fan_speed, exhaust_fan_speed,
             chamber_temp_c, standby_temp_c)
     }
@@ -392,6 +397,7 @@ impl FilamentProfile {
             retract_restart_extra_mm: diff_field!(cur.retract_restart_extra_mm, base.retract_restart_extra_mm),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
+            fan_max: diff_field!(cur.fan_max, base.fan_max),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
             bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
@@ -425,6 +431,7 @@ impl FilamentProfile {
             retract_restart_extra_mm: diff_field!(cur.retract_restart_extra_mm, base.retract_restart_extra_mm),
             fan_speed: diff_field!(cur.fan_speed, base.fan_speed),
             bridge_fan_speed: diff_field!(cur.bridge_fan_speed, base.bridge_fan_speed),
+            fan_max: diff_field!(cur.fan_max, base.fan_max),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
             bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
@@ -544,10 +551,7 @@ impl Profiles {
         p.printers.insert("sovol-zero".into(), parse("printer/sovol_zero", include_str!("../profiles/printer/sovol_zero.toml")));
         p.filaments.insert("pla".into(), parse("filament/pla", include_str!("../profiles/filament/pla.toml")));
         p.filaments.insert("petg".into(), parse("filament/petg", include_str!("../profiles/filament/petg.toml")));
-        p.filaments.insert("pla-hf".into(), parse("filament/pla_hf", include_str!("../profiles/filament/pla_hf.toml")));
         p.filaments.insert("asa".into(), parse("filament/asa", include_str!("../profiles/filament/asa.toml")));
-        p.filaments.insert("abs".into(), parse("filament/abs", include_str!("../profiles/filament/abs.toml")));
-        p.filaments.insert("polymaker-pc".into(), parse("filament/polymaker_pc", include_str!("../profiles/filament/polymaker_pc.toml")));
         p.processes.insert("standard".into(), parse("process/standard", include_str!("../profiles/process/standard.toml")));
         for name in p.printers.keys() {
             p.builtin.insert(("printer", name.clone()));
@@ -858,6 +862,7 @@ impl Profiles {
             pressure_advance: t0.pressure_advance,
             fan_speed: t0.fan_speed,
             bridge_fan_speed: t0.bridge_fan_speed,
+            fan_max: t0.fan_max,
             fan_off_layers: t0.fan_off_layers,
             has_aux_fan: pr.aux_fan.unwrap_or(d.has_aux_fan),
             has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
@@ -929,6 +934,7 @@ fn tool_settings(name: &str, fl: &FilamentProfile, d: &Settings) -> crate::ToolS
     let material = fl.material.as_deref().and_then(crate::Material::parse).unwrap_or(d.material);
     // The operating nozzle temperature: the spool's value, else the class.
     let nozzle_temp = fl.nozzle_temp_c.unwrap_or_else(|| material.nozzle_temp_c());
+    let bridge_fan = fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1);
     crate::ToolSettings {
         filament_name: name.to_string(),
         color_rgb: fl
@@ -951,7 +957,11 @@ fn tool_settings(name: &str, fl: &FilamentProfile, d: &Settings) -> crate::ToolS
         bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
         bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
         fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
-        bridge_fan_speed: fl.bridge_fan_speed.unwrap_or_else(|| material.fan().1),
+        bridge_fan_speed: bridge_fan,
+        // The ladder ceiling: the card's own cap, else the bridge duty —
+        // the pre-fan_max behavior, so profiles without the field resolve
+        // byte-identically.
+        fan_max: fl.fan_max.unwrap_or(bridge_fan),
         fan_off_layers: fl.fan_off_layers.unwrap_or_else(|| material.fan().2),
         aux_fan_speed: fl.aux_fan_speed.unwrap_or_else(|| material.aux_exhaust().0),
         exhaust_fan_speed: fl.exhaust_fan_speed.unwrap_or_else(|| material.aux_exhaust().1),
@@ -995,7 +1005,7 @@ mod tests {
         assert_eq!(s.bed_size_x_mm, 350.0);
         assert_eq!(s.bed_size_z_mm, 340.0); // build height
         assert_eq!(s.nozzle_diameter_mm, 0.4); // inherited from generic
-        assert_eq!(s.nozzle_temp_c, 210); // from pla (Orca-matched bulk temp)
+        assert_eq!(s.nozzle_temp_c, 207); // from pla (user's calibrated bulk temp)
         assert_eq!(s.layer_height_mm, 0.2); // from standard
         assert!(s.start_gcode.contains("PRINT_START"));
         // No declared aux/exhaust hardware: M106 P-forms must stay locked out.
@@ -1051,7 +1061,7 @@ mod tests {
         assert_eq!(s.first_layer_speed_mm_s, 55.0); // Orca initial layer
         assert_eq!(s.travel_speed_mm_s, 1000.0); // Orca travel
         assert_eq!(s.jerk_mm_s, 5.0); // Orca square-corner velocity
-        assert_eq!(s.max_volumetric_speed_mm3_s, 21.0); // Orca generic-PLA melt ceiling
+        assert_eq!(s.max_volumetric_speed_mm3_s, 15.0); // user's calibrated ceiling (was Orca's 21)
         // Stock firmware macros are bare START_PRINT/END_PRINT (not Voron-style
         // PRINT_START) and they do no heating — the g-code must heat explicitly,
         // to the first-layer temp (the emitter drops to the bulk temp at layer 2).
@@ -1059,19 +1069,33 @@ mod tests {
         assert!(s.start_gcode.contains("M190 S{bed_temp}"));
         assert!(s.start_gcode.contains("M109 S{first_layer_nozzle_temp}"));
         assert!(s.end_gcode.contains("END_PRINT"));
-        // Temps + pressure advance pinned to the same Orca pairing (its PLA
-        // profile on this machine): hot 230 first layer for adhesion, 210 bulk.
-        assert_eq!(s.first_layer_nozzle_temp_c, 230);
-        assert_eq!(s.nozzle_temp_c, 210);
+        // Temps + pressure advance: the user's calibrated card (promoted from
+        // pla-custom 2026-08-16): 207 bulk, +20 PLA bump = 227 first layer.
+        assert_eq!(s.first_layer_nozzle_temp_c, 227);
+        assert_eq!(s.nozzle_temp_c, 207);
         assert_eq!(s.bed_temp_c, 65);
-        assert_eq!(s.pressure_advance, 0.032);
+        assert_eq!(s.pressure_advance, 0.044);
         // Fan hardware flags + the Orca PLA duties for the side/exhaust fans.
         assert!(s.has_aux_fan && s.has_exhaust_fan);
         assert_eq!(s.aux_fan_speed, 0.75);
         assert_eq!(s.exhaust_fan_speed, 0.8);
-        // The stock hotend is high-flow: pla-hf raises only the ceiling.
-        let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        // A high-flow card raises only the ceiling (synthesized fixture —
+        // the shipped pla-hf card was removed with the other unused cards).
+        let mut p = p;
+        p.filaments.insert("hf".into(), hf_fixture());
+        let hf = p.resolve("sovol-zero", "hf", "standard").unwrap();
         assert_eq!(hf.max_volumetric_speed_mm3_s, 30.0);
+    }
+
+    /// High-flow PLA fixture for ceiling/derivation tests: inherits the pla
+    /// card, 215 °C operating, 30 mm³/s melt ceiling (the deleted pla-hf).
+    fn hf_fixture() -> FilamentProfile {
+        FilamentProfile {
+            inherits: Some("pla".into()),
+            nozzle_temp_c: Some(215),
+            max_volumetric_speed_mm3_s: Some(30.0),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1089,10 +1113,10 @@ mod tests {
         assert_eq!(s.fan_speed, 0.15);
         assert_eq!(s.aux_fan_speed, 0.0);
         // The chamber pre-soak pairing: the printer declares the sensor (its
-        // Klipper name, verified live on the machine), the class supplies
-        // the 50 °C soak.
+        // Klipper name, verified live on the machine); the card pins 40 °C
+        // (measured comfortable on the Zero; the class default is 50).
         assert_eq!(s.chamber_sensor, "chamber_temp");
-        assert_eq!(s.chamber_temp_c, 50);
+        assert_eq!(s.chamber_temp_c, 40);
         // PLA on the same machine must never soak — a warm chamber means
         // heat creep and sag.
         let pla = p.resolve("sovol-zero", "pla", "standard").unwrap();
@@ -1104,28 +1128,62 @@ mod tests {
         // turns that into a legible message.
         let generic = p.resolve("generic", "asa", "standard").unwrap();
         assert!(generic.chamber_sensor.is_empty());
-        assert_eq!(generic.chamber_temp_c, 50); // the wish survives; a sensorless machine errors at print time
+        assert_eq!(generic.chamber_temp_c, 40); // the wish survives; a sensorless machine errors at print time
         // The Voron spec wires [temperature_sensor chamber].
         let voron = p.resolve("voron24", "asa", "standard").unwrap();
         assert_eq!(voron.chamber_sensor, "chamber");
     }
 
     #[test]
+    fn bambu_petg_matches_orca_reference() {
+        // The card mirrors OrcaSlicer's "Bambu PETG Basic @System" — the
+        // profile a Voron actually receives for this spool (Orca's Voron
+        // vendor ships no filament profiles of its own) — pin the pairing so
+        // a profile edit can't silently drift from the reference.
+        let p = Profiles::builtin();
+        let s = p.resolve("sovol-zero", "petg", "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 255);
+        // First layer flat at 255, matching Orca's emitted behavior — the
+        // old +10 class bump (265) made PETG grab the nozzle and shred.
+        assert_eq!(s.first_layer_nozzle_temp_c, 255);
+        // 80 like the generic petg card (Bambu textured-plate value) — the
+        // Orca card's 70 is the smooth-PEI number and lifted a corner here.
+        assert_eq!(s.bed_temp_c, 80);
+        assert_eq!(s.extrusion_multiplier, 0.93); // local; Orca's flow_ratio is 0.95
+        assert_eq!(s.pressure_advance, 0.05); // local; the Orca card sets none
+        assert_eq!(s.filament_density_g_cm3, 1.25);
+        // Orca's card rates 13 (Bambu hotend); walls sustained at 13 shred
+        // PETG on the Sovol — deliberate deviation (see the card).
+        assert_eq!(s.max_volumetric_speed_mm3_s, 9.0);
+        // Orca's card ramps 10→40 by layer time (90 on overhangs); the base
+        // deliberately deviates to a flat 40 — at 10% a dense wall field on
+        // long layers heat-soaks PETG into ragged walls (see the card).
+        assert_eq!(s.fan_speed, 0.4);
+        assert_eq!(s.fan_max, 0.4);
+        assert_eq!(s.bridge_fan_speed, 0.9);
+        assert_eq!(s.fan_off_layers, 3); // class = Orca's first-3-layers-off
+        assert_eq!(s.retract_len_mm, 0.6); // filament-tier here; Orca defers to printer
+        assert_eq!(s.chamber_temp_c, 0); // PETG never pre-soaks
+    }
+
+    #[test]
     fn auto_speeds_balance_to_flow_ceiling() {
         let p = Profiles::builtin();
         let s = p.resolve("sovol-zero", "pla", "standard").unwrap();
-        // Nominal = 80% of the 400 rating = 320. 21 mm³/s through a
-        // 0.45 × 0.2 bead ≈ 258 mm/s. Support (90% of 320 = 288) would
-        // overshoot — the triangle binds it...
+        // Nominal = 80% of the 400 rating = 320. 15 mm³/s through a
+        // 0.45 × 0.2 bead ≈ 184 mm/s. Support (90% of 320 = 288) and
+        // solid (80% = 256) both overshoot — the ceiling binds them...
         let cap = crate::flow_speed_cap_mm_s(s.max_volumetric_speed_mm3_s, s.line_width_mm, s.layer_height_mm);
-        assert!((cap - 258.0).abs() < 1.0);
+        assert!((cap - 184.3).abs() < 1.0);
         assert_eq!(s.print_speed_mm_s, 320.0);
         assert_eq!(s.support_speed_mm_s, cap);
-        // ...while solid's 80% (256) and outer wall's 50% (160) fit beneath.
-        assert_eq!(s.solid_speed_mm_s, 256.0);
+        assert_eq!(s.solid_speed_mm_s, cap);
+        // ...while outer wall's 50% (160) fits beneath.
         assert_eq!(s.external_perimeter_speed_mm_s, 160.0);
         // A high-flow filament lifts the ceiling clear of every ratio.
-        let hf = p.resolve("sovol-zero", "pla-hf", "standard").unwrap();
+        let mut p = p;
+        p.filaments.insert("hf".into(), hf_fixture());
+        let hf = p.resolve("sovol-zero", "hf", "standard").unwrap();
         assert_eq!(hf.solid_speed_mm_s, 256.0);
     }
 
@@ -1135,10 +1193,12 @@ mod tests {
         // adds the material class's adhesion bump on top.
         let p = Profiles::builtin();
         let s = p.resolve("generic", "petg", "standard").unwrap();
-        assert_eq!(s.nozzle_temp_c, 240);
-        assert_eq!(s.first_layer_nozzle_temp_c, 250); // +10 PETG bump
-        // pla-hf runs warmer: 215 °C operating, +20 PLA bump first layer.
-        let s = p.resolve("generic", "pla-hf", "standard").unwrap();
+        assert_eq!(s.nozzle_temp_c, 255);
+        assert_eq!(s.first_layer_nozzle_temp_c, 255); // PETG: no bump (shreds hot)
+        // A PLA-class card at 215 °C: +20 PLA bump on the first layer.
+        let mut p = p;
+        p.filaments.insert("hf".into(), hf_fixture());
+        let s = p.resolve("generic", "hf", "standard").unwrap();
         assert_eq!(s.nozzle_temp_c, 215);
         assert_eq!(s.first_layer_nozzle_temp_c, 235);
     }
@@ -1325,18 +1385,18 @@ mod tests {
         assert_eq!(s.toolchange_seconds, 6.5);
         // Per-tool temps ride each slot's own filament.
         assert_eq!(s.tools.len(), 2);
-        assert_eq!(s.tools[0].nozzle_temp_c, 210); // pla
-        assert_eq!(s.tools[1].nozzle_temp_c, 240); // petg
+        assert_eq!(s.tools[0].nozzle_temp_c, 207); // pla
+        assert_eq!(s.tools[1].nozzle_temp_c, 255); // petg
         // Retraction distance rides each slot's own filament now.
         assert_eq!(s.tools[0].retract_len_mm, 0.5); // pla
         assert_eq!(s.tools[1].retract_len_mm, 0.6); // petg
         assert_eq!(s.retract_len_mm, s.tools[0].retract_len_mm); // flat mirrors tool 0
-        assert_eq!(s.tools[1].first_layer_nozzle_temp_c, 250); // +10 PETG bump
+        assert_eq!(s.tools[1].first_layer_nozzle_temp_c, 255); // PETG: no bump (shreds hot)
         // Colors: parsed hex, garbage → the neutral fallback.
         assert_eq!(s.tools[0].color_rgb, [1.0, 0.0, 0.0]);
         assert_eq!(s.tools[1].color_rgb, crate::NEUTRAL_FILAMENT_RGB);
         // The flat view is tool 0's.
-        assert_eq!(s.nozzle_temp_c, 210);
+        assert_eq!(s.nozzle_temp_c, 207);
         assert_eq!(s.filament_color_rgb, [1.0, 0.0, 0.0]);
         // tool() clamps past the loadout instead of panicking.
         assert_eq!(s.tool(9).filament_name, "mystery");
@@ -1353,13 +1413,13 @@ mod tests {
         // whatever slot it sits in; the flat filament view stays tool 0's.
         let p = Profiles::builtin();
         let s = p.resolve_tools("sovol-zero", &["pla", "asa"], "standard").unwrap();
-        assert_eq!(s.nozzle_temp_c, 210); // flat = pla (tool 0)
+        assert_eq!(s.nozzle_temp_c, 207); // flat = pla (tool 0)
         assert_eq!(s.bed_temp_c, 100); // asa's bed
-        assert_eq!(s.chamber_temp_c, 50); // asa's soak
+        assert_eq!(s.chamber_temp_c, 40); // asa's soak (card-pinned)
         let s = p.resolve_tools("sovol-zero", &["asa", "pla"], "standard").unwrap();
         assert_eq!(s.nozzle_temp_c, 260); // flat = asa (tool 0)
         assert_eq!(s.bed_temp_c, 100);
-        assert_eq!(s.chamber_temp_c, 50);
+        assert_eq!(s.chamber_temp_c, 40);
     }
 
     #[test]
@@ -1380,7 +1440,7 @@ mod tests {
         let alone = p.resolve("sovol-zero", "pla", "standard").unwrap();
         let s = p.resolve_tools("sovol-zero", &["pla", "slow-melt"], "standard").unwrap();
         let cap = crate::flow_speed_cap_mm_s(5.0, s.line_width_mm, s.layer_height_mm);
-        assert_eq!(s.max_volumetric_speed_mm3_s, 21.0); // flat = tool 0 (pla)
+        assert_eq!(s.max_volumetric_speed_mm3_s, 15.0); // flat = tool 0 (pla)
         assert_eq!(s.support_speed_mm_s, cap);
         assert_eq!(s.solid_speed_mm_s, cap);
         assert_eq!(s.external_perimeter_speed_mm_s, cap);

@@ -412,14 +412,16 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             in_standby.remove(&n);
         }
         // Part cooling: off for the first `fan_off_layers`, then the normal duty
-        // climbed toward the ceiling on short layers (fan_boost) — both from the
-        // tool in hand; bridges may override per path below.
+        // climbed toward `fan_max` on short layers (fan_boost) — both from the
+        // tool in hand; bridges may override per path below. The ladder's
+        // ceiling is deliberately NOT the bridge duty: a spool can want 90%
+        // on airborne beads while tolerating far less draft on plain walls.
         let active = tools.get(cur_tool);
         let mut normal_fan = if layer.index < active.fan_off_layers {
             0
         } else {
             let duty = active.fan_speed
-                + (active.bridge_fan_speed - active.fan_speed).max(0.0) * layer.fan_boost;
+                + (active.fan_max - active.fan_speed).max(0.0) * layer.fan_boost;
             fan_duty(duty)
         };
         if normal_fan != cur_fan {
@@ -572,7 +574,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     0
                 } else {
                     let duty = tn.fan_speed
-                        + (tn.bridge_fan_speed - tn.fan_speed).max(0.0) * layer.fan_boost;
+                        + (tn.fan_max - tn.fan_speed).max(0.0) * layer.fan_boost;
                     fan_duty(duty)
                 };
                 if s.has_aux_fan {
@@ -3715,6 +3717,7 @@ mod tests {
         // Ceiling == base: the short-layer cooling ramp has no headroom, so
         // the emitted duty is exactly the base (this test pins base + off-layers).
         s.bridge_fan_speed = 0.8;
+        s.fan_max = 0.8;
         s.fan_off_layers = 2;
         s.pressure_advance = 0.045;
         let g = to_gcode(&generate(&m, &s), &s);
@@ -3782,6 +3785,7 @@ mod tests {
         t1.filament_diameter_mm = 2.85;
         t1.fan_speed = 0.5;
         t1.bridge_fan_speed = 0.5;
+        t1.fan_max = 0.5;
         s.tools = vec![t0, t1];
         s
     }

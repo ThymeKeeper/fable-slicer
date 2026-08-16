@@ -101,11 +101,14 @@ impl Material {
         }
     }
     /// First-layer bump over the operating temperature (adhesion), clipped
-    /// by the packaging max.
+    /// by the packaging max. PETG gets NO bump: it already runs near its top
+    /// and a hotter first layer makes it grab the nozzle and shred instead of
+    /// stick (2026-08-16 comb print; Orca's PETG cards run the first layer
+    /// flat too — the bump is a PLA convention).
     pub fn first_layer_bump_c(self) -> u32 {
         match self {
             Self::Pla => 20,
-            Self::Petg => 10,
+            Self::Petg => 0,
             Self::Abs => 10,
             Self::Tpu => 5,
             Self::Other => 10,
@@ -365,6 +368,10 @@ pub struct ToolSettings {
     pub bridge_speed_mm_s: f64,
     pub fan_speed: f64,
     pub bridge_fan_speed: f64,
+    /// Ceiling of the short-layer cooling ramp — how much fan this material
+    /// tolerates on plain walls (draft-sensitive spools cap it below the
+    /// bridge duty). Auto: `bridge_fan_speed`.
+    pub fan_max: f64,
     pub fan_off_layers: usize,
     pub aux_fan_speed: f64,
     pub exhaust_fan_speed: f64,
@@ -595,6 +602,12 @@ pub struct Settings {
     pub fan_speed: f64,
     /// Fan duty while printing bridges / arc overhangs (usually maxed).
     pub bridge_fan_speed: f64,
+    /// Ceiling of the short-layer cooling ramp: layers faster than the
+    /// cooling window climb from `fan_speed` toward this, never past it.
+    /// Distinct from the bridge duty — a material can want 90% on airborne
+    /// beads while tolerating far less draft on plain walls (PETG warps).
+    /// Auto: `bridge_fan_speed`.
+    pub fan_max: f64,
     /// Keep the fan off for this many initial layers (adhesion).
     pub fan_off_layers: usize,
     /// The machine has an auxiliary part-cooling fan addressed as `M106 P2`
@@ -748,6 +761,7 @@ impl Default for Settings {
             pressure_advance: 0.0,
             fan_speed: 1.0,
             bridge_fan_speed: 1.0,
+            fan_max: 1.0,
             fan_off_layers: 1,
             has_aux_fan: false, // off until the printer declares it (GUI checkbox / aux_fan = true)
             aux_fan_speed: 0.0,
@@ -822,6 +836,7 @@ impl Settings {
             bridge_speed_mm_s: self.bridge_speed_mm_s,
             fan_speed: self.fan_speed,
             bridge_fan_speed: self.bridge_fan_speed,
+            fan_max: self.fan_max,
             fan_off_layers: self.fan_off_layers,
             aux_fan_speed: self.aux_fan_speed,
             exhaust_fan_speed: self.exhaust_fan_speed,

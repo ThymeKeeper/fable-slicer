@@ -1,16 +1,17 @@
-# Generic PLA, as a packaging card: the temperature and bed below are what a
-# typical PLA box says (matched to the Orca pairing used on the Sovol Zero —
-# 210 °C operating, +20 first-layer bump = 230). Calibration entries
-# carry the measured numbers; everything else follows the material class.
+# PLA as printed here: the user's calibrated card (formerly pla-custom),
+# promoted to the default 2026-08-16. Temperature and flow/PA are measured
+# on the Sovol Zero (comb + PA tower), not box values.
 material = "pla"
+color = "#FFFFFF"
 filament_diameter_mm = 1.75
-nozzle_temp_c = 210
+nozzle_temp_c = 207
 bed_temp_c = 65
 # Retraction distance (mm). PLA sets little; direct-drive short pull.
 retract_len_mm = 0.5
 
-# --- calibration (measured on the Zero's stock hotend / Orca-matched) ---
-pressure_advance = 0.032
-max_volumetric_speed_mm3_s = 21.0
+# --- calibration (measured on the Zero's stock hotend) ---
+extrusion_multiplier = 0.9610821072615093
+pressure_advance = 0.044
+max_volumetric_speed_mm3_s = 15.0
 aux_fan_speed = 0.75
 exhaust_fan_speed = 0.8

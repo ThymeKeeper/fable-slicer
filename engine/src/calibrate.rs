@@ -163,8 +163,13 @@ fn tower_settings(settings: &Settings) -> Settings {
     // spreads less and calipers narrower, which would bias the flow read
     // high. Setting the ceiling equal to the base leaves the ladder no
     // headroom without touching the duty the user actually prints with.
+    // (`fan_max` is the ladder's ceiling; the bridge duty is pinned too —
+    // the towers have no bridges, but a stray overhang grade must not
+    // punch through the pin either.)
+    s.fan_max = s.fan_speed;
     s.bridge_fan_speed = s.fan_speed;
     for t in &mut s.tools {
+        t.fan_max = t.fan_speed;
         t.bridge_fan_speed = t.fan_speed;
     }
     s

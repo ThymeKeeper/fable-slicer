@@ -12,5 +12,9 @@ bed_temp_c = 100
 # end next to Orca's 0.8 on the same machine — match the known-good pull.
 retract_len_mm = 0.8
 
-# --- calibration ---
+# --- calibration (formerly asa-custom, promoted to the default 2026-08-16) ---
 density_g_cm3 = 1.07
+extrusion_multiplier = 0.9477576236635189
+pressure_advance = 0.032
+# 40 °C pre-soak, measured comfortable on the Zero (class default is 50).
+chamber_temp_c = 40
