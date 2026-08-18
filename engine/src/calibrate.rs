@@ -60,7 +60,7 @@ pub fn test_cube_gcode(settings: &Settings, tool: u32) -> String {
     let header = format!(
         "; TEST CUBE: {TEST_CUBE_XY_MM:.0} x {TEST_CUBE_XY_MM:.0} x {TEST_CUBE_H_MM:.0} mm printed as a solid concentric ring\n\
          ; field (99 walls, no top or bottom skin) at THIS profile's own settings —\n\
-         ; flow x {:.3}, pressure advance {:.4}. The open inside is the instrument:\n\
+         ; flow x {:.3}, pressure advance {:.4}. The TOP LAYER is the instrument:\n\
          ; FLOW: look across the ring field. Rings crowding/piling into each other\n\
          ; = too much; visible channels or gaps between them = too little.\n\
          ; PA: look at the ring CORNERS along the diagonal collapse lines. Bulged\n\

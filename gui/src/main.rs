@@ -536,7 +536,7 @@ fn filament_card_rows(
             .add_enabled(cube.host_ready, egui::Button::new("⟲ print test cube"))
             .on_hover_text(format!(
                 "Print a {:.0} × {:.0} × {:.0} mm slab as a solid ring field (99 walls, \
-                 no top) at the settings above — then read its open inside. \
+                 no top) at the settings above — then read its top layer. \
                  FLOW: rings crowding and piling into each other = too much; \
                  channels or gaps between them = too little. PA: ring corners \
                  along the diagonals bulge when PA is too low, starve or round \
@@ -6853,7 +6853,7 @@ impl eframe::App for App {
                 match c.upload("test-cube.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the test cube at flow × {flow:.3}, PA {pa:.4} — read its open inside: crowded rings = too much flow, gaps between them = too little; bulged corners on the diagonals = too little PA, starved/rounded = too much."),
+                        msg: format!("Printing the test cube at flow × {flow:.3}, PA {pa:.4} — read its top layer: crowded rings = too much flow, gaps between them = too little; bulged corners on the diagonals = too little PA, starved/rounded = too much."),
                     },
                     Err(e) => HostReply::SendDone { ok: false, msg: format!("test-cube upload failed: {e}") },
                 }
