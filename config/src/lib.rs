@@ -625,6 +625,10 @@ pub struct Settings {
     /// Exhaust duty 0.0..=1.0 for the whole print — vents chamber heat
     /// (PLA wants it high, ABS low or zero). 0 = off.
     pub exhaust_fan_speed: f64,
+    /// The printer profile this was resolved from — identity for the g-code
+    /// header (and whatever reads it), not a setting anything slices by.
+    /// Empty when the settings weren't built from a profile.
+    pub printer_name: String,
     /// The machine's chamber thermistor, by its Klipper `temperature_sensor`
     /// name (e.g. "chamber_temp" on the Sovol Zero, "chamber" on a Voron).
     /// Empty = no sensor; gates all chamber pre-soak emission.
@@ -767,6 +771,7 @@ impl Default for Settings {
             aux_fan_speed: 0.0,
             has_exhaust_fan: false,
             exhaust_fan_speed: 0.0,
+            printer_name: String::new(),
             chamber_sensor: String::new(),
             chamber_temp_c: Material::Pla.chamber_temp_c(),
             machine_kind: MachineKind::default(),

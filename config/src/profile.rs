@@ -868,6 +868,7 @@ impl Profiles {
             has_exhaust_fan: pr.exhaust_fan.unwrap_or(d.has_exhaust_fan),
             aux_fan_speed: t0.aux_fan_speed,
             exhaust_fan_speed: t0.exhaust_fan_speed,
+            printer_name: printer.to_string(),
             chamber_sensor: pr.chamber_sensor.unwrap_or_else(|| d.chamber_sensor.clone()),
             chamber_temp_c: chamber_temp,
             machine_kind: pr
