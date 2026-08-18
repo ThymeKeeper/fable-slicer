@@ -445,23 +445,14 @@ impl FilamentBaseline {
     }
 }
 
-/// The App-side state the guided flow-calibration row drives: arming the
-/// comb print, the winning tooth's underside LABEL (percent, mod-100 as
-/// printed), and the status line it reports to. The comb prints its
-/// ladder at ABSOLUTE flow values, so "apply" pins the label verbatim —
-/// no snapshot bookkeeping, idempotent by construction.
-struct FlowCalUi<'a> {
+/// The App-side state the test-cube row drives: arming the print. There is
+/// nothing to read back — the cube is judged by eye against the sliders
+/// right above it (crowded/sparse rings = flow, corner bulge = pressure
+/// advance), so calibration is edit-print-look, with no label to transcribe
+/// and no ladder value to pin.
+struct TestCubeUi<'a> {
     host_ready: bool,
     start: &'a mut bool,
-    label: &'a mut f64,
-    status: &'a mut String,
-}
-
-/// Same shape for the guided pressure-advance tower: arm the print, take the
-/// measured best-corner height, report to the status line.
-struct PaCalUi<'a> {
-    height_mm: &'a mut f64,
-    status: &'a mut String,
 }
 
 /// The Filament packaging-card rows, written once for both surfaces (see
@@ -475,8 +466,7 @@ fn filament_card_rows(
     show_standby: bool,
     line_width_mm: f64,
     layer_height_mm: f64,
-    cal: FlowCalUi<'_>,
-    pa_cal: PaCalUi<'_>,
+    cube: TestCubeUi<'_>,
 ) {
     revert_row(ui, f.nozzle_temp_c, &base.nozzle_temp_c, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, config::NOZZLE_TEMP_MIN_C..=config::NOZZLE_TEMP_MAX_C), "nozzle °C",
@@ -518,7 +508,7 @@ fn filament_card_rows(
     });
     // Measured calibration — the slicer is blind to the true output, so
     // these are pinned from a test, not derived (default 1.0 / conservative;
-    // nudge after a flow comb or a pressure-advance tower). Density,
+    // nudge them against a test-cube print, the button below). Density,
     // flow-derate and the heat ceiling are material physics —
     // class-derived, not knobs.
     let mf_hint = format!(
@@ -529,102 +519,36 @@ fn filament_card_rows(
         hslider(ui, true, egui::Slider::new(v, 0.0..=80.0), "max flow mm³/s",
             mf_hint);
     });
-    let flow = f.extrusion_multiplier;
-    revert_row(ui, &mut *flow, &base.extrusion_multiplier, |ui, v| {
+    revert_row(ui, f.extrusion_multiplier, &base.extrusion_multiplier, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.8..=1.2), "flow ×",
-            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; pin a measured value after a flow-comb print.");
+            "Per-spool flow calibration — scales every extrusion. 1.0 = trust the geometry; tune it against a test-cube print (crowded rings = too much, gaps between them = too little).");
     });
-    let pa = f.pressure_advance;
-    revert_row(ui, &mut *pa, &base.pressure_advance, |ui, v| {
+    revert_row(ui, f.pressure_advance, &base.pressure_advance, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 0.0..=0.2), "pressure advance",
             "Klipper pressure advance, emitted as SET_PRESSURE_ADVANCE. 0 = leave the printer's value.");
     });
-    // Guided calibration: ONE print carries both instruments (the radial
-    // flow comb with the PA tower nested in its hub), so the print button
-    // stands alone, above the two reading rows it feeds — comb → flow ×,
-    // tower → pressure advance.
+    // The test cube: a slab printed as a solid concentric ring field with an
+    // open top, at THESE settings. It reads back through the eye, not a
+    // form — the two sliders directly above it are what it judges, so the
+    // button sits under them with nothing to transcribe.
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(cal.host_ready, egui::Button::new("⟲ print calibration suite"))
+            .add_enabled(cube.host_ready, egui::Button::new("⟲ print test cube"))
             .on_hover_text(format!(
-                "One plate, both instruments: the {}-tooth flow comb with the PA \
-                 tower inside its hub. Read each instrument into its row below — \
-                 FLOW: caliper the ring for teeth reading {:.2} mm mid-face, take \
-                 the middle of the matching run, enter the winning tooth's \
-                 underside label. PA: judge the tower's two front bands and enter \
-                 the height where they balance.",
-                engine::COMB_TEETH,
-                line_width_mm,
+                "Print a {:.0} × {:.0} × {:.0} mm slab as a solid ring field (99 walls, \
+                 no top) at the settings above — then read its open inside. \
+                 FLOW: rings crowding and piling into each other = too much; \
+                 channels or gaps between them = too little. PA: ring corners \
+                 along the diagonals bulge when PA is too low, starve or round \
+                 off when it is too high. Adjust, reprint, compare.",
+                engine::TEST_CUBE_XY_MM,
+                engine::TEST_CUBE_XY_MM,
+                engine::TEST_CUBE_H_MM,
             ))
             .on_disabled_hover_text("Needs a printer host (Connection section) and no other printer operation in flight.")
             .clicked()
         {
-            *cal.start = true;
-        }
-    });
-    // The suite's flow reading: the winning tooth's underside label, pinned
-    // verbatim (the comb prints its ladder at ABSOLUTE flow values).
-    ui.horizontal(|ui| {
-        ui.label("flow comb reading:")
-            .on_hover_text("The winning tooth's underside label, exactly as printed (e.g. 0.96). Applies to flow × above.");
-        ui.add(
-            egui::DragValue::new(cal.label)
-                .speed(0.002)
-                .range(0.0..=1.5)
-                .fixed_decimals(2),
-        )
-        .on_hover_text("The winning tooth's underside label, exactly as printed (e.g. 0.96).");
-        if ui
-            .button("apply")
-            .on_hover_text("Pin the label as the spool's extrusion multiplier, verbatim.")
-            .clicked()
-        {
-            if let Some(m) = engine::flow_from_comb_value(*cal.label) {
-                let before = *flow;
-                *flow = m;
-                *cal.status =
-                    format!("flow × {before:.3} → {:.3} (comb label {:.2})", *flow, *cal.label);
-            } else {
-                *cal.status = format!("comb label {:.2} isn't on the ladder", *cal.label);
-            }
-        }
-    });
-    // The suite's PA reading: enter the height where the tower's two
-    // speed-step bands balance out → pin PA.
-    ui.horizontal(|ui| {
-        ui.label("PA tower reading:").on_hover_text(format!(
-            "From the suite's cylinder tower (PA ramps 0 \u{2192} {:.2}, {} per mm of \
-             height). Judge the two vertical bands flanking the FRONT (the seam \
-             column marks the rear): too little PA = fat ridge on one, starved \
-             streak on the other; too much = they swap. Enter the height where \
-             they vanish or trade places.",
-            engine::PA_TOWER_START + engine::PA_TOWER_FACTOR * engine::TOWER_H_MM,
-            engine::PA_TOWER_FACTOR,
-        ));
-        ui.add(
-            egui::DragValue::new(pa_cal.height_mm)
-                .speed(0.1)
-                .range(0.0..=engine::TOWER_H_MM)
-                .fixed_decimals(1)
-                .suffix(" mm"),
-        )
-        .on_hover_text("Height (mm from the bed) where the two bands vanish or trade places.");
-        if ui
-            .button("apply")
-            .on_hover_text(format!(
-                "Pin pressure advance = {} + {} × height.",
-                engine::PA_TOWER_START,
-                engine::PA_TOWER_FACTOR
-            ))
-            .clicked()
-            && *pa_cal.height_mm > 0.0
-        {
-            let before = *pa;
-            *pa = engine::pa_from_height(before, *pa_cal.height_mm);
-            *pa_cal.status = format!(
-                "pressure advance {before:.4} → {:.4} (bands balanced at {:.1} mm)",
-                *pa, *pa_cal.height_mm
-            );
+            *cube.start = true;
         }
     });
     revert_row(ui, f.bridge_flow, &base.bridge_flow, |ui, v| {
@@ -1789,18 +1713,11 @@ struct App {
     baseline: Settings,
     /// Open save/delete-profile dialog, if any.
     profile_dialog: Option<ProfileDialog>,
-    /// Flow calibration: the Filament-panel button arms this; the dispatch
-    /// generates the flow comb and sends it to the printer.
-    start_flow_cal: bool,
-    /// The winning comb tooth's underside label — the literal decimal as
-    /// printed (0.96); "apply" pins it verbatim — the comb prints its
-    /// ladder at flow 1.0, so nothing compounds and no dispatch snapshot
-    /// is needed.
-    flow_cal_label: f64,
-
-    /// Best-corner height (mm) entered after the PA tower print; "apply"
-    /// turns it into the filament's `pressure_advance`.
-    pa_cal_mm: f64,
+    /// Calibration: the Filament-panel button arms this; the dispatch
+    /// generates the test cube at the current settings and sends it to the
+    /// printer. Nothing comes back through the UI — the cube is read by eye
+    /// against the flow and pressure-advance sliders themselves.
+    start_test_cube: bool,
     /// A profile switch requested while settings carry unsaved (*) edits —
     /// held here until the user confirms discarding them.
     pending_switch: Option<(String, String, String)>,
@@ -2129,10 +2046,7 @@ impl App {
             settings,
             baseline,
             profile_dialog: None,
-            start_flow_cal: false,
-            flow_cal_label: 0.0,
-
-            pa_cal_mm: 0.0,
+            start_test_cube: false,
             pending_switch: None,
             pending_slot: None,
             active_tool_tab: 0,
@@ -5031,19 +4945,9 @@ impl eframe::App for App {
                     // or the accent flow (single) — the loaded spool, not the
                     // profile, owns the color.
                     let (line_w, layer_h) = (s.line_width_mm, s.layer_height_mm);
-                    let cal = FlowCalUi {
+                    let cube = TestCubeUi {
                         host_ready: host_set && !host_busy,
-                        start: &mut self.start_flow_cal,
-                        label: &mut self.flow_cal_label,
-                        status: &mut self.status,
-                    };
-                    // The PA row reports through a local: `cal` above already
-                    // holds the status line mutably (one report per frame is
-                    // plenty — copied back after the card renders).
-                    let mut pa_cal_status = String::new();
-                    let pa_cal = PaCalUi {
-                        height_mm: &mut self.pa_cal_mm,
-                        status: &mut pa_cal_status,
+                        start: &mut self.start_test_cube,
                     };
                     // The blend palette lives at the top of the Filament
                     // card — blends are filament-tier facts (mixes of the
@@ -5490,16 +5394,13 @@ impl eframe::App for App {
                         // a shared heater ramps its one heater, so hide the row.
                         let show_standby = !s.single_heater();
                         if s.tool_count > 1 {
-                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, show_standby, line_w, layer_h, cal, pa_cal);
+                            filament_card_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, show_standby, line_w, layer_h, cube);
                             ui.separator();
                             cooling_rows(ui, FilamentFields::tool(&mut s.tools[tab]), &fb, aux, exhaust);
                         } else {
-                            filament_card_rows(ui, FilamentFields::flat(s), &fb, false, line_w, layer_h, cal, pa_cal);
+                            filament_card_rows(ui, FilamentFields::flat(s), &fb, false, line_w, layer_h, cube);
                             ui.separator();
                             cooling_rows(ui, FilamentFields::flat(s), &fb, aux, exhaust);
-                        }
-                        if !pa_cal_status.is_empty() {
-                            self.status = pa_cal_status;
                         }
                     }
                 });
@@ -6938,30 +6839,23 @@ impl eframe::App for App {
             }
         }
 
-        // Calibration suite: the Filament-panel button armed `start_flow_cal`.
-        // One print, both instruments — the comb ring with the PA tower in
-        // its hub, generated from the current settings. On a toolchanger it
-        // prints with the ACTIVE tab's tool — the spool whose profile the
-        // readings pin.
-        if std::mem::take(&mut self.start_flow_cal) {
+        // Test cube: the Filament-panel button armed `start_test_cube`. The
+        // slab prints at the CURRENT settings — the point is to judge the
+        // values in the panel, so nothing here overrides them but the shell
+        // counts that open the inside up. On a toolchanger it prints with
+        // the ACTIVE tab's tool — the spool being judged.
+        if std::mem::take(&mut self.start_test_cube) {
             let tool = self.active_tool_tab as u32;
-            let gcode = engine::calibration_suite_gcode(&self.settings, tool);
-            let lw = self.settings.line_width_mm;
-            // With no profile PA pinned there is nothing to restore to — the
-            // machine keeps the sweep's top until a height is applied.
-            let pa_note = if self.settings.pressure_advance > 0.0 {
-                ""
-            } else {
-                " (Until you apply a PA height, the printer keeps the sweep's top PA — apply promptly.)"
-            };
+            let gcode = engine::test_cube_gcode(&self.settings, tool);
+            let (flow, pa) = (self.settings.extrusion_multiplier, self.settings.pressure_advance);
             let ctx = ui.ctx().clone();
             self.spawn_host_op(&ctx, false, move |c| {
-                match c.upload("calibration-suite.gcode", gcode.as_bytes(), true) {
+                match c.upload("test-cube.gcode", gcode.as_bytes(), true) {
                     Ok(()) => HostReply::SendDone {
                         ok: true,
-                        msg: format!("Printing the calibration suite — flow: caliper the ring for teeth reading {lw:.2} mm and enter the winning tooth's underside label as printed (0.96); PA: enter the height where the tower's two front bands balance. Both go in the Filament panel.{pa_note}"),
+                        msg: format!("Printing the test cube at flow × {flow:.3}, PA {pa:.4} — read its open inside: crowded rings = too much flow, gaps between them = too little; bulged corners on the diagonals = too little PA, starved/rounded = too much."),
                     },
-                    Err(e) => HostReply::SendDone { ok: false, msg: format!("calibration-suite upload failed: {e}") },
+                    Err(e) => HostReply::SendDone { ok: false, msg: format!("test-cube upload failed: {e}") },
                 }
             });
         }

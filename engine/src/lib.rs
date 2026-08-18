@@ -18,12 +18,7 @@ mod paint;
 mod plan;
 mod slice;
 
-pub use calibrate::{
-    calibration_suite_gcode, comb_hub_r_mm, comb_tooth_angle, comb_tooth_flow, flow_comb_gcode,
-    flow_from_comb_value, pa_from_height, pa_tower_gcode, COMB_FLOW_FAT, COMB_FLOW_THIN,
-    COMB_H_MM, COMB_TEETH, COMB_TOOTH_LEN_MM, PA_STEP_SLOW_FRAC, PA_TOWER_FACTOR, PA_TOWER_START,
-    TOWER_H_MM, TOWER_R_MM,
-};
+pub use calibrate::{test_cube_gcode, TEST_CUBE_H_MM, TEST_CUBE_XY_MM};
 
 pub use emit::{
     audit_combing, audit_flow_clamps, estimate_filament, estimate_filament_per_tool,

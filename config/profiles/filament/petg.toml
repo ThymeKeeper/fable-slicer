@@ -16,9 +16,11 @@ bed_temp_c = 80
 retract_len_mm = 0.6
 
 # --- from the Orca card, locally adjusted ---
-# Orca's filament_flow_ratio is 0.95; 0.93 set 2026-08-16 (with PA 0.05)
-# against the shredded-wall prints. Comb/tower readings should replace both.
-extrusion_multiplier = 0.93
+# Orca's filament_flow_ratio is 0.95; 0.90 measured by print quality
+# 2026-08-17 (test prints improved down to 0.90 — the comb's caliper-width
+# reading disagreed, see the card history; trust the field). PA 0.05
+# provisional until a tower reading.
+extrusion_multiplier = 0.90
 pressure_advance = 0.05
 density_g_cm3 = 1.25
 # Orca's card says 13 — a Bambu-hotend rating. On the Sovol Zero, PETG walls

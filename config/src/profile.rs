@@ -1149,7 +1149,7 @@ mod tests {
         // 80 like the generic petg card (Bambu textured-plate value) — the
         // Orca card's 70 is the smooth-PEI number and lifted a corner here.
         assert_eq!(s.bed_temp_c, 80);
-        assert_eq!(s.extrusion_multiplier, 0.93); // local; Orca's flow_ratio is 0.95
+        assert_eq!(s.extrusion_multiplier, 0.90); // print-quality measured; Orca's flow_ratio is 0.95
         assert_eq!(s.pressure_advance, 0.05); // local; the Orca card sets none
         assert_eq!(s.filament_density_g_cm3, 1.25);
         // Orca's card rates 13 (Bambu hotend); walls sustained at 13 shred

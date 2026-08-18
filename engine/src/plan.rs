@@ -1717,21 +1717,24 @@ fn plan_part(
                 return Polygons::new();
             }
             let here = &layers[i].polygons;
-            // A face is only reserved (carved out of the walls, skinned) if it will
-            // actually be skinned — gate each on its own shell count. With top and
-            // bottom layers both 0 there is no surface at all, so the walls fill the
-            // cross-section solid with no infill or shells anywhere.
-            // Exposure is computed regardless of the shell counts: a face the
-            // wall stack consumed still shows, and it must skin even at zero
-            // configured shells — the reservation gates (buried AND
-            // wide-enough) are what scope this to wall-swallowed faces, so
-            // thin rims and intentionally-open hollow prints keep their walls.
-            let top = if i + 1 < n {
+            // The shell counts are LITERAL: a face only skins if its own count
+            // says so — top_layers = 0 means no top surface, ever, walls
+            // burying the section or not (hollow is a choice the user makes
+            // with the counts, not one the slicer second-guesses). The
+            // wall-swallowed-face override that skinned exposed faces at zero
+            // counts is gone by explicit user decision (2026-08-18); the
+            // reservation gates below (buried AND wide-enough) still scope
+            // nonzero counts to wall-swallowed faces only.
+            let top = if settings.top_layers == 0 {
+                Polygons::new()
+            } else if i + 1 < n {
                 difference(here, &offset(&layers[i + 1].polygons, 0.05))
             } else {
                 here.clone()
             };
-            let bot = if i > 0 {
+            let bot = if settings.bottom_layers == 0 {
+                Polygons::new()
+            } else if i > 0 {
                 difference(here, &offset(&layers[i - 1].polygons, 0.05))
             } else {
                 here.clone()
