@@ -128,6 +128,9 @@ enum HostOp {
     Resume,
     Cancel,
     Status,
+    /// Fetch and parse the job the printer is running, so the Machine view
+    /// can mirror it. Once per job, never per poll — these are tens of MB.
+    FetchJob { filename: String },
     /// Toggle the printer's auxiliary fan as a live chamber-circulation
     /// control (destratify while an external chamber heater runs).
     Circulate { on: bool },
@@ -139,9 +142,12 @@ enum HostReply {
     Message(String),
     /// A Send / Send & print finished; success reveals the live-print overlay.
     SendDone { ok: bool, msg: String },
-    /// A quiet interval poll feeding the live-print overlay — never touches
-    /// the status line.
+    /// A quiet interval poll feeding the Machine view — never touches the
+    /// status line.
     Status(Result<printhost::PrintStatus, String>),
+    /// A running job, parsed into the timeline the playhead walks. Parsed on
+    /// the worker: a 47 MB file is a fifth of a second the UI needn't stall.
+    Job { filename: String, timeline: Result<gcode::Timeline, String> },
 }
 
 /// Which of the three views the viewport is showing. Model is the only one
@@ -173,6 +179,15 @@ fn drop_preview(view: &mut ViewMode) {
     if *view == ViewMode::Preview {
         *view = ViewMode::Model;
     }
+}
+
+/// The printer's current job, mirrored locally.
+struct JobMirror {
+    filename: String,
+    timeline: gcode::Timeline,
+    head: gcode::Playhead,
+    /// When the playhead was last advanced, for the frame delta.
+    ticked: std::time::Instant,
 }
 
 /// What the preview colors encode.
@@ -1812,6 +1827,13 @@ struct App {
     sent_to_printer: bool,
     /// Latest polled printer state (None until the first poll lands).
     printer_status: Option<Result<printhost::PrintStatus, String>>,
+    /// The running job, mirrored locally: whatever file the printer is
+    /// executing — ours or another slicer's — parsed into a motion timeline
+    /// with a playhead walking it in step with the machine.
+    job: Option<JobMirror>,
+    /// A fetch in flight (or failed) for this filename, so a 47 MB download
+    /// is attempted once per job rather than once per poll.
+    job_wanted: Option<String>,
     /// When the last quiet status poll started (None = poll next frame).
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
@@ -2099,6 +2121,8 @@ impl App {
             host_rx: None,
             sent_to_printer: false,
             printer_status: None,
+            job: None,
+            job_wanted: None,
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
@@ -4327,7 +4351,53 @@ impl eframe::App for App {
                         op_done = true;
                     }
                     HostReply::Status(st) => {
+                        // A reading is the playhead's discipline: executed
+                        // seconds measure real time, the file position says
+                        // where in the timeline that got us, and their ratio
+                        // is the playback rate (see gcode::Playhead).
+                        if let Ok(st) = &st {
+                            let running = st.state == "printing" || st.state == "paused";
+                            match &mut self.job {
+                                Some(job) if running && job.filename == st.filename => {
+                                    let t = job
+                                        .timeline
+                                        .time_at_byte(st.file_position.min(u32::MAX as u64) as u32);
+                                    job.head.sync(st.print_duration_s as f32, t);
+                                    job.ticked = std::time::Instant::now();
+                                }
+                                // A different job (or none): mirror what the
+                                // machine is actually running, whoever sliced
+                                // it. Cleared outright when nothing is.
+                                _ => {
+                                    self.job = None;
+                                    if !running {
+                                        self.job_wanted = None;
+                                    }
+                                }
+                            }
+                        }
                         self.printer_status = Some(st);
+                        op_done = true;
+                    }
+                    HostReply::Job { filename, timeline } => {
+                        match timeline {
+                            Ok(timeline) => {
+                                self.job = Some(JobMirror {
+                                    filename,
+                                    timeline,
+                                    head: gcode::Playhead::default(),
+                                    ticked: std::time::Instant::now(),
+                                });
+                                // Sync on the next poll rather than guessing.
+                                self.last_status_poll = None;
+                            }
+                            Err(e) => {
+                                // Leave job_wanted set: one failed fetch per
+                                // job, not a retry loop against a printer
+                                // that is busy printing.
+                                self.status = format!("Couldn't mirror the running job: {e}");
+                            }
+                        }
                         op_done = true;
                     }
                 }
@@ -4356,6 +4426,39 @@ impl eframe::App for App {
             }
             // egui only repaints on input; keep frames coming for the timer.
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        // Mirror whatever the machine is running — ours or another slicer's.
+        // One fetch per job: `job_wanted` remembers the attempt so a poll
+        // every two seconds can't turn into a download every two seconds.
+        if let Some(Ok(st)) = &self.printer_status {
+            let running = st.state == "printing" || st.state == "paused";
+            let have = self.job.as_ref().map(|j| j.filename.as_str());
+            if running
+                && !st.filename.is_empty()
+                && have != Some(st.filename.as_str())
+                && self.job_wanted.as_deref() != Some(st.filename.as_str())
+                && !host_busy
+                && host_op.is_none()
+            {
+                self.job_wanted = Some(st.filename.clone());
+                host_op = Some(HostOp::FetchJob { filename: st.filename.clone() });
+            }
+        }
+        // Between readings the playhead free-runs at the rate it has learned
+        // — the whole point of mirroring locally instead of asking the
+        // machine where it is several times a second. A paused job holds.
+        if let (Some(job), Some(Ok(st))) = (&mut self.job, &self.printer_status) {
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(job.ticked).as_secs_f32();
+            job.ticked = now;
+            if st.state == "printing" {
+                job.head.advance(dt);
+            }
+            if self.view == ViewMode::Machine {
+                // 20 fps is plenty for a nozzle crossing a bed, and it keeps
+                // the view honest without pinning a core.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
         }
 
         // Multi-tool edits requested inside the panel closure (which borrows
@@ -6678,6 +6781,41 @@ impl eframe::App for App {
                                         }
                                     }
                                 }
+                                // The mirrored job: where the nozzle is right
+                                // now, on OUR clock, and how that clock is
+                                // tracking the machine's.
+                                if let Some(job) = &self.job {
+                                    ui.separator();
+                                    let (pos, mv) = job.timeline.at(job.head.t);
+                                    let layer = job.timeline.layer_of(mv) + 1;
+                                    ui.horizontal(|ui| {
+                                        ui.label("layer");
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{layer} / {}",
+                                                job.timeline.layers.len()
+                                            ))
+                                            .strong(),
+                                        );
+                                        ui.weak(format!("z {:.2}", pos[2]));
+                                    });
+                                    ui.weak(format!("nozzle  {:.1}, {:.1}", pos[0], pos[1]));
+                                    // Remaining is the timeline's own, converted
+                                    // to real minutes through the learned rate —
+                                    // a better estimate than either clock alone.
+                                    if job.head.rate > 0.01 {
+                                        let left = (job.timeline.seconds - job.head.t).max(0.0)
+                                            / job.head.rate;
+                                        ui.weak(format!(
+                                            "{:.0} min left  ·  ×{:.2}",
+                                            left / 60.0,
+                                            job.head.rate
+                                        ));
+                                    }
+                                } else if self.job_wanted.is_some() {
+                                    ui.separator();
+                                    ui.weak("reading the job…");
+                                }
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     let live = !host_busy;
@@ -6859,6 +6997,15 @@ impl eframe::App for App {
         if let Some(op) = host_op {
             let ctx = ui.ctx().clone();
             match op {
+                HostOp::FetchJob { filename } => {
+                    let name = filename.clone();
+                    self.spawn_host_op(&ctx, true, move |c| {
+                        let timeline = c
+                            .download(&name)
+                            .map(|bytes| gcode::Timeline::parse(&bytes));
+                        HostReply::Job { filename: name, timeline }
+                    })
+                }
                 HostOp::Test => self.spawn_host_op(&ctx, false, |c| {
                     HostReply::Message(match c.server_info() {
                         Ok(state) => format!("Printer reachable — Klipper is {state}."),

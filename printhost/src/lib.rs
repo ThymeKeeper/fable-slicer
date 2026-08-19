@@ -95,6 +95,21 @@ impl Client {
         Ok(())
     }
 
+    /// Fetch a g-code file's bytes from the printer's own storage — how the
+    /// Machine view mirrors a job it did not send. These run to tens of
+    /// megabytes, so callers do this on a worker thread and only once per
+    /// job, not per poll.
+    pub fn download(&self, filename: &str) -> Result<Vec<u8>, String> {
+        let resp = self
+            .request("GET", &format!("/server/files/gcodes/{}", urlencode(filename)))
+            .call()
+            .map_err(err_str)?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
+            .map_err(|e| format!("reading {filename}: {e}"))?;
+        Ok(buf)
+    }
+
     /// Start printing an already-uploaded file.
     pub fn start_print(&self, filename: &str) -> Result<(), String> {
         let encoded = urlencode(filename);

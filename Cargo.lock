@@ -1210,6 +1210,7 @@ dependencies = [
  "config",
  "eframe",
  "engine",
+ "gcode",
  "geo2d",
  "glam",
  "mesh",
