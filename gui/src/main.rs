@@ -4286,6 +4286,10 @@ struct RenderSig {
     show_stars: bool,
     /// (count, joint_count, current_layer bits, dim bits, mask), or None in model mode.
     preview: Option<(u32, u32, u32, u32, u32)>,
+    /// Which bead primitive is in use. It rides with `camera_moving`, which
+    /// also halves `size` — but the gate must not depend on that coincidence:
+    /// drop dynamic resolution and the ribbon would stick after mouse-up.
+    flat: bool,
     /// Where the mirrored hotend is standing. It has to be here: everything
     /// else in this signature is pinned while a job runs, so the gate was
     /// driven by the bead COUNT alone — and count is a tally of extruding
@@ -6597,10 +6601,17 @@ impl eframe::App for App {
                     color_mode,
                     tool_palette: self.tool_palette(),
                     nozzle: nozzle_at.is_some(),
-                    // The mirrored view redraws the whole print every frame,
-                    // so it takes the cheap bead. Preview draws once and sits
-                    // there, and keeps the tube.
-                    flat_beads: self.view == ViewMode::Machine,
+                    // The cheap bead (a view-facing ribbon, 12 verts) instead
+                    // of the tube (36) whenever the scene is being redrawn
+                    // continuously: always in the mirrored view, and in
+                    // Preview for as long as the camera is moving. A still
+                    // Preview renders once and then blits, so there is nothing
+                    // to win there and a look to lose — but mid-orbit nobody
+                    // is judging a bead's cross-section, and the tube is
+                    // costing three times the vertices per frame. Snaps back
+                    // on the settle frame, which `camera_moving` already
+                    // guarantees is drawn.
+                    flat_beads: self.view == ViewMode::Machine || camera_moving,
                 })
             } else {
                 None
@@ -6634,6 +6645,7 @@ impl eframe::App for App {
                 show_mesh,
                 show_stars: self.show_stars,
                 preview: preview_sig,
+                flat: preview.as_ref().is_some_and(|p| p.flat_beads),
                 nozzle: (self.nozzle_parked[0] != f32::MAX).then(|| {
                     [
                         self.nozzle_parked[0].to_bits(),
