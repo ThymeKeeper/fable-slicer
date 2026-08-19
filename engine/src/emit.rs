@@ -665,7 +665,10 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
             );
 
             let z = layer.print_z_mm;
-            let small = small_loop_factor(path);
+            // The first layer's speed is an absolute off the filament card —
+            // one pace for every feature, chosen for adhesion. Thermal pacing
+            // on top of it would quietly override the number the user set.
+            let small = if layer.index == 0 { 1.0 } else { small_loop_factor(path) };
             let feed =
                 feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
                     * layer.speed_scale
@@ -1225,22 +1228,40 @@ fn layer_flow_cap_mm3_s(layer: &LayerPlan, tool: &ToolSettings) -> f64 {
 /// small-perimeter rule (50% speed on small loops).
 const SMALL_LOOP_MM: f64 = 40.0;
 
-/// Pace factor (≤1) for small closed wall loops, fading linearly from full
-/// speed at [`SMALL_LOOP_MM`] down to half speed. Applied at emission (and to
-/// the segment feeds), not inside `feed_for` — the flow-clamp audit
-/// reads `feed_for` and must not report thermal pacing as a flow limit.
+/// Pace factor (≤1) for a small wall feature, fading linearly from full speed
+/// at [`SMALL_LOOP_MM`] down to half. Applied at emission (and to the segment
+/// feeds), not inside `feed_for` — the flow-clamp audit reads `feed_for` and
+/// must not report thermal pacing as a flow limit.
+///
+/// Measured on PATH LENGTH, not on a closed circumference. Every wall loop is
+/// opened a hair short of its own start by `apply_seam_gap`, so keying this on
+/// `path.closed` meant it fired for nothing — a fact hidden for as long as
+/// outer walls were exempt from that trim because they scarfed. It is the
+/// SIZE of a feature that says whether it can shed heat between passes;
+/// whether its loop happens to be closed says nothing.
+///
+/// Gap fill counts too. A gap stroke lives in the sliver between two walls of
+/// the same small feature, laid seconds after them into plastic that has not
+/// set — and it was taking the full external-perimeter speed while the loop
+/// around it was paced, which is how a 0.9 mm free-standing rib ends up
+/// stirred rather than printed.
 fn small_loop_factor(path: &ToolPath) -> f64 {
-    if !path.closed
-        || !matches!(
-            path.kind,
-            PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
-        )
-    {
+    if !matches!(
+        path.kind,
+        PathKind::ExternalPerimeter
+            | PathKind::Perimeter
+            | PathKind::OverhangWall
+            | PathKind::GapFill
+    ) {
         return 1.0;
     }
     let n = path.points.len();
+    if n < 2 {
+        return 1.0;
+    }
+    let segs = if path.closed { n } else { n - 1 };
     let mut circ = 0.0;
-    for k in 0..n {
+    for k in 0..segs {
         circ += dist_mm(path.points[k], path.points[(k + 1) % n]);
         if circ >= SMALL_LOOP_MM {
             return 1.0;
@@ -1993,9 +2014,12 @@ fn layer_naive_seconds(plan: &LayerPlan, s: &Settings, tools: &Tools) -> f64 {
             continue;
         }
         let tool = tools.get(path.tool);
+        // Mirrors emission, first layer included (see `small_loop_factor`),
+        // so the estimate and the g-code cannot disagree about pacing.
+        let small = if plan.index == 0 { 1.0 } else { small_loop_factor(path) };
         let feed =
             feed_for(path, plan.index, plan.height_mm, layer_flow_cap_mm3_s(plan, tool), tool, s)
-                * small_loop_factor(path)
+                * small
                 / 60.0;
         if feed > 1.0e-6 {
             let mut len = 0.0;
@@ -4501,5 +4525,59 @@ mod tests {
             }
         }
         assert!(checked > 20, "only {checked} paths checked");
+    }
+
+    /// A small feature is paced whether or not its loop is closed, and the gap
+    /// stroke inside it is paced with it.
+    ///
+    /// Both halves were broken and both are load-bearing. `apply_seam_gap`
+    /// opens every wall loop, so keying the pace on `path.closed` fired for
+    /// nothing — hidden only while outer walls were exempt from that trim
+    /// because they scarfed. And gap fill took the full external-perimeter
+    /// speed regardless: on a 0.9 mm free-standing rib that meant a 126 mm/s
+    /// stroke down the middle of two beads laid moments earlier.
+    #[test]
+    fn a_small_feature_is_paced_and_so_is_the_gap_inside_it() {
+        let mut s = single_wall_cube();
+        s.wall_count = 2;
+        // A 6 mm cube: 24 mm around, comfortably inside SMALL_LOOP_MM.
+        let plans = generate(&mesh::Mesh::cube(6.0), &s);
+        let nominal = s.external_perimeter_speed_mm_s;
+        let g = to_gcode(&plans, &s);
+
+        // Layer 2+ (the first layer is exempt — its speed is an absolute).
+        let chunk = layer_chunk(&g, 3);
+        let feeds: Vec<f64> = chunk
+            .lines()
+            .filter(|l| l.starts_with("G1 ") && l.contains(" X") && l.contains(" E") && !l.contains("E-"))
+            .filter_map(|l| l.split(" F").nth(1).and_then(|f| f.split(' ').next().unwrap_or("").parse::<f64>().ok()))
+            .collect();
+        assert!(!feeds.is_empty(), "no feeds on the wall");
+        let fastest = feeds.iter().cloned().fold(0.0f64, f64::max) / 60.0;
+        assert!(
+            fastest < nominal * 0.95,
+            "a {nominal:.0} mm/s nominal on a 24 mm loop should be paced, got {fastest:.1} mm/s"
+        );
+
+        // The pace is a property of the path, not of its closure: a loop that
+        // apply_seam_gap has opened is still a small loop.
+        let mut open_loop = plans[3].paths[0].clone();
+        assert!(!open_loop.closed, "apply_seam_gap should have opened this loop");
+        let paced = super::small_loop_factor(&open_loop);
+        assert!(paced < 1.0, "an opened small loop must still pace, got {paced}");
+        open_loop.closed = true;
+        assert!(
+            (super::small_loop_factor(&open_loop) - paced).abs() < 0.05,
+            "closing the loop should barely change its pace"
+        );
+
+        // And a short gap stroke paces like the walls it sits between.
+        let mut gap = plans[3].paths[0].clone();
+        gap.kind = PathKind::GapFill;
+        gap.closed = false;
+        assert!(
+            super::small_loop_factor(&gap) < 1.0,
+            "a short gap stroke must be paced, not run at wall speed"
+        );
     }
 }
