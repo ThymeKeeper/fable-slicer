@@ -9,7 +9,7 @@
 //! it avoids unbounded absolute-E growth.
 
 pub mod timeline;
-pub use timeline::{Layer, Move, Playhead, Timeline};
+pub use timeline::{Feature, Layer, Move, Playhead, Timeline};
 
 use std::fmt::Write;
 

@@ -13,12 +13,14 @@ mod calibrate;
 mod coverage;
 mod emit;
 mod fill;
+mod mirror;
 pub mod medial;
 mod paint;
 mod plan;
 mod slice;
 
 pub use calibrate::{test_cube_gcode, TEST_CUBE_H_MM, TEST_CUBE_XY_MM};
+pub use mirror::plans_from_timeline;
 
 pub use emit::{
     audit_combing, audit_flow_clamps, estimate_filament, estimate_filament_per_tool,

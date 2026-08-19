@@ -185,6 +185,9 @@ fn drop_preview(view: &mut ViewMode) {
 struct JobMirror {
     filename: String,
     timeline: gcode::Timeline,
+    /// The timeline rebuilt as layer plans, so the bead renderer draws a
+    /// mirrored job exactly as it draws one of ours.
+    plans: Vec<engine::LayerPlan>,
     head: gcode::Playhead,
     /// When the playhead was last advanced, for the frame delta.
     ticked: std::time::Instant,
@@ -1834,6 +1837,12 @@ struct App {
     /// A fetch in flight (or failed) for this filename, so a 47 MB download
     /// is attempted once per job rather than once per poll.
     job_wanted: Option<String>,
+    /// What the bead buffer was built from: (showing a mirrored job, which
+    /// slice generation, which job). Switching views or loading a job has to
+    /// rebuild it, and nothing else should.
+    beads_built_from: (bool, u64, u64),
+    /// Bumped when a mirrored job is loaded, to invalidate the above.
+    job_gen: u64,
     /// When the last quiet status poll started (None = poll next frame).
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
@@ -2123,6 +2132,8 @@ impl App {
             printer_status: None,
             job: None,
             job_wanted: None,
+            beads_built_from: (false, u64::MAX, u64::MAX),
+            job_gen: 0,
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
@@ -3631,7 +3642,7 @@ impl App {
     /// (Re)build the preview bead instances from the sliced layers, colored
     /// per the active mode. Called after slicing and when the mode changes.
     fn set_preview_instances(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        let Some(layers) = self.sliced.as_ref() else { return };
+        let Some(layers) = self.preview_plans() else { return };
         let hop = self.settings.z_hop_mm;
         let layer_colors = self.layer_color_table();
         let (verts, ends, joints, joint_ends) = build_instances(
@@ -3970,9 +3981,19 @@ impl App {
         self.view == ViewMode::Model
     }
 
-    /// The viewport is showing sliced beads rather than the mesh.
+    /// The viewport is showing beads rather than the mesh.
     fn beads_view(&self) -> bool {
         matches!(self.view, ViewMode::Preview | ViewMode::Machine)
+    }
+
+    /// Which plans the bead renderer draws: the mirrored job in the Machine
+    /// view, this session's slice everywhere else. One renderer, two sources
+    /// — which is the whole reason a job is rebuilt into layer plans.
+    fn preview_plans(&self) -> Option<&[engine::LayerPlan]> {
+        match self.view {
+            ViewMode::Machine => self.job.as_ref().map(|j| j.plans.as_slice()),
+            _ => self.sliced.as_deref(),
+        }
     }
 
     fn upload_filename(&self) -> String {
@@ -4083,7 +4104,7 @@ impl App {
         // change while judging the sliced preview free: the beads recolor from
         // the tool palette (a uniform, tracked by RenderSig) and the hidden mesh
         // isn't touched at all.
-        let show_mesh = !(self.beads_view() && self.sliced.is_some());
+        let show_mesh = !(self.beads_view() && self.preview_plans().is_some());
         if (self.mesh_struct_dirty
             || self.mesh_xform_dirty
             || self.mesh_color_dirty
@@ -4227,6 +4248,20 @@ fn palette_hash(pal: &[[f32; 4]; render::TOOL_PALETTE_LEN]) -> u64 {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let rs = frame.wgpu_render_state().expect("wgpu render state").clone();
+
+        // The bead buffer holds ONE source at a time — this session's slice,
+        // or the job the printer is running. Switching views or loading a job
+        // rebuilds it; a signature keeps that from happening every frame.
+        let want = (self.view == ViewMode::Machine, self.slice_gen, self.job_gen);
+        if want != self.beads_built_from && self.preview_plans().is_some() {
+            self.beads_built_from = want;
+            self.set_preview_instances(&rs);
+            // A mirrored job has its own layer count; show all of it rather
+            // than whatever layer the last slice was parked on.
+            if want.0 {
+                self.preview_layer = self.layer_ends.len().max(1);
+            }
+        }
 
         // A background slice finished? Commit + upload it. While one is in
         // flight, keep repainting so we notice the frame it lands (the worker
@@ -4382,9 +4417,15 @@ impl eframe::App for App {
                     HostReply::Job { filename, timeline } => {
                         match timeline {
                             Ok(timeline) => {
+                                let plans = engine::plans_from_timeline(
+                                    &timeline,
+                                    self.settings.filament_diameter_mm,
+                                );
+                                self.job_gen += 1;
                                 self.job = Some(JobMirror {
                                     filename,
                                     timeline,
+                                    plans,
                                     head: gcode::Playhead::default(),
                                     ticked: std::time::Instant::now(),
                                 });
@@ -6252,8 +6293,8 @@ impl eframe::App for App {
             if camera_moving {
                 ui.ctx().request_repaint();
             }
-            let show_mesh = !(self.beads_view() && self.sliced.is_some());
-            let preview = if self.beads_view() && self.sliced.is_some() {
+            let show_mesh = !(self.beads_view() && self.preview_plans().is_some());
+            let preview = if self.beads_view() && self.preview_plans().is_some() {
                 let n = self.layer_ends.len();
                 let idx = self.preview_layer.saturating_sub(1);
                 let count = self.layer_ends.get(idx).copied().unwrap_or(0);
@@ -6503,7 +6544,7 @@ impl eframe::App for App {
 
             // Vertical layer slider on the right edge of the viewport — drag to
             // set the highest layer shown (lower layers dim). Preview only.
-            if self.beads_view() && self.sliced.is_some() {
+            if self.beads_view() && self.preview_plans().is_some() {
                 let n = self.layer_ends.len();
                 if n > 0 {
                     egui::Area::new(egui::Id::new("layer_slider"))

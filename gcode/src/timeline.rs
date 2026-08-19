@@ -30,6 +30,66 @@ pub struct Move {
     pub at_byte: u32,
     /// Lays material down (rather than travelling or retracting).
     pub extruding: bool,
+    /// Filament consumed on this move (mm of filament) — what a bead's width
+    /// is reconstructed from when the timeline is drawn.
+    pub e_mm: f32,
+    /// What the file said it was printing, from its `;TYPE:` comments. Every
+    /// slicer in circulation writes these and they agree closely enough to
+    /// map; a file without them draws as one feature, which is honest.
+    pub feature: Feature,
+}
+
+/// The feature a move belongs to, as named by the file's `;TYPE:` comments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Feature {
+    #[default]
+    Other,
+    OuterWall,
+    InnerWall,
+    Overhang,
+    Infill,
+    Solid,
+    Top,
+    Bottom,
+    Bridge,
+    GapFill,
+    Support,
+    Skirt,
+}
+
+impl Feature {
+    /// Map a `;TYPE:` label. Matched loosely and case-insensitively: the
+    /// slicers spell these differently ("Outer wall", "External perimeter",
+    /// "WALL-OUTER") and gain new ones between versions.
+    pub fn parse(label: &str) -> Feature {
+        let l = label.trim().to_ascii_lowercase();
+        let has = |a: &str, b: &str| l.contains(a) && l.contains(b);
+        if l.contains("skirt") || l.contains("brim") {
+            Feature::Skirt
+        } else if l.contains("support") {
+            Feature::Support
+        } else if l.contains("overhang") {
+            Feature::Overhang
+        } else if l.contains("bridge") {
+            Feature::Bridge
+        } else if l.contains("gap") {
+            Feature::GapFill
+        } else if has("outer", "wall") || has("external", "perimeter") || l.contains("wall-outer") {
+            Feature::OuterWall
+        } else if l.contains("wall") || l.contains("perimeter") {
+            Feature::InnerWall
+        } else if l.contains("top") {
+            Feature::Top
+        } else if l.contains("bottom") {
+            Feature::Bottom
+        } else if l.contains("solid") {
+            Feature::Solid
+        } else if l.contains("infill") || l.contains("fill") {
+            Feature::Infill
+        } else {
+            Feature::Other
+        }
+    }
 }
 
 /// A printed layer: the Z it sits at and where it starts.
@@ -65,6 +125,7 @@ struct Parser {
     /// Multiplier into mm — 25.4 after a G20, 1.0 after a G21.
     scale: f64,
     layer_z: Option<f64>,
+    feature: Feature,
     /// Z last set by NON-extruding motion since the previous extrusion — the
     /// layer-change signal (see `commit`).
     pending_z: Option<f64>,
@@ -84,6 +145,7 @@ impl Timeline {
             abs_e: false,
             scale: 1.0,
             layer_z: None,
+            feature: Feature::default(),
             pending_z: None,
             t: 0.0,
         };
@@ -92,10 +154,16 @@ impl Timeline {
         for line in src.split(|&b| b == b'\n') {
             let start_of_line = at;
             at += line.len() + 1;
-            let code = match line.iter().position(|&b| b == b';') {
-                Some(i) => &line[..i],
-                None => line,
+            let (code, comment) = match line.iter().position(|&b| b == b';') {
+                Some(i) => (&line[..i], &line[i + 1..]),
+                None => (line, &line[line.len()..]),
             };
+            if let Ok(c) = std::str::from_utf8(comment) {
+                let c = c.trim_start();
+                if let Some(label) = c.strip_prefix("TYPE:") {
+                    p.feature = Feature::parse(label);
+                }
+            }
             let code = std::str::from_utf8(code).unwrap_or("").trim();
             if code.is_empty() {
                 continue;
@@ -349,6 +417,8 @@ impl Parser {
             t_end: self.t as f32,
             at_byte,
             extruding,
+            e_mm: (e_new - self.e) as f32,
+            feature: self.feature,
         });
         self.pos = to;
         self.e = e_new;
