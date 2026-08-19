@@ -1884,6 +1884,15 @@ struct App {
     frame_last: std::time::Instant,
     frame_report: std::time::Instant,
     frame_times: Vec<f32>,
+    /// Scene renders in the current FABLE_FRAME_LOG window. Frames minus this
+    /// is how often a stale texture was re-blitted — the number that hid the
+    /// frozen-nozzle bug from the frame rate.
+    renders: u32,
+    /// Millimetres the RENDERED hotend moved between consecutive frames, over
+    /// the current FABLE_FRAME_LOG window. Frame rate says how often the
+    /// picture changes; this says how far the nozzle jumps when it does —
+    /// which is the thing a person actually judges as smooth or stepped.
+    nozzle_steps: Vec<f32>,
     /// When the last quiet status poll started (None = poll next frame).
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
@@ -2180,6 +2189,8 @@ impl App {
             frame_last: std::time::Instant::now(),
             frame_report: std::time::Instant::now(),
             frame_times: Vec::new(),
+            renders: 0,
+            nozzle_steps: Vec::new(),
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
@@ -4275,6 +4286,14 @@ struct RenderSig {
     show_stars: bool,
     /// (count, joint_count, current_layer bits, dim bits, mask), or None in model mode.
     preview: Option<(u32, u32, u32, u32, u32)>,
+    /// Where the mirrored hotend is standing. It has to be here: everything
+    /// else in this signature is pinned while a job runs, so the gate was
+    /// driven by the bead COUNT alone — and count is a tally of extruding
+    /// moves, which cannot change inside a move and does not change at ALL
+    /// during a travel. The scene therefore held its last texture for the
+    /// whole of every travel and every long bead, and the head appeared to
+    /// arrive rather than travel. Bit patterns so the derive stays Eq.
+    nozzle: Option<[u32; 3]>,
     accent: egui::Color32,
     size: (u32, u32),
     content: u64,
@@ -4315,12 +4334,26 @@ impl eframe::App for App {
                 let n = self.frame_times.len() as f32;
                 let mean = self.frame_times.iter().sum::<f32>() / n;
                 let worst = self.frame_times.iter().cloned().fold(0.0f32, f32::max);
+                let step = {
+                    let mut v = std::mem::take(&mut self.nozzle_steps);
+                    v.sort_by(|a: &f32, b| a.partial_cmp(b).unwrap());
+                    if v.is_empty() {
+                        String::new()
+                    } else {
+                        let q = |f: f32| v[((v.len() as f32 - 1.0) * f) as usize];
+                        format!(
+                            "  nozzle step mm: p50 {:.2} p90 {:.2} p99 {:.2} max {:.1}",
+                            q(0.5), q(0.9), q(0.99), v[v.len() - 1]
+                        )
+                    }
+                };
                 eprintln!(
-                    "frames: {:.0}/s  mean {:.1} ms  worst {:.1} ms  ({} frames, {} beads drawn)",
+                    "frames: {:.0}/s  mean {:.1} ms  worst {:.1} ms  ({} frames, {} redraws, {} beads drawn){step}",
                     1.0 / mean.max(1.0e-6),
                     mean * 1000.0,
                     worst * 1000.0,
                     self.frame_times.len(),
+                    std::mem::take(&mut self.renders),
                     self.layer_ends.last().copied().unwrap_or(0),
                 );
                 self.frame_times.clear();
@@ -6536,6 +6569,12 @@ impl eframe::App for App {
                 // model matrix through the shared uniform.
                 match &nozzle_at {
                     Some(at) if *at != self.nozzle_parked => {
+                        if self.frame_log && self.nozzle_parked[0] != f32::MAX {
+                            let p = self.nozzle_parked;
+                            self.nozzle_steps.push(
+                                ((at[0] - p[0]).powi(2) + (at[1] - p[1]).powi(2) + (at[2] - p[2]).powi(2)).sqrt(),
+                            );
+                        }
                         self.nozzle_parked = *at;
                         self.scene.set_nozzle(&rs.device, &rs.queue, &nozzle_verts(*at));
                     }
@@ -6595,6 +6634,13 @@ impl eframe::App for App {
                 show_mesh,
                 show_stars: self.show_stars,
                 preview: preview_sig,
+                nozzle: (self.nozzle_parked[0] != f32::MAX).then(|| {
+                    [
+                        self.nozzle_parked[0].to_bits(),
+                        self.nozzle_parked[1].to_bits(),
+                        self.nozzle_parked[2].to_bits(),
+                    ]
+                }),
                 accent: self.accent,
                 size: (w, h),
                 content: self.content_version,
@@ -6611,6 +6657,7 @@ impl eframe::App for App {
                     label_color,
                 );
                 self.last_render_sig = Some(sig);
+                self.renders += 1;
             }
 
             ui.painter().image(
@@ -8029,60 +8076,191 @@ fn finish_slice(
 /// Emit one bead segment `a→b`, subdivided into ≤ `max_seg` mm pieces when set
 /// (paint mode) so a brush can target a sub-portion of a long straight run.
 #[allow(clippy::too_many_arguments)]
-/// A hotend, roughly a Revo: brass tip, anodized heater block, a bright
-/// heatbreak, and a finned heatsink. Built in world coordinates with `tip` at
-/// the nozzle's point, so the caller parks it by rebuilding rather than by
-/// transforming — it is a few hundred vertices and it only moves when the
-/// print does.
+/// The hotend, modelled on a Revo nozzle: brass point, red silicone sock over
+/// the heater core, brass body, a steel collar under the brass flange, the
+/// coil spring, and the thin brass tube it rides on. Dimensions are the real
+/// ones in millimetres, so it sits over the print at the scale a hotend
+/// actually has.
 ///
-/// Vertex layout matches `Scene::set_nozzle`: `[pos.xyz, normal.xyz, rgb]`.
-/// Dimensions are the real ones in millimetres, so it sits over the print at
-/// the scale a hotend actually has.
-fn nozzle_verts(tip: [f32; 3]) -> Vec<[f32; 9]> {
-    const BRASS: [f32; 3] = [0.78, 0.60, 0.26];
-    const BLOCK: [f32; 3] = [0.16, 0.16, 0.18];
-    const STEEL: [f32; 3] = [0.62, 0.64, 0.68];
-    const FIN: [f32; 3] = [0.50, 0.53, 0.57];
-    let mut v: Vec<[f32; 9]> = Vec::with_capacity(700);
-    // Each band is a truncated cone from (r0, z0) to (r1, z1); a cylinder is
-    // one with equal radii, and the nozzle's point is one that closes to zero.
-    let mut band = |r0: f32, z0: f32, r1: f32, z1: f32, c: [f32; 3]| {
-        const N: usize = 20;
-        let dz = (z1 - z0).max(1.0e-4);
-        // Slope of the side, so the normal leans out (or in) with the wall
-        // instead of pointing flat sideways on a cone.
-        let nz = (r0 - r1) / dz;
-        for i in 0..N {
-            let (a0, a1) = (
-                i as f32 / N as f32 * std::f32::consts::TAU,
-                (i + 1) as f32 / N as f32 * std::f32::consts::TAU,
-            );
-            let (c0, s0, c1, s1) = (a0.cos(), a0.sin(), a1.cos(), a1.sin());
-            let p = |r: f32, z: f32, ca: f32, sa: f32| {
-                [tip[0] + r * ca, tip[1] + r * sa, tip[2] + z]
-            };
-            let n0 = [c0, s0, nz];
-            let n1 = [c1, s1, nz];
-            let (a, b) = (p(r0, z0, c0, s0), p(r0, z0, c1, s1));
-            let (d, e) = (p(r1, z1, c0, s0), p(r1, z1, c1, s1));
-            for (pos, nor) in [(a, n0), (b, n1), (d, n0), (b, n1), (e, n1), (d, n0)] {
-                v.push([pos[0], pos[1], pos[2], nor[0], nor[1], nor[2], c[0], c[1], c[2]]);
+/// Built ONCE in local coordinates (tip at the origin) and cached: the shape
+/// never changes, only where it stands, so parking it is an add per vertex
+/// rather than several thousand sin/cos. The alternative — a model matrix —
+/// would mean threading a second uniform through a pipeline that otherwise
+/// shares the scene's.
+///
+/// Vertex layout matches `Scene::set_nozzle`: `[pos.xyz, normal.xyz, rgb,
+/// metal]`, where metal 0 is matte silicone and 1 a polished turned surface.
+fn nozzle_verts(tip: [f32; 3]) -> Vec<[f32; 10]> {
+    nozzle_mesh()
+        .iter()
+        .map(|v| {
+            let mut o = *v;
+            o[0] += tip[0];
+            o[1] += tip[1];
+            o[2] += tip[2];
+            o
+        })
+        .collect()
+}
+
+fn nozzle_mesh() -> &'static [[f32; 10]] {
+    static MESH: std::sync::OnceLock<Vec<[f32; 10]>> = std::sync::OnceLock::new();
+    MESH.get_or_init(build_nozzle_mesh)
+}
+
+/// Sides on every turned surface. The whole hotend is a lathe part, so this
+/// is the only smoothness knob that matters.
+const NOZ_SIDES: usize = 28;
+
+/// A truncated cone from (r0, z0) to (r1, z1); equal radii make a cylinder.
+/// The normal leans with the wall so a cone shades as a cone.
+fn noz_band(v: &mut Vec<[f32; 10]>, r0: f32, z0: f32, r1: f32, z1: f32, c: [f32; 3], m: f32) {
+    let dz = (z1 - z0).max(1.0e-4);
+    let nz = (r0 - r1) / dz;
+    for i in 0..NOZ_SIDES {
+        let (a0, a1) = (
+            i as f32 / NOZ_SIDES as f32 * std::f32::consts::TAU,
+            (i + 1) as f32 / NOZ_SIDES as f32 * std::f32::consts::TAU,
+        );
+        let (c0, s0, c1, s1) = (a0.cos(), a0.sin(), a1.cos(), a1.sin());
+        let p = |r: f32, z: f32, ca: f32, sa: f32| [r * ca, r * sa, z];
+        let (n0, n1) = ([c0, s0, nz], [c1, s1, nz]);
+        let (a, b) = (p(r0, z0, c0, s0), p(r0, z0, c1, s1));
+        let (d, e) = (p(r1, z1, c0, s0), p(r1, z1, c1, s1));
+        for (pos, nor) in [(a, n0), (b, n1), (d, n0), (b, n1), (e, n1), (d, n0)] {
+            v.push([pos[0], pos[1], pos[2], nor[0], nor[1], nor[2], c[0], c[1], c[2], m]);
+        }
+    }
+}
+
+/// A flat annulus at height `z` — the shoulder where one diameter steps to
+/// another, and the ring that makes the top of the tube read as a bore.
+fn noz_ring(v: &mut Vec<[f32; 10]>, ri: f32, ro: f32, z: f32, up: bool, c: [f32; 3], m: f32) {
+    let n = [0.0, 0.0, if up { 1.0 } else { -1.0 }];
+    for i in 0..NOZ_SIDES {
+        let (a0, a1) = (
+            i as f32 / NOZ_SIDES as f32 * std::f32::consts::TAU,
+            (i + 1) as f32 / NOZ_SIDES as f32 * std::f32::consts::TAU,
+        );
+        let (c0, s0, c1, s1) = (a0.cos(), a0.sin(), a1.cos(), a1.sin());
+        let q = |r: f32, ca: f32, sa: f32| [r * ca, r * sa, z];
+        for pos in [
+            q(ri, c0, s0), q(ro, c0, s0), q(ro, c1, s1),
+            q(ri, c0, s0), q(ro, c1, s1), q(ri, c1, s1),
+        ] {
+            v.push([pos[0], pos[1], pos[2], n[0], n[1], n[2], c[0], c[1], c[2], m]);
+        }
+    }
+}
+
+/// The spring: a circle of radius `wire` swept along a helix. The frame comes
+/// from the helix's own tangent and its outward radial, which is enough for a
+/// coil — no parallel transport needed when the curve never flips.
+fn noz_helix(v: &mut Vec<[f32; 10]>, r: f32, wire: f32, z0: f32, z1: f32, turns: f32, c: [f32; 3], m: f32) {
+    const STEPS: usize = 176;
+    const ROUND: usize = 8;
+    let tau = std::f32::consts::TAU;
+    let ring_at = |u: f32| -> Vec<([f32; 3], [f32; 3])> {
+        let ang = u * turns * tau;
+        let (ca, sa) = (ang.cos(), ang.sin());
+        let center = [r * ca, r * sa, z0 + u * (z1 - z0)];
+        // d(center)/du, normalized.
+        let t = {
+            let d = [-r * sa * turns * tau, r * ca * turns * tau, z1 - z0];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1.0e-6);
+            [d[0] / l, d[1] / l, d[2] / l]
+        };
+        let n1 = [ca, sa, 0.0];
+        let n2 = {
+            let x = [
+                t[1] * n1[2] - t[2] * n1[1],
+                t[2] * n1[0] - t[0] * n1[2],
+                t[0] * n1[1] - t[1] * n1[0],
+            ];
+            let l = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt().max(1.0e-6);
+            [x[0] / l, x[1] / l, x[2] / l]
+        };
+        (0..ROUND)
+            .map(|k| {
+                let ph = k as f32 / ROUND as f32 * tau;
+                let (cp, sp) = (ph.cos(), ph.sin());
+                let nor = [
+                    n1[0] * cp + n2[0] * sp,
+                    n1[1] * cp + n2[1] * sp,
+                    n1[2] * cp + n2[2] * sp,
+                ];
+                (
+                    [
+                        center[0] + nor[0] * wire,
+                        center[1] + nor[1] * wire,
+                        center[2] + nor[2] * wire,
+                    ],
+                    nor,
+                )
+            })
+            .collect()
+    };
+    let mut prev = ring_at(0.0);
+    for i in 1..=STEPS {
+        let cur = ring_at(i as f32 / STEPS as f32);
+        for k in 0..ROUND {
+            let k2 = (k + 1) % ROUND;
+            for (pos, nor) in [prev[k], prev[k2], cur[k], prev[k2], cur[k2], cur[k]] {
+                v.push([pos[0], pos[1], pos[2], nor[0], nor[1], nor[2], c[0], c[1], c[2], m]);
             }
         }
-    };
-    // Nozzle: a fine point opening into the brass body.
-    band(0.2, 0.0, 1.6, 1.2, BRASS);
-    band(1.6, 1.2, 3.2, 3.4, BRASS);
-    band(3.2, 3.4, 3.2, 4.6, BRASS);
-    // Heater block — the wide part that reads as "hotend" at a glance.
-    band(6.5, 4.6, 6.5, 13.0, BLOCK);
-    // Heatbreak, then the finned stack above it.
-    band(2.6, 13.0, 2.6, 16.0, STEEL);
-    for k in 0..5 {
-        let z = 16.0 + k as f32 * 2.6;
-        band(6.0, z, 6.0, z + 1.1, FIN);
-        band(3.0, z + 1.1, 3.0, z + 2.6, STEEL);
+        prev = cur;
     }
+}
+
+fn build_nozzle_mesh() -> Vec<[f32; 10]> {
+    const BRASS: [f32; 3] = [0.80, 0.62, 0.27];
+    const SOCK: [f32; 3] = [0.76, 0.11, 0.10];
+    const STEEL: [f32; 3] = [0.57, 0.59, 0.63];
+    const SPRING: [f32; 3] = [0.26, 0.26, 0.29];
+    // Turned brass and steel are polished; silicone only sheens.
+    const MET: f32 = 1.0;
+    const RUB: f32 = 0.10;
+    let mut v: Vec<[f32; 10]> = Vec::with_capacity(20_000);
+
+    // --- the brass point, below the sock ---
+    noz_ring(&mut v, 0.0, 0.20, 0.0, false, BRASS, MET);  // the orifice face
+    noz_band(&mut v, 0.20, 0.00, 0.62, 0.38, BRASS, MET);
+    noz_band(&mut v, 0.62, 0.38, 2.05, 3.10, BRASS, MET);
+
+    // --- the silicone sock: the one feature that says "Revo" at a glance ---
+    noz_ring(&mut v, 2.05, 8.00, 3.10, false, SOCK, RUB);
+    noz_band(&mut v, 8.00, 3.10, 8.00, 8.55, SOCK, RUB);
+    // Its top rolls over rather than ending square.
+    noz_band(&mut v, 8.00, 8.55, 7.55, 9.05, SOCK, RUB);
+    noz_ring(&mut v, 3.55, 7.55, 9.05, true, SOCK, RUB);
+
+    // --- heater core and body ---
+    // The core's lip sits just INSIDE the sock's mouth — the silicone laps
+    // over the brass, not the other way round.
+    noz_band(&mut v, 7.50, 9.05, 7.50, 9.62, BRASS, MET);
+    noz_ring(&mut v, 3.55, 7.50, 9.62, true, BRASS, MET);
+    // Body, tapering very slightly wider as it rises (as the real one does).
+    noz_band(&mut v, 3.35, 9.62, 3.55, 22.60, BRASS, MET);
+
+    // --- the steel collar under the flange ---
+    noz_ring(&mut v, 1.35, 3.55, 22.60, true, BRASS, MET);
+    noz_band(&mut v, 1.35, 22.60, 1.35, 24.70, STEEL, MET);
+
+    // --- brass flange, chamfered top and bottom ---
+    noz_ring(&mut v, 1.35, 3.30, 24.70, false, BRASS, MET);
+    noz_band(&mut v, 3.30, 24.70, 3.60, 25.10, BRASS, MET);
+    noz_band(&mut v, 3.60, 25.10, 3.60, 25.95, BRASS, MET);
+    noz_band(&mut v, 3.60, 25.95, 3.30, 26.35, BRASS, MET);
+    noz_ring(&mut v, 1.15, 3.30, 26.35, true, BRASS, MET);
+
+    // --- the tube, and the spring riding on it ---
+    noz_band(&mut v, 1.15, 26.35, 1.15, 46.70, BRASS, MET);
+    noz_helix(&mut v, 1.68, 0.34, 26.80, 37.80, 10.5, SPRING, MET);
+    // Open bore at the top, so it reads as a tube and not a rod.
+    noz_ring(&mut v, 0.72, 1.15, 46.70, true, BRASS, MET);
+    noz_band(&mut v, 0.72, 46.70, 0.72, 45.60, BRASS, MET);
+
     v
 }
 
@@ -8646,5 +8824,81 @@ mod tests {
         let t = mesh::Transform { rotation: r, ..Default::default() };
         let p = t.apply_linear([1.0, 0.0, 0.0]);
         assert!((p[0]).abs() < 1e-9 && (p[1] - 1.0).abs() < 1e-9, "{p:?}");
+    }
+
+    /// Renders the hotend mesh to a PPM so its silhouette can be judged
+    /// against a photograph. Ignored by default — it writes a file and is
+    /// looked at, not asserted. Run it with:
+    ///   cargo test -p gui nozzle_portrait -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn nozzle_portrait() {
+        let v = super::nozzle_mesh();
+        let (w, h) = (420usize, 900usize);
+        let (mut zb, mut img) = (vec![f32::MAX; w * h], vec![250u8; w * h * 3]);
+        let s = h as f32 / 52.0;
+        let (ox, oz) = (w as f32 / 2.0, h as f32 - 20.0);
+        let light = [0.30f32, 0.84, 0.45];
+        for tri in v.chunks(3) {
+            let p: Vec<[f32; 3]> = tri.iter().map(|a| [a[0], a[1], a[2]]).collect();
+            let n: Vec<[f32; 3]> = tri.iter().map(|a| [a[3], a[4], a[5]]).collect();
+            let c = [tri[0][6], tri[0][7], tri[0][8]];
+            let sc = |q: [f32; 3]| [ox + q[0] * s, oz - q[2] * s];
+            let (a, b, cc) = (sc(p[0]), sc(p[1]), sc(p[2]));
+            let x0 = a[0].min(b[0]).min(cc[0]).floor().max(0.0) as usize;
+            let x1 = a[0].max(b[0]).max(cc[0]).ceil().min(w as f32 - 1.0) as usize;
+            let y0 = a[1].min(b[1]).min(cc[1]).floor().max(0.0) as usize;
+            let y1 = a[1].max(b[1]).max(cc[1]).ceil().min(h as f32 - 1.0) as usize;
+            let area = (b[0] - a[0]) * (cc[1] - a[1]) - (cc[0] - a[0]) * (b[1] - a[1]);
+            if area.abs() < 1.0e-9 {
+                continue;
+            }
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                    let w0 = ((b[0] - fx) * (cc[1] - fy) - (cc[0] - fx) * (b[1] - fy)) / area;
+                    let w1 = ((cc[0] - fx) * (a[1] - fy) - (a[0] - fx) * (cc[1] - fy)) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let depth = -(p[0][1] * w0 + p[1][1] * w1 + p[2][1] * w2);
+                    let i = py * w + px;
+                    if depth >= zb[i] {
+                        continue;
+                    }
+                    zb[i] = depth;
+                    let nn = [
+                        n[0][0] * w0 + n[1][0] * w1 + n[2][0] * w2,
+                        n[0][1] * w0 + n[1][1] * w1 + n[2][1] * w2,
+                        n[0][2] * w0 + n[1][2] * w1 + n[2][2] * w2,
+                    ];
+                    let l = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]).sqrt().max(1.0e-6);
+                    let d = ((nn[0] * light[0] + nn[1] * light[1] + nn[2] * light[2]) / l)
+                        .abs()
+                        .clamp(0.0, 1.0);
+                    // Mirrors fs_nozzle: diffuse plus a tinted specular lobe,
+                    // so the colour judged here is the colour that ships.
+                    let m = tri[0][9];
+                    let sh = (0.28 - 0.17 * m) + (0.62 + 0.08 * m) * d;
+                    let spec = (d.powf(16.0) * 0.30 + d.powf(5.0) * 0.10) * m;
+                    let tint = [
+                        1.00 * 0.25 + c[0] * 0.75,
+                        0.97 * 0.25 + c[1] * 0.75,
+                        0.92 * 0.25 + c[2] * 0.75,
+                    ];
+                    for k in 0..3 {
+                        img[i * 3 + k] =
+                            ((c[k] * sh + tint[k] * spec).clamp(0.0, 1.0) * 255.0) as u8;
+                    }
+                }
+            }
+        }
+        let out = std::env::var("FABLE_NOZZLE_PPM")
+            .unwrap_or_else(|_| "/tmp/nozzle.ppm".to_string());
+        let mut buf = format!("P6\n{w} {h}\n255\n").into_bytes();
+        buf.extend_from_slice(&img);
+        std::fs::write(&out, buf).unwrap();
+        println!("{} triangles -> {out}", v.len() / 3);
     }
 }

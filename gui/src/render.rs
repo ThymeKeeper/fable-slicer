@@ -135,23 +135,46 @@ struct NozzleOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) @interpolate(flat) metal: f32,
 };
 @vertex fn vs_nozzle(
     @location(0) p: vec3<f32>,
     @location(1) n: vec3<f32>,
     @location(2) c: vec3<f32>,
+    @location(3) m: f32,
 ) -> NozzleOut {
     var o: NozzleOut;
     o.clip = u.mvp * vec4<f32>(p, 1.0);
     o.normal = n;
     o.color = c;
+    o.metal = m;
     return o;
 }
 @fragment fn fs_nozzle(i: NozzleOut) -> @location(0) vec4<f32> {
     let n = normalize(i.normal);
-    let kd = max(dot(n, normalize(u.light.xyz)), 0.0);
+    let l = normalize(u.light.xyz);
+    let kd = max(dot(n, l), 0.0);
     let fd = max(dot(n, normalize(u.mesh_unsel.xyz)), 0.0);
-    return vec4<f32>(i.color * (0.28 + 0.62 * kd + 0.26 * fd), 1.0);
+    // Metal is mostly CONTRAST: little ambient, a steep diffuse, so it goes
+    // dark where it turns away and bright where it faces the key. Silicone
+    // keeps the softer, flatter response.
+    let amb = mix(0.28, 0.11, i.metal);
+    let dg = mix(0.62, 0.70, i.metal);
+    let fg = mix(0.26, 0.30, i.metal);
+    var base = i.color * (amb + dg * kd + fg * fd);
+    // Metal IS its highlight. Lit by diffuse alone, brass reads as yellow
+    // paint — the hue is right and the material is missing. The rig is
+    // camera-relative, so the key light stands in for the view direction and
+    // dot(n, l) serves as a half-vector: a tight lobe for the hot spot, a
+    // broad one for the sheen along the turned flanks. Tinted toward the
+    // base colour, because a metal's highlight carries its own colour rather
+    // than the light's.
+    // Tinted hard toward the metal's own colour: a whiter highlight turns
+    // the flat faces — the flange top, the ring above the sock — to cream,
+    // which reads as painted rather than turned.
+    let tint = mix(vec3<f32>(1.0, 0.97, 0.92), i.color, 0.75);
+    base = base + tint * (pow(kd, 16.0) * 0.30 + pow(kd, 5.0) * 0.10) * i.metal;
+    return vec4<f32>(base, 1.0);
 }
 
 // --- plain lines (bed grid) ---
@@ -645,9 +668,11 @@ impl Scene {
         let nozzle_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_nozzle", "fs_nozzle",
             &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<[f32; 9]>() as u64,
+                array_stride: std::mem::size_of::<[f32; 10]>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+                attributes: &wgpu::vertex_attr_array![
+                    0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32
+                ],
             }],
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::BlendState::REPLACE,
@@ -1206,7 +1231,7 @@ impl Scene {
     /// rgb]` per vertex. Rewritten whenever it moves — a few hundred vertices,
     /// which is cheaper than threading a model matrix through the uniform.
     /// An empty slice hides it.
-    pub fn set_nozzle(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[[f32; 9]]) {
+    pub fn set_nozzle(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[[f32; 10]]) {
         self.nozzle_count = verts.len() as u32;
         if !verts.is_empty() {
             self.nozzle_vbuf.write(device, queue, "nozzle_body", bytemuck::cast_slice(verts));
