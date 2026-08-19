@@ -4866,6 +4866,11 @@ fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
 /// beads; the rest — sub-length specks and culled corner ribs — come back to
 /// the caller so [`absorb_dropped_voids`] can widen a neighbouring ring over
 /// them instead of leaving pinholes.
+/// Narrowest gap bead worth placing, as a fraction of the line width. Below
+/// this the nozzle cannot draw what is being asked of it — see `emit_gap_fill`.
+const GAP_BEAD_MIN_W: f64 = 0.75;
+
+
 fn emit_gap_fill(
     raw: &Polygons,
     lw: f64,
@@ -4888,6 +4893,21 @@ fn emit_gap_fill(
     let (beads, mut runts) = crate::medial::medial_axis_with_runts(&gaps, min, max);
     for tp in beads {
         if tp.length_mm() < GAP_BEAD_MIN_MM {
+            runts.push(tp);
+            continue;
+        }
+        // A bead narrower than the orifice that has to draw it is not a bead.
+        // The extruder meters the volume for, say, a 0.17 mm ribbon, but the
+        // plastic still leaves through a 0.4 mm hole: what lands is an
+        // under-pressured thread that bonds to nothing, and it costs a
+        // travel, a retract and a restart to place. Measured on a real job,
+        // 92% of gap beads were under 0.25 mm and ALL of them under 0.34 mm,
+        // for 0.6% of the print's material across 3,480 separate strokes.
+        // Hand those to the absorb pass instead: it widens the neighbouring
+        // ring toward the void, feathered, which is where that volume wanted
+        // to be in the first place.
+        let wmean = tp.widths.iter().sum::<f64>() / tp.widths.len().max(1) as f64;
+        if wmean < GAP_BEAD_MIN_W * lw {
             runts.push(tp);
             continue;
         }
@@ -7935,49 +7955,58 @@ mod tests {
     }
 
     #[test]
-    fn gap_bead_fills_the_center_slit() {
+    fn the_center_slit_is_closed_by_widening_not_by_a_hair_bead() {
         // A 60×6 mm plate at lw 0.4: concentric walls leave a ~0.2 mm slit
-        // down the middle (6.0 isn't an integer number of bead spacings). The
-        // medial gap bead must trace it — long, thin, and on the centerline.
-        // The straight sides facing each other at 0.6 mm pitch must NOT read
-        // as a pinch (no width-modulated rings here).
+        // down the middle (6.0 isn't an integer number of bead spacings).
+        //
+        // That slit used to be traced with a 0.2 mm "bead". A 0.4 mm orifice
+        // cannot draw one: the extruder meters the volume, the plastic still
+        // leaves through a 0.4 mm hole, and what lands is an under-pressured
+        // thread that bonds to nothing — at the cost of a travel, a retract
+        // and a restart. The volume belongs in the walls that bound the slit,
+        // and `absorb_dropped_voids` is what puts it there.
         let mesh = mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 60.0, 6.0, 2.0]]));
         let layers = generate(&mesh, &all_wall_settings());
         let mid = &layers[layers.len() / 2];
-        let beads: Vec<&ToolPath> =
-            mid.paths.iter().filter(|p| p.kind == PathKind::GapFill).collect();
-        assert!(!beads.is_empty(), "the center slit must get a gap bead");
-        let longest = beads
+
+        // No hair beads.
+        for p in mid.paths.iter().filter(|p| p.kind == PathKind::GapFill) {
+            let ws = p.widths.as_ref().expect("a gap bead carries a width profile");
+            let mean = ws.iter().sum::<f64>() / ws.len() as f64;
+            assert!(
+                mean >= 0.75 * 0.4 - 1e-9,
+                "a {mean:.3} mm gap bead was placed; the nozzle is 0.4"
+            );
+        }
+
+        // The slit's volume went into a wall instead: some ring carries a
+        // per-segment width profile that runs ABOVE nominal, on the midline.
+        let (ymin, ymax) = mid
+            .paths
             .iter()
-            .max_by(|a, b| path_len_mm(a).partial_cmp(&path_len_mm(b)).unwrap())
-            .unwrap();
-        assert!(
-            path_len_mm(longest) > 20.0,
-            "the slit runs most of the plate, got {:.1} mm",
-            path_len_mm(longest)
-        );
-        let ws = longest.widths.as_ref().expect("a gap bead carries a width profile");
-        let mean = ws.iter().sum::<f64>() / ws.len() as f64;
-        assert!((0.1..0.75).contains(&mean), "slit-sized bead, got mean width {mean:.2}");
-        // On the centerline: compare against the plate's own midline.
-        let ext = mid.paths.iter().find(|p| p.kind == PathKind::ExternalPerimeter).unwrap();
-        let (ymin, ymax) = ext
+            .find(|p| p.kind == PathKind::ExternalPerimeter)
+            .unwrap()
             .points
             .iter()
             .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y_mm()), b.max(p.y_mm())));
-        let bead_y =
-            longest.points.iter().map(|p| p.y_mm()).sum::<f64>() / longest.points.len() as f64;
-        assert!(
-            (bead_y - (ymin + ymax) * 0.5).abs() < 0.4,
-            "the bead rides the plate midline"
-        );
+        let midline = (ymin + ymax) * 0.5;
+        let widened = mid.paths.iter().any(|p| {
+            p.kind == PathKind::Perimeter
+                && p.widths.as_ref().is_some_and(|ws| {
+                    ws.iter().zip(&p.points).any(|(&w, pt)| {
+                        w > 0.4 + 1e-3 && (pt.y_mm() - midline).abs() < 1.0
+                    })
+                })
+        });
+        assert!(widened, "the slit was neither filled nor absorbed — it was just dropped");
+
+        // And nothing got pinched below nominal doing it.
         assert!(
             !mid.paths.iter().any(|p| p.kind == PathKind::Perimeter
                 && p.widths.as_ref().is_some_and(|ws| ws.iter().any(|&w| w < 0.4 - 1e-6))),
             "parallel sides at 0.6 mm pitch are not a pinch"
         );
     }
-
     #[test]
     fn short_gap_beads_are_skipped() {
         // A 6×6 column's concentric walls leave only a sub-bead speck at the
