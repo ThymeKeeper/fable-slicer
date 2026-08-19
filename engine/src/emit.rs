@@ -500,7 +500,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // Not on a tool boundary: the toolchange block runs its own
             // pre-dock retract with the outgoing tool's distance.
             let toolchange = multi && tool0 != cur_tool;
-            if layer.travels[i0].retract && rlen > 0.0 && !toolchange {
+            // Every layer change retracts, not only those whose first travel
+            // was going to. Island-aware ordering can start a layer right
+            // where the last one ended, and then the lift happened with a
+            // charged nozzle — the exact bleed this block exists to prevent.
+            // The reference slicer retracts on every layer change for the
+            // same reason (retract_when_changing_layer).
+            if rlen > 0.0 && !toolchange && layer.index > 0 {
                 g.retract(rlen, retract_f);
                 if s.wipe_mm > 0.0 {
                     if let Some(tail) = &wipe_tail {
@@ -2770,7 +2776,7 @@ fn path_exit(p: &ToolPath, layer_index: usize, s: &Settings) -> Point {
 /// Which island a point sits in: the innermost CCW contour containing it.
 /// `None` = outside every outer (skirt/brim territory). Two points with
 /// different islands can never be joined by an in-material route.
-fn island_of(outline: &Polygons, p: Point) -> Option<usize> {
+pub(crate) fn island_of(outline: &Polygons, p: Point) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for (k, c) in outline.contours.iter().enumerate() {
         if c.is_ccw() && c.contains(p) {

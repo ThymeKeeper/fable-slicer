@@ -11,9 +11,10 @@ material = "petg"
 filament_diameter_mm = 1.75
 nozzle_temp_c = 255
 bed_temp_c = 80
-# Retraction distance (mm). Orca defers this to the printer profile; here it
-# rides the filament tier — the same touch-more-than-PLA pull as generic PETG.
-retract_len_mm = 0.6
+# Retraction distance (mm). 0.8 — what this hotend needs (Orca uses 0.8 for
+# every filament on this machine); 0.6 left PETG drawing strings across every
+# void crossing. Retraction is really melt-zone volume — a printer property.
+retract_len_mm = 0.8
 
 # --- from the Orca card, locally adjusted ---
 # Orca's filament_flow_ratio is 0.95; 0.90 measured by print quality

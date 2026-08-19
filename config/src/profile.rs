@@ -1163,7 +1163,9 @@ mod tests {
         assert_eq!(s.fan_max, 0.4);
         assert_eq!(s.bridge_fan_speed, 0.9);
         assert_eq!(s.fan_off_layers, 3); // class = Orca's first-3-layers-off
-        assert_eq!(s.retract_len_mm, 0.6); // filament-tier here; Orca defers to printer
+        // 0.8 = what this hotend's melt zone actually needs (Orca uses it for
+        // every filament on this machine); 0.6 left PETG drawing strings.
+        assert_eq!(s.retract_len_mm, 0.8);
         assert_eq!(s.chamber_temp_c, 0); // PETG never pre-soaks
     }
 
@@ -1390,7 +1392,7 @@ mod tests {
         assert_eq!(s.tools[1].nozzle_temp_c, 255); // petg
         // Retraction distance rides each slot's own filament now.
         assert_eq!(s.tools[0].retract_len_mm, 0.5); // pla
-        assert_eq!(s.tools[1].retract_len_mm, 0.6); // petg
+        assert_eq!(s.tools[1].retract_len_mm, 0.8); // petg
         assert_eq!(s.retract_len_mm, s.tools[0].retract_len_mm); // flat mirrors tool 0
         assert_eq!(s.tools[1].first_layer_nozzle_temp_c, 255); // PETG: no bump (shreds hot)
         // Colors: parsed hex, garbage → the neutral fallback.
