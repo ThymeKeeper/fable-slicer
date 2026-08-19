@@ -969,6 +969,9 @@ pub struct Playhead {
     /// A snap-sized jump that one reading asked for and no reading has yet
     /// confirmed. Held rather than obeyed — see [`Playhead::sync`].
     snap_pending: Option<f32>,
+    /// Whether a believed position has ever placed the head. Before that it is
+    /// not tracking, it is waiting, and the first reading goes straight in.
+    anchored: bool,
 }
 
 /// Position error beyond which the playhead gives up on catching up and just
@@ -988,17 +991,18 @@ const MAX_CATCH_UP: f32 = 2.5;
 const MIN_CRAWL: f32 = 0.2;
 /// Below this the machine has not printed enough for a trustworthy ratio.
 const MIN_RATIO_S: f32 = 8.0;
-/// The most timeline a SINGLE frame may consume. A frame that took a long
-/// time — a GPU stall, a hidden window, a slow first frame — would otherwise
-/// hand the head that whole interval at once, which is a teleport however
-/// perfect the tracking is. Capped, the remainder becomes ordinary phase
-/// error that the correction carries at up to `MAX_CATCH_UP`; the head keeps
-/// up as long as frames stay under MAX_FRAME_S * MAX_CATCH_UP.
-const MAX_FRAME_S: f32 = 0.15;
 
 impl Default for Playhead {
     fn default() -> Self {
-        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false, since: None, snap_pending: None }
+        Playhead {
+            t: 0.0,
+            rate: 1.0,
+            correction: 0.0,
+            learned: false,
+            since: None,
+            snap_pending: None,
+            anchored: false,
+        }
     }
 }
 
@@ -1006,7 +1010,17 @@ impl Playhead {
     /// Free-run by `dt` real seconds, at the learned rate plus whatever
     /// correction is still being absorbed.
     pub fn advance(&mut self, dt: f32) {
-        let dt = dt.clamp(0.0, MAX_FRAME_S);
+        // Every second that passes is a second the machine printed, so the
+        // head spends all of it. Capping the step to keep a slow frame from
+        // looking like a jump was a mistake worth recording: frames arrive
+        // about once a second when the Machine view is not on screen, so a
+        // cap of a tenth or two meant the head banked 85% of every second and
+        // never got it back. It fell minutes behind, the drift crossed
+        // SNAP_S, and coming back to the view produced exactly the jump the
+        // cap was meant to prevent. A stall is better shown honestly — the
+        // nozzle really did cross that distance — than smoothed into a
+        // desync.
+        let dt = dt.max(0.0);
         // Never runs backwards — a print does not un-print — but never
         // stops either. A floor of zero reads as the head PAUSING every time
         // a reading says it is ahead; crawling instead keeps the motion
@@ -1045,6 +1059,20 @@ impl Playhead {
             _ => {}
         }
         let Some(target) = phase else { return };
+        // The FIRST position ever believed is taken whole, with no
+        // corroboration and no easing. Until it lands the head is not
+        // tracking anything — it sits at t = 0, the start of the file — so
+        // there is no continuity to protect and every poll spent deliberating
+        // is a poll with the nozzle drawn at the wrong end of the print.
+        // (Making the first one wait was worth two seconds of the nozzle
+        // parked on layer 0 and then a jump, every time a job was picked up.)
+        if !self.anchored {
+            self.anchored = true;
+            self.t = target;
+            self.correction = 0.0;
+            self.snap_pending = None;
+            return;
+        }
         let drift = target - self.t;
         if drift.abs() > SNAP_S {
             // A jump this big is either a real discontinuity — a resume, a
@@ -1123,7 +1151,7 @@ mod playhead_tests {
 
     #[test]
     fn a_reading_never_moves_the_head_only_its_rate() {
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
         ph.sync(100.0, 104.0, Some(104.0)); // 4 s behind
         assert_eq!(ph.t, 100.0, "the reading itself moved the head");
         // It closes the gap by running fast, and gets most of the way there
@@ -1139,7 +1167,7 @@ mod playhead_tests {
     fn the_head_never_stutters_or_reverses() {
         // Frame-by-frame motion must stay smooth and forward through a bad
         // reading — this is what the eye actually judges.
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
         let mut prev = ph.t;
         let mut worst_step = 0.0f32;
         for frame in 0..400 {
@@ -1157,31 +1185,52 @@ mod playhead_tests {
     }
 
     #[test]
-    fn a_stalled_frame_does_not_teleport_the_head() {
-        // Rendering hiccups are the one remaining way a perfectly-tracked head
-        // can jump: dt is real time, and handing a 400 ms frame 400 ms of
-        // timeline moves the nozzle 40 mm in one step. The cap turns that into
-        // phase error, which the correction absorbs smoothly.
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
-        ph.advance(0.4);
-        assert!(ph.t - 100.0 <= MAX_FRAME_S + 1.0e-4, "a stalled frame jumped {:.3} s", ph.t - 100.0);
-        // And the head still catches up afterwards, because the machine's next
-        // reading turns the shortfall into a correction.
-        ph.sync(100.0, 100.0, Some(100.6));
-        let mut t = ph.t;
-        for _ in 0..60 {
-            ph.advance(0.05);
-            assert!(ph.t >= t, "never backwards");
-            t = ph.t;
+    fn slow_frames_never_make_the_head_lose_time() {
+        // Frames arrive about once a second when the Machine view is not the
+        // one on screen. Capping how much timeline a single frame may spend
+        // (this was 0.15 s) meant the head banked most of every second and
+        // could never get it back: minutes behind, drift past SNAP_S, and a
+        // jump the moment the view came back. Whatever the frame rate, an
+        // hour of frames must be an hour of print.
+        for frame in [1.0f32, 0.5, 0.25, 1.0 / 60.0] {
+            let mut ph = Playhead { t: 0.0, learned: true, anchored: true, ..Playhead::default() };
+            let n = (60.0 / frame) as u32;
+            for _ in 0..n {
+                ph.advance(frame);
+            }
+            let elapsed = n as f32 * frame;
+            assert!(
+                (ph.t - elapsed).abs() < 1.0e-2,
+                "{frame} s frames: {:.2} s of head for {elapsed:.2} s of print",
+                ph.t
+            );
         }
-        assert!((ph.t - 103.6).abs() < 0.35, "caught up to {:.2}, expected ~103.6", ph.t);
+        // A single long stall is likewise spent in full — the nozzle really
+        // did cross that distance, and pretending otherwise is the desync.
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
+        ph.advance(30.0);
+        assert!((ph.t - 130.0).abs() < 1.0e-3, "a 30 s gap advanced {:.2} s", ph.t - 100.0);
+    }
+
+    #[test]
+    fn the_first_believed_position_lands_at_once() {
+        // Until a reading places it the head is not tracking, it is sitting at
+        // t = 0 — the start of the file. Deliberating over that first fix (by
+        // waiting for a second reading to agree) leaves the nozzle drawn on
+        // layer 0 while the machine is halfway up the part, and then jumps it.
+        let mut ph = Playhead::default();
+        ph.sync(3900.0, 3783.0, Some(3780.0));
+        assert!((ph.t - 3780.0).abs() < 1.0e-3, "the first fix left the head at {:.1}", ph.t);
+        // Once tracking, a wild reading is back to needing corroboration.
+        ph.sync(3902.0, 3785.0, Some(10.0));
+        assert!(ph.t > 3700.0, "a lone outlier moved the tracking head to {:.1}", ph.t);
     }
 
     #[test]
     fn being_ahead_slows_the_head_but_never_parks_it() {
         // A floor of zero reads as the nozzle PAUSING every time a reading
         // says it is ahead — which is exactly what it looked like.
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
         ph.sync(100.0, 90.0, Some(90.0)); // 10 s ahead: as wrong as it gets short of a snap
         let mut prev = ph.t;
         for _ in 0..40 {
@@ -1207,7 +1256,7 @@ mod playhead_tests {
 
     #[test]
     fn a_real_discontinuity_still_goes_straight_there() {
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
         ph.sync(500.0, 500.0, Some(500.0)); // the job is somewhere else entirely
         assert!(ph.t < 101.0, "one reading was enough to move it, to {}", ph.t);
         ph.sync(502.0, 502.0, Some(502.0)); // and the next reading says the same
@@ -1219,7 +1268,7 @@ mod playhead_tests {
         // One mis-match — the layer below, a macro move, a stray position —
         // asks for a jump no other reading agrees with. It must not be obeyed,
         // and it must not poison the readings that follow it either.
-        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        let mut ph = Playhead { t: 100.0, learned: true, anchored: true, ..Playhead::default() };
         ph.sync(100.0, 100.0, Some(40.0)); // 60 s back: nonsense
         assert_eq!(ph.t, 100.0, "the outlier moved the head to {}", ph.t);
         assert_eq!(ph.correction, 0.0, "the outlier left a correction behind");
