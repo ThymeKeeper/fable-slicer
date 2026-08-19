@@ -477,10 +477,13 @@ impl Parser {
                 a1 += TAU;
             }
         }
-        // Sample to a ~0.4 mm chord: fine enough to draw and to place a
-        // nozzle on, cheap enough for a file with a million arcs.
+        // Sample to a ~1 mm chord. The obvious 0.4 mm (a bead width) is far
+        // finer than anything the eye or the timing needs: on a 10 mm radius
+        // a 1 mm chord departs the true arc by 0.012 mm, a thirtieth of a
+        // bead — while a quarter of this file's million segments came from
+        // arc sampling, and every one of them is an instance to draw.
         let sweep = (a1 - a0).abs();
-        let n = ((sweep * r / 0.4).ceil() as usize).clamp(1, 512);
+        let n = ((sweep * r / 1.0).ceil() as usize).clamp(1, 512);
         let arc_len = sweep * r;
         let secs = arc_len / self.feed_mm_s;
         let extruding = de > 0.0;
@@ -756,7 +759,9 @@ G1 X0 Y0 E5
         // the origin: arc length 15.7 mm at 10 mm/s → ~1.57 s.
         let g = "G90\nM83\nG1 X10 Y0 Z0.2 F600\nG3 X0 Y10 I-10 J0 E1 F600\n";
         let tl = Timeline::parse(g.as_bytes());
-        assert!(tl.moves.len() > 20, "arc sampled into segments");
+        // ~1 mm chords over a 15.7 mm quarter-circle: a dozen or so segments,
+        // not the forty the old bead-width sampling produced.
+        assert!(tl.moves.len() > 10, "arc sampled into segments: {}", tl.moves.len());
         let last = tl.moves.last().unwrap();
         assert!((last.to[0]).abs() < 0.01 && (last.to[1] - 10.0).abs() < 0.01);
         // Mid-sweep the head is out on the radius, not on the chord.

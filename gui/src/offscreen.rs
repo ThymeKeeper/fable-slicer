@@ -191,6 +191,10 @@ pub fn run(a: &Args) -> Result<(), String> {
     let preview = crate::render::Preview {
         // The oracle renders a slice, never a live machine.
         nozzle: false,
+        // Tubes by default so the oracle's imagery stays comparable across
+        // versions; FABLE_FLAT_BEADS=1 renders the cheap primitive instead,
+        // which is how the two are compared at a fixed camera.
+        flat_beads: std::env::var("FABLE_FLAT_BEADS").is_ok(),
         count,
         joint_count,
         current_layer: layer as f32,

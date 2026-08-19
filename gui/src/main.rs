@@ -6464,6 +6464,10 @@ impl eframe::App for App {
                     color_mode,
                     tool_palette: self.tool_palette(),
                     nozzle: nozzle_at.is_some(),
+                    // The mirrored view redraws the whole print every frame,
+                    // so it takes the cheap bead. Preview draws once and sits
+                    // there, and keeps the tube.
+                    flat_beads: self.view == ViewMode::Machine,
                 })
             } else {
                 None

@@ -225,6 +225,56 @@ struct BeadOut {
     o.tool = tool;
     return o;
 }
+// The same bead as a single view-facing quad — two triangles instead of the
+// tube's twelve. A bead is one to three pixels wide at working zoom, so the
+// facets were never visible; what the eye reads is the ribbon's silhouette
+// and its round shading, and both survive. The silhouette is exact (the quad
+// spans the cross-section's support along the view-perpendicular axis) and
+// the roundness is synthesised in the normal, the standard impostor. Only
+// the depth is a simplification: the quad is flat where the tube bulged,
+// which shows only where beads interpenetrate at extreme zoom.
+@vertex fn vs_bead_flat(
+    @location(0) lpos: vec3<f32>,
+    @location(1) lnorm: vec3<f32>,
+    @location(2) p0: vec3<f32>,
+    @location(3) dir_len: vec3<f32>,
+    @location(4) dims: vec2<f32>,
+    @location(5) color: vec3<f32>,
+    @location(6) lc: vec2<f32>,
+    @location(7) tool: f32,
+) -> BeadOut {
+    let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
+    let zaxis = vec3<f32>(0.0, 0.0, 1.0);
+    let yaxis = cross(zaxis, xaxis);                  // across, in the bed plane
+    let along = xaxis * (lpos.x * dir_len.z);
+    let mid = p0 + xaxis * (0.5 * dir_len.z);
+    var view = u.cam_eye.xyz - mid;
+    let vlen = length(view);
+    view = select(zaxis, view / vlen, vlen > 1.0e-6);
+    // Walk the cross-section, not the screen. The half of the ellipse facing
+    // the camera spans a quarter turn either side of the view direction, so
+    // the quad's edges land on the silhouette and every point between them
+    // carries the angle it would have on the tube — which is what keeps a
+    // bead lit from above when seen from above. (Rolling the normal toward
+    // the CAMERA instead, the obvious impostor, lights every bead as if the
+    // key light sat on the lens: the whole print goes flat and dark.)
+    let th_v = atan2(dot(view, zaxis), dot(view, yaxis));
+    let th = th_v + lpos.y * 3.14159265;   // lpos.y in [-0.5, 0.5] = +/- a quarter turn
+    let c = cos(th);
+    let s = sin(th);
+    let a = dims.x * 0.5;
+    let b = dims.y * 0.5;
+    var o: BeadOut;
+    o.clip = u.mvp * vec4<f32>(p0 + along + yaxis * (a * c) + zaxis * (b * s), 1.0);
+    // The ellipse's own normal at that angle (gradient of x²/a² + z²/b²).
+    let n_local = normalize(vec2<f32>(c / a, s / b));
+    o.normal = yaxis * n_local.x + zaxis * n_local.y;
+    o.color = color;
+    o.layer = lc.x;
+    o.cat = lc.y;
+    o.tool = tool;
+    return o;
+}
 @fragment fn fs_bead(i: BeadOut) -> @location(0) vec4<f32> {
     let mask = u32(u.ctrl.z + 0.5);
     let cat = u32(i.cat + 0.5);
@@ -402,6 +452,9 @@ pub struct Preview {
     /// Draw the nozzle body (uploaded separately by `set_nozzle`) — on for a
     /// mirrored print, off for a slice preview.
     pub nozzle: bool,
+    /// Draw beads as view-facing quads rather than tubes: a sixth of the
+    /// vertices, for the view that redraws every frame.
+    pub flat_beads: bool,
 }
 
 pub struct Scene {
@@ -410,6 +463,7 @@ pub struct Scene {
     line_pipeline: wgpu::RenderPipeline,
     nozzle_pipeline: wgpu::RenderPipeline,
     bead_pipeline: wgpu::RenderPipeline,
+    bead_flat_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// The render-target size — halved while the camera is moving (dynamic
@@ -463,6 +517,9 @@ pub struct Scene {
     bed_fill_count: u32,
     box_vbuf: wgpu::Buffer,
     box_count: u32,
+    /// The flat bead's two triangles (see `vs_bead_flat`).
+    quad_vbuf: wgpu::Buffer,
+    quad_count: u32,
     inst_vbuf: GrowBuf,
     inst_count: u32,
     joint_pipeline: wgpu::RenderPipeline,
@@ -632,6 +689,28 @@ impl Scene {
             true,
             wgpu::CompareFunction::Less,
             Some(wgpu::Face::Back),
+        );
+        let bead_flat_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_bead_flat", "fs_bead",
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (14 * 4) as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32],
+                },
+            ],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
+            wgpu::CompareFunction::Less,
+            // No culling: the quad turns to face the camera, so which way it
+            // winds depends on where you are standing.
+            None,
         );
         let joint_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_joint", "fs_bead",
@@ -833,6 +912,12 @@ impl Scene {
             contents: bytemuck::cast_slice(&box_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let quad_verts = bead_quad_vertices();
+        let quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bead_quad_base"),
+            contents: bytemuck::cast_slice(&quad_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let blob_verts = blob_vertices();
         let blob_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("joint_base"),
@@ -848,6 +933,7 @@ impl Scene {
             line_pipeline,
             nozzle_pipeline,
             bead_pipeline,
+            bead_flat_pipeline,
             uniform_buf,
             bind_group,
             size: (1, 1),
@@ -878,6 +964,8 @@ impl Scene {
             bed_fill_count: 0,
             box_vbuf,
             box_count: box_verts.len() as u32,
+            quad_vbuf,
+            quad_count: quad_verts.len() as u32,
             inst_vbuf: GrowBuf::default(),
             inst_count: 0,
             joint_pipeline,
@@ -1313,10 +1401,15 @@ impl Scene {
                 let n = p.count.min(self.inst_count);
                 if n > 0 {
                     if let Some(inst) = self.inst_vbuf.as_ref() {
-                        pass.set_pipeline(&self.bead_pipeline);
-                        pass.set_vertex_buffer(0, self.box_vbuf.slice(..));
+                        let (pipe, base, count) = if p.flat_beads {
+                            (&self.bead_flat_pipeline, &self.quad_vbuf, self.quad_count)
+                        } else {
+                            (&self.bead_pipeline, &self.box_vbuf, self.box_count)
+                        };
+                        pass.set_pipeline(pipe);
+                        pass.set_vertex_buffer(0, base.slice(..));
                         pass.set_vertex_buffer(1, inst.slice(..));
-                        pass.draw(0..self.box_count, 0..n);
+                        pass.draw(0..count, 0..n);
                     }
                 }
                 if p.nozzle && self.nozzle_count > 0 {
@@ -1424,6 +1517,27 @@ impl Scene {
 }
 
 /// Unit bead: an open tube along +X (`x` in [0,1]) with a rounded cross-section
+/// Two triangles spanning the segment: x along it in [0,1], y across it in
+/// [-0.5, 0.5]. `vs_bead_flat` turns this to face the camera and sizes it to
+/// the cross-section's silhouette, so six vertices stand in for the tube's
+/// thirty-six.
+fn bead_quad_vertices() -> Vec<Vertex> {
+    let n = [0.0, 0.0, 1.0]; // unused: the shader synthesises the normal
+    let v = |x: f32, y: f32| Vertex { pos: [x, y, 0.0], normal: n };
+    // THREE columns across, not two. With only the silhouette edges, their
+    // normals point in opposite directions and interpolate through zero —
+    // every bead goes dark down its middle. The extra column carries the
+    // crown of the cross-section, where the normal faces the camera-side
+    // top, and the two halves interpolate over a quarter turn each. Still
+    // twelve vertices against the tube's thirty-six.
+    vec![
+        v(0.0, -0.5), v(0.0, 0.0), v(1.0, 0.0),
+        v(0.0, -0.5), v(1.0, 0.0), v(1.0, -0.5),
+        v(0.0, 0.0), v(0.0, 0.5), v(1.0, 0.5),
+        v(0.0, 0.0), v(1.0, 0.5), v(1.0, 0.0),
+    ]
+}
+
 /// (unit circle radius 0.5 in the Y-Z plane). The instance scales the
 /// cross-section to (line width, layer height). Ends are left open; a joint blob
 /// at every vertex rounds the ends and fills corners between segments.
