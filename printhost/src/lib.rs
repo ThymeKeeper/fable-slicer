@@ -37,8 +37,14 @@ pub struct PrintStatus {
     /// a file offset it isn't running ahead of the motion queue.
     pub print_duration_s: f64,
     /// Byte offset the g-code reader has reached, for matching progress
-    /// against a file we sliced ourselves.
+    /// against a file we sliced ourselves. Runs AHEAD of the plastic: the
+    /// reader fills a buffer the motion queue then drains.
     pub file_position: u64,
+    /// Where the nozzle is RIGHT NOW (mm), queue-corrected — Klipper's
+    /// `motion_report.live_position`, the one position report that isn't
+    /// ahead of the deposited material. `toolhead.position` is the end of
+    /// the queued moves and can be a whole layer further on.
+    pub live_pos: Option<[f64; 3]>,
 }
 
 impl Client {
@@ -133,7 +139,7 @@ impl Client {
     pub fn print_status(&self) -> Result<PrintStatus, String> {
         let v = self.call(
             "GET",
-            "/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan",
+            "/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan&motion_report",
         )?;
         let status = &v["result"]["status"];
         let pair = |o: &serde_json::Value| {
@@ -148,6 +154,9 @@ impl Client {
             fan: status["fan"]["speed"].as_f64(),
             print_duration_s: status["print_stats"]["print_duration"].as_f64().unwrap_or(0.0),
             file_position: status["virtual_sdcard"]["file_position"].as_u64().unwrap_or(0),
+            live_pos: status["motion_report"]["live_position"].as_array().and_then(|a| {
+                Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])
+            }),
         })
     }
 

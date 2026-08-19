@@ -247,6 +247,51 @@ impl Timeline {
         }
     }
 
+    /// The move whose end lies closest to `pos`, searched only within
+    /// `window_s` seconds either side of `around_t`.
+    ///
+    /// This is how a machine's REAL position becomes a time on this timeline.
+    /// Searching the whole file would be both slow and ambiguous — a print
+    /// passes through the same XY on every layer — but within a few seconds
+    /// of where the playhead already believes it is, the nearest point is
+    /// the right one. Ties (concentric rings pass near each other) go to the
+    /// candidate closest in time, which is the conservative reading.
+    pub fn nearest_move(&self, pos: [f32; 3], around_t: f32, window_s: f32) -> Option<usize> {
+        if self.moves.is_empty() {
+            return None;
+        }
+        // Search BACKWARDS from the anchor. When the anchor is the file
+        // position, the nozzle is always behind it — the reader fills a
+        // buffer the motion queue drains — so looking forward can only find
+        // the wrong pass. A little slack ahead absorbs the anchor's own
+        // quantisation.
+        let lo = self.move_at_time(around_t - window_s);
+        let hi = self.move_at_time(around_t + 2.0).min(self.moves.len() - 1);
+        let mut best: Option<(f32, f32, usize)> = None; // (dist², |Δt|, index)
+        for i in lo..=hi {
+            let m = self.moves[i];
+            let d = (m.to[0] - pos[0]).powi(2)
+                + (m.to[1] - pos[1]).powi(2)
+                + (m.to[2] - pos[2]).powi(2);
+            let dt = (m.t_end - around_t).abs();
+            let better = match best {
+                None => true,
+                // Only points essentially ON each other count as a tie. This
+                // has to be tighter than the gap between neighbouring passes
+                // (a bead width, 0.4 mm) or every adjacent ring ties with the
+                // right one — and the tie-break, preferring the time nearest
+                // the anchor, then drags the answer back to the reader and
+                // reinstates exactly the lead this is here to remove.
+                Some((bd, bdt, _)) if (d - bd).abs() < 0.01 => dt < bdt,
+                Some((bd, ..)) => d < bd,
+            };
+            if better {
+                best = Some((d, dt, i));
+            }
+        }
+        best.map(|(.., i)| i)
+    }
+
     /// Which layer a move belongs to (0 when the file has none).
     pub fn layer_of(&self, move_idx: usize) -> usize {
         match self.layers.binary_search_by_key(&(move_idx as u32), |l| l.first_move) {
@@ -712,6 +757,31 @@ G1 X0 Y0 E5
     }
 
     #[test]
+    fn a_real_position_finds_its_place_on_the_timeline() {
+        // Two layers tracing the same square: matching a position must pick
+        // the pass the playhead is actually on, not the one below it.
+        let mut g = String::from("G90\nM83\nG1 X0 Y0 Z0.2 F600\n");
+        for z in ["0.2", "0.4"] {
+            g.push_str(&format!("G1 Z{z}\n"));
+            for (x, y) in [(10, 0), (10, 10), (0, 10), (0, 0)] {
+                g.push_str(&format!("G1 X{x} Y{y} E0.3\n"));
+            }
+        }
+        let tl = Timeline::parse(g.as_bytes());
+        assert_eq!(tl.layers.len(), 2);
+        let second = tl.layers[1].first_move as usize;
+        let t_second = tl.moves[second].t_end;
+        // A point on the second layer's run, looked for from a playhead that
+        // believes it is on the second layer.
+        let i = tl.nearest_move([10.0, 10.0, 0.4], t_second, 5.0).unwrap();
+        assert!(i >= second, "found the layer below: move {i} < {second}");
+        assert!((tl.moves[i].to[2] - 0.4).abs() < 1e-6);
+        // Looking from the first layer finds the first layer's copy.
+        let i0 = tl.nearest_move([10.0, 10.0, 0.2], tl.moves[1].t_end, 5.0).unwrap();
+        assert!(i0 < second, "should have stayed on the first layer");
+    }
+
+    #[test]
     fn byte_offsets_anchor_a_resync() {
         let g = "G90\nM83\nG1 X10 Y0 Z0.2 F600 E1\nG1 X20 Y0 E1\n";
         let tl = Timeline::parse(g.as_bytes());
@@ -770,6 +840,12 @@ pub struct Playhead {
     /// until it has absorbed one, the way the machine itself would.
     correction: f32,
     learned: bool,
+    /// The last reading a rate was measured against: (machine seconds,
+    /// timeline seconds). Rate comes from the DIFFERENCE between readings,
+    /// never from the ratio — the machine's clock starts at print start and
+    /// counts the homing and heating the timeline knows nothing about, so a
+    /// ratio would read low forever.
+    since: Option<(f32, f32)>,
 }
 
 /// Position error beyond which the playhead gives up on catching up and just
@@ -789,7 +865,7 @@ const MIN_RATIO_S: f32 = 8.0;
 
 impl Default for Playhead {
     fn default() -> Self {
-        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false }
+        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false, since: None }
     }
 }
 
@@ -816,12 +892,17 @@ impl Playhead {
     /// pops them in and out too. Instead the error becomes a rate the head
     /// carries until it has caught up.
     pub fn sync(&mut self, machine_secs: f32, timeline_t: f32) {
-        if machine_secs > MIN_RATIO_S && timeline_t > 0.0 {
-            let r = (timeline_t / machine_secs).clamp(0.05, 20.0);
-            // First reading takes the measurement whole — the initial 1.0 is
-            // a placeholder, not an estimate worth blending with.
-            self.rate = if self.learned { self.rate * 0.75 + r * 0.25 } else { r };
-            self.learned = true;
+        match self.since {
+            Some((m0, t0)) if machine_secs - m0 >= MIN_RATIO_S => {
+                let r = ((timeline_t - t0) / (machine_secs - m0)).clamp(0.05, 20.0);
+                // The first measurement is taken whole — the initial 1.0 is a
+                // placeholder, not an estimate worth blending with.
+                self.rate = if self.learned { self.rate * 0.75 + r * 0.25 } else { r };
+                self.learned = true;
+                self.since = Some((machine_secs, timeline_t));
+            }
+            None => self.since = Some((machine_secs, timeline_t)),
+            _ => {}
         }
         let drift = timeline_t - self.t;
         if drift.abs() > SNAP_S {
@@ -866,8 +947,23 @@ mod playhead_tests {
     }
 
     #[test]
+    fn the_machines_startup_cannot_bias_the_rate() {
+        // The machine's clock starts at print start and counts homing and
+        // heating; ours starts at the first move. A ratio of the two would
+        // read low forever, so the rate comes from differences.
+        let mut ph = Playhead::default();
+        let startup = 180.0; // three minutes of heating before anything moved
+        for step in 1..=40 {
+            let machine = startup + step as f32 * 30.0;
+            let timeline = step as f32 * 30.0; // real time, 1:1
+            ph.sync(machine, timeline);
+        }
+        assert!((ph.rate - 1.0).abs() < 0.02, "rate {} should be 1.0", ph.rate);
+    }
+
+    #[test]
     fn a_reading_never_moves_the_head_only_its_rate() {
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
         ph.sync(100.0, 104.0); // 4 s behind
         assert_eq!(ph.t, 100.0, "the reading itself moved the head");
         // It closes the gap by running fast, and gets most of the way there
@@ -883,7 +979,7 @@ mod playhead_tests {
     fn the_head_never_stutters_or_reverses() {
         // Frame-by-frame motion must stay smooth and forward through a bad
         // reading — this is what the eye actually judges.
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
         let mut prev = ph.t;
         let mut worst_step = 0.0f32;
         for frame in 0..400 {
@@ -902,7 +998,7 @@ mod playhead_tests {
 
     #[test]
     fn a_real_discontinuity_still_goes_straight_there() {
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
         ph.sync(500.0, 500.0); // the job is somewhere else entirely
         assert!((ph.t - 500.0).abs() < 1.0e-3, "snapped to {}", ph.t);
     }

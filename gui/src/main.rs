@@ -4410,9 +4410,33 @@ impl eframe::App for App {
                             let running = st.state == "printing" || st.state == "paused";
                             match &mut self.job {
                                 Some(job) if running && job.filename == st.filename => {
-                                    let t = job
-                                        .timeline
-                                        .time_at_byte(st.file_position.min(u32::MAX as u64) as u32);
+                                    // Where the machine REALLY is. Its live
+                                    // position is queue-corrected, so unlike
+                                    // the file position (which is the reader,
+                                    // running seconds ahead of the plastic) it
+                                    // can be trusted for phase. Matched to the
+                                    // timeline near where the playhead already
+                                    // believes it is; the file position stays
+                                    // as the fallback for hosts that don't
+                                    // report motion.
+                                    // The file position anchors the SEARCH, the
+                                    // live position refines it. Anchoring on our
+                                    // own estimate instead cannot bootstrap: a
+                                    // playhead that starts at zero would look
+                                    // for the nozzle in the first thirty seconds
+                                    // of the file and lock onto whatever it
+                                    // found there, forever.
+                                    let t_read = job.timeline.time_at_byte(
+                                        st.file_position.min(u32::MAX as u64) as u32,
+                                    );
+                                    let t = st
+                                        .live_pos
+                                        .and_then(|p| {
+                                            let p = [p[0] as f32, p[1] as f32, p[2] as f32];
+                                            job.timeline.nearest_move(p, t_read, 30.0)
+                                        })
+                                        .map(|i| job.timeline.moves[i].t_end)
+                                        .unwrap_or(t_read);
                                     job.head.sync(st.print_duration_s as f32, t);
                                 }
                                 // A different job (or none): mirror what the
