@@ -147,7 +147,14 @@ enum HostReply {
     Status(Result<printhost::PrintStatus, String>),
     /// A running job, parsed into the timeline the playhead walks. Parsed on
     /// the worker: a 47 MB file is a fifth of a second the UI needn't stall.
-    Job { filename: String, timeline: Result<gcode::Timeline, String> },
+    Job {
+        filename: String,
+        /// The parsed motion, and the byte offset each SOURCE LINE starts at
+        /// — so a bead picked in the viewport can name the g-code line that
+        /// produced it. Built here because the worker is the only place that
+        /// ever holds the file's bytes.
+        timeline: Result<(gcode::Timeline, Vec<u32>), String>,
+    },
 }
 
 /// Which of the three views the viewport is showing. Model is the only one
@@ -199,6 +206,9 @@ struct JobMirror {
     /// wipe, and running the head through the first layers during those
     /// draws a print that hasn't started.
     locked: bool,
+    /// Byte offset of the start of each source line, so `Move::at_byte` can be
+    /// turned into a line number for the hover readout.
+    line_starts: Vec<u32>,
 }
 
 /// What the preview colors encode.
@@ -1897,6 +1907,11 @@ struct App {
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
     print_overlay_rect: Option<egui::Rect>,
+    /// The last hover readout and what it was computed for: pointer position,
+    /// view, and which layers were drawn. A pick walks every visible bead, so
+    /// it runs when the pointer MOVES, not on every frame the pointer happens
+    /// to be still over the viewport.
+    hover_pick: Option<((i32, i32, u8, usize, u64), Option<String>)>,
     /// Cumulative bead-instance count after each layer (for the layer slider).
     layer_ends: Vec<u32>,
     /// Cumulative joint-blob count after each layer.
@@ -2194,6 +2209,7 @@ impl App {
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
+            hover_pick: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             view: ViewMode::Model,
@@ -4611,7 +4627,7 @@ impl eframe::App for App {
                     }
                     HostReply::Job { filename, timeline } => {
                         match timeline {
-                            Ok(timeline) => {
+                            Ok((timeline, line_starts)) => {
                                 let plans = engine::plans_from_timeline(
                                     &timeline,
                                     self.settings.filament_diameter_mm,
@@ -4624,6 +4640,7 @@ impl eframe::App for App {
                                     head: gcode::Playhead::default(),
                                     ticked: std::time::Instant::now(),
                                     locked: false,
+                                    line_starts,
                                 });
                                 // Sync on the next poll rather than guessing.
                                 self.last_status_poll = None;
@@ -6474,6 +6491,56 @@ impl eframe::App for App {
                     self.camera.zoom(scroll);
                     camera_moving = true;
                 }
+                // What is under the pointer, in the terms the g-code is written
+                // in. Pointing at a defect on the part and reading back its
+                // layer, feature and source line is the difference between
+                // describing a blemish and finding the move that made it.
+                // Not while the camera is moving: the pick is a scan of every
+                // visible layer, and a drag has no use for it.
+                if self.beads_view() && !camera_moving {
+                    if let Some(p) = response.hover_pos() {
+                        let n = self.preview_plans().map(|p| p.len()).unwrap_or(0);
+                        let key = (
+                            p.x as i32,
+                            p.y as i32,
+                            self.view as u8,
+                            self.top_visible_layer(n),
+                            self.slice_gen ^ self.job_gen,
+                        );
+                        if self.hover_pick.as_ref().is_none_or(|(k, _)| *k != key) {
+                            let (o, d) = pointer_ray(vp, rect, p);
+                            let txt = self.pick_bead(o, d).map(|hit| {
+                                let mut t = format!(
+                                    "layer {} / {}   z {:.2} mm\n{}   width {:.2} mm",
+                                    hit.layer + 1,
+                                    n,
+                                    hit.z,
+                                    engine::kind_label(hit.kind),
+                                    hit.width_mm,
+                                );
+                                if let Some((line, feed)) = hit.line {
+                                    t.push_str(&format!(
+                                        "\ng-code line {line}   commanded {feed:.0} mm/s"
+                                    ));
+                                }
+                                t
+                            });
+                            self.hover_pick = Some((key, txt));
+                        }
+                        if let Some((_, Some(txt))) = &self.hover_pick {
+                            let txt = txt.clone();
+                            egui::Tooltip::always_open(
+                                ui.ctx().clone(),
+                                ui.layer_id(),
+                                egui::Id::new("bead_hover"),
+                                egui::PopupAnchor::Pointer,
+                            )
+                            .show(|ui| {
+                                ui.label(egui::RichText::new(txt).monospace().size(11.0));
+                            });
+                        }
+                    }
+                }
             }
 
             // Dynamic resolution: render at half size while the camera moves
@@ -7352,9 +7419,15 @@ impl eframe::App for App {
                 HostOp::FetchJob { filename } => {
                     let name = filename.clone();
                     self.spawn_host_op(&ctx, true, move |c| {
-                        let timeline = c
-                            .download(&name)
-                            .map(|bytes| gcode::Timeline::parse(&bytes));
+                        let timeline = c.download(&name).map(|bytes| {
+                            let tl = gcode::Timeline::parse(&bytes);
+                            let mut starts = vec![0u32];
+                            starts.extend(
+                                bytes.iter().enumerate().filter(|(_, b)| **b == b'\n')
+                                    .map(|(i, _)| i as u32 + 1),
+                            );
+                            (tl, starts)
+                        });
                         HostReply::Job { filename: name, timeline }
                     })
                 }
@@ -7836,6 +7909,195 @@ fn front_label_local(ui: &mut egui::Ui) -> Option<(Vec<([f32; 2], [f32; 2])>, f3
     }
 
     Some((out, tw, th))
+}
+
+/// What the pointer is over in a bead view, for the hover readout.
+#[derive(Clone)]
+struct BeadHit {
+    layer: usize,
+    z: f32,
+    kind: engine::PathKind,
+    width_mm: f64,
+    /// mm from the ray to the bead's centreline at closest approach.
+    off_mm: f32,
+    /// Where on the bead the ray came closest, in world coordinates.
+    at: glam::Vec3,
+    /// (source line, commanded feed mm/s) — only a MIRRORED job knows these,
+    /// because only it was read back out of a real file.
+    line: Option<(usize, f32)>,
+}
+
+impl App {
+/// The nearest drawn bead under the pointer.
+///
+/// Beads are laid on layer PLANES, so the ray is crossed with each visible
+/// layer's own z and the crossing is matched against that layer's segments in
+/// XY. That picks a wall seen edge-on as readily as a top surface, which
+/// matters: the defects worth pointing at are usually on the side of a part,
+/// where every layer is visible at once. Nearest crossing to the camera wins.
+fn pick_bead(&self, o: glam::Vec3, d: glam::Vec3) -> Option<BeadHit> {
+    let plans = self.preview_plans()?;
+    let top = self.top_visible_layer(plans.len());
+    let mut hit = pick_in_plans(plans, top, self.preview_origin_x(), o, d)?;
+    // A mirrored job can name the line: find the move whose own segment the
+    // crossing lands on, and turn its byte offset into a line number.
+    if let Some(job) = self.job.as_ref().filter(|_| self.view == ViewMode::Machine) {
+        hit.line = job.line_at(hit.at, hit.z);
+    }
+    Some(hit)
+}
+}
+
+/// The bead under a ray, given the layers currently drawn. Free of `App` so
+/// the geometry can be tested without one.
+///
+/// Measured in 3-D against each bead as a capsule, NOT by crossing the layer
+/// planes. Plane-crossing is cheaper and works fine looking down at a top
+/// surface, but it degenerates exactly where it is needed most: sighting
+/// along a wall makes the ray parallel to every plane, and the crossing runs
+/// off to infinity. Walls are what anyone points at — a defect is on the side
+/// of the part, with every layer visible at once.
+fn pick_in_plans(
+    plans: &[engine::LayerPlan],
+    top: usize,
+    ox: f32,
+    o: glam::Vec3,
+    d: glam::Vec3,
+) -> Option<BeadHit> {
+    let d = d.normalize_or_zero();
+    if d == glam::Vec3::ZERO {
+        return None;
+    }
+    let mut best: Option<(f32, BeadHit)> = None;
+    for (li, layer) in plans.iter().enumerate().take(top + 1) {
+        let z = layer.print_z_mm as f32;
+        for path in &layer.paths {
+            let half = (path.width_mm * 0.5 + 0.15) as f32;
+            for w in path.points.windows(2) {
+                let a = glam::Vec3::new(w[0].x_mm() as f32 + ox, w[0].y_mm() as f32, z);
+                let b = glam::Vec3::new(w[1].x_mm() as f32 + ox, w[1].y_mm() as f32, z);
+                let (t, dist) = ray_seg_dist(o, d, a, b);
+                // Sighting ALONG a wall grazes a whole stack of layers at
+                // once, and they all sit at nearly the same distance down the
+                // ray. Ranking on `t` alone then hands the answer to whichever
+                // was tested first — the bottom of the stack. So: nearer wins
+                // outright, but among beads at the same distance the one the
+                // ray passes closest to the CENTRE of wins.
+                let better = match &best {
+                    None => true,
+                    Some((bt, bh)) => {
+                        t < *bt - 0.05 || ((t - *bt).abs() <= 0.05 && dist < bh.off_mm)
+                    }
+                };
+                if dist <= half && better {
+                    best = Some((
+                        t,
+                        BeadHit {
+                            layer: li,
+                            z,
+                            kind: path.kind,
+                            width_mm: path.width_mm,
+                            off_mm: dist,
+                            at: o + d * t,
+                            line: None,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    best.map(|(_, h)| h)
+}
+
+/// Closest approach between a ray and a segment: the distance along the ray,
+/// and the gap there.
+fn ray_seg_dist(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3) -> (f32, f32) {
+    let r = b - a;
+    let w0 = o - a;
+    let (bb, cc) = (d.dot(r), r.dot(r));
+    let (dd, ee) = (d.dot(w0), r.dot(w0));
+    let denom = cc - bb * bb; // d is unit
+    let u = if denom.abs() < 1.0e-9 {
+        0.0
+    } else {
+        ((ee - bb * dd) / denom).clamp(0.0, 1.0)
+    };
+    let t = (u * bb - dd).max(0.0);
+    let p = o + d * t;
+    let q = a + r * u;
+    (t, (p - q).length())
+}
+
+impl App {
+/// The topmost layer index currently drawn.
+fn top_visible_layer(&self, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    match (self.view, self.job.as_ref()) {
+        (ViewMode::Machine, Some(job)) if job.locked => {
+            job.timeline.layer_of(job.timeline.at(job.head.t).1).min(n - 1)
+        }
+        _ => self.preview_layer.saturating_sub(1).min(n - 1),
+    }
+}
+
+
+}
+
+/// Distance (mm) from a point to a segment, in bed coordinates.
+fn point_seg_mm(px: f64, py: f64, a: geo2d::Point, b: geo2d::Point) -> f64 {
+    let (ax, ay) = (a.x_mm(), a.y_mm());
+    let (bx, by) = (b.x_mm(), b.y_mm());
+    let (vx, vy) = (bx - ax, by - ay);
+    let len2 = vx * vx + vy * vy;
+    let u = if len2 > 1.0e-12 { (((px - ax) * vx + (py - ay) * vy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    let (dx, dy) = (px - (ax + vx * u), py - (ay + vy * u));
+    (dx * dx + dy * dy).sqrt()
+}
+
+impl JobMirror {
+    /// The source line (and its commanded feed) for the extruding move under
+    /// a ray crossing this layer's plane. The plans a mirrored job draws come
+    /// one-per-extruding-move, but the mapping back is not kept — so the move
+    /// is found the same way the bead was: nearest segment on the plane.
+    fn line_at(&self, p: glam::Vec3, z: f32) -> Option<(usize, f32)> {
+        let li = self.timeline.layers.iter().position(|l| (l.z - z).abs() < 1.0e-3)?;
+        let first = self.timeline.layers[li].first_move as usize;
+        let last = self
+            .timeline
+            .layers
+            .get(li + 1)
+            .map(|n| n.first_move as usize)
+            .unwrap_or(self.timeline.moves.len());
+        let mut best: Option<(f64, usize)> = None;
+        let mut prev = if first == 0 { self.timeline.start } else { self.timeline.moves[first - 1].to };
+        for (i, m) in self.timeline.moves[first..last].iter().enumerate() {
+            if m.extruding {
+                let dist = point_seg_mm(
+                    p.x as f64,
+                    p.y as f64,
+                    geo2d::Point::from_mm(prev[0] as f64, prev[1] as f64),
+                    geo2d::Point::from_mm(m.to[0] as f64, m.to[1] as f64),
+                );
+                if best.as_ref().is_none_or(|(bd, _)| dist < *bd) {
+                    best = Some((dist, first + i));
+                }
+            }
+            prev = m.to;
+        }
+        let (dist, mi) = best?;
+        if dist > 1.0 {
+            return None;
+        }
+        let byte = self.timeline.moves[mi].at_byte;
+        let line = match self.line_starts.binary_search(&byte) {
+            Ok(i) => i + 1,
+            Err(0) => 1,
+            Err(i) => i,
+        };
+        Some((line, self.timeline.moves[mi].feed_mm_s))
+    }
 }
 
 fn pointer_ray(vp: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> (glam::Vec3, glam::Vec3) {
@@ -8912,5 +9174,132 @@ mod tests {
         buf.extend_from_slice(&img);
         std::fs::write(&out, buf).unwrap();
         println!("{} triangles -> {out}", v.len() / 3);
+    }
+
+    /// The hover readout has to name the layer a WALL belongs to, not the one
+    /// nearest the top — a defect on the side of a part is what anyone points
+    /// at, and every layer is visible there at once.
+    #[test]
+    fn hovering_a_wall_names_the_layer_the_ray_actually_crosses() {
+        use engine::{LayerPlan, PathKind, ToolPath};
+        use geo2d::{Point, Polygons};
+        let bead = |y: f64, kind: PathKind, w: f64| ToolPath {
+            kind,
+            closed: false,
+            width_mm: w,
+            points: vec![Point::from_mm(-20.0, y), Point::from_mm(20.0, y)],
+            flow: 1.0,
+            group: None,
+            height_scale: 1.0,
+            widths: None,
+            overhang: 0.0,
+            segs: None,
+            tool: 0,
+            joined: false,
+        };
+        // Ten layers of one straight bead each, stacked at y = 0.
+        let plans: Vec<LayerPlan> = (0..10)
+            .map(|i| LayerPlan {
+                index: i,
+                print_z_mm: 0.2 + i as f64 * 0.2,
+                height_mm: 0.2,
+                paths: vec![bead(0.0, if i == 4 { PathKind::Bridge } else { PathKind::ExternalPerimeter }, 0.45)],
+                travels: vec![Default::default()],
+                outline: Polygons::new(),
+                speed_scale: 1.0,
+                fan_boost: 0.0,
+                planned_temp_c: None,
+                temp_command_c: None,
+            })
+            .collect();
+
+        // Look horizontally at the stack from +Y, aimed at layer 4's z.
+        let z4 = plans[4].print_z_mm as f32;
+        let o = glam::Vec3::new(0.0, 60.0, z4);
+        let d = glam::Vec3::new(0.0, -1.0, 0.0);
+        // Dead horizontal — the case plane-crossing could never answer.
+        let hit = super::pick_in_plans(&plans, 9, 0.0, o, d).expect("a bead under the ray");
+        assert_eq!(hit.layer, 4, "named layer {} for a ray at z {z4}", hit.layer);
+        assert_eq!(hit.kind, PathKind::Bridge, "and carries that layer's feature");
+        assert!((hit.width_mm - 0.45).abs() < 1e-9);
+
+        // A ray that passes clear of every bead finds nothing, rather than
+        // snapping to the nearest thing on screen.
+        let off = super::pick_in_plans(
+            &plans, 9, 0.0,
+            glam::Vec3::new(0.0, 60.0, plans[9].print_z_mm as f32 + 5.0),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+        );
+        assert!(off.is_none(), "a ray above the stack must not pick a bead");
+
+        // Layers above the drawn top are not pickable — you cannot point at
+        // what is not on screen.
+        let hidden = super::pick_in_plans(&plans, 2, 0.0, o, d);
+        assert!(hidden.is_none(), "picked a layer that is not drawn");
+
+        // The bed-origin offset the mirrored view draws at is honoured.
+        let shifted = super::pick_in_plans(&plans, 9, 30.0, glam::Vec3::new(30.0, 60.0, z4), d)
+            .expect("same bead, shifted origin");
+        assert_eq!(shifted.layer, 4);
+    }
+
+    #[test]
+    fn point_to_segment_distance_is_in_millimetres() {
+        use geo2d::Point;
+        let a = Point::from_mm(0.0, 0.0);
+        let b = Point::from_mm(10.0, 0.0);
+        assert!((super::point_seg_mm(5.0, 2.0, a, b) - 2.0).abs() < 1e-9, "perpendicular");
+        assert!((super::point_seg_mm(-3.0, 0.0, a, b) - 3.0).abs() < 1e-9, "past the start");
+        assert!((super::point_seg_mm(13.0, 4.0, a, b) - 5.0).abs() < 1e-9, "past the end");
+    }
+
+    /// A pick walks every drawn bead, and the biggest job this mirrors is
+    /// around a million of them. It runs on pointer movement, so it has to
+    /// stay well inside a frame or hovering would stutter the view.
+    #[test]
+    fn picking_a_million_beads_stays_inside_a_frame() {
+        use engine::{LayerPlan, PathKind, ToolPath};
+        use geo2d::{Point, Polygons};
+        let per_layer = 5_000;
+        let layers = 200;
+        let plans: Vec<LayerPlan> = (0..layers)
+            .map(|i| LayerPlan {
+                index: i,
+                print_z_mm: 0.2 + i as f64 * 0.2,
+                height_mm: 0.2,
+                paths: (0..per_layer)
+                    .map(|k| ToolPath {
+                        kind: PathKind::Perimeter,
+                        closed: false,
+                        width_mm: 0.45,
+                        points: vec![
+                            Point::from_mm(k as f64 * 0.02, 0.0),
+                            Point::from_mm(k as f64 * 0.02, 20.0),
+                        ],
+                        flow: 1.0,
+                        group: None,
+                        height_scale: 1.0,
+                        widths: None,
+                        overhang: 0.0,
+                        segs: None,
+                        tool: 0,
+                        joined: false,
+                    })
+                    .collect(),
+                travels: Vec::new(),
+                outline: Polygons::new(),
+                speed_scale: 1.0,
+                fan_boost: 0.0,
+                planned_temp_c: None,
+                temp_command_c: None,
+            })
+            .collect();
+        let o = glam::Vec3::new(50.0, -40.0, 20.0);
+        let d = (glam::Vec3::new(50.0, 10.0, 20.0) - o).normalize();
+        let t0 = std::time::Instant::now();
+        let _ = super::pick_in_plans(&plans, layers - 1, 0.0, o, d);
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        println!("{} beads picked in {ms:.1} ms", layers * per_layer);
+        assert!(ms < 60.0, "a pick over {} beads took {ms:.1} ms", layers * per_layer);
     }
 }
