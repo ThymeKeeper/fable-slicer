@@ -837,8 +837,6 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
                 emit_scarf_loop(
                     &mut g,
                     &path.points,
-                    z,
-                    layer.height_mm,
                     coeff,
                     scarf_feed,
                     scarf_len_mm(s),
@@ -1131,8 +1129,6 @@ fn emit_spiral_layer(
 fn emit_scarf_loop(
     g: &mut GcodeBuilder,
     pts: &[Point],
-    z_top: f64,
-    h: f64,
     coeff: f64,
     feed: f64,
     scarf_len: f64,
@@ -1148,7 +1144,7 @@ fn emit_scarf_loop(
     }
     let perim = cum[n];
     let l = scarf_len.min(perim * 0.4).max(1.0e-6);
-    let z_low = z_top - h; // = the previous layer's top (print_z increments by h)
+
 
     let seg_at = |s: f64| -> usize {
         let s = s.clamp(0.0, perim);
@@ -1175,7 +1171,21 @@ fn emit_scarf_loop(
             (1.0 - (s - perim) / l).clamp(0.0, 1.0)
         }
     };
-    let z_at = |s: f64| if s <= l { z_low + h * (s / l) } else { z_top };
+    // NO Z RAMP. The seam feathers by FLOW alone, at the layer's own height.
+    //
+    // The ramp this replaces climbed from the previous layer's top, which is
+    // what "a bead growing from nothing" implies geometrically — and is wrong
+    // physically. A nozzle has a flat tip and the surface under it has bead
+    // crowns, so at zero clearance it ploughs the layer below instead of
+    // printing on it. Measured across a whole 26 MB job, EVERY seam started
+    // between 1 and 25 µm above solid plastic and then ran millimetres at
+    // 86 mm/s: a glossy remelted smear on the part, immune to turning the
+    // temperature down, because it is contact and not heat.
+    //
+    // The reference slicer on this machine varies Z while extruding exactly
+    // zero times in 442,398 extruding moves. Neither do we now. E is ramped by
+    // arc length independently of Z, so the two complementary passes still sum
+    // to exactly one bead — the feathering is unaffected.
     let ovf = |k: usize| ov.get(k).copied().unwrap_or(1.0);
 
     // Sample arc-lengths 0..perim+ov_end: fine steps AND source vertices
@@ -1231,11 +1241,9 @@ fn emit_scarf_loop(
         let mid = (prev_s + s1) * 0.5;
         let k = seg_at(if mid > perim { mid - perim } else { mid });
         let e = coeff * chord * frac(mid) * ovf(k);
-        if s1 <= l + 1.0e-9 {
-            g.extrude_z(x, y, z_at(s1), e, feed);
-        } else {
-            g.extrude(x, y, e, feed);
-        }
+        // One move form throughout: the whole loop, taper included, prints at
+        // the layer's own height, so there is no Z to reassert.
+        g.extrude(x, y, e, feed);
         (px, py) = (x, y);
         prev_s = s1;
     }
@@ -4454,13 +4462,26 @@ mod tests {
                 "no travel/retract/unretract/Z between donor and joined wall, found: {l}"
             );
         }
-        // A joined UNIFORM wall scarfs — the pressure-accurate ramp: its body
-        // ramps Z while extruding (the wedge), and the feathered scarf exit
-        // replaces the dive.
+        // A joined UNIFORM wall scarfs — the pressure-accurate pairing: the
+        // junction delivers the nozzle at full pressure and the scarf's flow
+        // ramp opens from near zero. Detected by that ramp, NOT by a Z change:
+        // the seam no longer varies Z while extruding at all (see
+        // `emit_scarf_loop`), and the taper is what a scarf actually is.
         let wall_body = &after[..after[1..].find(";TYPE:").map(|i| i + 1).unwrap_or(after.len())];
+        let es: Vec<f64> = wall_body
+            .lines()
+            .filter(|l| l.starts_with("G1 ") && l.contains(" X") && l.contains(" E"))
+            .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
+            .take(10)
+            .collect();
+        assert!(es.len() >= 6, "no wall deposits to inspect");
+        // The junction bead is deposited first and at full flow — the whole
+        // point of entering at pressure — so the ramp is the minimum after it.
+        let lo = es.iter().take(6).cloned().fold(f64::MAX, f64::min);
         assert!(
-            wall_body.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
-            "a joined uniform wall closes with a scarf (extruding Z-ramp)"
+            lo < es[5] * 0.5,
+            "a joined uniform wall closes with a scarf (flow ramp), got {:?}",
+            &es[..6]
         );
     }
 
@@ -4484,16 +4505,15 @@ mod tests {
         let (a, b) = (estimate_filament(&plans, &s).0, net(&on));
         assert!((b - a).abs() / a < 0.01, "scarf conserves net E: model {a:.2} gcode {b:.2}");
 
-        // A mid-layer outer wall (z_top = 8.2 at 0.2 mm layers) ramps Z from
-        // below the layer top up to it while extruding — the wedge.
+        // The seam feathers by FLOW, at the layer's own height. Nothing
+        // extrudes while moving Z: a ramp that starts at the previous layer's
+        // top puts a flat nozzle tip in contact with printed plastic, which
+        // shows on the part as a remelted smear and cannot be turned down with
+        // temperature. See `emit_scarf_loop`.
         let chunk = layer_chunk(&on, 40);
-        let parse_z = |l: &str| l.split(" Z").nth(1).and_then(|z| z.split(' ').next().unwrap_or("").parse::<f64>().ok());
-        // The descent into the wedge happens on an EXTRUDING move (diagonal),
-        // never a standalone Z-only dwell — a stationary drop at the aligned
-        // seam oozes a zit column every layer.
         assert!(
-            chunk.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E") && parse_z(l).is_some_and(|z| z < 8.1)),
-            "scarf ramps up from below the layer top on an extruding move"
+            !chunk.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
+            "an extruding move changed Z inside the scarf"
         );
         let wall = chunk.find(";TYPE:Outer wall").or_else(|| chunk.find(";TYPE:Overhang wall")).unwrap();
         let wall_body = &chunk[wall..chunk[wall + 1..].find(";TYPE:").map(|i| wall + 1 + i).unwrap_or(chunk.len())];
@@ -4501,8 +4521,18 @@ mod tests {
             !wall_body.lines().any(|l| l.starts_with("G1 Z") && !l.contains(" X") && !l.contains(" E")),
             "no standalone Z-drop dwell at the seam"
         );
-        let ramp = chunk.lines().filter(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")).count();
-        assert!(ramp >= 4, "scarf ramps Z while extruding, got {ramp}");
+        // And the taper is still there: the seam's first deposits are a small
+        // fraction of a full bead, growing.
+        let wall_i = chunk.find(";TYPE:Outer wall").or_else(|| chunk.find(";TYPE:Overhang wall")).unwrap();
+        let es: Vec<f64> = chunk[wall_i..]
+            .lines()
+            .filter(|l| l.starts_with("G1 ") && l.contains(" X") && l.contains(" E"))
+            .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
+            .take(12)
+            .collect();
+        assert!(es.len() >= 6, "no seam deposits to inspect");
+        let mid = es[es.len() / 2];
+        assert!(es[0] < mid * 0.5, "the seam opens at full flow: {:?}", &es[..6]);
 
         // Continuous through the seam: no retraction between the wall's first
         // extrusion and its end (the far end feathers, no retract there).
