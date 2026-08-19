@@ -33,6 +33,10 @@ pub struct Move {
     /// Filament consumed on this move (mm of filament) — what a bead's width
     /// is reconstructed from when the timeline is drawn.
     pub e_mm: f32,
+    /// The feed this move ASKED for (mm/s). What it actually achieves is the
+    /// planner's business: a 0.4 mm segment between two corners never sees
+    /// anything like this.
+    pub feed_mm_s: f32,
     /// What the file said it was printing, from its `;TYPE:` comments. Every
     /// slicer in circulation writes these and they agree closely enough to
     /// map; a file without them draws as one feature, which is honest.
@@ -126,6 +130,22 @@ struct Parser {
     scale: f64,
     layer_z: Option<f64>,
     feature: Feature,
+    /// Acceleration in force (mm/s²) and where it changed, so the planner can
+    /// use the limit that applied to each move. Files set this often — per
+    /// feature, and again for the first layer.
+    accel: f64,
+    /// (move index, acceleration, accel-to-decel) at each change.
+    accel_at: Vec<(u32, f64, f64)>,
+    /// Klipper's square-corner velocity (mm/s): how fast a right-angle corner
+    /// may be taken. Marlin's jerk, near enough.
+    scv: f64,
+    /// Klipper's accel-to-decel: the ceiling on a short move's peak, which is
+    /// most of why a real machine is slower than distance-over-feed. Klipper
+    /// defaults it to half the acceleration, so it TRACKS accel unless the
+    /// file sets it outright — miss that and a file which only sets ACCEL
+    /// (Orca's do) gets planned against a stale ceiling.
+    atd: f64,
+    atd_explicit: bool,
     /// Z last set by NON-extruding motion since the previous extrusion — the
     /// layer-change signal (see `commit`).
     pending_z: Option<f64>,
@@ -146,6 +166,12 @@ impl Timeline {
             scale: 1.0,
             layer_z: None,
             feature: Feature::default(),
+            // Defaults for a file that never says: a mid-range machine.
+            accel: 3000.0,
+            accel_at: Vec::new(),
+            scv: 5.0,
+            atd: 1500.0,
+            atd_explicit: false,
             pending_z: None,
             t: 0.0,
         };
@@ -170,7 +196,7 @@ impl Timeline {
             }
             p.line(code, start_of_line as u32, &mut tl);
         }
-        tl.seconds = p.t as f32;
+        plan_times(&mut tl, &p.accel_at, (p.accel, p.atd), p.scv);
         tl
     }
 
@@ -238,11 +264,27 @@ impl Parser {
         let cmd = cmd.to_ascii_uppercase();
         // A word is a letter plus a number; anything unparseable is skipped,
         // which is what keeps macros and firmware-specific lines harmless.
-        let mut w = [f64::NAN; 6]; // X Y Z E F I J → indices below
+        let mut w = [f64::NAN; 8]; // X Y Z E F S P T
         let mut ij = [f64::NAN; 2];
         for word in words {
             let b = word.as_bytes();
             if b.is_empty() {
+                continue;
+            }
+            // Klipper's extended commands are KEY=VALUE, not letter-number.
+            if let Some((key, val)) = word.split_once('=') {
+                if let Ok(v) = val.parse::<f64>() {
+                    match key.to_ascii_uppercase().as_str() {
+                        "ACCEL" if v > 0.0 => self.set_accel(v, tl),
+                        "SQUARE_CORNER_VELOCITY" if v >= 0.0 => self.scv = v,
+                        "ACCEL_TO_DECEL" if v > 0.0 => {
+                            self.atd = v;
+                            self.atd_explicit = true;
+                            self.note_limits(tl);
+                        }
+                        _ => {}
+                    }
+                }
                 continue;
             }
             let Ok(v) = word[1..].parse::<f64>() else { continue };
@@ -254,12 +296,24 @@ impl Parser {
                 b'F' => w[4] = v,
                 b'I' => ij[0] = v,
                 b'J' => ij[1] = v,
+                b'S' => w[5] = v,
+                b'P' => w[6] = v,
+                b'T' => w[7] = v,
                 _ => {}
             }
         }
         match cmd.as_str() {
             "G0" | "G1" => self.linear(&w, at_byte, tl),
             "G2" | "G3" => self.arc(&w, &ij, cmd == "G2", at_byte, tl),
+            // M204 S / P / T, and Klipper's SET_VELOCITY_LIMIT — both appear
+            // in the wild, sometimes in the same file.
+            "M204" => {
+                let a = [w[5], w[6], w[7]].into_iter().find(|v| !v.is_nan() && *v > 0.0);
+                if let Some(a) = a {
+                    self.set_accel(a, tl);
+                }
+            }
+            "SET_VELOCITY_LIMIT" => {}
             "G90" => self.abs_xyz = true,
             "G91" => self.abs_xyz = false,
             "M82" => self.abs_e = true,
@@ -282,8 +336,30 @@ impl Parser {
         }
     }
 
+    /// Note an acceleration change against the move it takes effect from.
+    /// Accel-to-decel follows at half, the firmware's own default, unless the
+    /// file has taken control of it.
+    fn set_accel(&mut self, a: f64, tl: &Timeline) {
+        if (a - self.accel).abs() > 1.0 {
+            self.accel = a;
+            if !self.atd_explicit {
+                self.atd = a * 0.5;
+            }
+            self.note_limits(tl);
+        }
+    }
+
+    /// Record the limits now in force against the next move.
+    fn note_limits(&mut self, tl: &Timeline) {
+        let at = tl.moves.len() as u32;
+        match self.accel_at.last_mut() {
+            Some(last) if last.0 == at => *last = (at, self.accel, self.atd),
+            _ => self.accel_at.push((at, self.accel, self.atd)),
+        }
+    }
+
     /// Target position for a move's words, honoring absolute/relative.
-    fn target(&self, w: &[f64; 6]) -> [f64; 3] {
+    fn target(&self, w: &[f64; 8]) -> [f64; 3] {
         let mut to = self.pos;
         for k in 0..3 {
             if !w[k].is_nan() {
@@ -295,7 +371,7 @@ impl Parser {
     }
 
     /// How much filament a move's E word commits, and the new E position.
-    fn extrusion(&self, w: &[f64; 6]) -> (f64, f64) {
+    fn extrusion(&self, w: &[f64; 8]) -> (f64, f64) {
         if w[3].is_nan() {
             return (0.0, self.e);
         }
@@ -307,7 +383,7 @@ impl Parser {
         }
     }
 
-    fn linear(&mut self, w: &[f64; 6], at_byte: u32, tl: &mut Timeline) {
+    fn linear(&mut self, w: &[f64; 8], at_byte: u32, tl: &mut Timeline) {
         if !w[4].is_nan() {
             self.feed_mm_s = (w[4] * self.scale / 60.0).max(1.0e-6);
         }
@@ -320,7 +396,7 @@ impl Parser {
         self.commit(to, e_new, de > 0.0 && d > 1.0e-9, secs, at_byte, tl);
     }
 
-    fn arc(&mut self, w: &[f64; 6], ij: &[f64; 2], clockwise: bool, at_byte: u32, tl: &mut Timeline) {
+    fn arc(&mut self, w: &[f64; 8], ij: &[f64; 2], clockwise: bool, at_byte: u32, tl: &mut Timeline) {
         if !w[4].is_nan() {
             self.feed_mm_s = (w[4] * self.scale / 60.0).max(1.0e-6);
         }
@@ -418,6 +494,7 @@ impl Parser {
             at_byte,
             extruding,
             e_mm: (e_new - self.e) as f32,
+            feed_mm_s: self.feed_mm_s as f32,
             feature: self.feature,
         });
         self.pos = to;
@@ -428,6 +505,116 @@ impl Parser {
 fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     let (dx, dy, dz) = (b[0] - a[0], b[1] - a[1], b[2] - a[2]);
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+
+/// Re-time a parsed timeline the way the machine will actually run it.
+///
+/// Distance over feed is what a naive reading gives, and on a real file it is
+/// 30–90% fast: at these speeds a 0.4 mm segment between two corners never
+/// gets near its commanded feed. So plan the moves as the firmware does —
+/// corner-limited entry speeds, then a backward pass so every move can brake
+/// into the next, a forward pass so every move is reachable from the last,
+/// and a trapezoid per move.
+///
+/// This is what makes the machine's executed-seconds clock a phase reference
+/// worth trusting: if our seconds are its seconds, "how long has it been
+/// printing" says where the nozzle is, with no lookahead-queue bias — which
+/// asking the machine for a position never escapes.
+fn plan_times(tl: &mut Timeline, accel_at: &[(u32, f64, f64)], fallback: (f64, f64), scv: f64) {
+    let n = tl.moves.len();
+    if n == 0 {
+        return;
+    }
+    // The acceleration in force for each move, expanded from its changes.
+    let limits_of = |i: usize| -> (f64, f64) {
+        match accel_at.binary_search_by_key(&(i as u32), |(at, ..)| *at) {
+            Ok(k) => (accel_at[k].1, accel_at[k].2),
+            Err(0) => accel_at.first().map(|&(_, a, d)| (a, d)).unwrap_or(fallback),
+            Err(k) => (accel_at[k - 1].1, accel_at[k - 1].2),
+        }
+    };
+    let accel_of = |i: usize| limits_of(i).0;
+    let mut from = tl.start;
+    let mut len = Vec::with_capacity(n);
+    let mut dir = Vec::with_capacity(n);
+    for m in tl.moves.iter() {
+        let d = [m.to[0] - from[0], m.to[1] - from[1], m.to[2] - from[2]];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f64;
+        len.push(l);
+        dir.push(if l > 1.0e-9 {
+            [d[0] as f64 / l, d[1] as f64 / l, d[2] as f64 / l]
+        } else {
+            [0.0; 3]
+        });
+        from = m.to;
+    }
+    // Entry speed per move: the corner it starts at, capped by its own feed.
+    // A right angle is allowed exactly the square-corner velocity; a straight
+    // join is not limited at all.
+    let mut entry = vec![0.0f64; n];
+    for i in 1..n {
+        let v = tl.moves[i].feed_mm_s as f64;
+        if len[i] <= 1.0e-9 || len[i - 1] <= 1.0e-9 {
+            entry[i] = 0.0;
+            continue;
+        }
+        let cos = (dir[i - 1][0] * dir[i][0] + dir[i - 1][1] * dir[i][1] + dir[i - 1][2] * dir[i][2])
+            .clamp(-1.0, 1.0);
+        let sin_half = ((1.0 - cos) * 0.5).max(0.0).sqrt();
+        entry[i] = if sin_half < 1.0e-6 { v } else { (scv / (2.0 * sin_half)).min(v) };
+    }
+    // Backward: no faster than we can brake into the next corner.
+    for i in (0..n).rev() {
+        let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
+        let a = accel_of(i);
+        entry[i] = entry[i].min((exit * exit + 2.0 * a * len[i]).sqrt());
+    }
+    // Forward: no faster than we can reach from the last corner.
+    for i in 1..n {
+        let a = accel_of(i - 1);
+        entry[i] = entry[i].min((entry[i - 1] * entry[i - 1] + 2.0 * a * len[i - 1]).sqrt());
+    }
+    let mut t = 0.0f64;
+    for i in 0..n {
+        let exit = if i + 1 < n { entry[i + 1] } else { 0.0 };
+        let (a, atd) = limits_of(i);
+        let a = a.max(1.0);
+        t += if len[i] <= 1.0e-9 {
+            // An E-only move — a retraction, a prime, a purge. No distance to
+            // plan, but it still costs the filament's own travel time, and a
+            // print is full of them.
+            (tl.moves[i].e_mm.abs() as f64) / (tl.moves[i].feed_mm_s as f64).max(1.0e-6)
+        } else {
+            trapezoid_time(len[i], entry[i], exit, tl.moves[i].feed_mm_s as f64, a, atd)
+        };
+        tl.moves[i].t_end = t as f32;
+    }
+    tl.seconds = t as f32;
+}
+
+/// Time for one move: accelerate from `v_entry`, cruise no faster than
+/// `v_cruise`, brake to `v_exit`. `atd` is Klipper's accel-to-decel — the
+/// ceiling on a short move's peak, and most of why a real machine is slower
+/// than distance-over-feed on a file full of tiny segments.
+fn trapezoid_time(dist: f64, v_entry: f64, v_exit: f64, v_cruise: f64, accel: f64, atd: f64) -> f64 {
+    if dist <= 1.0e-9 {
+        return 0.0;
+    }
+    let cap = (atd * dist + 0.5 * (v_entry * v_entry + v_exit * v_exit)).max(0.0).sqrt();
+    let vc = v_cruise.min(cap).max(v_entry).max(v_exit).max(1.0e-6);
+    let d_acc = ((vc * vc - v_entry * v_entry) / (2.0 * accel)).max(0.0);
+    let d_dec = ((vc * vc - v_exit * v_exit) / (2.0 * accel)).max(0.0);
+    if d_acc + d_dec <= dist {
+        (vc - v_entry) / accel + (dist - d_acc - d_dec) / vc + (vc - v_exit) / accel
+    } else {
+        let peak = (((2.0 * accel * dist + v_entry * v_entry + v_exit * v_exit) * 0.5).max(0.0))
+            .sqrt()
+            .max(v_entry)
+            .max(v_exit)
+            .max(1.0e-6);
+        (peak - v_entry) / accel + (peak - v_exit) / accel
+    }
 }
 
 #[cfg(test)]
@@ -450,14 +637,49 @@ G1 X0 Y0 E5
         assert_eq!(tl.layers.len(), 2, "two printed Zs");
         assert!((tl.layers[0].z - 0.2).abs() < 1e-6);
         assert!((tl.layers[1].z - 0.4).abs() < 1e-6);
-        // 2 s of extrusion each way, plus the tiny Z hop.
-        assert!((tl.seconds - 4.004).abs() < 0.01, "seconds {}", tl.seconds);
-        // Halfway through the first extrusion — which starts at t = 0.004,
-        // after the 0.2 mm lift the file opens with.
-        let (p, _) = tl.at(0.004 + 1.0);
-        assert!((p[0] - 50.0).abs() < 0.01, "x {}", p[0]);
+        // 2 s of extrusion each way, plus the tiny Z hop — and the ramps at
+        // each end, which is why this is a shade over the 4.004 s that
+        // distance-over-feed would claim.
+        assert!(tl.seconds > 4.004, "the planner must cost MORE than naive time");
+        assert!((tl.seconds - 4.06).abs() < 0.03, "seconds {}", tl.seconds);
+        // A move ends where it said it would, when it said it would. Within
+        // one move the head interpolates linearly — real files are made of
+        // sub-millimetre segments, so easing INSIDE a move is far below what
+        // a frame can show; what has to be right is when each move ends.
+        let (p, _) = tl.at(tl.moves[1].t_end);
+        assert!((p[0] - 100.0).abs() < 0.01, "x {}", p[0]);
         // The travel to the start is not extrusion; the two long moves are.
         assert_eq!(tl.moves.iter().filter(|m| m.extruding).count(), 2);
+    }
+
+    #[test]
+    fn a_corner_costs_time_that_a_straight_line_does_not() {
+        // The planner's whole point: the same distance, at the same feed,
+        // takes longer when the machine has to turn. A right angle may only
+        // be taken at the square-corner velocity, so the head brakes into it
+        // and climbs back out.
+        let head = "G21\nG90\nM83\nM204 S3000\nSET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5\n";
+        let straight = Timeline::parse(
+            format!("{head}G1 X0 Y0 Z0.2 F12000\nG1 X20 Y0 E1\nG1 X40 Y0 E1\n").as_bytes(),
+        );
+        let corner = Timeline::parse(
+            format!("{head}G1 X0 Y0 Z0.2 F12000\nG1 X20 Y0 E1\nG1 X20 Y20 E1\n").as_bytes(),
+        );
+        assert!(
+            corner.seconds > straight.seconds * 1.2,
+            "corner {} vs straight {}",
+            corner.seconds,
+            straight.seconds
+        );
+        // And a gentler machine is slower still on the same corner.
+        let slow = Timeline::parse(
+            format!(
+                "G21\nG90\nM83\nM204 S500\nSET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5\n\
+                 G1 X0 Y0 Z0.2 F12000\nG1 X20 Y0 E1\nG1 X20 Y20 E1\n"
+            )
+            .as_bytes(),
+        );
+        assert!(slow.seconds > corner.seconds, "less accel must cost more time");
     }
 
     #[test]
