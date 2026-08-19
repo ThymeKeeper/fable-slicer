@@ -23,6 +23,7 @@ pub use calibrate::{test_cube_gcode, TEST_CUBE_H_MM, TEST_CUBE_XY_MM};
 pub use mirror::plans_from_timeline;
 
 pub use emit::{
+    to_gcode_indexed, GcodeIndex,
     audit_combing, audit_flow_clamps, estimate_filament, estimate_filament_per_tool,
     estimate_seconds, format_duration, kind_label, per_layer_stats, to_gcode, used_tools,
     LayerStats,

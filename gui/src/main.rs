@@ -1907,6 +1907,12 @@ struct App {
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
     print_overlay_rect: Option<egui::Rect>,
+    /// Our OWN slice's g-code, indexed by (layer, path) to the line it starts
+    /// on, with the slice generation it was built for. A mirrored job reads
+    /// lines out of the file it came from; our own slice has no file until it
+    /// is emitted, so this emits it — once, lazily, the first time anyone
+    /// hovers, because most sessions never ask.
+    own_index: Option<(u64, engine::GcodeIndex)>,
     /// The last hover readout and what it was computed for: pointer position,
     /// view, and which layers were drawn. A pick walks every visible bead, so
     /// it runs when the pointer MOVES, not on every frame the pointer happens
@@ -2209,6 +2215,7 @@ impl App {
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
+            own_index: None,
             hover_pick: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
@@ -6443,6 +6450,16 @@ impl eframe::App for App {
                 }
                 self.painting = false;
             }
+            // In a bead view a click has nothing else to do, so it hands the
+            // readout to the clipboard: the point of naming a spot is being
+            // able to pass the name to someone else.
+            if !edit && !blocked && response.clicked() {
+                if let Some((_, Some(txt))) = &self.hover_pick {
+                    let one = txt.replace("\n(click to copy)", "").replace('\n', "  |  ");
+                    ui.ctx().copy_text(one.clone());
+                    self.status = format!("Copied: {one}");
+                }
+            }
             // A plain click selects the object under the cursor (its bed
             // becomes active), or — on empty space — deselects and activates
             // the bed nearest the click.
@@ -6508,21 +6525,54 @@ impl eframe::App for App {
                             self.slice_gen ^ self.job_gen,
                         );
                         if self.hover_pick.as_ref().is_none_or(|(k, _)| *k != key) {
+                            // Our own slice has no file until it is emitted.
+                            // Emit it once per slice, here, the first time
+                            // anyone actually asks — ~340 ms on the biggest
+                            // jobs, against every slice paying it up front for
+                            // a readout most sessions never open.
+                            if self.view != ViewMode::Machine
+                                && self.own_index.as_ref().is_none_or(|(g, _)| *g != self.slice_gen)
+                            {
+                                if let Some(plans) = self.sliced.clone() {
+                                    let mut plans = plans;
+                                    engine::apply_bead_dabs(
+                                        &mut plans,
+                                        &self.engine_dabs(),
+                                        &self.settings,
+                                    );
+                                    let (_, idx) =
+                                        engine::to_gcode_indexed(&plans, &self.settings);
+                                    self.own_index = Some((self.slice_gen, idx));
+                                }
+                            }
                             let (o, d) = pointer_ray(vp, rect, p);
                             let txt = self.pick_bead(o, d).map(|hit| {
+                                // X and Y are the whole point: a layer number
+                                // says how high the trouble is, not WHERE in
+                                // the layer it is, and a layer is a metre of
+                                // path. These are bed coordinates — the same
+                                // numbers the g-code is written in, so they
+                                // can be searched for directly.
                                 let mut t = format!(
-                                    "layer {} / {}   z {:.2} mm\n{}   width {:.2} mm",
+                                    "X {:.1}  Y {:.1}  Z {:.2}\nlayer {} / {}   {}   width {:.2} mm",
+                                    hit.at.x - self.preview_origin_x(),
+                                    hit.at.y,
+                                    hit.z,
                                     hit.layer + 1,
                                     n,
-                                    hit.z,
                                     engine::kind_label(hit.kind),
                                     hit.width_mm,
                                 );
                                 if let Some((line, feed)) = hit.line {
-                                    t.push_str(&format!(
-                                        "\ng-code line {line}   commanded {feed:.0} mm/s"
-                                    ));
+                                    t.push_str(&format!("\ng-code line {line}"));
+                                    // A mirrored job knows the feed the file
+                                    // actually commanded; our own index does
+                                    // not carry one.
+                                    if feed.is_finite() {
+                                        t.push_str(&format!("   commanded {feed:.0} mm/s"));
+                                    }
                                 }
+                                t.push_str("\n(click to copy)");
                                 t
                             });
                             self.hover_pick = Some((key, txt));
@@ -7920,7 +7970,13 @@ struct BeadHit {
     width_mm: f64,
     /// mm from the ray to the bead's centreline at closest approach.
     off_mm: f32,
-    /// Where on the bead the ray came closest, in world coordinates.
+    /// Index of the path within its layer — the handle the g-code index is
+    /// keyed by.
+    path: usize,
+    /// The point on the BEAD's centreline where the ray came closest, in
+    /// world coordinates. Deliberately not the point on the ray: sighting
+    /// along a wall, the two differ by up to a bead radius, and the number
+    /// worth reporting is the one that names the bead.
     at: glam::Vec3,
     /// (source line, commanded feed mm/s) — only a MIRRORED job knows these,
     /// because only it was read back out of a real file.
@@ -7939,11 +7995,20 @@ fn pick_bead(&self, o: glam::Vec3, d: glam::Vec3) -> Option<BeadHit> {
     let plans = self.preview_plans()?;
     let top = self.top_visible_layer(plans.len());
     let mut hit = pick_in_plans(plans, top, self.preview_origin_x(), o, d)?;
-    // A mirrored job can name the line: find the move whose own segment the
-    // crossing lands on, and turn its byte offset into a line number.
-    if let Some(job) = self.job.as_ref().filter(|_| self.view == ViewMode::Machine) {
-        hit.line = job.line_at(hit.at, hit.z);
-    }
+    // Name the line. A mirrored job reads it out of the file it was parsed
+    // from; our own slice reads it off the index built from the emitter.
+    hit.line = match self.view {
+        ViewMode::Machine => self
+            .job
+            .as_ref()
+            .and_then(|job| job.line_at(hit.at, hit.z)),
+        _ => self
+            .own_index
+            .as_ref()
+            .and_then(|(_, idx)| idx.get(hit.layer)?.get(hit.path).copied())
+            .filter(|l| *l > 0)
+            .map(|l| (l as usize, f32::NAN)),
+    };
     Some(hit)
 }
 }
@@ -7971,12 +8036,12 @@ fn pick_in_plans(
     let mut best: Option<(f32, BeadHit)> = None;
     for (li, layer) in plans.iter().enumerate().take(top + 1) {
         let z = layer.print_z_mm as f32;
-        for path in &layer.paths {
+        for (pi, path) in layer.paths.iter().enumerate() {
             let half = (path.width_mm * 0.5 + 0.15) as f32;
             for w in path.points.windows(2) {
                 let a = glam::Vec3::new(w[0].x_mm() as f32 + ox, w[0].y_mm() as f32, z);
                 let b = glam::Vec3::new(w[1].x_mm() as f32 + ox, w[1].y_mm() as f32, z);
-                let (t, dist) = ray_seg_dist(o, d, a, b);
+                let (t, dist, on_bead) = ray_seg_dist(o, d, a, b);
                 // Sighting ALONG a wall grazes a whole stack of layers at
                 // once, and they all sit at nearly the same distance down the
                 // ray. Ranking on `t` alone then hands the answer to whichever
@@ -7998,7 +8063,8 @@ fn pick_in_plans(
                             kind: path.kind,
                             width_mm: path.width_mm,
                             off_mm: dist,
-                            at: o + d * t,
+                            path: pi,
+                            at: on_bead,
                             line: None,
                         },
                     ));
@@ -8009,9 +8075,14 @@ fn pick_in_plans(
     best.map(|(_, h)| h)
 }
 
-/// Closest approach between a ray and a segment: the distance along the ray,
-/// and the gap there.
-fn ray_seg_dist(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3) -> (f32, f32) {
+/// Closest approach between a ray and a segment: how far along the ray, the
+/// gap there, and the point on the SEGMENT.
+fn ray_seg_dist(
+    o: glam::Vec3,
+    d: glam::Vec3,
+    a: glam::Vec3,
+    b: glam::Vec3,
+) -> (f32, f32, glam::Vec3) {
     let r = b - a;
     let w0 = o - a;
     let (bb, cc) = (d.dot(r), r.dot(r));
@@ -8025,7 +8096,7 @@ fn ray_seg_dist(o: glam::Vec3, d: glam::Vec3, a: glam::Vec3, b: glam::Vec3) -> (
     let t = (u * bb - dd).max(0.0);
     let p = o + d * t;
     let q = a + r * u;
-    (t, (p - q).length())
+    (t, (p - q).length(), q)
 }
 
 impl App {
