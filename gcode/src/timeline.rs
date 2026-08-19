@@ -543,31 +543,56 @@ pub struct Playhead {
     pub t: f32,
     /// Timeline seconds per real second — 1.0 until the machine teaches it.
     pub rate: f32,
+    /// Extra rate currently being applied to null the position error. The
+    /// playhead never jumps to a correction; it runs slightly fast or slow
+    /// until it has absorbed one, the way the machine itself would.
+    correction: f32,
     learned: bool,
 }
 
-/// Position error beyond which the playhead jumps instead of easing: a
-/// resume, a skipped section, or a file that isn't what we think it is.
+/// Position error beyond which the playhead gives up on catching up and just
+/// goes there: a resume, a skipped section, a file that isn't what we think
+/// it is. Anything a print could plausibly drift stays under this.
 const SNAP_S: f32 = 20.0;
-/// How much of the remaining error each sync eases away.
-const EASE: f32 = 0.35;
+/// Time constant for absorbing an error. The correction starts at
+/// error / this and decays with the same constant, so it delivers the whole
+/// error over a few of them — fast enough to track, slow enough that the
+/// nozzle glides.
+const CATCH_UP_S: f32 = 4.0;
+/// Ceiling on the corrected rate, as a multiple of the learned one: catching
+/// up is allowed to look brisk, never like a fast-forward.
+const MAX_CATCH_UP: f32 = 2.5;
 /// Below this the machine has not printed enough for a trustworthy ratio.
 const MIN_RATIO_S: f32 = 8.0;
 
 impl Default for Playhead {
     fn default() -> Self {
-        Playhead { t: 0.0, rate: 1.0, learned: false }
+        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false }
     }
 }
 
 impl Playhead {
-    /// Free-run by `dt` real seconds.
+    /// Free-run by `dt` real seconds, at the learned rate plus whatever
+    /// correction is still being absorbed.
     pub fn advance(&mut self, dt: f32) {
-        self.t = (self.t + dt * self.rate).max(0.0);
+        // Never runs backwards: a print does not un-print, and beads that
+        // vanish read far worse than a head that waits. An overshoot just
+        // stalls until the machine comes level.
+        let r = (self.rate + self.correction).clamp(0.0, self.rate * MAX_CATCH_UP);
+        self.t = (self.t + dt * r).max(0.0);
+        // The correction is a nudge, not a bias: it decays as it works, so a
+        // late reading can't let it run away.
+        self.correction *= (-dt / CATCH_UP_S).exp();
     }
 
     /// A reading landed: `machine_secs` executed, which the file position
     /// says is `timeline_t` into the timeline.
+    ///
+    /// Deliberately does NOT move the position. Nudging the head straight to
+    /// where the reading says it should be is a teleport every couple of
+    /// seconds — and now that the drawn beads follow the head, a teleport
+    /// pops them in and out too. Instead the error becomes a rate the head
+    /// carries until it has caught up.
     pub fn sync(&mut self, machine_secs: f32, timeline_t: f32) {
         if machine_secs > MIN_RATIO_S && timeline_t > 0.0 {
             let r = (timeline_t / machine_secs).clamp(0.05, 20.0);
@@ -577,7 +602,12 @@ impl Playhead {
             self.learned = true;
         }
         let drift = timeline_t - self.t;
-        self.t += if drift.abs() > SNAP_S { drift } else { drift * EASE };
+        if drift.abs() > SNAP_S {
+            self.t = timeline_t;
+            self.correction = 0.0;
+        } else {
+            self.correction = drift / CATCH_UP_S;
+        }
     }
 
     /// Start over (a new job, or a job that stopped).
@@ -614,11 +644,43 @@ mod playhead_tests {
     }
 
     #[test]
-    fn eases_small_drift_but_jumps_a_real_discontinuity() {
-        let mut ph = Playhead { t: 100.0, rate: 1.0, learned: true };
-        ph.sync(100.0, 104.0); // 4 s out: ease, don't teleport
-        assert!(ph.t > 100.0 && ph.t < 104.0, "eased to {}", ph.t);
-        let mut ph = Playhead { t: 100.0, rate: 1.0, learned: true };
+    fn a_reading_never_moves_the_head_only_its_rate() {
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
+        ph.sync(100.0, 104.0); // 4 s behind
+        assert_eq!(ph.t, 100.0, "the reading itself moved the head");
+        // It closes the gap by running fast, and gets most of the way there
+        // within a few time constants.
+        for _ in 0..240 {
+            ph.advance(0.05); // 12 s of frames, no further reading
+        }
+        let expect = 100.0 + 12.0 + 4.0; // free-run plus the absorbed error
+        assert!((ph.t - expect).abs() < 0.3, "caught up to {} not {expect}", ph.t);
+    }
+
+    #[test]
+    fn the_head_never_stutters_or_reverses() {
+        // Frame-by-frame motion must stay smooth and forward through a bad
+        // reading — this is what the eye actually judges.
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
+        let mut prev = ph.t;
+        let mut worst_step = 0.0f32;
+        for frame in 0..400 {
+            if frame == 40 {
+                ph.sync(100.0, 96.0); // 4 s AHEAD: it must slow, not rewind
+            }
+            ph.advance(0.05);
+            let step = ph.t - prev;
+            assert!(step >= 0.0, "the head went backwards by {step}");
+            worst_step = worst_step.max(step);
+            prev = ph.t;
+        }
+        // No frame jumped: the fastest step stays within the rate ceiling.
+        assert!(worst_step <= 0.05 * MAX_CATCH_UP + 1e-4, "a frame jumped {worst_step}");
+    }
+
+    #[test]
+    fn a_real_discontinuity_still_goes_straight_there() {
+        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true };
         ph.sync(500.0, 500.0); // the job is somewhere else entirely
         assert!((ph.t - 500.0).abs() < 1.0e-3, "snapped to {}", ph.t);
     }

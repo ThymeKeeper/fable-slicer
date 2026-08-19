@@ -189,7 +189,9 @@ struct JobMirror {
     /// mirrored job exactly as it draws one of ours.
     plans: Vec<engine::LayerPlan>,
     head: gcode::Playhead,
-    /// When the playhead was last advanced, for the frame delta.
+    /// When the playhead was last advanced, for the frame delta. Readings
+    /// deliberately leave it alone — they change the head's rate, never its
+    /// position or its clock.
     ticked: std::time::Instant,
 }
 
@@ -4412,7 +4414,6 @@ impl eframe::App for App {
                                         .timeline
                                         .time_at_byte(st.file_position.min(u32::MAX as u64) as u32);
                                     job.head.sync(st.print_duration_s as f32, t);
-                                    job.ticked = std::time::Instant::now();
                                 }
                                 // A different job (or none): mirror what the
                                 // machine is actually running, whoever sliced
