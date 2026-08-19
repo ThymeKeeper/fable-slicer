@@ -3074,10 +3074,7 @@ fn plan_part(
                 } else {
                     voids
                 };
-                let runts = emit_gap_fill(&voids, lw, sp, &mut paths);
-                // What gap fill declined — sub-length specks, culled ribs —
-                // widens the neighbouring ring instead of staying a pinhole.
-                absorb_dropped_voids(&mut paths, &runts, lw, sp);
+                emit_gap_fill(&voids, lw, sp, &mut paths);
             }
         }
 
@@ -4871,14 +4868,9 @@ fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
 const GAP_BEAD_MIN_W: f64 = 0.75;
 
 
-fn emit_gap_fill(
-    raw: &Polygons,
-    lw: f64,
-    sp: f64,
-    out: &mut Vec<ToolPath>,
-) -> Vec<crate::medial::ThickPolyline> {
+fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
     if raw.is_empty() {
-        return Vec::new();
+        return;
     }
     let min = 0.2 * lw;
     let max = 2.0 * sp;
@@ -4888,12 +4880,11 @@ fn emit_gap_fill(
     let wide = offset(&offset(&raw, -max * 0.5), max * 0.5);
     let gaps = difference(&opened_min, &wide);
     if gaps.is_empty() {
-        return Vec::new();
+        return;
     }
-    let (beads, mut runts) = crate::medial::medial_axis_with_runts(&gaps, min, max);
+    let (beads, _runts) = crate::medial::medial_axis_with_runts(&gaps, min, max);
     for tp in beads {
         if tp.length_mm() < GAP_BEAD_MIN_MM {
-            runts.push(tp);
             continue;
         }
         // A bead narrower than the orifice that has to draw it is not a bead.
@@ -4908,14 +4899,12 @@ fn emit_gap_fill(
         // to be in the first place.
         let wmean = tp.widths.iter().sum::<f64>() / tp.widths.len().max(1) as f64;
         if wmean < GAP_BEAD_MIN_W * lw {
-            runts.push(tp);
             continue;
         }
         // A bead claiming to be wider than the fillable band is a medial
         // mis-measure (jagged raster blobs defeat the wide-core subtraction;
-        // the width AND the centerline are then suspect). Demote to a runt:
-        // the absorb pass folds its volume into neighbouring rings, clamped
-        // to sane widths — never a monster bead in the print.
+        // the width AND the centerline are then suspect). Drop it rather than
+        // print a monster bead on a mis-measurement.
         let wmax = tp.widths.iter().cloned().fold(0.0f64, f64::max);
         if wmax > max * 1.5 {
             if std::env::var("FABLE_DEBUG_GAPS").is_ok() {
@@ -4926,159 +4915,9 @@ fn emit_gap_fill(
                     q.y_mm()
                 );
             }
-            runts.push(tp);
             continue;
         }
         emit_tapered_bead(&tp, lw, out);
-    }
-    runts
-}
-
-/// The dual of [`narrow_pinched_rings`]: where gap fill DROPPED a void — a
-/// sub-length speck, or a rib the medial's twig cull removed — widen the
-/// nearest inner ring over the void's span instead of leaving a pinhole. Each
-/// receiving vertex shifts half the absorbed width toward the void and widens
-/// by all of it, so the bead's near edge sweeps across the void while its far
-/// edge stays put: the void's volume is deposited without double-covering the
-/// far side. Runt samples already inside a placed gap bead's footprint (a
-/// culled corner rib of a channel that got its bead) are skipped, and the
-/// visible outer wall is never a receiver.
-fn absorb_dropped_voids(
-    paths: &mut [ToolPath],
-    runts: &[crate::medial::ThickPolyline],
-    lw: f64,
-    sp: f64,
-) {
-    if runts.is_empty() {
-        return;
-    }
-    // Placed gap beads' segments — absorption must not re-fill their coverage.
-    let mut placed: Vec<(Point, Point, f64)> = Vec::new();
-    for p in paths.iter() {
-        if p.kind != PathKind::GapFill || p.points.len() < 2 {
-            continue;
-        }
-        if let Some(ws) = &p.widths {
-            for j in 0..p.points.len() - 1 {
-                let hw = ws[j].max(ws[j + 1]) * 0.5;
-                placed.push((p.points[j], p.points[j + 1], hw));
-            }
-        }
-    }
-    // Receiver segments (inner rings only, still plain), on a coarse grid.
-    let receivers: Vec<usize> = (0..paths.len())
-        .filter(|&i| {
-            let p = &paths[i];
-            p.kind == PathKind::Perimeter && p.closed && p.segs.is_none() && p.points.len() >= 4
-        })
-        .collect();
-    if receivers.is_empty() {
-        return;
-    }
-    let cell = ((lw + sp) * geo2d::UNITS_PER_MM).max(1.0) as i64;
-    let mut grid: std::collections::HashMap<(i64, i64), Vec<(usize, usize)>> =
-        std::collections::HashMap::new();
-    for &i in &receivers {
-        let pts = &paths[i].points;
-        let n = pts.len();
-        for j in 0..n {
-            let (a, b) = (pts[j], pts[(j + 1) % n]);
-            for gx in a.x.min(b.x).div_euclid(cell)..=a.x.max(b.x).div_euclid(cell) {
-                for gy in a.y.min(b.y).div_euclid(cell)..=a.y.max(b.y).div_euclid(cell) {
-                    grid.entry((gx, gy)).or_default().push((i, j));
-                }
-            }
-        }
-    }
-    // Match every runt sample to its nearest receiver.
-    // BTreeMap: iterated below — receiver processing order must not vary
-    // run to run (HashMap's random seed made slices nondeterministic).
-    let mut assigned: std::collections::BTreeMap<usize, Vec<([f64; 2], f64)>> =
-        std::collections::BTreeMap::new();
-    for tp in runts {
-        let (rp, rw) = resample_thick(&tp.points, &tp.widths, PINCH_STEP_MM);
-        for (q, w) in rp.iter().zip(&rw) {
-            let v = w.min(lw);
-            if v < 0.05 {
-                continue; // dust below print resolution
-            }
-            let qm = [q.x_mm(), q.y_mm()];
-            if placed
-                .iter()
-                .any(|&(a, b, hw)| point_segment_dist_mm(*q, a, b) <= hw + v * 0.5)
-            {
-                continue; // a culled rib of a channel that got its bead
-            }
-            let (cx, cy) = (q.x.div_euclid(cell), q.y.div_euclid(cell));
-            let mut best: Option<(usize, f64)> = None;
-            for gx in (cx - 1)..=(cx + 1) {
-                for gy in (cy - 1)..=(cy + 1) {
-                    let Some(js) = grid.get(&(gx, gy)) else { continue };
-                    for &(i, j) in js {
-                        let pts = &paths[i].points;
-                        let d = point_segment_dist_mm(*q, pts[j], pts[(j + 1) % pts.len()]);
-                        if best.is_none_or(|(_, bd)| d < bd) {
-                            best = Some((i, d));
-                        }
-                    }
-                }
-            }
-            if let Some((i, d)) = best {
-                if d <= lw + v {
-                    assigned.entry(i).or_default().push((qm, v));
-                }
-            }
-        }
-    }
-    // Apply per receiving ring: resample so the profile can be local, then
-    // widen + nudge toward each void, feathered so E doesn't step.
-    for (i, samples) in assigned {
-        let p = &mut paths[i];
-        if p.widths.is_none() {
-            let mut wrapped = p.points.clone();
-            wrapped.push(wrapped[0]);
-            let dummy = vec![0.0; wrapped.len()];
-            let (mut rp, _) = resample_thick(&wrapped, &dummy, PINCH_STEP_MM);
-            rp.pop();
-            if rp.len() < 4 {
-                continue;
-            }
-            let n = rp.len();
-            p.points = rp;
-            p.widths = Some(vec![p.width_mm; n]);
-        }
-        let n = p.points.len();
-        let (mut add, mut sx, mut sy) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-        for (qm, v) in samples {
-            let (mut k, mut kd) = (0usize, f64::MAX);
-            for (j, pt) in p.points.iter().enumerate() {
-                let d = (qm[0] - pt.x_mm()).hypot(qm[1] - pt.y_mm());
-                if d < kd {
-                    (k, kd) = (j, d);
-                }
-            }
-            if v > add[k] {
-                add[k] = v;
-                let l = kd.max(1e-9);
-                sx[k] = (qm[0] - p.points[k].x_mm()) / l * v * 0.5;
-                sy[k] = (qm[1] - p.points[k].y_mm()) / l * v * 0.5;
-            }
-        }
-        // A tight feather (±1 sample): enough that E doesn't step, without
-        // smearing a short void's volume past its own neighbourhood.
-        let add = smooth_widths(&add, PINCH_STEP_MM, 1.0);
-        let sx = smooth_widths(&sx, PINCH_STEP_MM, 1.0);
-        let sy = smooth_widths(&sy, PINCH_STEP_MM, 1.0);
-        let ws = p.widths.as_mut().unwrap();
-        for j in 0..n {
-            if add[j] > 1e-6 {
-                ws[j] = (ws[j] + add[j]).min(lw * 2.0);
-                p.points[j] = Point::from_mm(
-                    p.points[j].x_mm() + sx[j],
-                    p.points[j].y_mm() + sy[j],
-                );
-            }
-        }
     }
 }
 
@@ -7955,21 +7794,29 @@ mod tests {
     }
 
     #[test]
-    fn the_center_slit_is_closed_by_widening_not_by_a_hair_bead() {
+    fn a_slit_narrower_than_the_nozzle_is_left_alone() {
         // A 60×6 mm plate at lw 0.4: concentric walls leave a ~0.2 mm slit
         // down the middle (6.0 isn't an integer number of bead spacings).
         //
-        // That slit used to be traced with a 0.2 mm "bead". A 0.4 mm orifice
-        // cannot draw one: the extruder meters the volume, the plastic still
-        // leaves through a 0.4 mm hole, and what lands is an under-pressured
-        // thread that bonds to nothing — at the cost of a travel, a retract
-        // and a restart. The volume belongs in the walls that bound the slit,
-        // and `absorb_dropped_voids` is what puts it there.
+        // Nothing is done about it, deliberately. The two things that COULD
+        // be done are both worse than the slit:
+        //
+        //   - trace it with a 0.2 mm bead. A 0.4 mm orifice cannot draw one.
+        //     The extruder meters the volume, the plastic still leaves through
+        //     a 0.4 mm hole, and what lands is an under-pressured thread that
+        //     bonds to nothing — for a travel, a retract and a restart each.
+        //   - widen the neighbouring wall to swallow it. That was measured on
+        //     a real job: inner-wall runs varying by more than 0.15 mm along
+        //     their length went from 8% to 41%, because the widening follows
+        //     the void's raster boundary and writes its noise into the wall.
+        //
+        // A wall you can trust beats 0.6% of material in gaps narrower than
+        // the nozzle. So: no bead under 0.75 × line width, and no wall
+        // carries a width profile at all.
         let mesh = mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 60.0, 6.0, 2.0]]));
         let layers = generate(&mesh, &all_wall_settings());
         let mid = &layers[layers.len() / 2];
 
-        // No hair beads.
         for p in mid.paths.iter().filter(|p| p.kind == PathKind::GapFill) {
             let ws = p.widths.as_ref().expect("a gap bead carries a width profile");
             let mean = ws.iter().sum::<f64>() / ws.len() as f64;
@@ -7978,33 +7825,11 @@ mod tests {
                 "a {mean:.3} mm gap bead was placed; the nozzle is 0.4"
             );
         }
-
-        // The slit's volume went into a wall instead: some ring carries a
-        // per-segment width profile that runs ABOVE nominal, on the midline.
-        let (ymin, ymax) = mid
-            .paths
-            .iter()
-            .find(|p| p.kind == PathKind::ExternalPerimeter)
-            .unwrap()
-            .points
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y_mm()), b.max(p.y_mm())));
-        let midline = (ymin + ymax) * 0.5;
-        let widened = mid.paths.iter().any(|p| {
-            p.kind == PathKind::Perimeter
-                && p.widths.as_ref().is_some_and(|ws| {
-                    ws.iter().zip(&p.points).any(|(&w, pt)| {
-                        w > 0.4 + 1e-3 && (pt.y_mm() - midline).abs() < 1.0
-                    })
-                })
-        });
-        assert!(widened, "the slit was neither filled nor absorbed — it was just dropped");
-
-        // And nothing got pinched below nominal doing it.
         assert!(
-            !mid.paths.iter().any(|p| p.kind == PathKind::Perimeter
-                && p.widths.as_ref().is_some_and(|ws| ws.iter().any(|&w| w < 0.4 - 1e-6))),
-            "parallel sides at 0.6 mm pitch are not a pinch"
+            !mid.paths
+                .iter()
+                .any(|p| p.kind == PathKind::Perimeter && p.widths.is_some()),
+            "an inner wall was width-modulated to chase a sub-nozzle void"
         );
     }
     #[test]
@@ -8025,71 +7850,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dropped_voids_widen_the_nearest_ring() {
-        // A square ring and a hand-made runt lying beside its bottom edge:
-        // absorption must widen the ring locally — the dual of pinch narrowing
-        // — shift the widened stretch toward the void (near edge sweeps the
-        // void, far edge stays put), honor the 2·lw cap, and keep the loop
-        // closed. Coarse corner-only vertices prove the resample kicks in.
-        let square: Vec<Point> = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
-            .iter()
-            .map(|&(x, y)| Point::from_mm(x, y))
-            .collect();
-        let mut paths = vec![ToolPath::new(PathKind::Perimeter, true, 0.4, square)];
-        let runt = crate::medial::ThickPolyline {
-            points: vec![Point::from_mm(8.0, -0.4), Point::from_mm(9.5, -0.4)],
-            widths: vec![0.3, 0.3],
-            endpoints: (true, true),
-        };
-        absorb_dropped_voids(&mut paths, &[runt], 0.4, 0.357);
-        let ring = &paths[0];
-        assert!(ring.closed, "the widened ring stays a closed loop");
-        let ws = ring.widths.as_ref().expect("the runt must be absorbed");
-        let (mut wmax, mut at) = (0.0f64, [0.0f64; 2]);
-        for (w, pt) in ws.iter().zip(&ring.points) {
-            assert!(*w >= 0.4 - 1e-6, "absorption only ever widens");
-            assert!(*w <= 0.8 + 1e-6, "the 2·lw cap holds");
-            if *w > wmax {
-                wmax = *w;
-                at = [pt.x_mm(), pt.y_mm()];
-            }
-        }
-        assert!((0.55..=0.72).contains(&wmax), "widens by ≈ the void width, got {wmax:.2}");
-        assert!(
-            (7.0..10.5).contains(&at[0]) && at[1] < 0.0,
-            "widening is localized at the runt and shifted toward it, at ({:.1},{:.2})",
-            at[0], at[1]
-        );
-    }
-
-    #[test]
-    fn covered_runts_are_not_absorbed() {
-        // The same runt, but a placed gap bead already covers it (a culled
-        // corner rib of a channel that got its bead): nothing may widen.
-        let square: Vec<Point> = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
-            .iter()
-            .map(|&(x, y)| Point::from_mm(x, y))
-            .collect();
-        let mut bead = ToolPath::new(
-            PathKind::GapFill,
-            false,
-            0.4,
-            vec![Point::from_mm(7.5, -0.4), Point::from_mm(10.0, -0.4)],
-        );
-        bead.widths = Some(vec![0.4, 0.4]);
-        let mut paths = vec![ToolPath::new(PathKind::Perimeter, true, 0.4, square), bead];
-        let runt = crate::medial::ThickPolyline {
-            points: vec![Point::from_mm(8.0, -0.4), Point::from_mm(9.5, -0.4)],
-            widths: vec![0.3, 0.3],
-            endpoints: (true, true),
-        };
-        absorb_dropped_voids(&mut paths, &[runt], 0.4, 0.357);
-        assert!(
-            paths[0].widths.is_none(),
-            "a runt inside a placed bead's footprint is already filled"
-        );
-    }
 
     /// A vertical prism over a CONVEX CCW footprint (fan triangulation).
     fn prism(fp: &[[f64; 2]], z0: f64, z1: f64) -> Vec<[[f64; 3]; 3]> {
