@@ -2009,6 +2009,14 @@ fn plan_layer_travels(
     let mut last_kind: Option<PathKind> = None;
     let mut travels: Vec<Travel> = Vec::with_capacity(plan.paths.len());
     let mut comb: Option<CombGraph> = None;
+    // EVERY travel lifts. The nozzle never crosses the layer at bead height,
+    // so nothing it passes over can be raked, smeared, or picked up — whatever
+    // the travel's length or what it starts and ends on. The old rule lifted
+    // only when the travel also retracted and touched a visible surface, which
+    // on a dense wall field left a few tens of mm per layer skimming the
+    // print at bead height for no benefit worth the exception. A pressure-join
+    // is not a travel and still never lifts.
+    let hop = s.z_hop_mm > 0.0;
     for path in &plan.paths {
         if path.points.len() < 2 {
             travels.push(Travel::default());
@@ -2030,10 +2038,20 @@ fn plan_layer_travels(
             _ if changes_tool => Travel {
                 points: vec![start],
                 retract: s.retract_len_mm > 0.0,
-                hop: s.z_hop_mm > 0.0,
+                hop,
             },
-            None => Travel { points: vec![start], retract: false, hop: false },
-            Some(prev) if dist_mm(prev, start) < MIN_TRAVEL_MM => {
+            None => Travel { points: vec![start], retract: false, hop },
+            // The one exception to the lift: the next bead starts within a
+            // bead's reach of where the last one ended, on a clear line. There
+            // is nothing to clear at that range — the only thing under the
+            // nozzle is the bead it just laid — and lifting would cycle Z and
+            // hand the seam another chance to ooze for no gain. A short move
+            // whose line is BLOCKED still lifts: 0.8 mm is plenty to step over
+            // a wall's edge or a hole's rim.
+            Some(prev)
+                if dist_mm(prev, start) < MIN_TRAVEL_MM
+                    && !travel_blocked(&plan.outline, prev, start) =>
+            {
                 Travel { points: vec![start], retract: false, hop: false }
             }
             // Endpoints in different islands (or off the part — a skirt/brim
@@ -2046,11 +2064,7 @@ fn plan_layer_travels(
             Some(prev)
                 if island_of(&plan.outline, prev) != island_of(&plan.outline, start) =>
             {
-                Travel {
-                    points: vec![start],
-                    retract: s.retract_len_mm > 0.0,
-                    hop: s.z_hop_mm > 0.0,
-                }
+                Travel { points: vec![start], retract: s.retract_len_mm > 0.0, hop }
             }
             Some(prev) if !travel_blocked(&plan.outline, prev, start) => {
                 // A clear in-material straight: how it travels depends on WHOSE
@@ -2071,7 +2085,7 @@ fn plan_layer_travels(
                 let retract = !s.spiral_vase
                     && s.retract_len_mm > 0.0
                     && (d > COMB_RETRACT_MM || (surface && d > SURFACE_RETRACT_MM));
-                Travel { points: vec![start], retract, hop: retract && surface && s.z_hop_mm > 0.0 }
+                Travel { points: vec![start], retract, hop }
             }
             Some(prev) => {
                 let graph = comb.get_or_insert_with(|| CombGraph::build(&plan.outline));
@@ -2095,17 +2109,9 @@ fn plan_layer_travels(
                         let retract = s.retract_len_mm > 0.0
                             && (len > COMB_RETRACT_MM
                                 || (!s.spiral_vase && surface && len > SURFACE_RETRACT_MM));
-                        Travel {
-                            points: route,
-                            retract,
-                            hop: retract && surface && s.z_hop_mm > 0.0,
-                        }
+                        Travel { points: route, retract, hop }
                     }
-                    None => Travel {
-                        points: vec![start],
-                        retract: s.retract_len_mm > 0.0,
-                        hop: s.z_hop_mm > 0.0,
-                    },
+                    None => Travel { points: vec![start], retract: s.retract_len_mm > 0.0, hop },
                 }
             }
         };
@@ -3193,8 +3199,8 @@ mod tests {
     }
 
     #[test]
-    fn travels_touching_a_surface_retract_and_hop_buried_ones_glide() {
-        // The D5 policy. Same geometry, same 10 mm hop, one big solid outline
+    fn travels_touching_a_surface_retract_while_buried_ones_glide() {
+        // The D5 retraction policy (the HOP is unconditional — see below). Same geometry, same 10 mm hop, one big solid outline
         // so every travel is a CLEAR in-material straight — only the KINDS
         // differ. Buried→buried (sparse infill) glides unretracted: nobody
         // will ever see that bead. Anything touching a visible surface
@@ -3218,7 +3224,10 @@ mod tests {
         assert!(dist_mm(Point::from_mm(6.0, 5.0), Point::from_mm(16.0, 5.0)) < COMB_RETRACT_MM);
         let buried = hop(PathKind::Infill, PathKind::Infill);
         assert!(!buried.retract, "buried→buried glides: no retract under the drool cap");
-        assert!(!buried.hop, "and no hop");
+        // ...but it still LIFTS. Retraction is graded by what the travel can
+        // spoil; the hop is not, since 2026-08-18: every travel clears the
+        // layer, so nothing is ever crossed at bead height.
+        assert!(buried.hop, "every travel hops, buried or not");
         let buried_solid = hop(PathKind::Solid, PathKind::Infill);
         assert!(!buried_solid.retract, "buried solid is buried too");
         for (from, to, what) in [
@@ -3243,6 +3252,9 @@ mod tests {
         );
         plan_travels(&mut tiny, &s);
         assert!(!tiny[0].travels[1].retract, "a sub-bead reposition still glides");
+        // ...and it is the ONE travel that also skips the lift: the next bead
+        // starts 0.4 mm away on a clear line, so there is nothing to clear.
+        assert!(!tiny[0].travels[1].hop, "a bead-adjacent reposition needs no lift");
     }
 
     #[test]
