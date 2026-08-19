@@ -125,6 +125,35 @@ struct MeshOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f
     return vec4<f32>(base * shade, 1.0);
 }
 
+// --- the nozzle: a lit little hotend parked where a mirrored print has
+// reached. Its own entry rather than the mesh one because it carries per-
+// vertex color (brass, anodized block, aluminium fins) and needs no model
+// matrix — the CPU parks it, since it moves every frame and is ~300
+// triangles. Lit by the same camera-relative rig as the parts, so it sits in
+// the same world rather than floating over it. ---
+struct NozzleOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) color: vec3<f32>,
+};
+@vertex fn vs_nozzle(
+    @location(0) p: vec3<f32>,
+    @location(1) n: vec3<f32>,
+    @location(2) c: vec3<f32>,
+) -> NozzleOut {
+    var o: NozzleOut;
+    o.clip = u.mvp * vec4<f32>(p, 1.0);
+    o.normal = n;
+    o.color = c;
+    return o;
+}
+@fragment fn fs_nozzle(i: NozzleOut) -> @location(0) vec4<f32> {
+    let n = normalize(i.normal);
+    let kd = max(dot(n, normalize(u.light.xyz)), 0.0);
+    let fd = max(dot(n, normalize(u.mesh_unsel.xyz)), 0.0);
+    return vec4<f32>(i.color * (0.28 + 0.62 * kd + 0.26 * fd), 1.0);
+}
+
 // --- plain lines (bed grid) ---
 struct LineOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec3<f32> };
 @vertex fn vs_line(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>) -> LineOut {
@@ -370,16 +399,16 @@ pub struct Preview {
     /// Per-tool spool colors (rgb; index by tool id). Only read when
     /// `color_mode == 1`. Extra slots are zero.
     pub tool_palette: [[f32; 4]; TOOL_PALETTE_LEN],
-    /// A blob to draw wherever the beads stop — the nozzle of a mirrored
-    /// print. Same instance layout as a joint (it rides that pipeline), but
-    /// its own buffer so it draws regardless of how many beads are visible.
-    pub marker: Option<[f32; 11]>,
+    /// Draw the nozzle body (uploaded separately by `set_nozzle`) — on for a
+    /// mirrored print, off for a slice preview.
+    pub nozzle: bool,
 }
 
 pub struct Scene {
     format: wgpu::TextureFormat,
     mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    nozzle_pipeline: wgpu::RenderPipeline,
     bead_pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -441,7 +470,8 @@ pub struct Scene {
     blob_count: u32,
     joint_vbuf: GrowBuf,
     joint_count: u32,
-    marker_vbuf: GrowBuf,
+    nozzle_vbuf: GrowBuf,
+    nozzle_count: u32,
     label_pipeline: wgpu::RenderPipeline,
     label_bgl: wgpu::BindGroupLayout,
     label_sampler: wgpu::Sampler,
@@ -554,6 +584,21 @@ impl Scene {
             true,
             wgpu::CompareFunction::Less,
             Some(wgpu::Face::Back),
+        );
+        let nozzle_pipeline = make_pipeline(
+            device, &layout, &shader, format, "vs_nozzle", "fs_nozzle",
+            &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 9]>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+            }],
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::BlendState::REPLACE,
+            true,
+            wgpu::CompareFunction::Less,
+            // Two-sided: the bands are open tubes, so a fin's underside must
+            // draw when the camera is below it.
+            None,
         );
         let line_pipeline = make_pipeline(
             device, &layout, &shader, format, "vs_line", "fs_line",
@@ -801,6 +846,7 @@ impl Scene {
             format,
             mesh_pipeline,
             line_pipeline,
+            nozzle_pipeline,
             bead_pipeline,
             uniform_buf,
             bind_group,
@@ -839,7 +885,8 @@ impl Scene {
             blob_count: blob_verts.len() as u32,
             joint_vbuf: GrowBuf::default(),
             joint_count: 0,
-            marker_vbuf: GrowBuf::default(),
+            nozzle_vbuf: GrowBuf::default(),
+            nozzle_count: 0,
             label_pipeline,
             label_bgl,
             label_sampler,
@@ -1067,11 +1114,15 @@ impl Scene {
         self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
 
-    /// Upload the nozzle marker (same layout as a joint blob). Called only
-    /// when it moves, which is every frame of a mirrored print — one instance,
-    /// so the write is nothing.
-    pub fn set_marker(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, m: &[f32; 11]) {
-        self.marker_vbuf.write(device, queue, "nozzle_marker", bytemuck::cast_slice(m));
+    /// Upload the nozzle body, in world coordinates: `[pos.xyz, normal.xyz,
+    /// rgb]` per vertex. Rewritten whenever it moves — a few hundred vertices,
+    /// which is cheaper than threading a model matrix through the uniform.
+    /// An empty slice hides it.
+    pub fn set_nozzle(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[[f32; 9]]) {
+        self.nozzle_count = verts.len() as u32;
+        if !verts.is_empty() {
+            self.nozzle_vbuf.write(device, queue, "nozzle_body", bytemuck::cast_slice(verts));
+        }
     }
 
     /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat, tool]`.
@@ -1268,12 +1319,12 @@ impl Scene {
                         pass.draw(0..self.box_count, 0..n);
                     }
                 }
-                if let (Some(m), Some(mbuf)) = (&p.marker, self.marker_vbuf.as_ref()) {
-                    let _ = m;
-                    pass.set_pipeline(&self.joint_pipeline);
-                    pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
-                    pass.set_vertex_buffer(1, mbuf.slice(..));
-                    pass.draw(0..self.blob_count, 0..1);
+                if p.nozzle && self.nozzle_count > 0 {
+                    if let Some(nbuf) = self.nozzle_vbuf.as_ref() {
+                        pass.set_pipeline(&self.nozzle_pipeline);
+                        pass.set_vertex_buffer(0, nbuf.slice(..));
+                        pass.draw(0..self.nozzle_count, 0..1);
+                    }
                 }
                 let jn = p.joint_count.min(self.joint_count);
                 if jn > 0 {

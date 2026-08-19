@@ -1843,6 +1843,9 @@ struct App {
     beads_built_from: (bool, u64, u64),
     /// Bumped when a mirrored job is loaded, to invalidate the above.
     job_gen: u64,
+    /// Where the hotend body was last built, so it is rebuilt on movement
+    /// rather than every frame. `f32::MAX` = not drawn.
+    nozzle_parked: [f32; 3],
     /// When the last quiet status poll started (None = poll next frame).
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
@@ -2134,6 +2137,7 @@ impl App {
             job_wanted: None,
             beads_built_from: (false, u64::MAX, u64::MAX),
             job_gen: 0,
+            nozzle_parked: [f32::MAX; 3],
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
@@ -6317,44 +6321,60 @@ impl eframe::App for App {
                 // the layer in progress, and a blob rides the end of it where
                 // the nozzle is. Everything drawn has been printed, so nothing
                 // dims.
-                let mut marker = None;
+                let mut nozzle_at: Option<[f32; 3]> = None;
                 if self.view == ViewMode::Machine {
                     if let Some(job) = &self.job {
                         let (pos, mv) = job.timeline.at(job.head.t);
                         let li = job.timeline.layer_of(mv);
-                        let f = job.timeline.layer_fraction(job.head.t, li);
+                        // How much of the layer exists is a count of BEADS, not
+                        // a fraction of its time: a layer spends much of itself
+                        // travelling, and time-fraction drifts the drawn print
+                        // ahead of and behind the nozzle within every layer.
+                        // Each extruding move became exactly one bead segment
+                        // in plans_from_timeline, so counting them is exact.
+                        let first = job.timeline.layers[li].first_move as usize;
+                        let laid = job.timeline.moves[first..=mv.max(first)]
+                            .iter()
+                            .filter(|m| m.extruding)
+                            .count() as u32;
                         let span = |ends: &[u32]| -> u32 {
                             let a = if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
                             let b = ends.get(li).copied().unwrap_or(a);
-                            a + ((b - a) as f32 * f) as u32
+                            (a + laid).min(b)
                         };
                         count = span(&self.layer_ends);
-                        joint_count = span(&self.joint_layer_ends);
+                        // Joints (bead ends and corners) have no such 1:1 move,
+                        // so they ride the same proportion of their own layer.
+                        joint_count = {
+                            let a = if li == 0 { 0 } else { self.layer_ends.get(li - 1).copied().unwrap_or(0) };
+                            let b = self.layer_ends.get(li).copied().unwrap_or(a);
+                            let f = if b > a { (count - a) as f32 / (b - a) as f32 } else { 1.0 };
+                            let ja = if li == 0 { 0 } else { self.joint_layer_ends.get(li - 1).copied().unwrap_or(0) };
+                            let jb = self.joint_layer_ends.get(li).copied().unwrap_or(ja);
+                            ja + ((jb - ja) as f32 * f) as u32
+                        };
                         current_layer = (li + 1) as f32;
                         dim = 1.0;
-                        // Blob layout: [x, y, z, width, height, r, g, b, layer,
-                        // category, tool]. Sized well over a bead so it reads as
-                        // the nozzle rather than as another joint, and on the
-                        // accent's complement so it never hides in the print.
-                        let (ah, as_, _) = accent_hsl(self.accent);
-                        let c = hsl_to_rgb(ah + 180.0, (as_ * 0.9).clamp(0.0, 0.9), 0.6);
-                        marker = Some([
-                            pos[0] - self.preview_origin_x(),
-                            pos[1],
-                            pos[2],
-                            1.6,
-                            1.6,
-                            c[0],
-                            c[1],
-                            c[2],
-                            current_layer,
-                            0.0,
-                            0.0,
-                        ]);
+                        // The hotend itself, parked with its tip on the bead
+                        // just laid. Same X convention as the beads (push_inst
+                        // ADDS the origin), or the two would part company on a
+                        // multi-bed layout.
+                        nozzle_at = Some([pos[0] + self.preview_origin_x(), pos[1], pos[2]]);
                     }
                 }
-                if let Some(m) = &marker {
-                    self.scene.set_marker(&rs.device, &rs.queue, m);
+                // Park (or hide) the hotend. Rebuilt in world coordinates when
+                // it moves — a few hundred vertices, cheaper than threading a
+                // model matrix through the shared uniform.
+                match &nozzle_at {
+                    Some(at) if *at != self.nozzle_parked => {
+                        self.nozzle_parked = *at;
+                        self.scene.set_nozzle(&rs.device, &rs.queue, &nozzle_verts(*at));
+                    }
+                    None if self.nozzle_parked != [f32::MAX; 3] => {
+                        self.nozzle_parked = [f32::MAX; 3];
+                        self.scene.set_nozzle(&rs.device, &rs.queue, &[]);
+                    }
+                    _ => {}
                 }
                 // Filament mode recolors extrusion beads from the tool palette
                 // in-shader, so a spool-color change is a uniform update, not an
@@ -6368,7 +6388,7 @@ impl eframe::App for App {
                     mask: self.category_mask(),
                     color_mode,
                     tool_palette: self.tool_palette(),
-                    marker,
+                    nozzle: nozzle_at.is_some(),
                 })
             } else {
                 None
@@ -7833,6 +7853,63 @@ fn finish_slice(
 /// Emit one bead segment `a→b`, subdivided into ≤ `max_seg` mm pieces when set
 /// (paint mode) so a brush can target a sub-portion of a long straight run.
 #[allow(clippy::too_many_arguments)]
+/// A hotend, roughly a Revo: brass tip, anodized heater block, a bright
+/// heatbreak, and a finned heatsink. Built in world coordinates with `tip` at
+/// the nozzle's point, so the caller parks it by rebuilding rather than by
+/// transforming — it is a few hundred vertices and it only moves when the
+/// print does.
+///
+/// Vertex layout matches `Scene::set_nozzle`: `[pos.xyz, normal.xyz, rgb]`.
+/// Dimensions are the real ones in millimetres, so it sits over the print at
+/// the scale a hotend actually has.
+fn nozzle_verts(tip: [f32; 3]) -> Vec<[f32; 9]> {
+    const BRASS: [f32; 3] = [0.78, 0.60, 0.26];
+    const BLOCK: [f32; 3] = [0.16, 0.16, 0.18];
+    const STEEL: [f32; 3] = [0.62, 0.64, 0.68];
+    const FIN: [f32; 3] = [0.50, 0.53, 0.57];
+    let mut v: Vec<[f32; 9]> = Vec::with_capacity(700);
+    // Each band is a truncated cone from (r0, z0) to (r1, z1); a cylinder is
+    // one with equal radii, and the nozzle's point is one that closes to zero.
+    let mut band = |r0: f32, z0: f32, r1: f32, z1: f32, c: [f32; 3]| {
+        const N: usize = 20;
+        let dz = (z1 - z0).max(1.0e-4);
+        // Slope of the side, so the normal leans out (or in) with the wall
+        // instead of pointing flat sideways on a cone.
+        let nz = (r0 - r1) / dz;
+        for i in 0..N {
+            let (a0, a1) = (
+                i as f32 / N as f32 * std::f32::consts::TAU,
+                (i + 1) as f32 / N as f32 * std::f32::consts::TAU,
+            );
+            let (c0, s0, c1, s1) = (a0.cos(), a0.sin(), a1.cos(), a1.sin());
+            let p = |r: f32, z: f32, ca: f32, sa: f32| {
+                [tip[0] + r * ca, tip[1] + r * sa, tip[2] + z]
+            };
+            let n0 = [c0, s0, nz];
+            let n1 = [c1, s1, nz];
+            let (a, b) = (p(r0, z0, c0, s0), p(r0, z0, c1, s1));
+            let (d, e) = (p(r1, z1, c0, s0), p(r1, z1, c1, s1));
+            for (pos, nor) in [(a, n0), (b, n1), (d, n0), (b, n1), (e, n1), (d, n0)] {
+                v.push([pos[0], pos[1], pos[2], nor[0], nor[1], nor[2], c[0], c[1], c[2]]);
+            }
+        }
+    };
+    // Nozzle: a fine point opening into the brass body.
+    band(0.2, 0.0, 1.6, 1.2, BRASS);
+    band(1.6, 1.2, 3.2, 3.4, BRASS);
+    band(3.2, 3.4, 3.2, 4.6, BRASS);
+    // Heater block — the wide part that reads as "hotend" at a glance.
+    band(6.5, 4.6, 6.5, 13.0, BLOCK);
+    // Heatbreak, then the finned stack above it.
+    band(2.6, 13.0, 2.6, 16.0, STEEL);
+    for k in 0..5 {
+        let z = 16.0 + k as f32 * 2.6;
+        band(6.0, z, 6.0, z + 1.1, FIN);
+        band(3.0, z + 1.1, 3.0, z + 2.6, STEEL);
+    }
+    v
+}
+
 fn push_bead(
     v: &mut Vec<[f32; 14]>,
     origin_x: f32,
