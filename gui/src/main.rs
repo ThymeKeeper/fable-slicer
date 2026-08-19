@@ -1848,6 +1848,12 @@ struct App {
     /// Where the hotend body was last built, so it is rebuilt on movement
     /// rather than every frame. `f32::MAX` = not drawn.
     nozzle_parked: [f32; 3],
+    /// Frame-timing report to stderr (FABLE_FRAME_LOG=1), for telling a
+    /// capped frame rate apart from a GPU that is behind.
+    frame_log: bool,
+    frame_last: std::time::Instant,
+    frame_report: std::time::Instant,
+    frame_times: Vec<f32>,
     /// When the last quiet status poll started (None = poll next frame).
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
@@ -2140,6 +2146,10 @@ impl App {
             beads_built_from: (false, u64::MAX, u64::MAX),
             job_gen: 0,
             nozzle_parked: [f32::MAX; 3],
+            frame_log: std::env::var("FABLE_FRAME_LOG").is_ok(),
+            frame_last: std::time::Instant::now(),
+            frame_report: std::time::Instant::now(),
+            frame_times: Vec::new(),
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
@@ -4265,6 +4275,33 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let rs = frame.wgpu_render_state().expect("wgpu render state").clone();
 
+        // FABLE_FRAME_LOG=1 reports frame timing to stderr every two seconds.
+        // The question it answers is the one that can't be answered by
+        // looking: when the mirrored head stutters, is the frame rate capped,
+        // is the GPU behind, or is the machine's data late? Costs a clock
+        // read per frame when off.
+        if self.frame_log {
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(self.frame_last).as_secs_f32();
+            self.frame_last = now;
+            self.frame_times.push(dt);
+            if self.frame_times.len() >= 2 && self.frame_report.elapsed().as_secs_f32() >= 2.0 {
+                let n = self.frame_times.len() as f32;
+                let mean = self.frame_times.iter().sum::<f32>() / n;
+                let worst = self.frame_times.iter().cloned().fold(0.0f32, f32::max);
+                eprintln!(
+                    "frames: {:.0}/s  mean {:.1} ms  worst {:.1} ms  ({} frames, {} beads drawn)",
+                    1.0 / mean.max(1.0e-6),
+                    mean * 1000.0,
+                    worst * 1000.0,
+                    self.frame_times.len(),
+                    self.layer_ends.last().copied().unwrap_or(0),
+                );
+                self.frame_times.clear();
+                self.frame_report = now;
+            }
+        }
+
         // The bead buffer holds ONE source at a time — this session's slice,
         // or the job the printer is running. Switching views or loading a job
         // rebuilds it; a signature keeps that from happening every frame.
@@ -4543,10 +4580,14 @@ impl eframe::App for App {
             if st.state == "printing" {
                 job.head.advance(dt);
             }
-            if self.view == ViewMode::Machine {
-                // 20 fps is plenty for a nozzle crossing a bed, and it keeps
-                // the view honest without pinning a core.
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            if self.view == ViewMode::Machine && st.state == "printing" {
+                // Draw as fast as the display will take it. A 50 ms delay
+                // capped this at 20 fps — and since the delay starts AFTER
+                // the frame, really at 1/(50 ms + render), which is what made
+                // a smoothly-interpolated head look choppy. Only while a job
+                // is actually moving, and only in this view: leave it and the
+                // frames stop.
+                ui.ctx().request_repaint();
             }
         }
 
