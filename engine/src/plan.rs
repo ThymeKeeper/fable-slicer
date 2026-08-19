@@ -6087,7 +6087,7 @@ const JOIN_REACH_SPACINGS: f64 = 1.5;
 /// travel/retract/unretract stop — the seam's uncontrollable flow transient —
 /// with one short junction extrude, so the visible wall never sees a restart.
 /// Donors are mutated only when their join commits; every gate failure leaves
-/// both paths untouched (graceful fallback to the scarf/butt seam).
+/// both paths untouched (graceful fallback to the trimmed butt seam).
 fn join_walls(plans: &mut [LayerPlan], settings: &Settings) {
     if settings.spiral_vase {
         return;
@@ -7109,15 +7109,18 @@ mod tests {
         assert!(count(slab, PathKind::Bridge) > 0, "anchored span bridges without support mode");
     }
 
+    /// Ring areas of the wall loops, in emission order. NOT filtered on
+    /// `closed`: every wall loop is opened a hair short of its own start by
+    /// the seam trim, so `closed` is false on all of them — the points still
+    /// describe the ring, which is what these tests measure.
     fn closed_wall_areas(plan: &LayerPlan) -> Vec<f64> {
         plan.paths
             .iter()
             .filter(|p| {
-                p.closed
-                    && matches!(
-                        p.kind,
-                        PathKind::Perimeter | PathKind::ExternalPerimeter | PathKind::OverhangWall
-                    )
+                matches!(
+                    p.kind,
+                    PathKind::Perimeter | PathKind::ExternalPerimeter | PathKind::OverhangWall
+                )
             })
             .map(|p| {
                 let pts = &p.points;

@@ -5879,7 +5879,7 @@ impl eframe::App for App {
                         "Bead (extrusion) width. Auto = nozzle × 1.125 (0.45 for a 0.4 nozzle); override to tune wall strength / detail. ⟲ returns to auto.");
                     revert_row(ui, &mut s.seam_mode, &self.baseline.seam_mode, |ui, v| {
                         seam_combo(ui, v)
-                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random. Seam mechanics are automatic — an outer wall reachable from its inner wall is entered at pressure with no stop at the seam; the rest get a derived scarf or a fixed butt trim.");
+                            .on_hover_text("Where each wall loop starts: nearest point, sharpest corner, or random. Seam mechanics are automatic — an outer wall reachable from its inner wall is entered at pressure with no stop at the seam, and every closed loop is opened a hair short of its own start so the closing bead never butts onto it.");
                     });
                     revert_row(ui, &mut s.elephant_foot_mm, &self.baseline.elephant_foot_mm, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 0.0..=0.5), "elephant foot mm",

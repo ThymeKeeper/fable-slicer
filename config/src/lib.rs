@@ -488,7 +488,7 @@ pub struct Settings {
     pub brim_loops: usize,
     /// Where to place the wall seam. Seam MECHANICS are automatic: an outer
     /// wall adjacent to its inner wall is entered at pressure (no stop at the
-    /// seam at all), the rest fall back to a derived-length scarf or a fixed
+    /// seam at all), the rest fall back to a fixed
     /// butt-seam trim — no knobs.
     pub seam_mode: SeamMode,
     /// Auto-center the model on the bed before slicing. The GUI positions objects

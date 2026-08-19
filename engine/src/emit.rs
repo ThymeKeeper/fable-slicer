@@ -495,8 +495,8 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
         // pressure, and that last bead is normally the outer wall's seam: a Z
         // move with a charged nozzle bleeds pressure straight down onto it, and
         // because the seam sits at the same XY every layer the ooze stacks into
-        // a blob column — the seam defect a scarf can't touch, because the
-        // scarf has already finished feathering by the time this happens.
+        // a blob column — a seam defect the closing trim can't touch, because
+        // the trim has already ended the bead by the time this happens.
         // This is the same retract the first path's travel was going to do; it
         // just has to happen on this side of the lift, so the loop below skips
         // it (`hoisted_retract`) and only unretracts on arrival.
@@ -675,27 +675,12 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
             let start = path.points[0];
 
             // Scarf (taper) seam: a closed outer-wall loop above the first layer
-            // blends its start and end over `scarf_seam_len_mm` instead of butting
+            // opens its closing leg a hair short of its start instead of butting
             // them at a point — no start/stop blob to stack into a column. The
             // whole loop then prints at one feed (its slowest segment, so an
             // overhang stretch is never outrun), which also sidesteps the slew
             // limiter. Needs room for the loop plus its overlap; too-short loops
             // and variable-width beads fall through to the normal branches.
-            let use_scarf = will_scarf(path, layer.index, s);
-            let scarf_feed = if use_scarf {
-                let flow_cap = layer_flow_cap_mm3_s(layer, t);
-                (0..n_segs)
-                    .map(|k| {
-                        let a = seg(k);
-                        feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
-                            * layer.speed_scale
-                            * small
-                    })
-                    .fold(f64::INFINITY, f64::min)
-            } else {
-                feed
-            };
-
             // Pressure-continuous entry for a joined path: no retract, no
             // travel, no unretract — one short junction bead from the donor's
             // exit (the path just emitted; `join_walls` seated its end here) to
@@ -794,7 +779,7 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
             // removes the double-counted bead overlap at concave wall vertices
             // — exact swept-area physics, always on. Every polyline-E branch
             // consults it (per-segment, plain, the chord fallbacks inside the
-            // arc branch, and the scarf sampler); a fitted G2/G3 extrudes from
+            // arc branch); a fitted G2/G3 extrudes from
             // true arc length and needs no correction. Rings only — closed, or
             // opened a hair by the butt-seam trim (still ≥99% of a ring, same
             // winding); a genuinely open arc (a paint split) has no winding to
@@ -815,34 +800,7 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
             };
             let ov = |k: usize| ov_scale.get(k).copied().unwrap_or(1.0);
 
-            if use_scarf {
-                // The scarf prints the whole loop at one kind/feed, so cooling
-                // can't grade per-segment. Set it from the MOST-overhanging
-                // segment (not seg(0), which may sit on a supported stretch) so
-                // an overhang stretch is never under-cooled. PA stays the
-                // path-level value seg(0) already set (pa_src = None here).
-                let worst = (0..n_segs)
-                    .map(seg)
-                    .max_by(|a, b| {
-                        a.overhang.partial_cmp(&b.overhang).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or(SegAttr { kind: path.kind, overhang: path.overhang, flow: 1.0 });
-                set_seg_attrs(
-                    &mut g, worst.kind, worst.overhang, layer, normal_fan, t, s, &mut cur_type,
-                    &mut cur_accel, &mut cur_pa, &mut cur_fan, None,
-                );
-                // A joined scarf enters via the junction bead — pressure
-                // engaged before the ramp's first commanded deposit.
-                emit_junction(&mut g, scarf_feed);
-                emit_scarf_loop(
-                    &mut g,
-                    &path.points,
-                    coeff,
-                    scarf_feed,
-                    scarf_len_mm(s),
-                    &ov_scale,
-                );
-            } else if let Some(ws) = &path.widths {
+            if let Some(ws) = &path.widths {
                 // Variable-width bead (a gap-fill stroke, or a pinch-narrowed
                 // ring): E per segment from the local width, so the bead tapers
                 // continuously. Arc fitting assumes a constant width, so it's
@@ -990,10 +948,7 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
                     g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * coeff * ov(n_pts - 1), feed);
                 }
             }
-            if path.joined && !use_scarf {
-                // (A scarfed joined loop needs no dive — it feathers its own
-                // exit to zero flow; a dive from the scarf exit would drag an
-                // unextruded pass back across several mm of fresh wall.)
+            if path.joined {
                 // Exit relocation — the PA-flush cut. The loop just finished at
                 // full pressure a trim short of its seam; stopping HERE parks
                 // the flush ooze on the seam column (and an unretracted glide
@@ -1007,12 +962,9 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
                 let exit = path_end(&layer.paths[i - 1]);
                 g.travel(exit.x_mm(), exit.y_mm(), feed);
             }
-            // A scarf feathers its own end to zero flow — no wipe needed, and a
-            // wipe would drag the nozzle back over the just-laid overlap. A
-            // joined loop dove into the gap — a wipe would climb back out onto
-            // the wall.
-            wipe_tail =
-                if use_scarf || path.joined { None } else { compute_wipe_tail(path, s.wipe_mm) };
+            // A joined loop dove into the gap — a wipe would climb back out
+            // onto the wall.
+            wipe_tail = if path.joined { None } else { compute_wipe_tail(path, s.wipe_mm) };
         }
     }
 
@@ -1102,150 +1054,6 @@ fn emit_spiral_layer(
         cum += d;
         let z = z_bot + (z_top - z_bot) * (cum / total);
         g.extrude_z(b.x_mm(), b.y_mm(), z, d * coeff, feed);
-    }
-}
-
-/// Emit a closed wall loop with a scarf (taper) seam. The loop is traced from
-/// the seam once around and then over its own first `scarf_len` again:
-///   1. Ramp-up wedge over the first `scarf_len`: the nozzle climbs from the
-///      previous layer's top to this layer's top while flow ramps 0 → full, so
-///      the bead grows from nothing to full height (a diagonal).
-///   2. Full height around the rest of the loop.
-///   3. Overlap over the first `scarf_len` again, at full Z, flow tapering
-///      full → 0 — this fills ON TOP of the ramp-up wedge (their heights are
-///      complementary and sum to full).
-/// Extrusion is continuous through the seam; the two retract points (loop start
-/// and end) land at the feathered near-zero-flow tips, so no blob forms — and
-/// across layers the ramp-up wedges stack into a diagonal instead of a column.
-/// Total extrusion equals a plain loop's (the two half-height passes over the
-/// overlap sum to one full pass). The nozzle ends at full Z, so `cur_z` is
-/// unchanged. E scales with the actual XY move (chord), not arc length, so
-/// resampling a curved scarf zone doesn't distort the deposited amount. `ov` is
-/// the per-source-segment concave overlap scale: source vertices are included
-/// in the taper-zone samples so every chord lies within ONE source segment, and
-/// both complementary passes over the overlap zone carry the same scale — their
-/// fractions sum to 1, so the trim totals exactly one full pass's worth.
-#[allow(clippy::too_many_arguments)]
-fn emit_scarf_loop(
-    g: &mut GcodeBuilder,
-    pts: &[Point],
-    coeff: f64,
-    feed: f64,
-    scarf_len: f64,
-    ov: &[f64],
-) {
-    let n = pts.len();
-    if n < 2 {
-        return;
-    }
-    let mut cum = vec![0.0f64; n + 1];
-    for k in 0..n {
-        cum[k + 1] = cum[k] + dist_mm(pts[k], pts[(k + 1) % n]);
-    }
-    let perim = cum[n];
-    let l = scarf_len.min(perim * 0.4).max(1.0e-6);
-
-
-    let seg_at = |s: f64| -> usize {
-        let s = s.clamp(0.0, perim);
-        let mut k = 0;
-        while k + 1 < n && cum[k + 1] < s {
-            k += 1;
-        }
-        k
-    };
-    let point_at = |s: f64| -> (f64, f64) {
-        let s = s.clamp(0.0, perim);
-        let k = seg_at(s);
-        let seg = cum[k + 1] - cum[k];
-        let t = if seg > 1.0e-9 { (s - cum[k]) / seg } else { 0.0 };
-        let (a, b) = (pts[k], pts[(k + 1) % n]);
-        (a.x_mm() + (b.x_mm() - a.x_mm()) * t, a.y_mm() + (b.y_mm() - a.y_mm()) * t)
-    };
-    let frac = |s: f64| -> f64 {
-        if s <= l {
-            (s / l).clamp(0.0, 1.0)
-        } else if s <= perim {
-            1.0
-        } else {
-            (1.0 - (s - perim) / l).clamp(0.0, 1.0)
-        }
-    };
-    // NO Z RAMP. The seam feathers by FLOW alone, at the layer's own height.
-    //
-    // The ramp this replaces climbed from the previous layer's top, which is
-    // what "a bead growing from nothing" implies geometrically — and is wrong
-    // physically. A nozzle has a flat tip and the surface under it has bead
-    // crowns, so at zero clearance it ploughs the layer below instead of
-    // printing on it. Measured across a whole 26 MB job, EVERY seam started
-    // between 1 and 25 µm above solid plastic and then ran millimetres at
-    // 86 mm/s: a glossy remelted smear on the part, immune to turning the
-    // temperature down, because it is contact and not heat.
-    //
-    // The reference slicer on this machine varies Z while extruding exactly
-    // zero times in 442,398 extruding moves. Neither do we now. E is ramped by
-    // arc length independently of Z, so the two complementary passes still sum
-    // to exactly one bead — the feathering is unaffected.
-    let ovf = |k: usize| ov.get(k).copied().unwrap_or(1.0);
-
-    // Sample arc-lengths 0..perim+ov_end: fine steps AND source vertices
-    // through the two taper zones (a chord straddling a vertex would cut the
-    // corner and misattribute its overlap trim), original vertices through the
-    // full middle.
-    let ds = FEED_PIECE_MM;
-    let ov_end = scarf_overlap_end(l);
-    let mut samples: Vec<f64> = Vec::new();
-    let mut s = ds;
-    while s < l - 1.0e-9 {
-        samples.push(s);
-        s += ds;
-    }
-    samples.push(l);
-    for k in 1..n {
-        if cum[k] < l - 1.0e-9 {
-            samples.push(cum[k]);
-        }
-        if cum[k] > l + 1.0e-9 && cum[k] < perim - 1.0e-9 {
-            samples.push(cum[k]);
-        }
-        // Overlap pass re-traces the early segments — their vertices again.
-        if cum[k] < ov_end - 1.0e-9 {
-            samples.push(perim + cum[k]);
-        }
-    }
-    samples.push(perim);
-    // Overlap — stops a seam-gap short of arc l so its last deposit lands where
-    // the ramp-up isn't full yet (flush, not proud on top). See SCARF_END_GAP_FRAC.
-    s = ds;
-    while s < ov_end - 1.0e-9 {
-        samples.push(perim + s);
-        s += ds;
-    }
-    samples.push(perim + ov_end);
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // No standalone Z-drop at the seam: a stationary move there dumps melt ooze
-    // on the same aligned spot every layer (a zit column). Instead the first
-    // ramp move descends diagonally from the travel height into the wedge while
-    // extruding its feathered lead-in — the nozzle never sits still, and it
-    // stays above the previous layer's top (z_low) the whole way, so it never
-    // plows.
-    let (mut px, mut py) = (pts[0].x_mm(), pts[0].y_mm());
-    let mut prev_s = 0.0;
-    for s1 in samples {
-        if s1 <= prev_s + 1.0e-9 {
-            continue;
-        }
-        let (x, y) = point_at(if s1 > perim { s1 - perim } else { s1 });
-        let chord = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
-        let mid = (prev_s + s1) * 0.5;
-        let k = seg_at(if mid > perim { mid - perim } else { mid });
-        let e = coeff * chord * frac(mid) * ovf(k);
-        // One move form throughout: the whole loop, taper included, prints at
-        // the layer's own height, so there is no Z to reassert.
-        g.extrude(x, y, e, feed);
-        (px, py) = (x, y);
-        prev_s = s1;
     }
 }
 
@@ -1419,7 +1227,7 @@ const SMALL_LOOP_MM: f64 = 40.0;
 
 /// Pace factor (≤1) for small closed wall loops, fading linearly from full
 /// speed at [`SMALL_LOOP_MM`] down to half speed. Applied at emission (and to
-/// the scarf/segment feeds), not inside `feed_for` — the flow-clamp audit
+/// the segment feeds), not inside `feed_for` — the flow-clamp audit
 /// reads `feed_for` and must not report thermal pacing as a flow limit.
 fn small_loop_factor(path: &ToolPath) -> f64 {
     if !path.closed
@@ -2593,11 +2401,9 @@ const SEAM_TRIM_LW: f64 = 0.1;
 /// enough to pockmark the wall just past the seam (seen at 0.15 on the Sovol).
 const JUNCTION_FLOW: f64 = 0.30;
 
-/// Plain-seam anti-zit: open each closed butt-seam wall loop a hair short of its
-/// own start so the closing bead stops before the seam point instead of butting
-/// onto it and piling a zit there. The scarf's [`SCARF_END_GAP_FRAC`] is the
-/// taper-seam analogue; scarfed loops are left alone (they feather their own
-/// end). JOINED loops take the trim too: entered at pressure the closing bead
+/// Seam anti-zit: open each closed wall loop a hair short of its own start so
+/// the closing bead stops before the seam point instead of butting onto it and
+/// piling a zit there. JOINED loops take the trim too: entered at pressure the closing bead
 /// arrives at FULL flow, so butting it onto the (also full) entry bead piles
 /// exactly the end-cap this trim cancels — the first Sovol reprint showed it
 /// as minor seam zits. The concave overlap trim survives the opening (the
@@ -2612,7 +2418,6 @@ pub(crate) fn apply_seam_gap(plans: &mut [LayerPlan], s: &Settings) {
     }
     let gap = SEAM_TRIM_LW * s.line_width_mm;
     for plan in plans.iter_mut() {
-        let idx = plan.index;
         for path in plan.paths.iter_mut() {
             if path.closed
                 && path.widths.is_none()
@@ -2620,7 +2425,6 @@ pub(crate) fn apply_seam_gap(plans: &mut [LayerPlan], s: &Settings) {
                     path.kind,
                     PathKind::ExternalPerimeter | PathKind::Perimeter | PathKind::OverhangWall
                 )
-                && !will_scarf(path, idx, s)
             {
                 trim_seam_gap(path, gap);
             }
@@ -2722,91 +2526,11 @@ fn concave_overlap_seg_scale(pts: &[Point], closed: bool, width: f64) -> Vec<f64
     scale
 }
 
-/// Derived scarf (taper) seam length: a fixed multiple of the line width — long
-/// enough that the ramp wedges stack into a shallow diagonal across layers,
-/// short enough that modest loops still qualify (a loop must be ≥ 3× this).
-/// Derived, not a knob: it scales with the nozzle like every other bead
-/// dimension.
-fn scarf_len_mm(s: &Settings) -> f64 {
-    8.0 * s.line_width_mm
-}
 
-/// Whether a path is emitted with a scarf seam. MUST match the `use_scarf` gate
-/// in `to_gcode` exactly, so travel planning agrees with emission on where the
-/// loop ends (a scarf ends `scarf_len` along the contour, not at the seam).
-/// A JOINED loop scarfs too — that pairing is the whole prize: the junction
-/// delivers the nozzle at full, known pressure, so the scarf's 0→full ramp
-/// deposits exactly what it commands (a cold-started scarf's ramp rides an
-/// unknowable post-travel pressure — the rough seam), and the diagonal
-/// closure never stacks into a column. Mixed-overhang loops (`segs`) keep
-/// the per-segment branch — a scarf prints the whole loop at its minimum
-/// feed, which would swallow the graded overhang speed ramp.
-fn will_scarf(p: &ToolPath, layer_index: usize, s: &Settings) -> bool {
-    if s.spiral_vase
-        || !p.closed
-        || p.widths.is_some()
-        || p.segs.is_some()
-        || layer_index < 1
-        || !matches!(p.kind, PathKind::ExternalPerimeter | PathKind::OverhangWall)
-    {
-        return false;
-    }
-    let n = p.points.len();
-    (0..n).map(|k| dist_mm(p.points[k], p.points[(k + 1) % n])).sum::<f64>()
-        >= 3.0 * scarf_len_mm(s)
-}
-
-/// Trailing "seam gap" as a FRACTION of the scarf length: the overlap stops this
-/// much short of the full-height corner at arc `l`. Its last deposit then lands
-/// where the ramp-up wedge is only `(1−frac)` built up, so it fills UP to level
-/// (flush) instead of sitting proud ON TOP of a full bead — the raised end mark.
-/// A fraction (not a fixed distance) keeps the headroom constant at any scarf
-/// length: a fixed 0.5 mm is a healthy 17% of a 3 mm scarf but a useless 5% of a
-/// 10 mm one. The uncovered sliver [`(1−frac)·l`, `l`] is left at the ramp-up's
-/// height — a shallow blend into the full middle, far less visible than a bump.
-/// (Orca's "seam gap" is the same idea for plain loops.)
-const SCARF_END_GAP_FRAC: f64 = 0.15;
-
-/// Where the overlap ends: a seam-gap fraction short of the full scarf length
-/// `l`. Scales with `l`, so it degrades gracefully to 0 as `l → 0` (the derived
-/// scarf length is always positive, but the arithmetic is safe regardless).
-fn scarf_overlap_end(l: f64) -> f64 {
-    l * (1.0 - SCARF_END_GAP_FRAC)
-}
-
-/// The point a scarf loop's emission leaves the nozzle at: `scarf_overlap_end`
-/// (capped at 40% of the perimeter) along the contour from the seam — matching
-/// `emit_scarf_loop`'s final sample. Travel planning must start the next path's
-/// route from here, not the seam.
-fn scarf_exit_point(pts: &[Point], scarf_len: f64) -> Point {
-    let n = pts.len();
-    let perim: f64 = (0..n).map(|k| dist_mm(pts[k], pts[(k + 1) % n])).sum();
-    let l = scarf_overlap_end(scarf_len.min(perim * 0.4).max(1.0e-6));
-    let mut acc = 0.0;
-    for k in 0..n {
-        let d = dist_mm(pts[k], pts[(k + 1) % n]);
-        if acc + d >= l {
-            let t = if d > 1.0e-9 { (l - acc) / d } else { 0.0 };
-            let (a, b) = (pts[k], pts[(k + 1) % n]);
-            return Point::from_mm(
-                a.x_mm() + (b.x_mm() - a.x_mm()) * t,
-                a.y_mm() + (b.y_mm() - a.y_mm()) * t,
-            );
-        }
-        acc += d;
-    }
-    pts[0]
-}
-
-/// Nozzle position after a path's emission — the scarf overlap end for a scarfed
-/// outer wall, else the plain loop start (closed) / last point. Travel planning
-/// and time estimates chain from here.
-fn path_exit(p: &ToolPath, layer_index: usize, s: &Settings) -> Point {
-    if will_scarf(p, layer_index, s) {
-        scarf_exit_point(&p.points, scarf_len_mm(s))
-    } else {
-        path_end(p)
-    }
+/// Nozzle position after a path's emission: the plain loop start (closed) or
+/// the last point. Travel planning and time estimates chain from here.
+fn path_exit(p: &ToolPath, _layer_index: usize, _s: &Settings) -> Point {
+    path_end(p)
 }
 
 /// Which island a point sits in: the innermost CCW contour containing it.
@@ -3084,7 +2808,7 @@ fn crosses_hole(outline: &Polygons, a: Point, b: Point) -> bool {
 mod tests {
     use super::{
         apply_seam_gap, concave_overlap_seg_scale, dist_mm, fit_arc, island_of, path_end,
-        plan_travels, scarf_len_mm, travel_blocked, utc_stamp_at, CombGraph, ARC_MIN_PTS,
+        plan_travels, travel_blocked, utc_stamp_at, CombGraph, ARC_MIN_PTS,
         COMB_RETRACT_MM, FEED_SLEW_PER_MM, SEAM_TRIM_LW,
     };
     use crate::{
@@ -3199,7 +2923,7 @@ mod tests {
         // The seam blob column. A layer ends on the outer wall's seam with the
         // nozzle charged; if Z rises before the retract, melt pressure bleeds
         // straight down onto that seam, and since the seam sits at the same XY
-        // every layer the ooze stacks into a visible column. The scarf can't
+        // every layer the ooze stacks into a visible column. The trim can't
         // help — it has finished feathering by then. So on every layer change
         // that retracts at all, the retract must come FIRST.
         let mut s = Settings::default();
@@ -4431,7 +4155,7 @@ mod tests {
         // wall is entered AT PRESSURE — between the donor's last extrude and
         // the outer wall's first there must be NO travel, NO retract, and NO
         // unretract; just attribute lines and the junction extrude. And a
-        // joined wall never scarfs: no extruding-Z ramp in its body.
+        // joined wall prints flat: no extruding-Z ramp in its body.
         let mut s = Settings::default();
         s.top_layers = 0;
         s.bottom_layers = 0;
@@ -4462,156 +4186,14 @@ mod tests {
                 "no travel/retract/unretract/Z between donor and joined wall, found: {l}"
             );
         }
-        // A joined UNIFORM wall scarfs — the pressure-accurate pairing: the
-        // junction delivers the nozzle at full pressure and the scarf's flow
-        // ramp opens from near zero. Detected by that ramp, NOT by a Z change:
-        // the seam no longer varies Z while extruding at all (see
-        // `emit_scarf_loop`), and the taper is what a scarf actually is.
+        // The loop prints at one height throughout — nothing extrudes while
+        // moving Z anywhere in the file. (The taper seam that used to do that
+        // is gone: it ran the nozzle in contact with the layer below.)
         let wall_body = &after[..after[1..].find(";TYPE:").map(|i| i + 1).unwrap_or(after.len())];
-        let es: Vec<f64> = wall_body
-            .lines()
-            .filter(|l| l.starts_with("G1 ") && l.contains(" X") && l.contains(" E"))
-            .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
-            .take(10)
-            .collect();
-        assert!(es.len() >= 6, "no wall deposits to inspect");
-        // The junction bead is deposited first and at full flow — the whole
-        // point of entering at pressure — so the ramp is the minimum after it.
-        let lo = es.iter().take(6).cloned().fold(f64::MAX, f64::min);
         assert!(
-            lo < es[5] * 0.5,
-            "a joined uniform wall closes with a scarf (flow ramp), got {:?}",
-            &es[..6]
+            !wall_body.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
+            "an extruding move changed Z inside a wall loop"
         );
-    }
-
-    #[test]
-    fn scarf_seam_conserves_extrusion_and_feathers() {
-        // A single-wall cube has no inner wall to join from, so its outer wall
-        // takes the automatic scarf fallback. Net deposited filament must
-        // match the path model (the two half-height passes over the overlap
-        // sum to one full pass); retracts + primes cancel in the net sum.
-        let s = single_wall_cube();
-        let m = mesh::Mesh::cube(20.0);
-        let plans = generate(&m, &s);
-        let on = to_gcode(&plans, &s);
-        let net = |g: &str| -> f64 {
-            g.lines()
-                .filter(|l| l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 "))
-                .filter_map(|l| l.split(" E").nth(1))
-                .filter_map(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok())
-                .sum()
-        };
-        let (a, b) = (estimate_filament(&plans, &s).0, net(&on));
-        assert!((b - a).abs() / a < 0.01, "scarf conserves net E: model {a:.2} gcode {b:.2}");
-
-        // The seam feathers by FLOW, at the layer's own height. Nothing
-        // extrudes while moving Z: a ramp that starts at the previous layer's
-        // top puts a flat nozzle tip in contact with printed plastic, which
-        // shows on the part as a remelted smear and cannot be turned down with
-        // temperature. See `emit_scarf_loop`.
-        let chunk = layer_chunk(&on, 40);
-        assert!(
-            !chunk.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
-            "an extruding move changed Z inside the scarf"
-        );
-        let wall = chunk.find(";TYPE:Outer wall").or_else(|| chunk.find(";TYPE:Overhang wall")).unwrap();
-        let wall_body = &chunk[wall..chunk[wall + 1..].find(";TYPE:").map(|i| wall + 1 + i).unwrap_or(chunk.len())];
-        assert!(
-            !wall_body.lines().any(|l| l.starts_with("G1 Z") && !l.contains(" X") && !l.contains(" E")),
-            "no standalone Z-drop dwell at the seam"
-        );
-        // And the taper is still there: the seam's first deposits are a small
-        // fraction of a full bead, growing.
-        let wall_i = chunk.find(";TYPE:Outer wall").or_else(|| chunk.find(";TYPE:Overhang wall")).unwrap();
-        let es: Vec<f64> = chunk[wall_i..]
-            .lines()
-            .filter(|l| l.starts_with("G1 ") && l.contains(" X") && l.contains(" E"))
-            .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
-            .take(12)
-            .collect();
-        assert!(es.len() >= 6, "no seam deposits to inspect");
-        let mid = es[es.len() / 2];
-        assert!(es[0] < mid * 0.5, "the seam opens at full flow: {:?}", &es[..6]);
-
-        // Continuous through the seam: no retraction between the wall's first
-        // extrusion and its end (the far end feathers, no retract there).
-        let wall = chunk.find(";TYPE:Outer wall").unwrap();
-        let body = &chunk[wall..];
-        let body = &body[..body[1..].find(";TYPE:").map(|i| i + 1).unwrap_or(body.len())];
-        let wl: Vec<&str> = body.lines().collect();
-        let first_ex = wl.iter().position(|l| l.starts_with("G1 ") && l.contains(" E") && !l.contains(" E-")).unwrap();
-        assert!(!wl[first_ex..].iter().any(|l| l.contains("G1 E-")), "no retraction inside the scarf loop");
-
-        // Feathered ends: the first and last extruding moves of the loop carry
-        // near-zero E (a plain loop's are full-width). MOTION moves only — the
-        // lead-in's unretract is a stationary E-only line whose full priming
-        // charge is not a loop deposit.
-        let e_vals: Vec<f64> = wl[first_ex..]
-            .iter()
-            .filter(|l| l.contains(" X") || l.contains(" Y"))
-            .filter(|l| l.starts_with("G1 ") && l.contains(" E") && !l.contains(" E-"))
-            .filter_map(|l| l.split(" E").nth(1).and_then(|e| e.split(' ').next().unwrap_or("").parse::<f64>().ok()))
-            .collect();
-        assert!(e_vals.len() > 10, "loop has many moves");
-        let full = e_vals.iter().cloned().fold(0.0_f64, f64::max);
-        assert!(e_vals[0] < 0.1 * full, "loop starts feathered, got {}", e_vals[0]);
-        assert!(*e_vals.last().unwrap() < 0.1 * full, "loop ends feathered, got {}", e_vals.last().unwrap());
-    }
-
-    #[test]
-    fn scarf_loop_exit_is_down_the_contour_not_the_seam() {
-        // A scarf loop leaves the nozzle scarf_len along the contour from the
-        // seam, so travel planning for the NEXT path must chain from there, not
-        // points[0]. path_exit encodes that; without it the next path's retract
-        // and comb route are computed from the wrong head position.
-        let s = single_wall_cube();
-        let plans = generate(&mesh::Mesh::cube(20.0), &s);
-        let path = plans[40]
-            .paths
-            .iter()
-            .find(|p| matches!(p.kind, PathKind::ExternalPerimeter | PathKind::OverhangWall) && p.closed)
-            .expect("a closed outer wall on layer 40");
-        let seam = super::path_end(path);
-        // A joined copy scarfs too (the pressure-accurate pairing) — its
-        // exit matches the scarf exit, keeping travel planning in lockstep.
-        let mut jp = path.clone();
-        jp.joined = true;
-        assert_eq!(
-            super::path_exit(&jp, 40, &s).x,
-            super::path_exit(path, 40, &s).x,
-            "a joined loop shares the scarf exit"
-        );
-        // The overlap stops a seam-gap short of the derived scarf length, so
-        // the loop exits where its last deposit is flush.
-        let d = dist_mm(seam, super::path_exit(path, 40, &s));
-        let expected = super::scarf_overlap_end(scarf_len_mm(&s));
-        assert!((d - expected).abs() < 0.25, "scarf exit at the trimmed end {d:.2} vs {expected:.2}");
-        assert!(expected < scarf_len_mm(&s), "the trim ends short of the full-height corner");
-        // And layer 0 never scarfs (the butt trim opens its loop), so it exits
-        // at its real last point.
-        let l0 = plans[0]
-            .paths
-            .iter()
-            .find(|p| matches!(p.kind, PathKind::ExternalPerimeter | PathKind::OverhangWall))
-            .expect("an outer wall on layer 0");
-        assert_eq!(super::path_exit(l0, 0, &s).x, super::path_end(l0).x, "layer 0 exits at its end");
-    }
-
-    #[test]
-    fn scarf_seam_skips_the_first_layer() {
-        // Layer 0 would ramp below the bed — it must never scarf.
-        let s = single_wall_cube();
-        let g = to_gcode(&generate(&mesh::Mesh::cube(20.0), &s), &s);
-        let chunk = layer_chunk(&g, 0);
-        // A scarf ramp is an extruding Z move (X/Y + Z + E); the plain per-layer
-        // Z move (G1 Z… only) doesn't count.
-        assert!(
-            !chunk.lines().any(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")),
-            "no Z-ramp on the first layer"
-        );
-        // And no negative Z anywhere.
-        assert!(!g.contains(" Z-"), "scarf never drives Z negative");
     }
 
     #[test]

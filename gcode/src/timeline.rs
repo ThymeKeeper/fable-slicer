@@ -539,12 +539,13 @@ impl Parser {
         self.t += secs;
         // A new layer starts at the first extrusion after NON-extruding motion
         // raised Z. Detecting it from the printed Z alone looks obvious and is
-        // wrong: a scarf seam ramps Z by a fraction of a layer *while
-        // extruding* (this slicer's own files do, ~100 times a layer), and a
-        // z-hop lowers back to the same Z it left. Layer changes happen
-        // between extrusions, hops return to where they started, and scarfs
-        // never let go of the bead — which is exactly what this distinguishes.
-        // Slicer-agnostic on purpose: none of them agree on layer comments.
+        // wrong: a z-hop lowers back to the same Z it left, and any slicer that
+        // varies Z mid-bead (a taper seam, a vase spiral) would read as a new
+        // layer per sample — this slicer's own files did exactly that, ~100
+        // times a layer, until the taper seam was removed. Layer changes happen
+        // between extrusions and hops return to where they started, which is
+        // what this distinguishes. Slicer-agnostic on purpose: none of them
+        // agree on layer comments, and we still parse other slicers' files.
         if extruding {
             // The first extrusion of the file opens layer one wherever it
             // happens to be; after that only a non-extruding rise counts.
