@@ -14,7 +14,10 @@ pub struct Client {
     agent: ureq::Agent,
 }
 
-/// A snapshot of the printer's print state.
+/// A snapshot of the printer: everything the Machine view shows, in ONE
+/// query. Deliberately one round trip — the view polls on a timer, and a
+/// machine mid-print should never be answering four questions where one
+/// does. Temperatures are `None` when the machine has no such heater.
 #[derive(Debug, Clone)]
 pub struct PrintStatus {
     /// Moonraker print state: standby / printing / paused / complete / error / cancelled.
@@ -23,6 +26,19 @@ pub struct PrintStatus {
     pub filename: String,
     /// 0.0..=1.0 when printing.
     pub progress: f64,
+    /// Nozzle temperature and target (°C).
+    pub nozzle: Option<(f64, f64)>,
+    /// Bed temperature and target (°C).
+    pub bed: Option<(f64, f64)>,
+    /// Part-cooling fan duty, 0.0..=1.0.
+    pub fan: Option<f64>,
+    /// Seconds of printing executed, pauses excluded — Klipper's own clock.
+    /// The signal a local playhead disciplines against: unlike a position or
+    /// a file offset it isn't running ahead of the motion queue.
+    pub print_duration_s: f64,
+    /// Byte offset the g-code reader has reached, for matching progress
+    /// against a file we sliced ourselves.
+    pub file_position: u64,
 }
 
 impl Client {
@@ -98,14 +114,25 @@ impl Client {
         self.call("POST", "/printer/print/cancel").map(|_| ())
     }
 
-    /// Current print state / file / progress.
+    /// Current print state / file / progress / temperatures — one round trip.
     pub fn print_status(&self) -> Result<PrintStatus, String> {
-        let v = self.call("GET", "/printer/objects/query?print_stats&virtual_sdcard")?;
+        let v = self.call(
+            "GET",
+            "/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan",
+        )?;
         let status = &v["result"]["status"];
+        let pair = |o: &serde_json::Value| {
+            o["temperature"].as_f64().map(|t| (t, o["target"].as_f64().unwrap_or(0.0)))
+        };
         Ok(PrintStatus {
             state: status["print_stats"]["state"].as_str().unwrap_or("unknown").to_string(),
             filename: status["print_stats"]["filename"].as_str().unwrap_or("").to_string(),
             progress: status["virtual_sdcard"]["progress"].as_f64().unwrap_or(0.0),
+            nozzle: pair(&status["extruder"]),
+            bed: pair(&status["heater_bed"]),
+            fan: status["fan"]["speed"].as_f64(),
+            print_duration_s: status["print_stats"]["print_duration"].as_f64().unwrap_or(0.0),
+            file_position: status["virtual_sdcard"]["file_position"].as_u64().unwrap_or(0),
         })
     }
 

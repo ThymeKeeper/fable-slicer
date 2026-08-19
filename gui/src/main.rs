@@ -144,6 +144,37 @@ enum HostReply {
     Status(Result<printhost::PrintStatus, String>),
 }
 
+/// Which of the three views the viewport is showing. Model is the only one
+/// that edits: Preview and Machine both render the sliced beads read-only,
+/// Machine adding the connected printer's state on top (and, later, a
+/// playhead walking the toolpath in step with the job).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Model,
+    Preview,
+    Machine,
+}
+
+/// A slice just became available: show it — unless the user is watching the
+/// machine, where yanking the view out from under a running job would be
+/// worse than leaving the new slice for them to switch to. Free functions
+/// over the field, not `&mut self` methods: the panel closures that call
+/// them already hold other App fields mutably.
+fn show_preview(view: &mut ViewMode) {
+    if *view != ViewMode::Machine {
+        *view = ViewMode::Preview;
+    }
+}
+
+/// The slice is gone (geometry or settings changed). Fall back to the model,
+/// but leave the Machine view alone — what it shows belongs to the printer,
+/// not to this slice.
+fn drop_preview(view: &mut ViewMode) {
+    if *view == ViewMode::Preview {
+        *view = ViewMode::Model;
+    }
+}
+
 /// What the preview colors encode.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorBy {
@@ -1775,9 +1806,9 @@ struct App {
     /// In-flight printer-host operation: its reply arrives here from the
     /// worker thread (one op at a time; buttons disable).
     host_rx: Option<std::sync::mpsc::Receiver<HostReply>>,
-    /// True once a file has been sent this session — reveals the live-print
-    /// card on the viewport. The card's ✖ clears it (which also stops the
-    /// quiet status polls) until the next send.
+    /// True once a file has been sent this session. Keeps the quiet status
+    /// polls running from Model/Preview, so the Machine toggle's percentage
+    /// tracks the job you just started without having to sit in that view.
     sent_to_printer: bool,
     /// Latest polled printer state (None until the first poll lands).
     printer_status: Option<Result<printhost::PrintStatus, String>>,
@@ -1790,7 +1821,7 @@ struct App {
     /// Cumulative joint-blob count after each layer.
     joint_layer_ends: Vec<u32>,
     /// false = show the model mesh; true = show the sliced toolpaths.
-    view_preview: bool,
+    view: ViewMode,
     /// Last commanded state of the live chamber-circulation toggle (what WE
     /// sent, not polled hardware state — a starting print's own fan settings
     /// take over and this resets with the app).
@@ -2073,7 +2104,7 @@ impl App {
             bed_overlay_rect: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
-            view_preview: false,
+            view: ViewMode::Model,
             circulate_on: false,
             preview_layer: 1,
             show_walls: true,
@@ -2493,7 +2524,7 @@ impl App {
             self.baseline = self.settings.clone();
             self.sliced = None;
             self.slice_summary = None;
-            self.view_preview = false;
+            drop_preview(&mut self.view);
             self.mark_scene_dirty();
             self.refit_camera = true;
         }
@@ -3158,7 +3189,7 @@ impl App {
         self.grow_beds_to_fit();
         self.sliced = None;
         self.slice_summary = None;
-        self.view_preview = false;
+        drop_preview(&mut self.view);
         self.mark_scene_dirty();
     }
 
@@ -3412,7 +3443,7 @@ impl App {
         // tints and bumps content_version.)
         self.sliced = None;
         self.slice_summary = None;
-        self.view_preview = false;
+        drop_preview(&mut self.view);
         self.mark_mesh_color_dirty();
     }
 
@@ -3560,7 +3591,7 @@ impl App {
         } else {
             n.max(1)
         };
-        self.view_preview = true;
+        show_preview(&mut self.view);
         // The worker built the beads UNsubdivided + unpainted (it can't see paint
         // state). If there's surface paint (dabs) — or we're actively painting —
         // rebuild the beads subdivided and stamp the dabs, and refresh the readout
@@ -3909,6 +3940,17 @@ impl App {
 
     /// Upload filename: the active bed's first object name with a .gcode
     /// extension (uploads carry the last slice, which is per-bed).
+    /// Model view: the only one that edits. Preview and Machine are both
+    /// read-only renderings of the slice.
+    fn model_view(&self) -> bool {
+        self.view == ViewMode::Model
+    }
+
+    /// The viewport is showing sliced beads rather than the mesh.
+    fn beads_view(&self) -> bool {
+        matches!(self.view, ViewMode::Preview | ViewMode::Machine)
+    }
+
     fn upload_filename(&self) -> String {
         let base = self
             .objects
@@ -4017,7 +4059,7 @@ impl App {
         // change while judging the sliced preview free: the beads recolor from
         // the tool palette (a uniform, tracked by RenderSig) and the hidden mesh
         // isn't touched at all.
-        let show_mesh = !(self.view_preview && self.sliced.is_some());
+        let show_mesh = !(self.beads_view() && self.sliced.is_some());
         if (self.mesh_struct_dirty
             || self.mesh_xform_dirty
             || self.mesh_color_dirty
@@ -4210,7 +4252,7 @@ impl eframe::App for App {
                 self.arrange();
                 self.sliced = None;
                 self.slice_summary = None;
-                self.view_preview = false;
+                drop_preview(&mut self.view);
                 self.refit_camera = true;
             }
         }
@@ -4299,9 +4341,11 @@ impl eframe::App for App {
         let mut host_op: Option<HostOp> = None;
         let host_busy = self.host_rx.is_some();
         let host_set = !self.settings.host_url.trim().is_empty();
-        // The live-print overlay keeps itself fresh with quiet polls — brisk
-        // while printing, relaxed once idle/finished. No manual status button.
-        if self.sent_to_printer && host_set {
+        // Quiet polls keep the Machine view fresh — brisk while printing,
+        // relaxed once idle. They run while that view is open, or after a send
+        // (so the Machine button's percentage is live from the other views);
+        // never otherwise, and never more than one in flight.
+        if host_set && (self.sent_to_printer || self.view == ViewMode::Machine) {
             let interval = match &self.printer_status {
                 Some(Ok(st)) if st.state == "printing" || st.state == "paused" => 2.0,
                 None => 2.0, // first reading after a send
@@ -4714,29 +4758,57 @@ impl eframe::App for App {
             }
             ui.separator();
 
-            // Prominent Model / Preview toggle (Preview enabled once sliced).
+            // Prominent Model / Preview / Machine toggle (Preview enabled
+            // once sliced, Machine once a printer is configured). The Machine
+            // button carries the live job percentage, so a print stays legible
+            // from the other two views without an overlay floating over them.
             let n_layers = self.sliced.as_ref().map(|l| l.len()).unwrap_or(0);
+            let machine_label = match &self.printer_status {
+                Some(Ok(st)) if st.state == "printing" || st.state == "paused" => {
+                    format!("Machine {:.0}%", st.progress * 100.0)
+                }
+                _ => "Machine".to_string(),
+            };
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                // Split the row exactly: two buttons plus the spacing between
+                // Split the row exactly: the buttons plus the spacing between
                 // them must not exceed the row (a 2 pt overflow here widens
                 // the whole panel — see the note at Panel::left above).
-                let bw = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                let bw = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
                 if ui
-                    .add_sized([bw, 28.0], egui::Button::selectable(!self.view_preview, "Model"))
+                    .add_sized([bw, 28.0], egui::Button::selectable(self.model_view(), "Model"))
                     .on_hover_text("Show the 3D model(s) on the bed.")
                     .clicked()
                 {
-                    self.view_preview = false;
+                    self.view = ViewMode::Model;
                 }
                 let prev = ui
                     .add_enabled_ui(n_layers > 0, |ui| {
-                        ui.add_sized([bw, 28.0], egui::Button::selectable(self.view_preview, "Preview"))
-                            .on_hover_text("Show the sliced toolpaths.")
+                        ui.add_sized(
+                            [bw, 28.0],
+                            egui::Button::selectable(self.view == ViewMode::Preview, "Preview"),
+                        )
+                        .on_hover_text("Show the sliced toolpaths.")
                     })
                     .inner;
                 if prev.clicked() {
-                    self.view_preview = true;
+                    self.view = ViewMode::Preview;
+                }
+                let mach = ui
+                    .add_enabled_ui(host_set, |ui| {
+                        ui.add_sized(
+                            [bw, 28.0],
+                            egui::Button::selectable(
+                                self.view == ViewMode::Machine,
+                                machine_label.as_str(),
+                            ),
+                        )
+                        .on_hover_text("Show the connected printer: state, temperatures, and the running job.")
+                        .on_disabled_hover_text("Set a printer host under Connection first.")
+                    })
+                    .inner;
+                if mach.clicked() {
+                    self.view = ViewMode::Machine;
                 }
             });
             // The accent picker: one hue drives the whole 3D view (model
@@ -4784,7 +4856,7 @@ impl eframe::App for App {
             // the strokes are recorded as sub-bead dabs that resolve at bead
             // resolution when sliced (Preview shows the result, read-only). Only
             // meaningful on a multi-tool machine, in Model view.
-            if self.settings.tool_count > 1 && !self.view_preview {
+            if self.settings.tool_count > 1 && self.model_view() {
                 ui.horizontal(|ui| {
                     let tip = "Paint tool-color regions on the model. Click a spot to smart-fill \
                          (crease-bounded); drag to freehand brush; drag empty space orbits. \
@@ -4834,7 +4906,7 @@ impl eframe::App for App {
                     });
                 }
             }
-            if self.view_preview && n_layers > 0 {
+            if self.beads_view() && n_layers > 0 {
                 // The layer slider itself lives on the right edge of the 3D pane
                 // (vertical); here in the panel are just the feature toggles.
                 ui.horizontal_wrapped(|ui| {
@@ -5231,7 +5303,7 @@ impl eframe::App for App {
                         if repainted {
                             self.sliced = None;
                             self.slice_summary = None;
-                            self.view_preview = false;
+                            drop_preview(&mut self.view);
                         }
                         self.mesh_color_dirty = true; // swatch rows changed; tints may have
                     }
@@ -5248,7 +5320,7 @@ impl eframe::App for App {
                         {
                             self.sliced = None;
                             self.slice_summary = None;
-                            self.view_preview = false;
+                            drop_preview(&mut self.view);
                             self.mesh_color_dirty = true;
                         }
                         ui.ctx().request_repaint();
@@ -5887,7 +5959,7 @@ impl eframe::App for App {
             self.resync_tools();
             self.sliced = None;
             self.slice_summary = None;
-            self.view_preview = false;
+            drop_preview(&mut self.view);
             // single↔multi flips the model tint (accent vs per-part spool
             // colors) and reclamps part paints — a color change, not geometry.
             self.mark_mesh_color_dirty();
@@ -5919,7 +5991,7 @@ impl eframe::App for App {
             // Objects are only editable in Model view; Preview is read-only.
             // Painting also happens in Model view now (it records sub-bead dabs
             // that resolve at slice time); Preview just shows the result.
-            let edit = !self.view_preview;
+            let edit = self.model_view();
             // Ignore viewport input when the cursor is over a floating overlay.
             let pointer = ui.ctx().pointer_interact_pos();
             let over = |r: Option<egui::Rect>| matches!((r, pointer), (Some(r), Some(p)) if r.contains(p));
@@ -5975,7 +6047,7 @@ impl eframe::App for App {
                                 self.beds_dirty = true;
                                 self.sliced = None;
                                 self.slice_summary = None;
-                                self.view_preview = false;
+                                drop_preview(&mut self.view);
                             }
                         }
                     }
@@ -6077,8 +6149,8 @@ impl eframe::App for App {
             if camera_moving {
                 ui.ctx().request_repaint();
             }
-            let show_mesh = !(self.view_preview && self.sliced.is_some());
-            let preview = if self.view_preview && self.sliced.is_some() {
+            let show_mesh = !(self.beads_view() && self.sliced.is_some());
+            let preview = if self.beads_view() && self.sliced.is_some() {
                 let n = self.layer_ends.len();
                 let idx = self.preview_layer.saturating_sub(1);
                 let count = self.layer_ends.get(idx).copied().unwrap_or(0);
@@ -6328,7 +6400,7 @@ impl eframe::App for App {
 
             // Vertical layer slider on the right edge of the viewport — drag to
             // set the highest layer shown (lower layers dim). Preview only.
-            if self.view_preview && self.sliced.is_some() {
+            if self.beads_view() && self.sliced.is_some() {
                 let n = self.layer_ends.len();
                 if n > 0 {
                     egui::Area::new(egui::Id::new("layer_slider"))
@@ -6361,7 +6433,7 @@ impl eframe::App for App {
 
             // Floating translucent transform panel — only while an object is selected
             // and we're in Model view (Preview is read-only).
-            if let (Some(i), false) = (self.selected, self.view_preview) {
+            if let (Some(i), true) = (self.selected, self.model_view()) {
                 let (bx, by) = (self.settings.bed_size_x_mm, self.settings.bed_size_y_mm);
                 let mut changed = false;
                 let (mut dup, mut del, mut split) = (false, false, false);
@@ -6507,7 +6579,7 @@ impl eframe::App for App {
                     self.mark_geom_dirty();
                     self.sliced = None;
                     self.slice_summary = None;
-                    self.view_preview = false;
+                    drop_preview(&mut self.view);
                 }
                 if dup {
                     self.duplicate_selected();
@@ -6522,65 +6594,91 @@ impl eframe::App for App {
                 self.overlay_rect = None;
             }
 
-            // Live-print card: translucent, top-right of the viewport, shown
-            // once a file has been sent. The state refreshes itself on a timer
-            // (quiet polls), so there's no manual status button. Its ✖ hides
-            // the card (and stops the polls) until the next send.
-            if self.sent_to_printer && host_set {
+            // MACHINE VIEW: the printer's own panel, in the viewport. This
+            // is where the live-print card used to float over Model/Preview —
+            // it belongs to a view of its own now, and the Machine toggle
+            // carries the percentage so a running job is still legible from
+            // the other two. Deliberately rudimentary: state, temperatures,
+            // and transport. Mainsail is one tab away for everything else;
+            // what this view will earn its keep with is the slicer's own
+            // knowledge of the job (stage 2's playhead over the toolpath).
+            self.print_overlay_rect = None;
+            if self.view == ViewMode::Machine {
                 let state = self
                     .printer_status
                     .as_ref()
                     .and_then(|r| r.as_ref().ok())
                     .map(|st| st.state.as_str())
                     .unwrap_or("");
-                let mut hide_card = false;
-                let area = egui::Area::new(egui::Id::new("print_overlay"))
+                let area = egui::Area::new(egui::Id::new("machine_panel"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(rect.right() - 240.0, rect.top() + 10.0))
+                    .fixed_pos(egui::pos2(rect.right() - 300.0, rect.top() + 10.0))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style())
-                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 196))
+                            .fill(egui::Color32::from_rgba_unmultiplied(26, 22, 17, 214))
                             .show(ui, |ui| {
-                                ui.set_width(220.0);
-                                // Header: title left (fixed width, truncating)
-                                // with the dismiss ✖ to its right. No fill
-                                // layouts in here: an Area hands its content
-                                // LAST frame's rect as the available space, so
-                                // anything that centers or justifies against
-                                // it re-measures bigger every repaint and the
+                                // Fixed width, no fill layouts: an Area hands
+                                // its content LAST frame's rect as available
+                                // space, so anything justifying against it
+                                // re-measures bigger every repaint and the
                                 // card grows ~1 Hz with the status polls.
-                                ui.horizontal(|ui| {
-                                    let title = match &self.printer_status {
-                                        Some(Ok(st)) if !st.filename.is_empty() => st.filename.as_str(),
-                                        Some(Ok(_)) => "(no file)",
-                                        _ => "Printer",
-                                    };
-                                    ui.scope(|ui| {
-                                        ui.set_width(194.0);
-                                        ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
-                                    });
-                                    if ui
-                                        .small_button("✖")
-                                        .on_hover_text("Hide this card. Sending to the printer again brings it back.")
-                                        .clicked()
-                                    {
-                                        hide_card = true;
-                                    }
-                                });
+                                ui.set_width(280.0);
+                                ui.label(egui::RichText::new(self.settings.host_url.trim()).strong());
+                                ui.separator();
                                 match &self.printer_status {
                                     None => {
-                                        ui.weak("checking…");
+                                        ui.weak("reading the printer…");
                                     }
                                     Some(Err(e)) => {
                                         ui.colored_label(ui.visuals().error_fg_color, e);
+                                        ui.weak("Check the host under Connection.");
                                     }
                                     Some(Ok(st)) => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(&st.state).strong());
+                                            if !st.filename.is_empty() {
+                                                ui.add(
+                                                    egui::Label::new(egui::RichText::new(&st.filename).weak())
+                                                        .truncate(),
+                                                );
+                                            }
+                                        });
                                         if st.state == "printing" || st.state == "paused" {
-                                            ui.add(egui::ProgressBar::new(st.progress as f32).show_percentage());
+                                            ui.add(
+                                                egui::ProgressBar::new(st.progress as f32)
+                                                    .show_percentage(),
+                                            );
+                                            let m = (st.print_duration_s / 60.0).floor();
+                                            ui.weak(format!("{m:.0} min printing"));
                                         }
-                                        ui.weak(&st.state);
+                                        ui.separator();
+                                        let temp_row = |ui: &mut egui::Ui, what: &str, v: Option<(f64, f64)>| {
+                                            if let Some((now, target)) = v {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(what);
+                                                    ui.label(
+                                                        egui::RichText::new(format!("{now:.0} °C")).strong(),
+                                                    );
+                                                    if target > 0.0 {
+                                                        ui.weak(format!("→ {target:.0}"));
+                                                    }
+                                                });
+                                            }
+                                        };
+                                        temp_row(ui, "nozzle", st.nozzle);
+                                        temp_row(ui, "bed", st.bed);
+                                        if let Some(f) = st.fan {
+                                            ui.horizontal(|ui| {
+                                                ui.label("part fan");
+                                                ui.label(
+                                                    egui::RichText::new(format!("{:.0}%", f * 100.0))
+                                                        .strong(),
+                                                );
+                                            });
+                                        }
                                     }
                                 }
+                                ui.separator();
                                 ui.horizontal(|ui| {
                                     let live = !host_busy;
                                     if ui
@@ -6607,20 +6705,17 @@ impl eframe::App for App {
                                     {
                                         host_op = Some(HostOp::Cancel);
                                     }
+                                    if ui
+                                        .add_enabled(live, egui::Button::new("⟳"))
+                                        .on_hover_text("Read the printer now, without waiting for the next poll.")
+                                        .clicked()
+                                    {
+                                        host_op = Some(HostOp::Status);
+                                    }
                                 });
                             });
                     });
-                if hide_card {
-                    // Dismissed: drop the card and the polling behind it; the
-                    // next send re-arms both.
-                    self.sent_to_printer = false;
-                    self.printer_status = None;
-                    self.print_overlay_rect = None;
-                } else {
-                    self.print_overlay_rect = Some(area.response.rect);
-                }
-            } else {
-                self.print_overlay_rect = None;
+                self.print_overlay_rect = Some(area.response.rect);
             }
 
             // Messages pane: the one-line status plus the last slice's
