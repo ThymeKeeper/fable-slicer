@@ -4429,15 +4429,24 @@ impl eframe::App for App {
                                     let t_read = job.timeline.time_at_byte(
                                         st.file_position.min(u32::MAX as u64) as u32,
                                     );
-                                    let t = st
+                                    // Steer position only by a match we
+                                    // believe. The machine can report a
+                                    // position the file's path doesn't pass
+                                    // through — a pause lift, a macro, an
+                                    // adjust — and feeding that in reads as
+                                    // "the head is seconds ahead", which
+                                    // stalls it. A bad match is better
+                                    // ignored: the rate is already learned,
+                                    // so free-running is nearly right.
+                                    let phase = st
                                         .live_pos
                                         .and_then(|p| {
                                             let p = [p[0] as f32, p[1] as f32, p[2] as f32];
-                                            job.timeline.nearest_move(p, t_read, 30.0)
+                                            job.timeline.locate(p, t_read, 30.0)
                                         })
-                                        .map(|i| job.timeline.moves[i].t_end)
-                                        .unwrap_or(t_read);
-                                    job.head.sync(st.print_duration_s as f32, t);
+                                        .filter(|&(_, off)| off < 1.5)
+                                        .map(|(t, _)| t);
+                                    job.head.sync(st.print_duration_s as f32, t_read, phase);
                                 }
                                 // A different job (or none): mirror what the
                                 // machine is actually running, whoever sliced
