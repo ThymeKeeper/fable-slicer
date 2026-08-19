@@ -488,12 +488,18 @@ impl Parser {
         let secs = arc_len / self.feed_mm_s;
         let extruding = de > 0.0;
         let z0 = self.pos[2];
+        // The arc's E is shared out along its length, so each sub-move must be
+        // measured from where the arc STARTED. Reading `self.e` inside the
+        // loop instead reads the running total that `commit` has been
+        // advancing, and hands sub-move k a k-fold share: an arc ends up
+        // carrying about n/2 times the filament it should, and every bead
+        // reconstructed from one is drawn absurdly fat.
+        let e0 = self.e;
         for k in 1..=n {
             let f = k as f64 / n as f64;
             let a = a0 + (a1 - a0) * f;
             let p = [c[0] + r * a.cos(), c[1] + r * a.sin(), z0 + (to[2] - z0) * f];
-            let e_here = self.e + de * f;
-            self.commit(p, e_here, extruding, secs / n as f64, at_byte, tl);
+            self.commit(p, e0 + de * f, extruding, secs / n as f64, at_byte, tl);
         }
         self.e = e_new;
     }
@@ -798,6 +804,25 @@ G1 X0 Y0 E5
         assert!(dm < 0.01, "off the segment by {dm}");
         let (a, b) = (tl.moves[0].t_end, tl.moves[1].t_end);
         assert!(tm > a && tm < b, "mid-segment time {tm} not inside ({a}, {b})");
+    }
+
+    #[test]
+    fn an_arcs_filament_is_shared_out_along_it() {
+        // Every sub-move of an arc carries an equal share of the arc's E, and
+        // they sum to exactly what the file asked for. (Measured from the
+        // arc's start: reading the running total inside the loop gives sub-move
+        // k a k-fold share, and the reconstructed bead comes out ~n/2 times
+        // too wide.)
+        let g = "G90\nM83\nG1 X10 Y0 Z0.2 F600\nG3 X0 Y10 I-10 J0 E1.0 F600\n";
+        let tl = Timeline::parse(g.as_bytes());
+        let arc: Vec<&Move> = tl.moves.iter().filter(|m| m.extruding).collect();
+        assert!(arc.len() > 10, "arc sampled into {} moves", arc.len());
+        let total: f32 = arc.iter().map(|m| m.e_mm).sum();
+        assert!((total - 1.0).abs() < 1.0e-3, "arc laid {total} mm, asked for 1.0");
+        let share = 1.0 / arc.len() as f32;
+        for m in &arc {
+            assert!((m.e_mm - share).abs() < 1.0e-4, "uneven share {} vs {share}", m.e_mm);
+        }
     }
 
     #[test]

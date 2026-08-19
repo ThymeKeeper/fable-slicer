@@ -193,6 +193,12 @@ struct JobMirror {
     /// deliberately leave it alone — they change the head's rate, never its
     /// position or its clock.
     ticked: std::time::Instant,
+    /// The machine has been seen ON this file's path. Until then the head
+    /// stays parked at the start: a job counts as "printing" from the moment
+    /// it begins, but the first minutes are homing, heating and a nozzle
+    /// wipe, and running the head through the first layers during those
+    /// draws a print that hasn't started.
+    locked: bool,
 }
 
 /// What the preview colors encode.
@@ -4483,6 +4489,13 @@ impl eframe::App for App {
                                         })
                                         .filter(|&(_, off)| off < 1.5)
                                         .map(|(t, _)| t);
+                                    // Seeing the nozzle on the path is what
+                                    // says the file is under way; before that
+                                    // the machine is heating and wiping, and
+                                    // the head belongs at the start.
+                                    if phase.is_some() {
+                                        job.locked = true;
+                                    }
                                     job.head.sync(st.print_duration_s as f32, t_read, phase);
                                 }
                                 // A different job (or none): mirror what the
@@ -4513,6 +4526,7 @@ impl eframe::App for App {
                                     plans,
                                     head: gcode::Playhead::default(),
                                     ticked: std::time::Instant::now(),
+                                    locked: false,
                                 });
                                 // Sync on the next poll rather than guessing.
                                 self.last_status_poll = None;
@@ -4577,10 +4591,10 @@ impl eframe::App for App {
             let now = std::time::Instant::now();
             let dt = now.duration_since(job.ticked).as_secs_f32();
             job.ticked = now;
-            if st.state == "printing" {
+            if st.state == "printing" && job.locked {
                 job.head.advance(dt);
             }
-            if self.view == ViewMode::Machine && st.state == "printing" {
+            if self.view == ViewMode::Machine && st.state == "printing" && job.locked {
                 // Draw as fast as the display will take it. A 50 ms delay
                 // capped this at 20 fps — and since the delay starts AFTER
                 // the frame, really at 1/(50 ms + render), which is what made
@@ -6398,7 +6412,23 @@ impl eframe::App for App {
                 // dims.
                 let mut nozzle_at: Option<[f32; 3]> = None;
                 if self.view == ViewMode::Machine {
-                    if let Some(job) = &self.job {
+                    // Before the file's own motion begins — homing, heating,
+                    // a nozzle wipe — the hotend still belongs on screen,
+                    // standing wherever the machine actually has it. What it
+                    // must NOT do is walk the model's path: nothing has been
+                    // printed, so nothing is drawn.
+                    if let (Some(job), Some(Ok(st))) = (&self.job, &self.printer_status) {
+                        if !job.locked {
+                            count = 0;
+                            joint_count = 0;
+                            current_layer = 1.0;
+                            dim = 1.0;
+                            nozzle_at = st
+                                .live_pos
+                                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]);
+                        }
+                    }
+                    if let Some(job) = self.job.as_ref().filter(|j| j.locked) {
                         let (pos, mv) = job.timeline.at(job.head.t);
                         let li = job.timeline.layer_of(mv);
                         // How much of the layer exists is a count of BEADS, not
@@ -6982,6 +7012,9 @@ impl eframe::App for App {
                                 // tracking the machine's.
                                 if let Some(job) = &self.job {
                                     ui.separator();
+                                    if !job.locked {
+                                        ui.weak("waiting for the first move…");
+                                    }
                                     let (pos, mv) = job.timeline.at(job.head.t);
                                     let layer = job.timeline.layer_of(mv) + 1;
                                     ui.horizontal(|ui| {
