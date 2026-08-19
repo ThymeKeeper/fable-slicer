@@ -8,6 +8,9 @@
 //! and retraction is a plain negative-E move. This is what Klipper recommends, and
 //! it avoids unbounded absolute-E growth.
 
+pub mod timeline;
+pub use timeline::{Layer, Move, Playhead, Timeline};
+
 use std::fmt::Write;
 
 /// Accumulates G-code text while tracking the filament total and feed rate.
