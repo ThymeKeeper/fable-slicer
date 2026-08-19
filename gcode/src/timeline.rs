@@ -248,7 +248,7 @@ impl Timeline {
     }
 
     /// Where on the timeline a real machine position sits: the time of the
-    /// closest point on the path, and how far off it was (mm).
+    /// closest point on the path, and how far off it was LATERALLY (mm).
     ///
     /// Compares against the SEGMENTS, not their endpoints. Mid-travel the
     /// endpoints can be a hundred millimetres apart, and matching to the
@@ -278,16 +278,33 @@ impl Timeline {
             let t1 = self.moves[i].t_end;
             let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
             let ap = [pos[0] - a[0], pos[1] - a[1], pos[2] - a[2]];
-            let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let len2 = ab[0] * ab[0] + ab[1] * ab[1];
             let u = if len2 > 1.0e-9 {
-                ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0)
+                ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0)
             } else {
                 1.0
             };
             let d = [ap[0] - ab[0] * u, ap[1] - ab[1] * u, ap[2] - ab[2] * u];
-            let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            // Z decides whether to BELIEVE a candidate, never which one wins.
+            // The reported position comes back through the machine's transform
+            // stack — bed mesh, gcode offset — while the timeline holds the
+            // file's raw Z, and a tenth of a millimetre of that difference is
+            // enough to elect the layer directly below: same XY, one pitch
+            // down, and tens of seconds away in time. Ranked in XY, stacked
+            // candidates tie and the existing tie-break resolves them by time.
+            // The gate stays wide enough to admit a z-hop and refuse a pause
+            // lift or a macro that took the head somewhere else entirely.
+            if d[2].abs() > 1.0 {
+                continue;
+            }
+            let dist2 = d[0] * d[0] + d[1] * d[1];
             let t = t0 + (t1 - t0) * u;
-            let dt = (t - anchor_t).abs();
+            // Ties are broken by nearness to the anchor, but the two sides are
+            // not equally plausible: the anchor is the reader, and the nozzle
+            // is always behind it. A tie sitting AHEAD of the reader is a
+            // stretch of path the machine has not yet taken in, so it is
+            // weighed accordingly rather than accepted as an equal.
+            let dt = if t <= anchor_t { anchor_t - t } else { (t - anchor_t) * 4.0 };
             let better = match best {
                 None => true,
                 Some((bd, bdt, _)) if (dist2 - bd).abs() < 0.01 => dt < bdt,
@@ -807,6 +824,65 @@ G1 X0 Y0 E5
     }
 
     #[test]
+    fn a_z_biased_reading_still_finds_the_layer_it_is_on() {
+        // The machine reports its position after its own transform stack —
+        // bed mesh, gcode offset — so on a bowed bed the reported Z sits a
+        // tenth or two off the file's. Ranked in 3-D that elects the layer
+        // BELOW, whose bead is then tens of seconds back in time: the head
+        // stalls, and the next reading throws it forward again.
+        let mut g = String::from("G90\nM83\nG1 X0 Y0 Z0.2 F600\n");
+        for z in ["0.2", "0.4"] {
+            g.push_str(&format!("G1 Z{z}\n"));
+            for (x, y) in [(10, 0), (10, 10), (0, 10), (0, 0)] {
+                g.push_str(&format!("G1 X{x} Y{y} E0.3\n"));
+            }
+        }
+        let tl = Timeline::parse(g.as_bytes());
+        let second = tl.layers[1].first_move as usize;
+        let t_second = tl.moves[second].t_end;
+        // Printing the second layer at z 0.4, reported 0.15 mm low.
+        let (t, d) = tl.locate([10.0, 10.0, 0.25], t_second + 1.0, 5.0).unwrap();
+        assert!(t >= t_second, "the bias elected the layer below: {t} < {t_second}");
+        assert!(d < 0.01, "the lateral miss should be nil, not {d}");
+        // Biased the other way, into the layer above's travel plane, likewise.
+        let (t, _) = tl.locate([10.0, 10.0, 0.55], t_second + 1.0, 5.0).unwrap();
+        assert!(t >= t_second, "biased high, it left the layer: {t}");
+        // But Z is still believed when it says the head is somewhere else
+        // entirely — a pause lift, a macro — and no match comes back.
+        assert!(tl.locate([10.0, 10.0, 5.4], t_second + 1.0, 5.0).is_none(), "matched a lifted head");
+    }
+
+    #[test]
+    fn a_tie_resolves_behind_the_reader_not_ahead_of_it() {
+        // Once Z is out of the ranking, stacked passes tie, and the tie-break
+        // decides. It must not split the difference: the anchor is the file
+        // position, the nozzle trails it, and picking the copy the reader has
+        // not reached yet throws the head forward.
+        let mut g = String::from("G90\nM83\nG1 X0 Y0 Z0.2 F600\n");
+        for z in ["0.2", "0.4"] {
+            g.push_str(&format!("G1 Z{z}\n"));
+            for (x, y) in [(10, 0), (10, 10), (0, 10), (0, 0)] {
+                g.push_str(&format!("G1 X{x} Y{y} E0.3\n"));
+            }
+        }
+        let tl = Timeline::parse(g.as_bytes());
+        // The two times the head passes (10, 10), one per layer.
+        let corner: Vec<f32> = tl
+            .moves
+            .iter()
+            .filter(|m| (m.to[0] - 10.0).abs() < 1e-6 && (m.to[1] - 10.0).abs() < 1e-6)
+            .map(|m| m.t_end)
+            .collect();
+        assert_eq!(corner.len(), 2, "expected one corner per layer");
+        let (lower, upper) = (corner[0], corner[1]);
+        // An anchor placed NEARER the upper copy: a symmetric tie-break would
+        // take it, and the head would jump a whole layer ahead.
+        let anchor = lower + 0.55 * (upper - lower);
+        let (t, _) = tl.locate([10.0, 10.0, 0.3], anchor, 30.0).unwrap();
+        assert!((t - lower).abs() < 1e-3, "resolved ahead of the reader, to {t} (lower {lower}, upper {upper})");
+    }
+
+    #[test]
     fn an_arcs_filament_is_shared_out_along_it() {
         // Every sub-move of an arc carries an equal share of the arc's E, and
         // they sum to exactly what the file asked for. (Measured from the
@@ -890,6 +966,9 @@ pub struct Playhead {
     /// counts the homing and heating the timeline knows nothing about, so a
     /// ratio would read low forever.
     since: Option<(f32, f32)>,
+    /// A snap-sized jump that one reading asked for and no reading has yet
+    /// confirmed. Held rather than obeyed — see [`Playhead::sync`].
+    snap_pending: Option<f32>,
 }
 
 /// Position error beyond which the playhead gives up on catching up and just
@@ -909,10 +988,17 @@ const MAX_CATCH_UP: f32 = 2.5;
 const MIN_CRAWL: f32 = 0.2;
 /// Below this the machine has not printed enough for a trustworthy ratio.
 const MIN_RATIO_S: f32 = 8.0;
+/// The most timeline a SINGLE frame may consume. A frame that took a long
+/// time — a GPU stall, a hidden window, a slow first frame — would otherwise
+/// hand the head that whole interval at once, which is a teleport however
+/// perfect the tracking is. Capped, the remainder becomes ordinary phase
+/// error that the correction carries at up to `MAX_CATCH_UP`; the head keeps
+/// up as long as frames stay under MAX_FRAME_S * MAX_CATCH_UP.
+const MAX_FRAME_S: f32 = 0.15;
 
 impl Default for Playhead {
     fn default() -> Self {
-        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false, since: None }
+        Playhead { t: 0.0, rate: 1.0, correction: 0.0, learned: false, since: None, snap_pending: None }
     }
 }
 
@@ -920,6 +1006,7 @@ impl Playhead {
     /// Free-run by `dt` real seconds, at the learned rate plus whatever
     /// correction is still being absorbed.
     pub fn advance(&mut self, dt: f32) {
+        let dt = dt.clamp(0.0, MAX_FRAME_S);
         // Never runs backwards — a print does not un-print — but never
         // stops either. A floor of zero reads as the head PAUSING every time
         // a reading says it is ahead; crawling instead keeps the motion
@@ -960,11 +1047,30 @@ impl Playhead {
         let Some(target) = phase else { return };
         let drift = target - self.t;
         if drift.abs() > SNAP_S {
-            self.t = target;
-            self.correction = 0.0;
+            // A jump this big is either a real discontinuity — a resume, a
+            // skipped section, the wrong file — or one bad match. The real one
+            // says the same thing on the next reading; the bad one is gone by
+            // then. So corroborate before going: two readings that agree with
+            // each other move the head, and a lone outlier steers nothing at
+            // all, at the cost of honouring a genuine resume one poll late.
+            match self.snap_pending {
+                Some(p) if (target - p).abs() < SNAP_S => {
+                    self.t = target;
+                    self.correction = 0.0;
+                    self.snap_pending = None;
+                }
+                _ => self.snap_pending = Some(target),
+            }
         } else {
+            self.snap_pending = None;
             self.correction = drift / CATCH_UP_S;
         }
+    }
+
+    /// The correction currently being carried (timeline seconds per real
+    /// second, added to the rate). For diagnostics.
+    pub fn correction(&self) -> f32 {
+        self.correction
     }
 
     /// Start over (a new job, or a job that stopped).
@@ -1017,7 +1123,7 @@ mod playhead_tests {
 
     #[test]
     fn a_reading_never_moves_the_head_only_its_rate() {
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
         ph.sync(100.0, 104.0, Some(104.0)); // 4 s behind
         assert_eq!(ph.t, 100.0, "the reading itself moved the head");
         // It closes the gap by running fast, and gets most of the way there
@@ -1033,7 +1139,7 @@ mod playhead_tests {
     fn the_head_never_stutters_or_reverses() {
         // Frame-by-frame motion must stay smooth and forward through a bad
         // reading — this is what the eye actually judges.
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
         let mut prev = ph.t;
         let mut worst_step = 0.0f32;
         for frame in 0..400 {
@@ -1051,10 +1157,31 @@ mod playhead_tests {
     }
 
     #[test]
+    fn a_stalled_frame_does_not_teleport_the_head() {
+        // Rendering hiccups are the one remaining way a perfectly-tracked head
+        // can jump: dt is real time, and handing a 400 ms frame 400 ms of
+        // timeline moves the nozzle 40 mm in one step. The cap turns that into
+        // phase error, which the correction absorbs smoothly.
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        ph.advance(0.4);
+        assert!(ph.t - 100.0 <= MAX_FRAME_S + 1.0e-4, "a stalled frame jumped {:.3} s", ph.t - 100.0);
+        // And the head still catches up afterwards, because the machine's next
+        // reading turns the shortfall into a correction.
+        ph.sync(100.0, 100.0, Some(100.6));
+        let mut t = ph.t;
+        for _ in 0..60 {
+            ph.advance(0.05);
+            assert!(ph.t >= t, "never backwards");
+            t = ph.t;
+        }
+        assert!((ph.t - 103.6).abs() < 0.35, "caught up to {:.2}, expected ~103.6", ph.t);
+    }
+
+    #[test]
     fn being_ahead_slows_the_head_but_never_parks_it() {
         // A floor of zero reads as the nozzle PAUSING every time a reading
         // says it is ahead — which is exactly what it looked like.
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
         ph.sync(100.0, 90.0, Some(90.0)); // 10 s ahead: as wrong as it gets short of a snap
         let mut prev = ph.t;
         for _ in 0..40 {
@@ -1080,8 +1207,26 @@ mod playhead_tests {
 
     #[test]
     fn a_real_discontinuity_still_goes_straight_there() {
-        let mut ph = Playhead { t: 100.0, rate: 1.0, correction: 0.0, learned: true, since: None };
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
         ph.sync(500.0, 500.0, Some(500.0)); // the job is somewhere else entirely
-        assert!((ph.t - 500.0).abs() < 1.0e-3, "snapped to {}", ph.t);
+        assert!(ph.t < 101.0, "one reading was enough to move it, to {}", ph.t);
+        ph.sync(502.0, 502.0, Some(502.0)); // and the next reading says the same
+        assert!((ph.t - 502.0).abs() < 1.0e-3, "snapped to {}", ph.t);
+    }
+
+    #[test]
+    fn a_lone_wild_reading_steers_nothing() {
+        // One mis-match — the layer below, a macro move, a stray position —
+        // asks for a jump no other reading agrees with. It must not be obeyed,
+        // and it must not poison the readings that follow it either.
+        let mut ph = Playhead { t: 100.0, learned: true, ..Playhead::default() };
+        ph.sync(100.0, 100.0, Some(40.0)); // 60 s back: nonsense
+        assert_eq!(ph.t, 100.0, "the outlier moved the head to {}", ph.t);
+        assert_eq!(ph.correction, 0.0, "the outlier left a correction behind");
+        ph.sync(102.0, 102.0, Some(101.0)); // a sane reading, 1 s ahead
+        for _ in 0..200 {
+            ph.advance(0.05);
+        }
+        assert!((ph.t - 111.0).abs() < 0.3, "tracked to {:.2}, expected ~111", ph.t);
     }
 }

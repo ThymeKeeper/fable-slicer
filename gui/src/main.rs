@@ -1857,6 +1857,9 @@ struct App {
     /// Frame-timing report to stderr (FABLE_FRAME_LOG=1), for telling a
     /// capped frame rate apart from a GPU that is behind.
     frame_log: bool,
+    /// Per-sync tracing to stderr (FABLE_SYNC_LOG=1): what the machine said,
+    /// what it matched to, and what the head did about it.
+    sync_log: bool,
     frame_last: std::time::Instant,
     frame_report: std::time::Instant,
     frame_times: Vec<f32>,
@@ -2153,6 +2156,7 @@ impl App {
             job_gen: 0,
             nozzle_parked: [f32::MAX; 3],
             frame_log: std::env::var("FABLE_FRAME_LOG").is_ok(),
+            sync_log: std::env::var("FABLE_SYNC_LOG").is_ok(),
             frame_last: std::time::Instant::now(),
             frame_report: std::time::Instant::now(),
             frame_times: Vec::new(),
@@ -4496,7 +4500,47 @@ impl eframe::App for App {
                                     if phase.is_some() {
                                         job.locked = true;
                                     }
+                                    let before = job.head.t;
                                     job.head.sync(st.print_duration_s as f32, t_read, phase);
+                                    if self.sync_log {
+                                        let m = st.live_pos.and_then(|p| {
+                                            let p = [p[0] as f32, p[1] as f32, p[2] as f32];
+                                            job.timeline.locate(p, t_read, 30.0)
+                                        });
+                                        // The layer the head believes it is on
+                                        // and the one the match landed on: if
+                                        // they ever differ, so does `zb`, the
+                                        // gap between the reported Z and the
+                                        // file's — which is what used to
+                                        // decide the match.
+                                        let li = |t: f32| job.timeline.layer_of(job.timeline.at(t).1);
+                                        let lh = li(job.head.t);
+                                        let zb = st
+                                            .live_pos
+                                            .and_then(|p| {
+                                                Some(p[2] as f32 - job.timeline.layers.get(lh)?.z)
+                                            })
+                                            .unwrap_or(f32::NAN);
+                                        eprintln!(
+                                            "sync: dur {:7.1}  read {:7.1}  match {}  head {:7.1} -> {:7.1}  L{lh}{}  zb {zb:+.3}  drift {:+7.2}  rate {:.3} corr {:+.3}{}",
+                                            st.print_duration_s,
+                                            t_read,
+                                            match m {
+                                                Some((t, d)) => format!("t {t:7.1} at {d:5.2} mm"),
+                                                None => "        none        ".to_string(),
+                                            },
+                                            before,
+                                            job.head.t,
+                                            match m {
+                                                Some((t, _)) if li(t) != lh => format!("->L{}", li(t)),
+                                                _ => String::new(),
+                                            },
+                                            phase.map(|p| p - before).unwrap_or(f32::NAN),
+                                            job.head.rate,
+                                            job.head.correction(),
+                                            if (job.head.t - before).abs() > 1.0 { "  <-- SNAP" } else { "" },
+                                        );
+                                    }
                                 }
                                 // A different job (or none): mirror what the
                                 // machine is actually running, whoever sliced
@@ -4592,7 +4636,19 @@ impl eframe::App for App {
             let dt = now.duration_since(job.ticked).as_secs_f32();
             job.ticked = now;
             if st.state == "printing" && job.locked {
+                let before = job.head.t;
                 job.head.advance(dt);
+                // Threshold set to catch what a person can see: a tenth of a
+                // second of print motion is ~10 mm of nozzle travel.
+                if self.sync_log && (dt > 0.10 || (job.head.t - before) > 0.15) {
+                    eprintln!(
+                        "frame: dt {:.3} s advanced head {:+.3} s (rate {:.3} corr {:+.3})",
+                        dt,
+                        job.head.t - before,
+                        job.head.rate,
+                        job.head.correction(),
+                    );
+                }
             }
             if self.view == ViewMode::Machine && st.state == "printing" && job.locked {
                 // Draw as fast as the display will take it. A 50 ms delay
