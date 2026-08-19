@@ -1156,10 +1156,10 @@ mod tests {
         // Orca's card rates 13 (Bambu hotend); walls sustained at 13 shred
         // PETG on the Sovol — deliberate deviation (see the card).
         assert_eq!(s.max_volumetric_speed_mm3_s, 9.0);
-        // Orca's card ramps 10→40 by layer time (90 on overhangs); the base
-        // deliberately deviates to a flat 40 — at 10% a dense wall field on
-        // long layers heat-soaks PETG into ragged walls (see the card).
-        assert_eq!(s.fan_speed, 0.4);
+        // Orca's regime for this spool, restored 2026-08-18 after measuring
+        // what its clean print actually emits (0% and 10%, nothing higher):
+        // 10% base, ramping toward 40 by layer time, 90 on overhangs.
+        assert_eq!(s.fan_speed, 0.1);
         assert_eq!(s.fan_max, 0.4);
         assert_eq!(s.bridge_fan_speed, 0.9);
         assert_eq!(s.fan_off_layers, 3); // class = Orca's first-3-layers-off

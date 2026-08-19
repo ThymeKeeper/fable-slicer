@@ -29,11 +29,13 @@ density_g_cm3 = 1.25
 # to ~112 mm/s. Deliberate deviation, under test; raise only against a clean
 # print at the higher value.
 max_volumetric_speed_mm3_s = 9.0
-# Cooling: Orca's card runs 10% base ramping to 40% on short layers, 90% on
-# overhangs/bridges. Base DELIBERATELY deviates to 40% flat: dense wall-field
-# prints (walls-99) on long layers never trigger the short-layer ramp, and at
-# 10% the 255 °C beads heat-soak their neighbors into ragged walls (2026-08-16
-# untitled1 print — PLA/ASA clean on the identical toolpath). Under test.
-fan_speed = 0.4
+# Cooling, exactly Orca's card for this spool: 10% base, climbing toward 40%
+# only as layers get short enough to need it, 90% on overhangs and bridges.
+# A flat 40% base sat here from 2026-08-16 to test a heat-soak theory that the
+# next print refuted; measuring what Orca actually EMITS settled it — its
+# clean 4-hour PETG print used two duties in the whole file, 0% and 10%, and
+# never went above. PETG shrinks under draft, so the base is the number that
+# matters and it belongs low.
+fan_speed = 0.1
 fan_max = 0.4
 bridge_fan_speed = 0.9
