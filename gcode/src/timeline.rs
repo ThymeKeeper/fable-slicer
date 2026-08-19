@@ -221,6 +221,26 @@ impl Timeline {
         }
     }
 
+    /// How far through layer `li` the time `t` is, 0..=1 — what lets a
+    /// mirrored print grow a fraction of a layer at a time instead of
+    /// snapping a whole one into existence.
+    pub fn layer_fraction(&self, t: f32, li: usize) -> f32 {
+        let Some(layer) = self.layers.get(li) else { return 0.0 };
+        let first = layer.first_move as usize;
+        let start = if first == 0 { 0.0 } else { self.moves[first - 1].t_end };
+        let end = match self.layers.get(li + 1) {
+            Some(next) => {
+                let i = (next.first_move as usize).saturating_sub(1);
+                self.moves.get(i).map(|m| m.t_end).unwrap_or(self.seconds)
+            }
+            None => self.seconds,
+        };
+        if end - start <= 1.0e-6 {
+            return 1.0;
+        }
+        ((t - start) / (end - start)).clamp(0.0, 1.0)
+    }
+
     /// Which layer a move belongs to (0 when the file has none).
     pub fn layer_of(&self, move_idx: usize) -> usize {
         match self.layers.binary_search_by_key(&(move_idx as u32), |l| l.first_move) {
@@ -487,6 +507,27 @@ G1 X0 Y0 E5
         // Mid-sweep the head is out on the radius, not on the chord.
         let (p, _) = tl.at(tl.seconds - 0.785);
         assert!((p[0].hypot(p[1]) - 10.0).abs() < 0.1, "on the radius: {p:?}");
+    }
+
+    #[test]
+    fn layer_fraction_walks_a_layer_from_nothing_to_all_of_it() {
+        let g = "\
+G90
+M83
+G1 X0 Y0 Z0.2 F600
+G1 X10 Y0 E1
+G1 Z0.4
+G1 X0 Y0 E1
+";
+        let tl = Timeline::parse(g.as_bytes());
+        assert_eq!(tl.layers.len(), 2);
+        // Layer 0 spans the first extrusion only.
+        assert!(tl.layer_fraction(0.0, 0) < 0.01, "starts empty");
+        assert!((tl.layer_fraction(tl.seconds, 0) - 1.0).abs() < 1e-6, "ends full");
+        let mid = tl.layer_fraction(tl.moves[0].t_end + 0.5, 0);
+        assert!(mid > 0.3 && mid < 0.7, "halfway is halfway: {mid}");
+        // The last layer runs to the end of the file.
+        assert!((tl.layer_fraction(tl.seconds, 1) - 1.0).abs() < 1e-6);
     }
 
     #[test]

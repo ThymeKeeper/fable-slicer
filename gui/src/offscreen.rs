@@ -189,6 +189,8 @@ pub fn run(a: &Args) -> Result<(), String> {
     }
     let color_mode = std::env::var("CMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let preview = crate::render::Preview {
+        // The oracle renders a slice, never a live machine.
+        marker: None,
         count,
         joint_count,
         current_layer: layer as f32,

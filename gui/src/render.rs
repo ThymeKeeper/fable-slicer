@@ -370,6 +370,10 @@ pub struct Preview {
     /// Per-tool spool colors (rgb; index by tool id). Only read when
     /// `color_mode == 1`. Extra slots are zero.
     pub tool_palette: [[f32; 4]; TOOL_PALETTE_LEN],
+    /// A blob to draw wherever the beads stop — the nozzle of a mirrored
+    /// print. Same instance layout as a joint (it rides that pipeline), but
+    /// its own buffer so it draws regardless of how many beads are visible.
+    pub marker: Option<[f32; 11]>,
 }
 
 pub struct Scene {
@@ -437,6 +441,7 @@ pub struct Scene {
     blob_count: u32,
     joint_vbuf: GrowBuf,
     joint_count: u32,
+    marker_vbuf: GrowBuf,
     label_pipeline: wgpu::RenderPipeline,
     label_bgl: wgpu::BindGroupLayout,
     label_sampler: wgpu::Sampler,
@@ -834,6 +839,7 @@ impl Scene {
             blob_count: blob_verts.len() as u32,
             joint_vbuf: GrowBuf::default(),
             joint_count: 0,
+            marker_vbuf: GrowBuf::default(),
             label_pipeline,
             label_bgl,
             label_sampler,
@@ -1061,6 +1067,13 @@ impl Scene {
         self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
 
+    /// Upload the nozzle marker (same layout as a joint blob). Called only
+    /// when it moves, which is every frame of a mirrored print — one instance,
+    /// so the write is nothing.
+    pub fn set_marker(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, m: &[f32; 11]) {
+        self.marker_vbuf.write(device, queue, "nozzle_marker", bytemuck::cast_slice(m));
+    }
+
     /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat, tool]`.
     pub fn set_joints(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, joints: &[[f32; 11]]) {
         self.joint_count = joints.len() as u32;
@@ -1254,6 +1267,13 @@ impl Scene {
                         pass.set_vertex_buffer(1, inst.slice(..));
                         pass.draw(0..self.box_count, 0..n);
                     }
+                }
+                if let (Some(m), Some(mbuf)) = (&p.marker, self.marker_vbuf.as_ref()) {
+                    let _ = m;
+                    pass.set_pipeline(&self.joint_pipeline);
+                    pass.set_vertex_buffer(0, self.blob_vbuf.slice(..));
+                    pass.set_vertex_buffer(1, mbuf.slice(..));
+                    pass.draw(0..self.blob_count, 0..1);
                 }
                 let jn = p.joint_count.min(self.joint_count);
                 if jn > 0 {

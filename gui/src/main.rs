@@ -3650,7 +3650,7 @@ impl App {
             hop as f32,
             layer_colors.as_deref(),
             accent_hsl(self.accent),
-            self.sliced_origin_x as f32,
+            self.preview_origin_x(),
             // Subdivide beads when there's surface paint (or we're painting), so a
             // dab boundary can fall mid-bead (sub-bead resolution).
             if self.paint_mode || !self.bead_dabs.is_empty() {
@@ -3984,6 +3984,16 @@ impl App {
     /// The viewport is showing beads rather than the mesh.
     fn beads_view(&self) -> bool {
         matches!(self.view, ViewMode::Preview | ViewMode::Machine)
+    }
+
+    /// The X shift the bead buffer was built with. A mirrored job is drawn in
+    /// the machine's own coordinates; only this session's slice carries a
+    /// multi-bed offset.
+    fn preview_origin_x(&self) -> f32 {
+        match self.view {
+            ViewMode::Machine => 0.0,
+            _ => self.sliced_origin_x as f32,
+        }
     }
 
     /// Which plans the bead renderer draws: the mirrored job in the Machine
@@ -6297,10 +6307,55 @@ impl eframe::App for App {
             let preview = if self.beads_view() && self.preview_plans().is_some() {
                 let n = self.layer_ends.len();
                 let idx = self.preview_layer.saturating_sub(1);
-                let count = self.layer_ends.get(idx).copied().unwrap_or(0);
-                let joint_count = self.joint_layer_ends.get(idx).copied().unwrap_or(0);
+                let mut count = self.layer_ends.get(idx).copied().unwrap_or(0);
+                let mut joint_count = self.joint_layer_ends.get(idx).copied().unwrap_or(0);
                 // Dim lower layers only when the slider is below the top.
-                let dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
+                let mut dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
+                let mut current_layer = self.preview_layer as f32;
+                // A MIRRORED job draws itself as it is printed: the playhead —
+                // not the slider — says how much exists, down to a fraction of
+                // the layer in progress, and a blob rides the end of it where
+                // the nozzle is. Everything drawn has been printed, so nothing
+                // dims.
+                let mut marker = None;
+                if self.view == ViewMode::Machine {
+                    if let Some(job) = &self.job {
+                        let (pos, mv) = job.timeline.at(job.head.t);
+                        let li = job.timeline.layer_of(mv);
+                        let f = job.timeline.layer_fraction(job.head.t, li);
+                        let span = |ends: &[u32]| -> u32 {
+                            let a = if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
+                            let b = ends.get(li).copied().unwrap_or(a);
+                            a + ((b - a) as f32 * f) as u32
+                        };
+                        count = span(&self.layer_ends);
+                        joint_count = span(&self.joint_layer_ends);
+                        current_layer = (li + 1) as f32;
+                        dim = 1.0;
+                        // Blob layout: [x, y, z, width, height, r, g, b, layer,
+                        // category, tool]. Sized well over a bead so it reads as
+                        // the nozzle rather than as another joint, and on the
+                        // accent's complement so it never hides in the print.
+                        let (ah, as_, _) = accent_hsl(self.accent);
+                        let c = hsl_to_rgb(ah + 180.0, (as_ * 0.9).clamp(0.0, 0.9), 0.6);
+                        marker = Some([
+                            pos[0] - self.preview_origin_x(),
+                            pos[1],
+                            pos[2],
+                            1.6,
+                            1.6,
+                            c[0],
+                            c[1],
+                            c[2],
+                            current_layer,
+                            0.0,
+                            0.0,
+                        ]);
+                    }
+                }
+                if let Some(m) = &marker {
+                    self.scene.set_marker(&rs.device, &rs.queue, m);
+                }
                 // Filament mode recolors extrusion beads from the tool palette
                 // in-shader, so a spool-color change is a uniform update, not an
                 // instance rebuild. Other modes use each bead's baked rgb.
@@ -6308,11 +6363,12 @@ impl eframe::App for App {
                 Some(render::Preview {
                     count,
                     joint_count,
-                    current_layer: self.preview_layer as f32,
+                    current_layer,
                     dim,
                     mask: self.category_mask(),
                     color_mode,
                     tool_palette: self.tool_palette(),
+                    marker,
                 })
             } else {
                 None
@@ -6544,7 +6600,7 @@ impl eframe::App for App {
 
             // Vertical layer slider on the right edge of the viewport — drag to
             // set the highest layer shown (lower layers dim). Preview only.
-            if self.beads_view() && self.preview_plans().is_some() {
+            if self.view == ViewMode::Preview && self.preview_plans().is_some() {
                 let n = self.layer_ends.len();
                 if n > 0 {
                     egui::Area::new(egui::Id::new("layer_slider"))
