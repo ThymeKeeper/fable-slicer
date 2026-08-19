@@ -29,7 +29,8 @@ travel_speed_mm_s = 500.0
 print_speed_mm_s = 300.0
 # First-layer SPEED is filament-tier now (with its flow twin) — how gently a
 # material must be laid onto bare plate is a property of the material, not
-# the machine. The first-layer ACCEL stays here, where the moving mass is.
+# the machine. The first-layer ACCEL is not a field anywhere: it is always
+# min(1000, acceleration), and a machine wanting a calmer accel says so above.
 
 # Direct-drive extruder: fast retraction. Distance is filament-tier now.
 retract_speed_mm_s = 40.0

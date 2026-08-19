@@ -40,8 +40,6 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outer_wall_accel: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_layer_accel: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub jerk: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_cruise_ratio: Option<f64>,
@@ -285,7 +283,7 @@ impl Tier for PrinterProfile {
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
             travel_speed_mm_s, print_speed_mm_s, acceleration,
-            outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
+            outer_wall_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
             retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             aux_fan, exhaust_fan, chamber_sensor,
             machine_kind, tool_count, toolchange_gcode, toolchange_seconds, purge_volume_mm3,
@@ -354,7 +352,6 @@ impl PrinterProfile {
             print_speed_mm_s: diff_field!(cur.machine_speed_mm_s, base.machine_speed_mm_s),
             acceleration: diff_field!(cur.acceleration_mm_s2, base.acceleration_mm_s2),
             outer_wall_accel: diff_field!(cur.outer_wall_accel_mm_s2, base.outer_wall_accel_mm_s2),
-            first_layer_accel: diff_field!(cur.first_layer_accel_mm_s2, base.first_layer_accel_mm_s2),
             jerk: diff_field!(cur.jerk_mm_s, base.jerk_mm_s),
             min_cruise_ratio: diff_field!(cur.min_cruise_ratio, base.min_cruise_ratio),
             arc_fitting: diff_field!(cur.arc_fitting, base.arc_fitting),
@@ -789,9 +786,13 @@ impl Profiles {
             outer_wall_accel_mm_s2: pr.outer_wall_accel.unwrap_or_else(|| {
                 crate::derived_outer_wall_accel_mm_s2(pr.acceleration.unwrap_or(d.acceleration_mm_s2))
             }),
-            first_layer_accel_mm_s2: pr.first_layer_accel.unwrap_or_else(|| {
-                crate::derived_first_layer_accel_mm_s2(pr.acceleration.unwrap_or(d.acceleration_mm_s2))
-            }),
+            // Always derived, never pinned: the only thing anyone wants of the
+            // first layer's accel is that it be gentler than the rest, and a
+            // machine that cannot take a brisk accel wants that GLOBALLY, which
+            // `acceleration` already says — min() then carries it to layer 0.
+            first_layer_accel_mm_s2: crate::derived_first_layer_accel_mm_s2(
+                pr.acceleration.unwrap_or(d.acceleration_mm_s2),
+            ),
             jerk_mm_s: pr.jerk.unwrap_or(d.jerk_mm_s),
             min_cruise_ratio: pr.min_cruise_ratio.unwrap_or(d.min_cruise_ratio),
             layer_height_mm: layer_h,
@@ -1032,6 +1033,26 @@ mod tests {
         assert_eq!(s.acceleration_mm_s2, 10000.0);
         assert_eq!(s.outer_wall_accel_mm_s2, 3000.0);
         assert_eq!(s.first_layer_accel_mm_s2, 1000.0);
+    }
+
+    #[test]
+    fn a_calm_machine_gets_a_calm_first_layer_for_free() {
+        // There is no first-layer accel knob, and none is wanted: the only
+        // thing anyone asks of it is that it be gentler than the rest of the
+        // print. A machine that cannot take a brisk accel says so ONCE, in
+        // its acceleration, and min() carries that to layer 0 — asking it to
+        // repeat itself per-layer would be the redundant knob.
+        let mut lib = Profiles::builtin();
+        let mut slinger = lib.printers.get("voron24").cloned().unwrap();
+        slinger.inherits = None;
+        slinger.acceleration = Some(500.0);
+        lib.printers.insert("slinger".into(), slinger);
+        let s = lib.resolve("slinger", "pla", "standard").unwrap();
+        assert_eq!(s.acceleration_mm_s2, 500.0);
+        assert_eq!(
+            s.first_layer_accel_mm_s2, 500.0,
+            "the cap must never raise a slow machine's first layer"
+        );
     }
 
     #[test]
@@ -1288,10 +1309,10 @@ mod tests {
         // The first layer's pair is FILAMENT: how gently a material must be
         // laid onto bare plate, and how much of it the plate takes, are
         // properties of the material — the way its bridge pair already is.
-        // Only the ACCEL stays with the machine, where the moving mass is.
+        // (The first layer's ACCEL is no tier's business: it is always
+        // min(accel, 1000), with nothing to pin.)
         cur.first_layer_speed_mm_s = 31.0;
         cur.first_layer_flow = 1.15;
-        cur.first_layer_accel_mm_s2 = 900.0; // printer
 
         let pc = ProcessProfile::diff(&cur, &base);
         assert_eq!(pc.wall_count, Some(5));
@@ -1306,7 +1327,6 @@ mod tests {
         let pr = PrinterProfile::diff(&cur, &base);
         assert_eq!(pr.print_speed_mm_s, Some(120.0));
         assert_eq!(pr.bed_size_x_mm, Some(300.0));
-        assert_eq!(pr.first_layer_accel, Some(900.0), "the accel stays machine-tier");
 
         assert_eq!(tier_dirty(&cur, &base), [true, true, true]);
         assert_eq!(tier_dirty(&base, &base), [false, false, false]);

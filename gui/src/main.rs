@@ -220,7 +220,6 @@ enum ColorBy {
 struct Pins {
     line_width: bool,
     outer_wall_accel: bool,
-    first_layer_accel: bool,
 }
 
 /// A slider with an auto/pin badge: while unpinned it shows a weak "auto" tag
@@ -636,7 +635,7 @@ fn filament_card_rows(
     });
     revert_row(ui, f.first_layer_speed_mm_s, &base.first_layer_speed_mm_s, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 5.0..=100.0), "1st layer speed mm/s",
-            "Print speed for the whole first layer, every feature alike — slow buys the bond its dwell time and keeps the nozzle from dragging a bead that has not stuck yet. A material property (PETG wets bare plate slowly where PLA does not), so it lives on the card; the first layer's ACCELERATION stays on the printer, where the moving mass is.");
+            "Print speed for the whole first layer, every feature alike — slow buys the bond its dwell time and keeps the nozzle from dragging a bead that has not stuck yet. A material property (PETG wets bare plate slowly where PLA does not), so it lives on the card. The first layer's acceleration is not a knob at all — it is always min(1000, accel).");
     });
 }
 
@@ -2106,7 +2105,6 @@ impl App {
             (Ok(pc), Ok(pr), Ok(_)) => Pins {
                 line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
-                first_layer_accel: pr.first_layer_accel.is_some(),
             },
             _ => Pins::default(),
         };
@@ -2749,7 +2747,6 @@ impl App {
             Pins {
                 line_width: pc.line_width_mm.is_some(),
                 outer_wall_accel: pr.outer_wall_accel.is_some(),
-                first_layer_accel: pr.first_layer_accel.is_some(),
             }
         } else {
             self.pins
@@ -2785,18 +2782,13 @@ impl App {
         if !self.pins.outer_wall_accel {
             s.outer_wall_accel_mm_s2 = config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2);
         }
-        if !self.pins.first_layer_accel {
-            s.first_layer_accel_mm_s2 = config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2);
-        }
+        s.first_layer_accel_mm_s2 = config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2);
     }
 
     /// Printer-tier counterpart of `mask_auto`.
     fn mask_auto_printer(&self, pr: &mut PrinterProfile) {
         if !self.pins.outer_wall_accel {
             pr.outer_wall_accel = None;
-        }
-        if !self.pins.first_layer_accel {
-            pr.first_layer_accel = None;
         }
     }
 
@@ -6119,16 +6111,12 @@ impl eframe::App for App {
                     });
                     revert_row(ui, &mut s.acceleration_mm_s2, &self.baseline.acceleration_mm_s2, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 100.0..=20000.0), "accel mm/s²",
-                            "Acceleration for inner walls, infill, solid, support, and travel — emitted as M204 per feature. Klipper clamps to printer.cfg max_accel. Higher = faster but more ringing.");
+                            "Acceleration for inner walls, infill, solid, support, and travel — emitted as M204 per feature. The first layer runs at min(1000, this), always: gentler than the rest is the only thing anyone wants of it, and a machine that needs a calmer accel needs it here, not on one layer. Klipper clamps to printer.cfg max_accel. Higher = faster but more ringing.");
                     });
                     auto_slider(ui, &mut s.outer_wall_accel_mm_s2, 100.0..=20000.0, "outer accel",
                         &mut pins.outer_wall_accel, config::derived_outer_wall_accel_mm_s2(s.acceleration_mm_s2),
                         profile_pins.outer_wall_accel, self.baseline.outer_wall_accel_mm_s2,
                         "Acceleration for the visible outermost wall — lower hides ringing. Auto = 50% of accel.");
-                    auto_slider(ui, &mut s.first_layer_accel_mm_s2, 100.0..=20000.0, "1st layer accel",
-                        &mut pins.first_layer_accel, config::derived_first_layer_accel_mm_s2(s.acceleration_mm_s2),
-                        profile_pins.first_layer_accel, self.baseline.first_layer_accel_mm_s2,
-                        "Acceleration for the whole first layer — gentle for bed adhesion. Auto = min(1000, accel).");
                     revert_row(ui, &mut s.jerk_mm_s, &self.baseline.jerk_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 1.0..=50.0), "jerk mm/s",
                             "Klipper square-corner-velocity — how briskly direction changes are taken.");
