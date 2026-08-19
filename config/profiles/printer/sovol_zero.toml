@@ -25,7 +25,9 @@ outer_wall_accel = 6000.0
 jerk = 5.0
 travel_speed_mm_s = 1000.0
 print_speed_mm_s = 400.0
-first_layer_speed_mm_s = 55.0
+# First-layer SPEED is filament-tier now (with its flow twin) — how gently a
+# material must be laid onto bare plate is a property of the material, not
+# the machine. The first-layer ACCEL stays here, where the moving mass is.
 
 retract_speed_mm_s = 40.0
 

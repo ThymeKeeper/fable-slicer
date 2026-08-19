@@ -373,6 +373,8 @@ struct FilamentFields<'a> {
     retract_restart_extra_mm: &'a mut f64,
     bridge_flow: &'a mut f64,
     bridge_speed_mm_s: &'a mut f64,
+    first_layer_speed_mm_s: &'a mut f64,
+    first_layer_flow: &'a mut f64,
     fan_speed: &'a mut f64,
     bridge_fan_speed: &'a mut f64,
     fan_max: &'a mut f64,
@@ -397,6 +399,8 @@ impl<'a> FilamentFields<'a> {
             retract_restart_extra_mm: &mut s.retract_restart_extra_mm,
             bridge_flow: &mut s.bridge_flow,
             bridge_speed_mm_s: &mut s.bridge_speed_mm_s,
+            first_layer_speed_mm_s: &mut s.first_layer_speed_mm_s,
+            first_layer_flow: &mut s.first_layer_flow,
             fan_speed: &mut s.fan_speed,
             bridge_fan_speed: &mut s.bridge_fan_speed,
             fan_max: &mut s.fan_max,
@@ -421,6 +425,8 @@ impl<'a> FilamentFields<'a> {
             retract_restart_extra_mm: &mut t.retract_restart_extra_mm,
             bridge_flow: &mut t.bridge_flow,
             bridge_speed_mm_s: &mut t.bridge_speed_mm_s,
+            first_layer_speed_mm_s: &mut t.first_layer_speed_mm_s,
+            first_layer_flow: &mut t.first_layer_flow,
             fan_speed: &mut t.fan_speed,
             bridge_fan_speed: &mut t.bridge_fan_speed,
             fan_max: &mut t.fan_max,
@@ -446,6 +452,8 @@ struct FilamentBaseline {
     retract_restart_extra_mm: f64,
     bridge_flow: f64,
     bridge_speed_mm_s: f64,
+    first_layer_speed_mm_s: f64,
+    first_layer_flow: f64,
     fan_speed: f64,
     bridge_fan_speed: f64,
     fan_max: f64,
@@ -469,6 +477,8 @@ impl FilamentBaseline {
             retract_restart_extra_mm: s.retract_restart_extra_mm,
             bridge_flow: s.bridge_flow,
             bridge_speed_mm_s: s.bridge_speed_mm_s,
+            first_layer_speed_mm_s: s.first_layer_speed_mm_s,
+            first_layer_flow: s.first_layer_flow,
             fan_speed: s.fan_speed,
             bridge_fan_speed: s.bridge_fan_speed,
             fan_max: s.fan_max,
@@ -492,6 +502,8 @@ impl FilamentBaseline {
             retract_restart_extra_mm: t.retract_restart_extra_mm,
             bridge_flow: t.bridge_flow,
             bridge_speed_mm_s: t.bridge_speed_mm_s,
+            first_layer_speed_mm_s: t.first_layer_speed_mm_s,
+            first_layer_flow: t.first_layer_flow,
             fan_speed: t.fan_speed,
             bridge_fan_speed: t.bridge_fan_speed,
             fan_max: t.fan_max,
@@ -609,12 +621,22 @@ fn filament_card_rows(
         }
     });
     revert_row(ui, f.bridge_flow, &base.bridge_flow, |ui, v| {
-        hslider(ui, true, egui::Slider::new(v, 0.3..=2.0), "bridge flow",
-            "Extrusion multiplier for bridge strands and arc overhangs. <1 thins them so they pull taut over air; >1 fattens them to grip when cooling is poor.");
+        hslider(ui, true, egui::Slider::new(v, 0.3..=2.0), "bridge flow ×",
+            "Extrusion MULTIPLIER for bridge strands and arc overhangs. <1 thins them so they pull taut over air; >1 fattens them to grip when cooling is poor. 1.0 = nominal.");
     });
     revert_row(ui, f.bridge_speed_mm_s, &base.bridge_speed_mm_s, |ui, v| {
         hslider(ui, true, egui::Slider::new(v, 5.0..=100.0), "bridge speed mm/s",
             "Print speed for bridge strands. Slow lets each strand cool and set before the next is laid.");
+    });
+    // The first layer's pair, mirroring the bridge pair above: a condition
+    // where the material misbehaves needs both a time knob and a volume one.
+    revert_row(ui, f.first_layer_flow, &base.first_layer_flow, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 0.5..=1.5), "1st layer flow ×",
+            "Extrusion MULTIPLIER for the whole first layer. >1 fills what a textured plate swallows, or squashes harder without moving the nozzle; <1 thins a first layer that is over-squished. 1.0 = nominal. The melt ceiling still applies, so a fattened first layer slows itself rather than skipping.");
+    });
+    revert_row(ui, f.first_layer_speed_mm_s, &base.first_layer_speed_mm_s, |ui, v| {
+        hslider(ui, true, egui::Slider::new(v, 5.0..=100.0), "1st layer speed mm/s",
+            "Print speed for the whole first layer, every feature alike — slow buys the bond its dwell time and keeps the nozzle from dragging a bead that has not stuck yet. A material property (PETG wets bare plate slowly where PLA does not), so it lives on the card; the first layer's ACCELERATION stays on the printer, where the moving mass is.");
     });
 }
 
@@ -3465,6 +3487,8 @@ impl App {
             s.retract_restart_extra_mm = t0.retract_restart_extra_mm;
             s.bridge_flow = t0.bridge_flow;
             s.bridge_speed_mm_s = t0.bridge_speed_mm_s;
+            s.first_layer_speed_mm_s = t0.first_layer_speed_mm_s;
+            s.first_layer_flow = t0.first_layer_flow;
             s.fan_speed = t0.fan_speed;
             s.bridge_fan_speed = t0.bridge_fan_speed;
             s.fan_max = t0.fan_max;
@@ -6088,10 +6112,6 @@ impl eframe::App for App {
                     revert_row(ui, &mut s.machine_speed_mm_s, &self.baseline.machine_speed_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 10.0..=700.0), "rated mm/s",
                             "The machine's rated print speed — a datasheet number, the hard cap every derived speed works under. Lower it to slow the whole machine.");
-                    });
-                    revert_row(ui, &mut s.first_layer_speed_mm_s, &self.baseline.first_layer_speed_mm_s, |ui, v| {
-                        hslider(ui, true, egui::Slider::new(v, 5.0..=100.0), "1st layer mm/s",
-                            "Speed for the first layer — slower improves bed adhesion.");
                     });
                     revert_row(ui, &mut s.travel_speed_mm_s, &self.baseline.travel_speed_mm_s, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 20.0..=600.0), "travel mm/s",

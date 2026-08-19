@@ -18,3 +18,14 @@ extrusion_multiplier = 0.9477576236635189
 pressure_advance = 0.032
 # 40 °C pre-soak, measured comfortable on the Zero (class default is 50).
 chamber_temp_c = 40
+
+# --- the first layer ---
+# Speed for the whole first layer, every feature alike: slow buys the bond its
+# dwell time and keeps the nozzle from dragging a bead that has not stuck yet.
+# 55 is Orca's initial-layer speed, which is where this lived before it moved
+# off the printer tier — unchanged on purpose, so the move is a relocation and
+# not a retune. Tune it per material from here.
+first_layer_speed_mm_s = 55.0
+# Flow multiplier for the first layer: >1 fills what a textured plate swallows.
+# 1.0 until a print says otherwise.
+first_layer_flow = 1.0

@@ -463,7 +463,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     * layer.speed_scale;
                 let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale)
                     / tool_area_mm2(t)
-                    * flow_factor(path, t);
+                    * flow_factor(path, t, layer.index == 0);
                 g.raw(&format!(";TYPE:{}", type_label(path.kind)));
                 let accel = accel_for(path.kind, layer.index, s);
                 if (accel - cur_accel).abs() > 0.5 {
@@ -658,7 +658,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                     * layer.speed_scale
                     * small;
             let coeff = config::bead_area_mm2(path.width_mm, layer.height_mm * path.height_scale) / area
-                * flow_factor(path, t);
+                * flow_factor(path, t, layer.index == 0);
             let start = path.points[0];
 
             // Scarf (taper) seam: a closed outer-wall loop above the first layer
@@ -842,7 +842,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // at that feed (the extruder skips, then the pressure spike
                 // blobs downstream) — re-clamp per segment from its own width.
                 let h = layer.height_mm * path.height_scale;
-                let ff = flow_factor(path, t);
+                let ff = flow_factor(path, t, layer.index == 0);
                 let flow_cap = layer_flow_cap_mm3_s(layer, t);
                 let seg_feed = |w: f64| -> f64 {
                     if flow_cap > 0.0 {
@@ -924,7 +924,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 }
                 let mut run = seg(0);
                 let mut rcoeff =
-                    bead / area * flow_factor_kind(run.kind, path.flow, t) * run.flow as f64;
+                    bead / area * flow_factor_kind(run.kind, path.flow, t, layer.index == 0) * run.flow as f64;
                 // A joined entry lands at the slew-limited first piece's feed —
                 // no commanded step at the seam.
                 emit_junction(&mut g, pf[0]);
@@ -942,7 +942,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                             None,
                         );
                         rcoeff =
-                            bead / area * flow_factor_kind(a.kind, path.flow, t) * a.flow as f64;
+                            bead / area * flow_factor_kind(a.kind, path.flow, t, layer.index == 0) * a.flow as f64;
                         run = a;
                     }
                     let f = pf[i];
@@ -1298,7 +1298,10 @@ fn nominal_speed_mm_s(
     s: &Settings,
 ) -> f64 {
     if layer_index == 0 {
-        return s.first_layer_speed_mm_s; // first layer is slow everywhere
+        // Slow everywhere on layer 0, and off the CARD: how gently a material
+        // must be laid onto bare plate is a property of the material, the
+        // same way its bridge speed is.
+        return tool.first_layer_speed_mm_s;
     }
     match kind {
         PathKind::ExternalPerimeter => s.external_perimeter_speed_mm_s,
@@ -1336,13 +1339,13 @@ fn nominal_speed_mm_s(
 
 /// Extrusion-flow factor for a path beyond its w×h geometry: per-path flow
 /// (ironing), per-kind flow (bridges), and the tool's filament multiplier.
-fn flow_factor(path: &ToolPath, tool: &ToolSettings) -> f64 {
-    flow_factor_kind(path.kind, path.flow, tool)
+fn flow_factor(path: &ToolPath, tool: &ToolSettings, first_layer: bool) -> f64 {
+    flow_factor_kind(path.kind, path.flow, tool, first_layer)
 }
 
 /// [`flow_factor`] for one segment kind (so a bridge stretch inside an otherwise
 /// solid bead still gets bridge flow). `path_flow` is the bead's own multiplier.
-fn flow_factor_kind(kind: PathKind, path_flow: f64, tool: &ToolSettings) -> f64 {
+fn flow_factor_kind(kind: PathKind, path_flow: f64, tool: &ToolSettings, first_layer: bool) -> f64 {
     // Bridges and internal bridges (solid over open sparse) both span air — the
     // stretched strand wants the reduced bridge flow so it doesn't droop.
     let kind_flow = if matches!(kind, PathKind::Bridge | PathKind::InternalBridge) {
@@ -1350,7 +1353,13 @@ fn flow_factor_kind(kind: PathKind, path_flow: f64, tool: &ToolSettings) -> f64 
     } else {
         1.0
     };
-    path_flow * kind_flow * tool.extrusion_multiplier
+    // The first layer's own multiplier rides on top of everything else: it is
+    // about what the PLATE takes (texture to fill, squash to force), not about
+    // the feature being printed. Folded in here rather than at the call sites
+    // so the melt-rate clamp in `feed_for_seg` sees it too — a fattened first
+    // layer slows itself instead of skipping the extruder.
+    let first = if first_layer { tool.first_layer_flow } else { 1.0 };
+    path_flow * kind_flow * first * tool.extrusion_multiplier
 }
 
 /// The nozzle temperature for a layer: a per-layer planned override when the
@@ -1447,7 +1456,7 @@ fn feed_for_seg(
     let mut v = nominal_speed_mm_s(kind, overhang, layer_index, tool, s);
     if flow_cap_mm3_s > 0.0 {
         let mm3_per_mm = config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale)
-            * flow_factor_kind(kind, path.flow, tool);
+            * flow_factor_kind(kind, path.flow, tool, layer_index == 0);
         if mm3_per_mm > 1.0e-9 {
             v = v.min(flow_cap_mm3_s / mm3_per_mm);
         }
@@ -2374,7 +2383,7 @@ pub fn format_duration(seconds: f64) -> String {
 /// bridge flow, and the extrusion multiplier. Shared by the
 /// filament estimate and the heat stats so the preview maps can't disagree
 /// with the totals.
-fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings) -> f64 {
+fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings, first_layer: bool) -> f64 {
     let bead = config::bead_area_mm2(path.width_mm, layer_height_mm * path.height_scale);
     let n = path.points.len();
     if n < 2 {
@@ -2389,7 +2398,7 @@ fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings) -
             let a = sa[k.min(sa.len() - 1)];
             v += dist_mm(path.points[k], path.points[(k + 1) % n])
                 * bead
-                * flow_factor_kind(a.kind, path.flow, tool)
+                * flow_factor_kind(a.kind, path.flow, tool, first_layer)
                 * a.flow as f64;
         }
         return v;
@@ -2401,7 +2410,7 @@ fn path_volume_mm3(path: &ToolPath, layer_height_mm: f64, tool: &ToolSettings) -
     if path.closed {
         len += dist_mm(path.points[n - 1], path.points[0]);
     }
-    len * bead * flow_factor(path, tool)
+    len * bead * flow_factor(path, tool, first_layer)
 }
 
 /// Extrusion-only seconds for one path at a total speed multiplier — the
@@ -2463,7 +2472,7 @@ pub fn estimate_filament_per_tool(layers: &[LayerPlan], s: &Settings) -> Vec<(u3
         let mut layer_vol: BTreeMap<u32, f64> = BTreeMap::new();
         for path in layer.paths.iter().filter(|p| printable(p)) {
             *layer_vol.entry(path.tool).or_insert(0.0) +=
-                path_volume_mm3(path, layer.height_mm, tools.get(path.tool));
+                path_volume_mm3(path, layer.height_mm, tools.get(path.tool), layer.index == 0);
         }
         for (n, v) in layer_vol {
             *volume.entry(n).or_insert(0.0) += v;
@@ -4286,6 +4295,112 @@ mod tests {
         s.bottom_layers = 0;
         s.infill_density = 0.0;
         s
+    }
+
+    /// Lines that actually lay a bead: a move with filament behind it. A pure
+    /// E move is a retract or its unretract — fixed amounts that no flow
+    /// multiplier touches, and counting them dilutes every ratio measured here.
+    fn extruding_lines(g: &str, n: usize) -> impl Iterator<Item = &str> {
+        layer_chunk(g, n).lines().filter(|l| {
+            (l.starts_with("G1 ") || l.starts_with("G2 ") || l.starts_with("G3 "))
+                && l.contains(" E")
+                && !l.contains("E-")
+                && (l.contains(" X") || l.contains(" Y"))
+        })
+    }
+
+    /// Filament extruded (mm) into beads inside one layer's chunk of g-code.
+    fn layer_e_mm(g: &str, n: usize) -> f64 {
+        extruding_lines(g, n)
+            .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix('E')))
+            .filter_map(|v| v.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// The slowest feed (mm/min) any bead on that layer is laid at.
+    fn slowest_bead_feed(g: &str, n: usize) -> f64 {
+        let mut cur = f64::NAN;
+        let mut worst = f64::MAX;
+        for l in extruding_lines(g, n) {
+            if let Some(f) = l.split_whitespace().find_map(|w| w.strip_prefix('F')) {
+                cur = f.parse().unwrap_or(cur);
+            }
+            if cur.is_finite() {
+                worst = worst.min(cur);
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn the_first_layer_flow_scales_the_first_layer_and_nothing_else() {
+        // The volume twin of the first-layer speed: extra plastic for what a
+        // textured plate swallows. It must land on layer 0 alone — a global
+        // multiplier is what `flow ×` already is.
+        let s = single_wall_cube();
+        let plans = generate(&mesh::Mesh::cube(10.0), &s);
+        let base = to_gcode(&plans, &s);
+
+        let mut fat = s.clone();
+        fat.first_layer_flow = 1.2;
+        let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &fat), &fat);
+
+        let (e0, e0f) = (layer_e_mm(&base, 0), layer_e_mm(&g, 0));
+        let (e1, e1f) = (layer_e_mm(&base, 1), layer_e_mm(&g, 1));
+        assert!(e0 > 0.0 && e1 > 0.0, "no extrusion to measure ({e0}, {e1})");
+        assert!(
+            (e0f / e0 - 1.2).abs() < 0.01,
+            "first layer scaled by {:.3}, expected 1.2",
+            e0f / e0
+        );
+        assert!(
+            (e1f / e1 - 1.0).abs() < 0.001,
+            "the second layer moved too, by {:.3}",
+            e1f / e1
+        );
+    }
+
+    #[test]
+    fn a_fattened_first_layer_slows_itself_instead_of_skipping() {
+        // The multiplier goes through `flow_factor_kind`, so the melt-rate
+        // clamp in `feed_for_seg` sees it: asking for 40% more plastic at a
+        // ceiling that already binds has to come out of the feed, or the
+        // extruder just skips and blobs downstream.
+        let mut s = single_wall_cube();
+        // Low enough that the ceiling — not the first-layer speed — is what
+        // sets the feed in BOTH runs; otherwise the baseline is speed-limited
+        // and the ratio measures nothing.
+        s.max_volumetric_speed_mm3_s = 1.0;
+        let slow = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
+
+        let mut fat = s.clone();
+        fat.first_layer_flow = 1.4;
+        let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &fat), &fat);
+
+        let (a, b) = (slowest_bead_feed(&slow, 0), slowest_bead_feed(&g, 0));
+        assert!(
+            (a / b - 1.4).abs() < 0.05,
+            "feed went {a:.0} -> {b:.0} (x{:.3}); 40% more plastic should cost 40% of the feed",
+            a / b
+        );
+    }
+
+    #[test]
+    fn the_first_layer_speed_comes_off_the_filament_card() {
+        // It moved out of the motion profile: the card decides how gently a
+        // material is laid onto bare plate, the way it already decides its
+        // bridge speed. Layer 0 takes it whole, every feature alike.
+        let mut s = single_wall_cube();
+        s.first_layer_speed_mm_s = 17.0;
+        let g = to_gcode(&generate(&mesh::Mesh::cube(10.0), &s), &s);
+        let feeds: Vec<f64> = extruding_lines(&g, 0)
+            .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix('F')))
+            .filter_map(|v| v.parse::<f64>().ok())
+            .collect();
+        assert!(!feeds.is_empty(), "no extruding feeds on the first layer");
+        for f in feeds {
+            assert!((f - 17.0 * 60.0).abs() < 1.0, "first-layer feed {f} is not 17 mm/s");
+        }
     }
 
     #[test]

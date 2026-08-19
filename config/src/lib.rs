@@ -366,6 +366,18 @@ pub struct ToolSettings {
     pub retract_restart_extra_mm: f64,
     pub bridge_flow: f64,
     pub bridge_speed_mm_s: f64,
+    /// Print speed (mm/s) for the whole first layer, and the flow multiplier
+    /// it lays down at.
+    ///
+    /// The pair mirrors `bridge_speed_mm_s` / `bridge_flow` above, for the
+    /// same reason: a condition where the material misbehaves needs both a
+    /// time knob and a volume knob, because they answer different physics.
+    /// Speed buys the bond dwell and keeps the nozzle from dragging a bead
+    /// that has not stuck yet; flow covers what the plate's texture swallows.
+    /// Both are material properties — PETG wants to wet the bed slowly where
+    /// PLA does not — so they ride the filament tier, not the machine's.
+    pub first_layer_speed_mm_s: f64,
+    pub first_layer_flow: f64,
     pub fan_speed: f64,
     pub bridge_fan_speed: f64,
     /// Ceiling of the short-layer cooling ramp — how much fan this material
@@ -588,6 +600,11 @@ pub struct Settings {
     /// body to span and grip when cooling is poor (enclosed chamber) and a lean
     /// strand would curl into vines. 1.0 = nominal.
     pub bridge_flow: f64,
+    /// Flow multiplier for the whole first layer. >1.0 puts down extra to fill
+    /// what a textured plate swallows, or to squash harder without moving the
+    /// nozzle; <1.0 thins a first layer that is being over-squished. 1.0 =
+    /// nominal. Its speed twin is `first_layer_speed_mm_s`.
+    pub first_layer_flow: f64,
     /// How far (mm) a bridge sheet over an enclosed ceiling lands onto the
     /// supported rim — the perimeter-free foothold its ends rest on. Bigger =
     /// more solid under the bridge ends (sturdier anchor) but the inner
@@ -761,6 +778,7 @@ impl Default for Settings {
             // bead laid onto air needs a full round cross-section to have
             // the stiffness and shoulder contact to span without drooping.
             bridge_flow: 1.75,
+            first_layer_flow: 1.0,
             bridge_foothold_mm: 0.9,
             pressure_advance: 0.0,
             fan_speed: 1.0,
@@ -839,6 +857,8 @@ impl Settings {
             retract_restart_extra_mm: self.retract_restart_extra_mm,
             bridge_flow: self.bridge_flow,
             bridge_speed_mm_s: self.bridge_speed_mm_s,
+            first_layer_speed_mm_s: self.first_layer_speed_mm_s,
+            first_layer_flow: self.first_layer_flow,
             fan_speed: self.fan_speed,
             bridge_fan_speed: self.bridge_fan_speed,
             fan_max: self.fan_max,

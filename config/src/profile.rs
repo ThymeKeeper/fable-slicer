@@ -36,8 +36,6 @@ pub struct PrinterProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub print_speed_mm_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_layer_speed_mm_s: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outer_wall_accel: Option<f64>,
@@ -150,6 +148,17 @@ pub struct FilamentProfile {
     /// Print speed (mm/s) for bridge strands. Auto: 10.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_speed_mm_s: Option<f64>,
+    /// Print speed (mm/s) for the whole first layer — slow buys the bond its
+    /// dwell and keeps the nozzle from dragging a bead that has not stuck.
+    /// A material property (PETG wets the bed slowly, PLA does not), so it
+    /// lives here rather than on the machine. Its volume twin is
+    /// `first_layer_flow`; the accel stays machine-tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_layer_speed_mm_s: Option<f64>,
+    /// Flow multiplier for the whole first layer — what the plate's texture
+    /// swallows, or a deliberate extra squash. Auto: 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_layer_flow: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_flow_derate_per_c: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,7 +284,7 @@ impl Tier for PrinterProfile {
     }
     fn over(self, base: Self) -> Self {
         merge_fields!(self, base, bed_size_x_mm, bed_size_y_mm, bed_size_z_mm, nozzle_diameter_mm,
-            travel_speed_mm_s, print_speed_mm_s, first_layer_speed_mm_s, acceleration,
+            travel_speed_mm_s, print_speed_mm_s, acceleration,
             outer_wall_accel, first_layer_accel, jerk, min_cruise_ratio, arc_fitting, arc_tolerance_mm,
             retract_speed_mm_s, z_hop_mm, wipe_mm, host_url, api_key,
             aux_fan, exhaust_fan, chamber_sensor,
@@ -294,6 +303,7 @@ impl Tier for FilamentProfile {
             extrusion_multiplier, max_volumetric_speed_mm3_s, max_flow_derate_per_c,
             pressure_advance, retract_len_mm, retract_restart_extra_mm,
             fan_speed, bridge_fan_speed, fan_max, bridge_flow, bridge_speed_mm_s,
+            first_layer_speed_mm_s, first_layer_flow,
             fan_off_layers, aux_fan_speed, exhaust_fan_speed,
             chamber_temp_c, standby_temp_c)
     }
@@ -342,7 +352,6 @@ impl PrinterProfile {
             nozzle_diameter_mm: diff_field!(cur.nozzle_diameter_mm, base.nozzle_diameter_mm),
             travel_speed_mm_s: diff_field!(cur.travel_speed_mm_s, base.travel_speed_mm_s),
             print_speed_mm_s: diff_field!(cur.machine_speed_mm_s, base.machine_speed_mm_s),
-            first_layer_speed_mm_s: diff_field!(cur.first_layer_speed_mm_s, base.first_layer_speed_mm_s),
             acceleration: diff_field!(cur.acceleration_mm_s2, base.acceleration_mm_s2),
             outer_wall_accel: diff_field!(cur.outer_wall_accel_mm_s2, base.outer_wall_accel_mm_s2),
             first_layer_accel: diff_field!(cur.first_layer_accel_mm_s2, base.first_layer_accel_mm_s2),
@@ -400,6 +409,8 @@ impl FilamentProfile {
             fan_max: diff_field!(cur.fan_max, base.fan_max),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
             bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
+            first_layer_speed_mm_s: diff_field!(cur.first_layer_speed_mm_s, base.first_layer_speed_mm_s),
+            first_layer_flow: diff_field!(cur.first_layer_flow, base.first_layer_flow),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
             aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
             exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
@@ -434,6 +445,8 @@ impl FilamentProfile {
             fan_max: diff_field!(cur.fan_max, base.fan_max),
             bridge_flow: diff_field!(cur.bridge_flow, base.bridge_flow),
             bridge_speed_mm_s: diff_field!(cur.bridge_speed_mm_s, base.bridge_speed_mm_s),
+            first_layer_speed_mm_s: diff_field!(cur.first_layer_speed_mm_s, base.first_layer_speed_mm_s),
+            first_layer_flow: diff_field!(cur.first_layer_flow, base.first_layer_flow),
             fan_off_layers: diff_field!(cur.fan_off_layers, base.fan_off_layers),
             aux_fan_speed: diff_field!(cur.aux_fan_speed, base.aux_fan_speed),
             exhaust_fan_speed: diff_field!(cur.exhaust_fan_speed, base.exhaust_fan_speed),
@@ -845,7 +858,8 @@ impl Profiles {
             speed_quality: quality,
             print_speed_mm_s: print_v,
             travel_speed_mm_s: pr.travel_speed_mm_s.unwrap_or(d.travel_speed_mm_s),
-            first_layer_speed_mm_s: pr.first_layer_speed_mm_s.unwrap_or(d.first_layer_speed_mm_s),
+            first_layer_speed_mm_s: t0.first_layer_speed_mm_s,
+            first_layer_flow: t0.first_layer_flow,
             // Every feature speed derives: nominal × its quality ratio, under
             // the filament's flow ceiling. Heat control governs from there.
             external_perimeter_speed_mm_s: crate::derived_external_perimeter_speed_mm_s(print_v, flow_cap),
@@ -957,6 +971,8 @@ fn tool_settings(name: &str, fl: &FilamentProfile, d: &Settings) -> crate::ToolS
         retract_restart_extra_mm: fl.retract_restart_extra_mm.unwrap_or(d.retract_restart_extra_mm),
         bridge_flow: fl.bridge_flow.unwrap_or(d.bridge_flow),
         bridge_speed_mm_s: fl.bridge_speed_mm_s.unwrap_or(d.bridge_speed_mm_s),
+        first_layer_speed_mm_s: fl.first_layer_speed_mm_s.unwrap_or(d.first_layer_speed_mm_s),
+        first_layer_flow: fl.first_layer_flow.unwrap_or(d.first_layer_flow),
         fan_speed: fl.fan_speed.unwrap_or_else(|| material.fan().0),
         bridge_fan_speed: bridge_fan,
         // The ladder ceiling: the card's own cap, else the bridge duty —
@@ -1269,6 +1285,13 @@ mod tests {
         cur.nozzle_temp_c = 245; // filament
         cur.machine_speed_mm_s = 120.0; // printer (datasheet)
         cur.bed_size_x_mm = 300.0; // printer
+        // The first layer's pair is FILAMENT: how gently a material must be
+        // laid onto bare plate, and how much of it the plate takes, are
+        // properties of the material — the way its bridge pair already is.
+        // Only the ACCEL stays with the machine, where the moving mass is.
+        cur.first_layer_speed_mm_s = 31.0;
+        cur.first_layer_flow = 1.15;
+        cur.first_layer_accel_mm_s2 = 900.0; // printer
 
         let pc = ProcessProfile::diff(&cur, &base);
         assert_eq!(pc.wall_count, Some(5));
@@ -1277,10 +1300,13 @@ mod tests {
         let fl = FilamentProfile::diff(&cur, &base);
         assert_eq!(fl.nozzle_temp_c, Some(245));
         assert!(fl.bed_temp_c.is_none());
+        assert_eq!(fl.first_layer_speed_mm_s, Some(31.0));
+        assert_eq!(fl.first_layer_flow, Some(1.15));
 
         let pr = PrinterProfile::diff(&cur, &base);
         assert_eq!(pr.print_speed_mm_s, Some(120.0));
         assert_eq!(pr.bed_size_x_mm, Some(300.0));
+        assert_eq!(pr.first_layer_accel, Some(900.0), "the accel stays machine-tier");
 
         assert_eq!(tier_dirty(&cur, &base), [true, true, true]);
         assert_eq!(tier_dirty(&base, &base), [false, false, false]);
