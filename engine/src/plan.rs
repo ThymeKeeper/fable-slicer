@@ -233,7 +233,13 @@ pub fn debug_uncovered(layer: &LayerPlan, lw: f64) -> (f64, f64) {
             eprint!("{s}");
         }
     }
-    (layer.outline.net_area_mm2().abs(), unc.net_area_mm2().abs())
+    // The tracer returns hole contours wound like their parents (see the
+    // normalize_evenodd call where gap fill consumes voids); without the same
+    // normalization here, nested voids sum as stacked disks instead of rings.
+    (
+        layer.outline.net_area_mm2().abs(),
+        geo2d::normalize_evenodd(&unc).net_area_mm2().abs(),
+    )
 }
 
 /// The non-extruding move that reaches a path's start. Computed once (combing +
