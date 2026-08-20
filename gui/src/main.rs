@@ -790,7 +790,7 @@ fn accent_hsl(c: egui::Color32) -> (f32, f32, f32) {
     let l = (max + min) / 2.0;
     let d = max - min;
     if d < 1e-6 {
-        return (0.0, 0.35, l);
+        return (0.0, 0.0, l);
     }
     let s = d / (1.0 - (2.0 * l - 1.0).abs());
     let h = if max == r {
@@ -800,7 +800,14 @@ fn accent_hsl(c: egui::Color32) -> (f32, f32, f32) {
     } else {
         60.0 * ((r - g) / d + 4.0)
     };
-    (h, s.max(0.35), l)
+    // The TRUE saturation, no floor. Every consumer scales this
+    // multiplicatively (feature palette, mesh tints, heat ramp, travel/seam
+    // complements), so the picked color's character carries through the whole
+    // scheme: a muted pick mutes everything, a grey pick gives a genuinely
+    // monochrome view (the ramps live in lightness, so nothing goes
+    // illegible). A 0.35 floor here used to swallow the saturation slider
+    // for any pick below it — the picker looked broken because it was.
+    (h, s, l)
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
@@ -5212,8 +5219,9 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("accent").on_hover_text(
                     "The 3D view's color. The model tint, the feature palette, and the \
-                     heat-map ramps are all derived from this one hue — pick whatever \
-                     reads best to you. Remembered across sessions.",
+                     heat-map ramps all follow this pick's hue AND saturation — a vivid \
+                     pick colors the whole view, a muted one hushes it, a grey one goes \
+                     monochrome. Remembered across sessions.",
                 );
                 let mut rgb = [self.accent.r(), self.accent.g(), self.accent.b()];
                 if ui.color_edit_button_srgb(&mut rgb).changed() {
@@ -9100,6 +9108,40 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accent_saturation_carries_through_the_palette() {
+        // The pick's saturation is honored, not floored: a grey accent gives
+        // a genuinely monochrome scheme (every feature color has r=g=b), and
+        // a vivid accent yields a more saturated palette than a muted one of
+        // the same hue. A 0.35 floor used to make the saturation slider inert
+        // below it.
+        let grey = accent_hsl(egui::Color32::from_rgb(0x3e, 0x3c, 0x3f));
+        assert!(grey.1 < 0.05, "a near-grey pick keeps its near-zero saturation, got {}", grey.1);
+        for kind in [
+            engine::PathKind::ExternalPerimeter,
+            engine::PathKind::Perimeter,
+            engine::PathKind::Solid,
+            engine::PathKind::Infill,
+            engine::PathKind::Support,
+        ] {
+            let c = color_for(kind, (grey.0, 0.0, grey.2));
+            assert!(
+                (c[0] - c[1]).abs() < 1e-6 && (c[1] - c[2]).abs() < 1e-6,
+                "{kind:?} must render grey under a grey accent, got {c:?}"
+            );
+        }
+        let vivid = accent_hsl(egui::Color32::from_rgb(200, 40, 40));
+        let muted = accent_hsl(egui::Color32::from_rgb(140, 105, 105));
+        assert!(vivid.1 > muted.1 + 0.3, "saturation separates picks: {} vs {}", vivid.1, muted.1);
+        let cv = color_for(engine::PathKind::Solid, vivid);
+        let cm = color_for(engine::PathKind::Solid, muted);
+        let spread = |c: [f32; 3]| c.iter().cloned().fold(f32::MIN, f32::max) - c.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            spread(cv) > spread(cm) + 0.1,
+            "a vivid pick must yield a more saturated palette: {cv:?} vs {cm:?}"
+        );
+    }
 
     #[test]
     fn blend_part_splits_filament_evenly() {
