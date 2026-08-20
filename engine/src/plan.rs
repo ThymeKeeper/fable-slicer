@@ -2027,6 +2027,7 @@ fn plan_part(
             // Wall stretches hanging past the layer below print slow with full
             // cooling (the spiral loop must stay whole, so vase mode skips).
             // The unsupported region is usually empty, making this free.
+            let mut below_for_cuts: Option<Polygons> = None;
             let mut walls = if layer.index > 0 && !settings.spiral_vase {
                 // Support reference: the layer below grown by a jitter guard.
                 // A wall classifies as overhang only once its CENTERLINE is
@@ -2045,6 +2046,7 @@ fn plan_part(
                 if unsupported.is_empty() {
                     walls
                 } else {
+                    below_for_cuts = Some(below.clone());
                     // Rings crossing a wall-spannable hollow are simplified
                     // straight segments far longer than the void — split them
                     // at the hollow boundary first, so the airborne hop is its
@@ -2061,10 +2063,13 @@ fn plan_part(
             // the perimeters it nominally fits — e.g. a hole beside the outline),
             // drop the doubled run so the nozzle doesn't retrace the same bead.
             trim_thin_walls(&mut walls, lw, sp);
-            // Where a ring's own two sides pinch closer than a bead: narrow both
+            // Where a ring's two sides pinch closer than a bead: narrow both
             // if two beads still fit, and cut the stretch out for the gap filler
-            // to bead down the middle if they no longer do.
-            resolve_pinched_rings(&mut walls, lw);
+            // to bead down the middle if they no longer do. And the dual: where
+            // facing sides leave a channel too narrow for any gap bead, widen
+            // both over it so it never becomes a hairline void. Cut ends must
+            // land on supported ground — never over a lintel (below_for_cuts).
+            resolve_pinched_rings(&mut walls, lw, below_for_cuts.as_ref());
             // Inner walls stay CLOSED rings here — they are spiralized in Pass 2
             // (spiralize_shells), together with the concentric fill they ring, so the
             // wall stack and cavity fill become one continuous stroke.
@@ -4762,6 +4767,38 @@ const GAP_BEAD_MIN_MM: f64 = 0.5;
 /// follow the pinch through a corner arc.
 const PINCH_STEP_MM: f64 = 0.5;
 
+/// Starve hysteresis, in bead widths: an opposing side must sit at least this
+/// far away before the sliver between counts as a starving channel. Below it
+/// the residue is thinner than the coverage raster can even see, and widening
+/// would cost the ring its spot in the shell spiral for nothing.
+const STARVE_MIN: f64 = 1.05;
+
+/// Minimum fill (mm²) a ring's widening must buy before it carries a width
+/// profile at all. A width-carrying ring prints as its own loop — one more
+/// seam, one more pressurize — so a starve stretch has to be worth more than
+/// a speck. (Compare: the smallest printable gap bead is 0.3 × 0.5 mm.)
+const STARVE_MIN_AREA_MM2: f64 = 0.2;
+
+/// Channel width (in bead widths) the THINNED flanks leave behind for the gap
+/// filler: one full nominal width, for two reasons. Physically, the resulting
+/// bead prints at the nozzle's own width — the healthiest bead a 0.4 mm
+/// orifice can draw. Practically, the coverage raster ERODES a void before
+/// the medial measures it (measured on the slit fixture: a true 0.32 mm
+/// channel reads 0.228, a true 0.40 reads 0.360 — the deficit grows as the
+/// channel narrows), so a seed near the `GAP_BEAD_MIN_W` floor gets its own
+/// bead culled by the floor it was built to clear. At 1.0 the eroded reading
+/// still clears the floor with ~0.06 mm to spare.
+const GAP_SEED_W: f64 = 1.0;
+
+/// The widen/thin boundary, in bead widths: the pitch at which flanks thinned
+/// to the `GAP_BEAD_MIN_W` floor leave exactly a `GAP_SEED_W` channel. Below
+/// it, even floor-width flanks leave a sub-printable channel, so swallowing
+/// the channel by widening is the only fill; above it the flanks THIN toward
+/// nominal-or-below and a tapered gap bead carries the modulation instead —
+/// the walls stay trustworthy and the bead whose job is tapering tapers
+/// (the user's call, 2026-08-20: "thin the inner wall and place a gap fill").
+const STARVE_WIDEN_MAX: f64 = 2.0 * GAP_BEAD_MIN_W + GAP_SEED_W - 1.0;
+
 /// Where a closed inner ring's own two sides come closer than a bead width, it
 /// is trying to put TWO beads into a channel that has room for fewer.
 ///
@@ -4787,12 +4824,44 @@ const PINCH_STEP_MM: f64 = 0.5;
 /// a real job, that miss put 18.4 m of inner wall below 75% of the nozzle
 /// diameter.
 ///
+/// The DUAL case — an opposing side farther than a bead but nearer than a bead
+/// plus a printable gap bead — used to stay a hairline void: too narrow for
+/// the gap filler's `GAP_BEAD_MIN_W` floor, deliberately unfilled since the
+/// raster-driven absorb pass proved to be the wobble. Resolved here the way
+/// the pinch is, from polygon distance, never from a raster boundary, in two
+/// sub-regimes split at [`STARVE_WIDEN_MAX`]:
+///
+///   - `pitch < STARVE_WIDEN_MAX·lw` — even floor-width flanks would leave a
+///     sub-printable channel, so each side WIDENS to the same `(pitch + lw)/2`
+///     and re-centres a quarter of the excess toward the channel, closing it
+///     exactly (the two inner edges meet at its middle). Widening here is
+///     bounded at `(STARVE_WIDEN_MAX + 1)/2 ≈ 1.15·lw` — a modest bulge.
+///   - `pitch ≥ STARVE_WIDEN_MAX·lw` — each side THINS to
+///     `(pitch + (1−GAP_SEED_W)·lw)/2` and re-centres half the deficit AWAY
+///     from the channel, leaving a `GAP_SEED_W·lw` channel the gap filler
+///     beads with one continuous tapered stroke. The walls stay within a
+///     quarter-bead of nominal and the gap bead — whose whole identity is
+///     "tapered filler" — carries the modulation instead.
+///
+/// In both regimes the OUTWARD footprint edge stays precisely where it was
+/// (the re-centre cancels half the width change on the far side), so the ring
+/// never crowds the neighbour behind it.
+///
+/// A side widens only toward a surface that plays the same game: its own
+/// opposite side, or another closed constant-width inner ring (which runs this
+/// same rule and meets it halfway — the annular-band case, where the last
+/// generation's two contours face each other). If the nearest facing surface
+/// is anything else — the outer wall (never touched), an overhang run, an
+/// already-widthed ring — the channel is left alone.
+///
 /// The outer wall is never touched (visible surface); rings that gained
-/// per-segment channels or were cut open keep their width. Rings without a
-/// pinch are untouched — byte-identical paths.
-fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64) {
+/// per-segment channels or were cut open keep their width. Rings with neither
+/// a pinch nor a starving channel are untouched — byte-identical paths.
+fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64, below: Option<&Polygons>) {
+    let cutoff = lw * (1.0 + GAP_BEAD_MIN_W);
+    let soup = SegSoup::build(walls, cutoff, lw);
     let mut out: Vec<ToolPath> = Vec::with_capacity(walls.len());
-    for p in std::mem::take(walls) {
+    for (own, p) in std::mem::take(walls).into_iter().enumerate() {
         if p.kind != PathKind::Perimeter
             || !p.closed
             || p.widths.is_some()
@@ -4815,20 +4884,148 @@ fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64) {
             out.push(p);
             continue;
         }
-        let pitch = ring_self_pitch(&rp, lw);
-        // Hysteresis: a side grazing within float-noise of one bead width is
-        // not a pinch — narrowing it buys nothing and costs the ring its spot
-        // in the shell spiral.
-        if pitch.iter().all(|&d| d >= lw * 0.97) {
+        let pitch = ring_self_pitch(&rp, cutoff, 4.0 * lw);
+        let foreign = soup.probe(&rp, own as u32);
+        // Meets the gap filler's floor exactly: a channel is either narrow
+        // enough to resolve here or wide enough to bead — no dead band.
+        let starve_hi = lw + GAP_BEAD_MIN_W * lw;
+        let m = rp.len();
+        let mut widths = vec![lw; m];
+        let mut extra = vec![0.0; m];
+        let mut nudge = vec![(0.0, 0.0); m];
+        let mut any_pinch = false;
+        let mut starve_area = 0.0;
+        for k in 0..m {
+            let (ds, sdir) = pitch[k];
+            let (dok, odir) = foreign[k];
+            if ds < lw {
+                // Pinch: the ring against its own returning side.
+                if ds < lw * 0.97 {
+                    any_pinch = true;
+                }
+                widths[k] = (ds + lw) * 0.5;
+                continue;
+            }
+            // Starve: nearest cooperating side (own or another plain inner
+            // ring). The corridor check is what keeps this honest — anything
+            // untouchable BETWEEN here and the target (an outer wall, an
+            // overhang run) means the channel is not ours to fill. It must be
+            // directional: an untouchable surface behind the ring has no say
+            // over the channel in front of it.
+            let (dstar, dir) = if ds <= dok { (ds, sdir) } else { (dok, odir) };
+            if dstar > lw * STARVE_MIN
+                && dstar < starve_hi
+                && !soup.occluded(rp[k], own as u32, dir, dstar)
+            {
+                // Signed width delta: swallow narrow channels, thin toward
+                // gap-beadable ones (see STARVE_WIDEN_MAX).
+                let x = if dstar < lw * STARVE_WIDEN_MAX {
+                    (dstar - lw) * 0.5
+                } else {
+                    (dstar - (1.0 + GAP_SEED_W) * lw) * 0.5
+                };
+                extra[k] = x;
+                starve_area += (dstar - lw) * PINCH_STEP_MM;
+                nudge[k] = (dir.0 * x * 0.5, dir.1 * x * 0.5);
+            }
+        }
+        // A ring is worth processing when it pinches, or when its widening
+        // share buys real fill — a hairline stretch worth a fraction of a
+        // square millimetre is not worth the ring's spot in the shell spiral.
+        let starving = starve_area >= STARVE_MIN_AREA_MM2;
+        if !any_pinch && !starving {
             out.push(p);
             continue;
         }
-        let widths: Vec<f64> = pitch
-            .iter()
-            .map(|&d| if d < lw { (d + lw) * 0.5 } else { lw })
-            .collect();
+        if starving {
+            // Low-pass the starve contribution and the re-centring displacement
+            // (±1 mm at the resample step) so a widened stretch eases in and
+            // out at its ends instead of stepping where eligibility flips.
+            let boxcar5 = |v: &[(f64, f64)], k: usize| {
+                let mut a = (0.0, 0.0);
+                for o in 0..5usize {
+                    let j = (k + m + o - 2) % m;
+                    a.0 += v[j].0;
+                    a.1 += v[j].1;
+                }
+                (a.0 / 5.0, a.1 / 5.0)
+            };
+            let pairs: Vec<(f64, f64)> = extra.iter().map(|&x| (x, 0.0)).collect();
+            let floor = GAP_BEAD_MIN_W * lw;
+            for k in 0..m {
+                // Pinch keeps its exact profile; starve deltas are signed
+                // (widen or thin) and clamp at the printable floor so a
+                // float hair below it can't read as sub-printable and get
+                // the stretch cut by `kept_runs` below.
+                if widths[k] >= lw {
+                    widths[k] = (lw + boxcar5(&pairs, k).0).max(floor);
+                }
+            }
+            let sm: Vec<(f64, f64)> = (0..m).map(|k| boxcar5(&nudge, k)).collect();
+            for k in 0..m {
+                if sm[k].0 != 0.0 || sm[k].1 != 0.0 {
+                    rp[k] = Point::from_mm(rp[k].x_mm() + sm[k].0, rp[k].y_mm() + sm[k].1);
+                }
+            }
+        }
         let floor = GAP_BEAD_MIN_W * lw;
-        let blocked: Vec<bool> = widths.iter().map(|&w| w < floor).collect();
+        let mut blocked: Vec<bool> = widths.iter().map(|&w| w < floor).collect();
+        // A cut may not END over air. Where the sub-printable stretch crosses
+        // a lintel — the layer below has an opening there — cutting would park
+        // both bead ends and the replacement gap bead's tip in mid-air over
+        // the very span they were supposed to bridge (seen on a real job: a
+        // ring's two cut ends at the opening's middle, the gap bead dangling
+        // 1.4 mm short, an unprinted hole between them). Keep the ring
+        // CONTINUOUS across the opening instead, clamped at the printable
+        // floor: two floor-width beads over-fill a near-touching pinch, but a
+        // bridge anchored on both sides beats dangling ends every time. The
+        // anchor margin keeps the surviving cut ends a couple of samples onto
+        // supported ground. (Only the self-pinch cut needs this: a thin-wall
+        // trim's cut leaves the OTHER wall in place as the spanning bead.)
+        let mut air = vec![false; m];
+        if let Some(below) = below {
+            // Every sample of a processed ring, not just the blocked ones: a
+            // pinch-narrowed-but-kept stretch crossing the same opening needs
+            // the overhang stamp below just as much as the unblocked one.
+            for k in 0..m {
+                air[k] = !in_polys(below, rp[k]);
+            }
+            if blocked.iter().any(|&b| b) {
+                const ANCHOR: usize = 2; // samples ≈ 1 mm at PINCH_STEP_MM
+                for k in 0..m {
+                    if !blocked[k] {
+                        continue;
+                    }
+                    let near_air = (0..=2 * ANCHOR)
+                        .any(|o| air[(k + m + o - ANCHOR) % m]);
+                    if near_air {
+                        blocked[k] = false;
+                        widths[k] = widths[k].max(floor);
+                    }
+                }
+            }
+        }
+        // The kept-over-air stretch prints like the overhang it is: stamp
+        // OverhangWall seg attrs so emission takes the overhang slowdown and
+        // bridge-grade cooling across the lintel (the widths branch honors
+        // segs). Fully airborne (overhang 1.0) — these samples sit over a
+        // real opening, not past a graded rim.
+        let lintel_segs = |idx: &dyn Fn(usize) -> usize, n_pts: usize, closed: bool| -> Option<Vec<SegAttr>> {
+            let n_segs = if closed { n_pts } else { n_pts.saturating_sub(1) };
+            let mut any = false;
+            let sa: Vec<SegAttr> = (0..n_segs)
+                .map(|j| {
+                    let (a, b) = (idx(j), idx((j + 1) % n_pts));
+                    if air[a] || air[b] {
+                        any = true;
+                        SegAttr { kind: PathKind::OverhangWall, overhang: 1.0, flow: 1.0 }
+                    } else {
+                        SegAttr { kind: PathKind::Perimeter, overhang: 0.0, flow: 1.0 }
+                    }
+                })
+                .collect();
+            any.then_some(sa)
+        };
         // No margin pullback: `trim_thin_walls` pulls its tips back a bead so
         // they end clear of the OTHER wall they were doubling. Here the ring
         // is doubling itself, there is no other wall to clear, and every extra
@@ -4836,9 +5033,12 @@ fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64) {
         match kept_runs(&rp, true, &blocked, 0.0) {
             // Nothing sub-printable: two beads still fit, so narrow as before.
             None => {
+                let ident = |j: usize| j;
+                let sa = lintel_segs(&ident, rp.len(), true);
                 let mut q = p;
                 q.points = rp;
                 q.widths = Some(widths);
+                q.segs = sa;
                 out.push(q);
             }
             // Some stretch has room for one bead only. What survives stays a
@@ -4849,11 +5049,14 @@ fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64) {
                     let pts: Vec<Point> = run.iter().map(|&k| rp[k]).collect();
                     let ws: Vec<f64> = run.iter().map(|&k| widths[k]).collect();
                     let mean = ws.iter().sum::<f64>() / ws.len() as f64;
+                    let lookup = |j: usize| run[j.min(run.len() - 1)];
+                    let sa = lintel_segs(&lookup, run.len(), false);
                     let mut q = p.clone();
                     q.points = pts;
                     q.closed = false;
                     q.width_mm = mean;
                     q.widths = Some(ws);
+                    q.segs = sa;
                     out.push(q);
                 }
             }
@@ -4879,15 +5082,20 @@ fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64) {
 /// The ring continuing THROUGH a vertex runs parallel to it; the side coming
 /// BACK runs against it. So: reject parallel, accept anti-parallel, and skip
 /// only the immediately adjacent segments by index.
-fn ring_self_pitch(pts: &[Point], cutoff_mm: f64) -> Vec<f64> {
+///
+/// Returns per vertex the distance plus the unit direction toward the nearest
+/// opposing point — the starve rule re-centres along it. `min_total_mm` guards
+/// rings too short to have an opposing side at all (kept at `4·lw` so raising
+/// the probe cutoff doesn't blind small rings that used to be measurable).
+fn ring_self_pitch(pts: &[Point], cutoff_mm: f64, min_total_mm: f64) -> Vec<(f64, (f64, f64))> {
     let m = pts.len();
     let mut arc = vec![0.0; m + 1];
     for j in 0..m {
         arc[j + 1] = arc[j] + pt_dist_mm(pts[j], pts[(j + 1) % m]);
     }
     let total = arc[m];
-    let mut out = vec![f64::INFINITY; m];
-    if total < 4.0 * cutoff_mm {
+    let mut out = vec![(f64::INFINITY, (0.0, 0.0)); m];
+    if total < min_total_mm {
         return out; // too small to have an opposing side at all
     }
     let dir = |a: Point, b: Point| {
@@ -4924,7 +5132,11 @@ fn ring_self_pitch(pts: &[Point], cutoff_mm: f64) -> Vec<f64> {
                     if tx * ux + ty * uy > -0.5 {
                         continue;
                     }
-                    *d = d.min(point_segment_dist_mm(q, pts[j], pts[(j + 1) % m]));
+                    let (dj, cp) = point_segment_closest_mm(q, pts[j], pts[(j + 1) % m]);
+                    if dj < d.0 {
+                        let dd = dj.max(1.0e-9);
+                        *d = (dj, ((cp.0 - q.x_mm()) / dd, (cp.1 - q.y_mm()) / dd));
+                    }
                 }
             }
         }
@@ -4932,8 +5144,141 @@ fn ring_self_pitch(pts: &[Point], cutoff_mm: f64) -> Vec<f64> {
     out
 }
 
-/// Distance (mm) from point `q` to segment `a`–`b`.
-fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
+/// Every wall segment of the layer in one uniform grid, tagged by owner and by
+/// whether the starve rule may widen toward it — a closed constant-width inner
+/// `Perimeter`, i.e. a ring that runs the same rule and meets it halfway.
+/// Everything else (outer walls, overhang runs, widthed or cut rings) probes
+/// as untouchable: a channel bounded by one is left alone.
+struct SegSoup {
+    /// (a, b, owning path index, may-widen-toward)
+    segs: Vec<(Point, Point, u32, bool)>,
+    grid: std::collections::HashMap<(i64, i64), Vec<u32>>,
+    cell: i64,
+    cutoff_mm: f64,
+    lw_mm: f64,
+}
+
+impl SegSoup {
+    fn build(walls: &[ToolPath], cutoff_mm: f64, lw_mm: f64) -> Self {
+        let cell = (cutoff_mm * geo2d::UNITS_PER_MM).max(1.0) as i64;
+        let mut segs = Vec::new();
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, p) in walls.iter().enumerate() {
+            let n = p.points.len();
+            if n < 2 {
+                continue;
+            }
+            // Must mirror the processing gate above, so that whenever a ring
+            // widens toward a neighbour, the neighbour widens back.
+            let eligible = p.kind == PathKind::Perimeter
+                && p.closed
+                && p.widths.is_none()
+                && p.segs.is_none()
+                && n >= 4;
+            let last = if p.closed { n } else { n - 1 };
+            for j in 0..last {
+                let (a, b) = (p.points[j], p.points[(j + 1) % n]);
+                let id = segs.len() as u32;
+                segs.push((a, b, i as u32, eligible));
+                for gx in a.x.min(b.x).div_euclid(cell)..=a.x.max(b.x).div_euclid(cell) {
+                    for gy in a.y.min(b.y).div_euclid(cell)..=a.y.max(b.y).div_euclid(cell) {
+                        grid.entry((gx, gy)).or_default().push(id);
+                    }
+                }
+            }
+        }
+        Self { segs, grid, cell, cutoff_mm, lw_mm }
+    }
+
+    /// Is anything standing in the corridor from `q` toward the widening
+    /// target at `dstar_mm` along `dir`? A parallel neighbour ring is invisible
+    /// to the anti-parallel probes, so a ring one generation out could "see" a
+    /// channel THROUGH the ring that actually flanks it and widen toward a
+    /// slot it doesn't border. Any FOREIGN segment — whatever its direction or
+    /// eligibility — whose closest point sits inside a 30° cone toward the
+    /// target and clearly nearer than it (a quarter-bead margin absorbs the
+    /// probe's resample tolerance) means the channel is not this ring's. The
+    /// cone is 30°, not wider: near a hairpin tip the outer wall WRAPS the
+    /// feature, sitting close by at 40–60° off the channel axis without being
+    /// in the corridor at all — a 45° cone read that wrap as an occluder and
+    /// left the channel's end unfilled. The probing ring's own segments never
+    /// count: the target is already the nearest of its candidates, and the
+    /// segment underfoot of `q` sits at quantization distance in a numerically
+    /// arbitrary direction — counting it vetoed legitimate widens at random.
+    fn occluded(&self, q: Point, own: u32, dir: (f64, f64), dstar_mm: f64) -> bool {
+        let margin = dstar_mm - self.lw_mm * 0.25;
+        let (cx, cy) = (q.x.div_euclid(self.cell), q.y.div_euclid(self.cell));
+        for gx in (cx - 1)..=(cx + 1) {
+            for gy in (cy - 1)..=(cy + 1) {
+                let Some(ids) = self.grid.get(&(gx, gy)) else { continue };
+                for &id in ids {
+                    let (a, b, w, _) = self.segs[id as usize];
+                    if w == own {
+                        continue;
+                    }
+                    let (d, cp) = point_segment_closest_mm(q, a, b);
+                    if d >= margin {
+                        continue;
+                    }
+                    let dd = d.max(1.0e-9);
+                    let to = ((cp.0 - q.x_mm()) / dd, (cp.1 - q.y_mm()) / dd);
+                    if to.0 * dir.0 + to.1 * dir.1 > 0.87 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// For each vertex of ring `own`: nearest anti-parallel COOPERATING
+    /// segment of another wall within the cutoff, as (distance, unit direction
+    /// toward it). Whether an untouchable surface stands in the way is
+    /// [`SegSoup::occluded`]'s question — asked along the chosen direction,
+    /// never as a bearing-blind minimum.
+    fn probe(&self, rp: &[Point], own: u32) -> Vec<(f64, (f64, f64))> {
+        let m = rp.len();
+        let dir = |a: Point, b: Point| {
+            let (dx, dy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+            let l = dx.hypot(dy).max(1.0e-9);
+            (dx / l, dy / l)
+        };
+        (0..m)
+            .map(|i| {
+                let q = rp[i];
+                let (tx, ty) = dir(rp[(i + m - 1) % m], rp[(i + 1) % m]);
+                let mut best = (f64::INFINITY, (0.0, 0.0));
+                let (cx, cy) = (q.x.div_euclid(self.cell), q.y.div_euclid(self.cell));
+                for gx in (cx - 1)..=(cx + 1) {
+                    for gy in (cy - 1)..=(cy + 1) {
+                        let Some(ids) = self.grid.get(&(gx, gy)) else { continue };
+                        for &id in ids {
+                            let (a, b, w, ok) = self.segs[id as usize];
+                            if w == own || !ok {
+                                continue;
+                            }
+                            let (ux, uy) = dir(a, b);
+                            if tx * ux + ty * uy > -0.5 {
+                                continue;
+                            }
+                            let (d, cp) = point_segment_closest_mm(q, a, b);
+                            if d > self.cutoff_mm || d >= best.0 {
+                                continue;
+                            }
+                            let dd = d.max(1.0e-9);
+                            best = (d, ((cp.0 - q.x_mm()) / dd, (cp.1 - q.y_mm()) / dd));
+                        }
+                    }
+                }
+                best
+            })
+            .collect()
+    }
+}
+
+/// Distance (mm) and closest point (mm) from point `q` to segment `a`–`b`.
+fn point_segment_closest_mm(q: Point, a: Point, b: Point) -> (f64, (f64, f64)) {
     let (qx, qy) = (q.x_mm(), q.y_mm());
     let (ax, ay) = (a.x_mm(), a.y_mm());
     let (bx, by) = (b.x_mm(), b.y_mm());
@@ -4941,15 +5286,19 @@ fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
     let len2 = dx * dx + dy * dy;
     let t = if len2 <= 0.0 { 0.0 } else { ((qx - ax) * dx + (qy - ay) * dy) / len2 };
     let t = t.clamp(0.0, 1.0);
-    (qx - (ax + dx * t)).hypot(qy - (ay + dy * t))
+    let (px, py) = (ax + dx * t, ay + dy * t);
+    ((qx - px).hypot(qy - py), (px, py))
 }
 
-/// Trace each detected void's medial axis: long-enough runs become tapered
-/// beads; the rest — sub-length specks and culled corner ribs — come back to
-/// the caller so [`absorb_dropped_voids`] can widen a neighbouring ring over
-/// them instead of leaving pinholes.
+/// Distance (mm) from point `q` to segment `a`–`b`.
+fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
+    point_segment_closest_mm(q, a, b).0
+}
+
 /// Narrowest gap bead worth placing, as a fraction of the line width. Below
 /// this the nozzle cannot draw what is being asked of it — see `emit_gap_fill`.
+/// Channels under this floor are the starve rule's territory instead: the
+/// flanking rings widen over them at ring time (`resolve_pinched_rings`).
 const GAP_BEAD_MIN_W: f64 = 0.75;
 
 
@@ -7918,43 +8267,63 @@ mod tests {
     }
 
     #[test]
-    fn a_slit_narrower_than_the_nozzle_is_left_alone() {
+    fn a_slit_narrower_than_the_nozzle_is_resolved_by_its_walls() {
         // A 60×6 mm plate at lw 0.4: concentric walls leave a ~0.2 mm slit
         // down the middle (6.0 isn't an integer number of bead spacings).
-        //
-        // Nothing is done about it, deliberately. The two things that COULD
-        // be done are both worse than the slit:
-        //
-        //   - trace it with a 0.2 mm bead. A 0.4 mm orifice cannot draw one.
-        //     The extruder meters the volume, the plastic still leaves through
-        //     a 0.4 mm hole, and what lands is an under-pressured thread that
-        //     bonds to nothing — for a travel, a retract and a restart each.
-        //   - widen the neighbouring wall to swallow it. That was measured on
-        //     a real job: inner-wall runs varying by more than 0.15 mm along
-        //     their length went from 8% to 41%, because the widening follows
-        //     the void's raster boundary and writes its noise into the wall.
-        //
-        // A wall you can trust beats 0.6% of material in gaps narrower than
-        // the nozzle. So: no bead under 0.75 × line width, and no wall
-        // carries a width profile at all.
+        // The innermost ring's own two sides sit at 0.6 mm pitch = 1.5·lw —
+        // above STARVE_WIDEN_MAX, so the THIN regime applies: both sides slim
+        // toward the printable floor, re-centre away from the slit, and leave
+        // a GAP_SEED_W channel that the gap filler beads with one continuous
+        // stroke. Walls stay near nominal — the modulation lives in the gap
+        // bead, whose whole identity is "tapered filler" (the user's call:
+        // "thin the inner wall and place a gap fill"). Widening over the
+        // channel is reserved for pitches too tight for any printable bead.
         let mesh = mesh::Mesh::from_triangle_soup(&box_soup(&[[0.0, 0.0, 0.0, 60.0, 6.0, 2.0]]));
         let layers = generate(&mesh, &all_wall_settings());
         let mid = &layers[layers.len() / 2];
+        let lw = 0.4;
+        let floor = 0.75 * lw;
 
-        for p in mid.paths.iter().filter(|p| p.kind == PathKind::GapFill) {
+        // The channel gets a real, printable gap bead down its length.
+        let gaps: Vec<_> = mid.paths.iter().filter(|p| p.kind == PathKind::GapFill).collect();
+        assert!(!gaps.is_empty(), "the thinned channel produced no gap bead");
+        let mut gap_len = 0.0;
+        for p in &gaps {
             let ws = p.widths.as_ref().expect("a gap bead carries a width profile");
             let mean = ws.iter().sum::<f64>() / ws.len() as f64;
             assert!(
-                mean >= 0.75 * 0.4 - 1e-9,
+                mean >= floor - 1e-9,
                 "a {mean:.3} mm gap bead was placed; the nozzle is 0.4"
             );
+            gap_len += path_len_mm(p);
         }
-        assert!(
-            !mid.paths
-                .iter()
-                .any(|p| p.kind == PathKind::Perimeter && p.widths.is_some()),
-            "an inner wall was width-modulated to chase a sub-nozzle void"
-        );
+        assert!(gap_len > 40.0, "gap bead covers only {gap_len:.1} mm of a ~55 mm slit");
+
+        // The flanking ring carries a bounded, near-nominal width profile:
+        // never below the printable floor, never above the widen cap, and
+        // smooth along its length.
+        let thinned: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Perimeter && p.widths.is_some())
+            .collect();
+        assert!(!thinned.is_empty(), "no ring resolved the slit");
+        for p in &thinned {
+            let ws = p.widths.as_ref().unwrap();
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for &w in ws {
+                lo = lo.min(w);
+                hi = hi.max(w);
+            }
+            assert!(lo >= floor - 1e-9, "ring thinned to {lo:.3} mm, under the floor");
+            assert!(
+                hi <= lw * (STARVE_WIDEN_MAX + 1.0) * 0.5 + 1e-6,
+                "ring widened to {hi:.3} mm, past the widen cap"
+            );
+        }
+        // …and the slit is actually gone from the coverage oracle.
+        let (_, unc) = debug_uncovered(mid, lw);
+        assert!(unc < 1.0, "{unc:.2} mm2 of the slit survived");
     }
     #[test]
     fn short_gap_beads_are_skipped() {

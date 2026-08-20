@@ -800,31 +800,73 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
                 // a segment wider than the mean would exceed the melt ceiling
                 // at that feed (the extruder skips, then the pressure spike
                 // blobs downstream) — re-clamp per segment from its own width.
+                //
+                // A widths ring may ALSO carry `segs` (a pinch-kept stretch
+                // bridging a lintel is stamped OverhangWall): each segment
+                // takes its attr's feed — the overhang slowdown — and attr
+                // boundaries re-tune label/accel/fan exactly like the plain
+                // segmented branch below. These rings are resampled at
+                // PINCH_STEP_MM, so slew-limiting per segment is as fine as
+                // the piece planner; the sweep only runs when attrs vary
+                // (a plain tapered bead emits byte-identically).
                 let h = layer.height_mm * path.height_scale;
-                let ff = flow_factor(path, t, layer.index == 0);
                 let flow_cap = layer_flow_cap_mm3_s(layer, t);
-                let seg_feed = |w: f64| -> f64 {
+                let width_feed = |w: f64, base: f64, ffk: f64| -> f64 {
                     if flow_cap > 0.0 {
-                        let mm3_per_mm = config::bead_area_mm2(w, h) * ff;
-                        feed.min(60.0 * flow_cap / mm3_per_mm.max(1.0e-9))
+                        let mm3_per_mm = config::bead_area_mm2(w, h) * ffk;
+                        base.min(60.0 * flow_cap / mm3_per_mm.max(1.0e-9))
                     } else {
-                        feed
+                        base
                     }
                 };
-                let mut prev = start;
-                for k in 0..n_pts - 1 {
-                    let w = (ws[k] + ws[k + 1]) * 0.5;
-                    let c = config::bead_area_mm2(w, h) / area * ff;
-                    let p = path.points[k + 1];
-                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, seg_feed(w));
-                    prev = p;
+                let has_segs = path.segs.as_ref().is_some_and(|sa| !sa.is_empty());
+                let seg_w = |k: usize| (ws[k] + ws[(k + 1) % n_pts]) * 0.5;
+                let seg_ff =
+                    |k: usize| flow_factor_kind(seg(k).kind, path.flow, t, layer.index == 0) * seg(k).flow as f64;
+                let mut feeds: Vec<f64> = (0..n_segs)
+                    .map(|k| {
+                        let base = if has_segs {
+                            let a = seg(k);
+                            feed_for_seg(a.kind, a.overhang, path, layer.index, layer.height_mm, flow_cap, t, s)
+                                * layer.speed_scale
+                                * small
+                        } else {
+                            feed
+                        };
+                        width_feed(seg_w(k), base, seg_ff(k))
+                    })
+                    .collect();
+                if has_segs {
+                    let len = |k: usize| dist_mm(path.points[k], path.points[(k + 1) % n_pts]);
+                    let sweeps = if path.closed { 2 * n_segs } else { n_segs };
+                    for i in 1..sweeps {
+                        let (p, k) = ((i - 1) % n_segs, i % n_segs);
+                        feeds[k] = feeds[k].min(feeds[p] + FEED_SLEW_PER_MM * len(k));
+                    }
+                    for i in (0..sweeps.saturating_sub(1)).rev() {
+                        let (k, nx) = (i % n_segs, (i + 1) % n_segs);
+                        feeds[k] = feeds[k].min(feeds[nx] + FEED_SLEW_PER_MM * len(k));
+                    }
                 }
-                if path.closed {
-                    // Close the ring — a modulated ring must not leave its seam
-                    // segment unextruded.
-                    let w = (ws[n_pts - 1] + ws[0]) * 0.5;
-                    let c = config::bead_area_mm2(w, h) / area * ff;
-                    g.extrude(start.x_mm(), start.y_mm(), dist_mm(prev, start) * c, seg_feed(w));
+                let mut run = seg(0);
+                let mut prev = start;
+                for k in 0..n_segs {
+                    if has_segs {
+                        let a = seg(k);
+                        if a != run {
+                            set_seg_attrs(
+                                &mut g, a.kind, a.overhang, layer, normal_fan, t, s, &mut cur_type,
+                                &mut cur_accel, &mut cur_pa, &mut cur_fan,
+                                // Mid-bead: never touch PA (planner flush = blob).
+                                None,
+                            );
+                            run = a;
+                        }
+                    }
+                    let c = config::bead_area_mm2(seg_w(k), h) / area * seg_ff(k);
+                    let p = path.points[(k + 1) % n_pts];
+                    g.extrude(p.x_mm(), p.y_mm(), dist_mm(prev, p) * c, feeds[k]);
+                    prev = p;
                 }
             } else if path.segs.is_some() {
                 // Per-segment attributes: sub-block the bead into runs of equal
