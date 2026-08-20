@@ -227,7 +227,7 @@ struct BeadOut {
     @location(1) lnorm: vec3<f32>,
     @location(2) p0: vec3<f32>,
     @location(3) dir_len: vec3<f32>,
-    @location(4) dims: vec2<f32>,
+    @location(4) dims: vec3<f32>,   // (width at x=0 end, width at x=1 end, height)
     @location(5) color: vec3<f32>,
     @location(6) lc: vec2<f32>,
     @location(7) tool: f32,
@@ -236,21 +236,24 @@ struct BeadOut {
     let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
     let zaxis = vec3<f32>(0.0, 0.0, 1.0);
     // Place each END's cross-section ring in its vertex's MITER frame (the
-    // mean direction of the two segments meeting there, from the instance).
-    // Both segments at a shared vertex then generate the identical world
-    // hexagon, so consecutive tubes weld into one continuous mitered surface —
-    // per-segment frames left an open wedge at every turn, and at close
-    // oblique zoom the view INTO those open ends read as sawtooth slits.
+    // mean direction of the two segments meeting there, from the instance)
+    // at ITS OWN end width. Both segments at a shared vertex then generate
+    // the identical world hexagon — same frame, same width — so consecutive
+    // tubes weld into one continuous mitered surface even mid-taper, where a
+    // single per-instance width left a step at every joint of a width-
+    // modulated bead. A tapering segment renders as the cone between its
+    // end rings, which is what the deposited bead does.
     let ang = select(tang.x, tang.y, lpos.x > 0.5);
+    let wend = select(dims.x, dims.y, lpos.x > 0.5);
     let taxis = vec3<f32>(cos(ang), sin(ang), 0.0);
     let yaxis = cross(zaxis, taxis);                  // across, in the bed plane
-    let local = xaxis * (lpos.x * dir_len.z) + yaxis * (lpos.y * dims.x) + zaxis * (lpos.z * dims.y);
+    let local = xaxis * (lpos.x * dir_len.z) + yaxis * (lpos.y * wend) + zaxis * (lpos.z * dims.z);
     var o: BeadOut;
     o.clip = u.mvp * vec4<f32>(p0 + local, 1.0);
     // Correct the normal for the non-uniform (width, height) scaling of the
     // cross-section (inverse scale), then rotate into the end frame (so
     // shading is continuous across the welded joint too).
-    let n_local = normalize(vec3<f32>(lnorm.x, lnorm.y / dims.x, lnorm.z / dims.y));
+    let n_local = normalize(vec3<f32>(lnorm.x, lnorm.y / wend, lnorm.z / dims.z));
     o.normal = taxis * n_local.x + yaxis * n_local.y + zaxis * n_local.z;
     o.color = color;
     o.layer = lc.x;
@@ -271,7 +274,7 @@ struct BeadOut {
     @location(1) lnorm: vec3<f32>,
     @location(2) p0: vec3<f32>,
     @location(3) dir_len: vec3<f32>,
-    @location(4) dims: vec2<f32>,
+    @location(4) dims: vec3<f32>,   // (width at x=0 end, width at x=1 end, height)
     @location(5) color: vec3<f32>,
     @location(6) lc: vec2<f32>,
     @location(7) tool: f32,
@@ -304,8 +307,10 @@ struct BeadOut {
     let th = th_v + lpos.y * 3.14159265;   // lpos.y in [-0.5, 0.5] = +/- a quarter turn
     let c = cos(th);
     let s = sin(th);
-    let a = dims.x * 0.5;
-    let b = dims.y * 0.5;
+    // Each end's OWN width (the taper weld, same as the tube): both quads at
+    // a shared vertex then agree on the silhouette edge mid-taper too.
+    let a = select(dims.x, dims.y, lpos.x > 0.5) * 0.5;
+    let b = dims.z * 0.5;
     var o: BeadOut;
     o.clip = u.mvp * vec4<f32>(pend + yaxis * (a * c) + zaxis * (b * s), 1.0);
     // The ellipse's own normal at that angle (gradient of x²/a² + z²/b²).
@@ -338,20 +343,30 @@ struct BeadOut {
     return vec4<f32>(col * shade, 1.0);
 }
 
-// --- joint blobs (instanced; round path ends and fill corners) ---
+// --- joint instances: seam markers (blob mesh) and bead end caps (dome
+// mesh). One shader serves both draws; dims.z is a bed-plane rotation so a
+// cap's dome points OUT of its tube along the end tangent (markers pass 0,
+// where the rotation is the identity for the symmetric blob). The dome's
+// unit ring matches the tube's unit ring, and the same (width, height)
+// scaling applies, so a cap welds onto the tube's end hexagon exactly. ---
 @vertex fn vs_joint(
     @location(0) lpos: vec3<f32>,
     @location(1) lnorm: vec3<f32>,
     @location(2) p0: vec3<f32>,
-    @location(3) dims: vec2<f32>,
+    @location(3) dims: vec3<f32>,   // (width, height, out-angle)
     @location(4) color: vec3<f32>,
     @location(5) lc: vec2<f32>,
     @location(6) tool: f32,
 ) -> BeadOut {
     let r = vec3<f32>(dims.x * 0.5, dims.x * 0.5, dims.y * 0.5);
+    let taxis = vec3<f32>(cos(dims.z), sin(dims.z), 0.0);
+    let zaxis = vec3<f32>(0.0, 0.0, 1.0);
+    let yaxis = cross(zaxis, taxis);
+    let l = lpos * r;
     var o: BeadOut;
-    o.clip = u.mvp * vec4<f32>(p0 + lpos * r, 1.0);
-    o.normal = normalize(lnorm / r);
+    o.clip = u.mvp * vec4<f32>(p0 + taxis * l.x + yaxis * l.y + zaxis * l.z, 1.0);
+    let n = normalize(lnorm / r);
+    o.normal = taxis * n.x + yaxis * n.y + zaxis * n.z;
     o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
@@ -478,6 +493,7 @@ pub struct Preview {
     pub count: u32,
     /// Number of joint-blob instances to draw, through the current layer.
     pub joint_count: u32,
+    pub cap_count: u32,
     /// Current (top visible) layer, 1-based.
     pub current_layer: f32,
     /// Brightness multiplier for layers below the current one (1.0 = no dim).
@@ -569,6 +585,10 @@ pub struct Scene {
     blob_count: u32,
     joint_vbuf: GrowBuf,
     joint_count: u32,
+    cap_vbuf: wgpu::Buffer,
+    cap_mesh_count: u32,
+    cap_inst: GrowBuf,
+    cap_count: u32,
     nozzle_vbuf: GrowBuf,
     nozzle_count: u32,
     label_pipeline: wgpu::RenderPipeline,
@@ -723,9 +743,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (16 * 4) as u64,
+                    array_stride: (17 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x3, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -743,9 +763,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (16 * 4) as u64,
+                    array_stride: (17 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x3, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -765,9 +785,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (11 * 4) as u64,
+                    array_stride: (12 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Float32x3, 5 => Float32x2, 6 => Float32],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x3, 5 => Float32x2, 6 => Float32],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -968,6 +988,12 @@ impl Scene {
             contents: bytemuck::cast_slice(&blob_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let cap_verts = cap_vertices();
+        let cap_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cap_base"),
+            contents: bytemuck::cast_slice(&cap_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         let (color_view, depth_view, resolve_view, resolve_tex) = make_targets(device, format, 1, 1);
 
@@ -1017,6 +1043,10 @@ impl Scene {
             blob_count: blob_verts.len() as u32,
             joint_vbuf: GrowBuf::default(),
             joint_count: 0,
+            cap_vbuf,
+            cap_mesh_count: cap_verts.len() as u32,
+            cap_inst: GrowBuf::default(),
+            cap_count: 0,
             nozzle_vbuf: GrowBuf::default(),
             nozzle_count: 0,
             label_pipeline,
@@ -1241,7 +1271,7 @@ impl Scene {
     }
 
     /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat, tool]`.
-    pub fn set_toolpaths(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[[f32; 16]]) {
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[[f32; 17]]) {
         self.inst_count = instances.len() as u32;
         self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
@@ -1258,9 +1288,15 @@ impl Scene {
     }
 
     /// Upload joint-blob instances: `[p0.xyz, width, height, r, g, b, layer, cat, tool]`.
-    pub fn set_joints(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, joints: &[[f32; 11]]) {
+    pub fn set_joints(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, joints: &[[f32; 12]]) {
         self.joint_count = joints.len() as u32;
         self.joint_vbuf.write(device, queue, "joint_instances", bytemuck::cast_slice(joints));
+    }
+
+    /// Bead end caps: same instance layout as joints, drawn with the dome mesh.
+    pub fn set_caps(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, caps: &[[f32; 12]]) {
+        self.cap_count = caps.len() as u32;
+        self.cap_inst.write(device, queue, "cap_instances", bytemuck::cast_slice(caps));
     }
 
     /// Upload the font-atlas coverage (R8) the bed label samples, and (re)build
@@ -1472,6 +1508,15 @@ impl Scene {
                         pass.draw(0..self.blob_count, 0..jn);
                     }
                 }
+                let cn = p.cap_count.min(self.cap_count);
+                if cn > 0 {
+                    if let Some(cinst) = self.cap_inst.as_ref() {
+                        pass.set_pipeline(&self.joint_pipeline);
+                        pass.set_vertex_buffer(0, self.cap_vbuf.slice(..));
+                        pass.set_vertex_buffer(1, cinst.slice(..));
+                        pass.draw(0..self.cap_mesh_count, 0..cn);
+                    }
+                }
             }
 
             if show_mesh {
@@ -1617,6 +1662,38 @@ fn bead_vertices() -> Vec<Vertex> {
 /// The instance scales it to (width/2, width/2, height/2) and places it at a
 /// path vertex, rounding ends and filling corners. Vertex positions are unit
 /// vectors, so they double as normals.
+/// Unit bead end cap: a half-dome closing the tube's hexagonal cross-section
+/// (ring at x=0 matching `bead_vertices`' ring phase, dome bulging to a pole
+/// at x=+0.5). Instanced through `vs_joint` with the end's own (width,
+/// height) and the OUTWARD tangent angle, its base hexagon lands exactly on
+/// the tube's welded end ring — the cap continues the bead's surface instead
+/// of a ball intersecting it.
+fn cap_vertices() -> Vec<Vertex> {
+    const N: usize = 6;
+    // vs_joint scales by (w/2, w/2, h/2): build on the unit sphere so
+    // positions double as normals (same convention as the blob).
+    let ring = |phi: f32| -> Vec<[f32; 3]> {
+        (0..N)
+            .map(|k| {
+                let t = std::f32::consts::TAU * (k as f32) / (N as f32);
+                [phi.sin(), phi.cos() * t.cos(), phi.cos() * t.sin()]
+            })
+            .collect()
+    };
+    let r0 = ring(0.0);
+    let r1 = ring(std::f32::consts::FRAC_PI_4);
+    let pole = [1.0, 0.0, 0.0];
+    let v = |p: [f32; 3]| Vertex { pos: p, normal: p };
+    let mut out = Vec::with_capacity(9 * N);
+    for k in 0..N {
+        let k1 = (k + 1) % N;
+        // base ring -> mid ring (quad), mid ring -> pole (tri)
+        out.extend_from_slice(&[v(r0[k]), v(r0[k1]), v(r1[k1]), v(r0[k]), v(r1[k1]), v(r1[k])]);
+        out.extend_from_slice(&[v(r1[k]), v(r1[k1]), v(pole)]);
+    }
+    out
+}
+
 fn blob_vertices() -> Vec<Vertex> {
     // A tiny corner/end filler — a pentagonal bipyramid is plenty round at this
     // scale (and joints are now culled to only sharp corners anyway).

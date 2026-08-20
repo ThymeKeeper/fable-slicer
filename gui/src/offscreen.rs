@@ -138,11 +138,15 @@ pub fn run(a: &Args) -> Result<(), String> {
         ),
         _ => None,
     };
-    let (inst, ends, joints, joint_ends) =
+    let (inst, ends, joints, joint_ends, caps, cap_ends) =
         build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0, None);
     let count = ends.get(layer - 1).copied().unwrap_or(0);
     let joint_count = joint_ends.get(layer - 1).copied().unwrap_or(0);
-    eprintln!("offscreen: instances beads={} joints={} (through layer {layer})", count, joint_count);
+    let cap_count = cap_ends.get(layer - 1).copied().unwrap_or(0);
+    eprintln!(
+        "offscreen: instances beads={} joints={} caps={} (through layer {layer})",
+        count, joint_count, cap_count
+    );
 
     // Scene (4× MSAA — within the WebGPU baseline, so no device feature needed).
     let format = wgpu::TextureFormat::Rgba8Unorm;
@@ -152,6 +156,10 @@ pub fn run(a: &Args) -> Result<(), String> {
     let joint_count = if std::env::var("NO_JOINTS").is_ok() { 0 } else { joint_count };
     if joint_count > 0 {
         scene.set_joints(&device, &queue, &joints);
+    }
+    let cap_count = if std::env::var("NO_JOINTS").is_ok() { 0 } else { cap_count };
+    if cap_count > 0 {
+        scene.set_caps(&device, &queue, &caps);
     }
 
     // Camera: frame the geometry visible through this layer, from a high front
@@ -197,6 +205,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         flat_beads: std::env::var("FABLE_FLAT_BEADS").is_ok(),
         count,
         joint_count,
+        cap_count,
         current_layer: layer as f32,
         dim,
         mask,

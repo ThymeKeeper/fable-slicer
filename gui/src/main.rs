@@ -1669,10 +1669,12 @@ struct SliceOutput {
     geo: Option<engine::GeometryPlan>,
     summary: SliceSummary,
     layer_stats: Vec<engine::LayerStats>,
-    verts: Vec<[f32; 16]>,
+    verts: Vec<[f32; 17]>,
     ends: Vec<u32>,
-    joints: Vec<[f32; 11]>,
+    joints: Vec<[f32; 12]>,
     joint_ends: Vec<u32>,
+    caps: Vec<[f32; 12]>,
+    cap_ends: Vec<u32>,
 }
 
 /// A freehand paint stroke on the SLICED beads: a shallow disc on the surface at
@@ -1702,12 +1704,12 @@ struct BeadGrid {
 }
 
 /// A bead instance's midpoint (start + ½·dir·len) in world/render coords.
-fn bead_mid(b: &[f32; 16]) -> glam::Vec3 {
+fn bead_mid(b: &[f32; 17]) -> glam::Vec3 {
     glam::Vec3::new(b[0] + b[3] * b[5] * 0.5, b[1] + b[4] * b[5] * 0.5, b[2])
 }
 
 impl BeadGrid {
-    fn build(inst: &[[f32; 16]], cell: f32) -> Self {
+    fn build(inst: &[[f32; 17]], cell: f32) -> Self {
         let inv = 1.0 / cell.max(1e-3);
         let mut map: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
             std::collections::HashMap::new();
@@ -1724,7 +1726,7 @@ impl BeadGrid {
     }
 
     /// Indices of beads whose midpoint is within `radius` of `center`.
-    fn query(&self, inst: &[[f32; 16]], center: glam::Vec3, radius: f32) -> Vec<u32> {
+    fn query(&self, inst: &[[f32; 17]], center: glam::Vec3, radius: f32) -> Vec<u32> {
         let inv = 1.0 / self.cell.max(1e-3);
         let r2 = radius * radius;
         let lo = (center - glam::Vec3::splat(radius)) * inv;
@@ -1926,6 +1928,8 @@ struct App {
     layer_ends: Vec<u32>,
     /// Cumulative joint-blob count after each layer.
     joint_layer_ends: Vec<u32>,
+    /// Cumulative end-cap count after each layer.
+    cap_layer_ends: Vec<u32>,
     /// false = show the model mesh; true = show the sliced toolpaths.
     view: ViewMode,
     /// Last commanded state of the live chamber-circulation toggle (what WE
@@ -1989,10 +1993,10 @@ struct App {
     /// independent, re-applied after every (re)slice and mode change.
     bead_dabs: Vec<BeadDab>,
     /// Working copy of the bead instances (== what's on the GPU); dabs recolor it.
-    bead_inst: Vec<[f32; 16]>,
+    bead_inst: Vec<[f32; 17]>,
     /// The pristine (mesh-paint) instances, so an erase reverts a bead and the
     /// dabs can be re-applied onto a fresh slice.
-    bead_pristine: Vec<[f32; 16]>,
+    bead_pristine: Vec<[f32; 17]>,
     /// Spatial index over `bead_inst` midpoints for brush queries.
     bead_grid: BeadGrid,
     /// Bumped whenever the scene's GPU buffers change (mesh, beads, beds), so the
@@ -2223,6 +2227,7 @@ impl App {
             hover_pick: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
+            cap_layer_ends: Vec::new(),
             view: ViewMode::Model,
             circulate_on: false,
             preview_layer: 1,
@@ -3698,9 +3703,11 @@ impl App {
         self.sliced_origin_x = origin_x;
         self.commit_bead_instances(out.verts, rs);
         self.scene.set_joints(&rs.device, &rs.queue, &out.joints);
+        self.scene.set_caps(&rs.device, &rs.queue, &out.caps);
         self.content_version += 1;
         self.layer_ends = out.ends;
         self.joint_layer_ends = out.joint_ends;
+        self.cap_layer_ends = out.cap_ends;
         self.preview_layer = if resliced {
             self.preview_layer.clamp(1, n.max(1))
         } else {
@@ -3725,7 +3732,7 @@ impl App {
         let Some(layers) = self.preview_plans() else { return };
         let hop = self.settings.z_hop_mm;
         let layer_colors = self.layer_color_table();
-        let (verts, ends, joints, joint_ends) = build_instances(
+        let (verts, ends, joints, joint_ends, caps, cap_ends) = build_instances(
             layers,
             hop as f32,
             layer_colors.as_deref(),
@@ -3741,9 +3748,11 @@ impl App {
         );
         self.commit_bead_instances(verts, rs);
         self.scene.set_joints(&rs.device, &rs.queue, &joints);
+        self.scene.set_caps(&rs.device, &rs.queue, &caps);
         self.content_version += 1;
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
+        self.cap_layer_ends = cap_ends;
     }
 
     /// Take a fresh bead instance buffer (from `build_instances` — pristine
@@ -3751,7 +3760,7 @@ impl App {
     /// index, re-apply the accumulated bead dabs on top, and upload to the GPU.
     fn commit_bead_instances(
         &mut self,
-        verts: Vec<[f32; 16]>,
+        verts: Vec<[f32; 17]>,
         rs: &eframe::egui_wgpu::RenderState,
     ) {
         self.bead_grid = BeadGrid::build(&verts, BEAD_GRID_CELL_MM);
@@ -3790,10 +3799,10 @@ impl App {
             match dab.tool {
                 Some(t) => {
                     let c = render::visible_against_backdrop(self.settings.tool(t as usize).color_rgb);
-                    self.bead_inst[i][8] = c[0];
-                    self.bead_inst[i][9] = c[1];
-                    self.bead_inst[i][10] = c[2];
-                    self.bead_inst[i][13] = t as f32;
+                    self.bead_inst[i][9] = c[0];
+                    self.bead_inst[i][10] = c[1];
+                    self.bead_inst[i][11] = c[2];
+                    self.bead_inst[i][14] = t as f32;
                 }
                 None => self.bead_inst[i] = self.bead_pristine[i],
             }
@@ -4312,7 +4321,7 @@ struct RenderSig {
     show_mesh: bool,
     show_stars: bool,
     /// (count, joint_count, current_layer bits, dim bits, mask), or None in model mode.
-    preview: Option<(u32, u32, u32, u32, u32)>,
+    preview: Option<(u32, u32, u32, u32, u32, u32)>,
     /// Which bead primitive is in use. It rides with `camera_moving`, which
     /// also halves `size` — but the gate must not depend on that coincidence:
     /// drop dynamic resolution and the ribbon would stick after mouse-up.
@@ -6627,6 +6636,7 @@ impl eframe::App for App {
                 let idx = self.preview_layer.saturating_sub(1);
                 let mut count = self.layer_ends.get(idx).copied().unwrap_or(0);
                 let mut joint_count = self.joint_layer_ends.get(idx).copied().unwrap_or(0);
+                let mut cap_count = self.cap_layer_ends.get(idx).copied().unwrap_or(0);
                 // Dim lower layers only when the slider is below the top.
                 let mut dim = if self.preview_layer >= n { 1.0 } else { 0.15 };
                 let mut current_layer = self.preview_layer as f32;
@@ -6646,6 +6656,7 @@ impl eframe::App for App {
                         if !job.locked {
                             count = 0;
                             joint_count = 0;
+                            cap_count = 0;
                             current_layer = 1.0;
                             dim = 1.0;
                             nozzle_at = st
@@ -6675,14 +6686,18 @@ impl eframe::App for App {
                         count = span(&self.layer_ends);
                         // Joints (bead ends and corners) have no such 1:1 move,
                         // so they ride the same proportion of their own layer.
-                        joint_count = {
+                        let layer_frac = {
                             let a = if li == 0 { 0 } else { self.layer_ends.get(li - 1).copied().unwrap_or(0) };
                             let b = self.layer_ends.get(li).copied().unwrap_or(a);
-                            let f = if b > a { (count - a) as f32 / (b - a) as f32 } else { 1.0 };
-                            let ja = if li == 0 { 0 } else { self.joint_layer_ends.get(li - 1).copied().unwrap_or(0) };
-                            let jb = self.joint_layer_ends.get(li).copied().unwrap_or(ja);
-                            ja + ((jb - ja) as f32 * f) as u32
+                            if b > a { (count - a) as f32 / (b - a) as f32 } else { 1.0 }
                         };
+                        let ride = |ends: &[u32]| -> u32 {
+                            let a = if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
+                            let b = ends.get(li).copied().unwrap_or(a);
+                            a + ((b - a) as f32 * layer_frac) as u32
+                        };
+                        joint_count = ride(&self.joint_layer_ends);
+                        cap_count = ride(&self.cap_layer_ends);
                         current_layer = (li + 1) as f32;
                         dim = 1.0;
                         // The hotend itself, parked with its tip on the bead
@@ -6719,6 +6734,7 @@ impl eframe::App for App {
                 Some(render::Preview {
                     count,
                     joint_count,
+                    cap_count,
                     current_layer,
                     dim,
                     mask: self.category_mask(),
@@ -6745,7 +6761,7 @@ impl eframe::App for App {
             // input (a mouse-move over the panel included); without this a big
             // slice redrew all its beads on each of those frames.
             let preview_sig = preview.as_ref().map(|p| {
-                (p.count, p.joint_count, p.current_layer.to_bits(), p.dim.to_bits(), p.mask)
+                (p.count, p.joint_count, p.cap_count, p.current_layer.to_bits(), p.dim.to_bits(), p.mask)
             });
             // Only the palette actually feeds a pixel (via ctrl.w) in Filament
             // mode, so hash it just then — a spool-color change re-renders the
@@ -8319,7 +8335,7 @@ const CAT_SURFACE: f32 = 9.0;
 /// each with a cumulative per-layer count for the layer slider.
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
-type Instances = (Vec<[f32; 16]>, Vec<u32>, Vec<[f32; 11]>, Vec<u32>);
+type Instances = (Vec<[f32; 17]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>);
 
 /// The active metric mapped to per-path colors — or `None` in feature mode
 /// (`build_instances` then colors by path kind). Filament = each path's tool
@@ -8415,9 +8431,9 @@ fn finish_slice(
         toolchanges,
     };
     let color_table = build_color_table(&layers, color_by, settings, accent, &layer_stats);
-    let (verts, ends, joints, joint_ends) =
+    let (verts, ends, joints, joint_ends, caps, cap_ends) =
         build_instances(&layers, z_hop, color_table.as_deref(), accent, origin_x, None);
-    SliceOutput { layers, geo, summary, layer_stats, verts, ends, joints, joint_ends }
+    SliceOutput { layers, geo, summary, layer_stats, verts, ends, joints, joint_ends, caps, cap_ends }
 }
 
 /// Emit one bead segment `a→b`, subdivided into ≤ `max_seg` mm pieces when set
@@ -8612,7 +8628,7 @@ fn build_nozzle_mesh() -> Vec<[f32; 10]> {
 }
 
 fn push_bead(
-    v: &mut Vec<[f32; 16]>,
+    v: &mut Vec<[f32; 17]>,
     origin_x: f32,
     a: geo2d::Point,
     b: geo2d::Point,
@@ -8626,30 +8642,36 @@ fn push_bead(
     max_seg: Option<f32>,
     t0_ang: f32,
     t1_ang: f32,
+    w1: f32,
 ) {
     let Some(ms) = max_seg else {
-        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool, t0_ang, t1_ang);
+        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool, t0_ang, t1_ang, w1);
         return;
     };
     let len = ((b.x_mm() - a.x_mm()).powi(2) + (b.y_mm() - a.y_mm()).powi(2)).sqrt();
     let nsub = (len / ms.max(0.05) as f64).ceil().max(1.0) as usize;
     if nsub <= 1 {
-        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool, t0_ang, t1_ang);
+        push_inst(v, origin_x, a, b, zc, w, h, color, layer, cat, tool, t0_ang, t1_ang, w1);
         return;
     }
     // Interior sub-boundaries are collinear: the segment's own direction welds
-    // them exactly, so only the outermost ends carry the vertex tangents.
+    // them exactly, so only the outermost ends carry the vertex tangents. A
+    // taper interpolates through the sub-splits so each piece welds to the
+    // next at the split's own width.
     let mut prev = a;
+    let mut wprev = w;
     for si in 1..=nsub {
         let t = si as f64 / nsub as f64;
         let p = geo2d::Point::from_mm(
             a.x_mm() + (b.x_mm() - a.x_mm()) * t,
             a.y_mm() + (b.y_mm() - a.y_mm()) * t,
         );
+        let wt = w + (w1 - w) * t as f32;
         let s0 = if si == 1 { t0_ang } else { f32::NAN };
         let s1 = if si == nsub { t1_ang } else { f32::NAN };
-        push_inst(v, origin_x, prev, p, zc, w, h, color, layer, cat, tool, s0, s1);
+        push_inst(v, origin_x, prev, p, zc, wprev, h, color, layer, cat, tool, s0, s1, wt);
         prev = p;
+        wprev = wt;
     }
 }
 
@@ -8661,10 +8683,12 @@ fn build_instances(
     origin_x: f32,
     max_seg: Option<f32>,
 ) -> Instances {
-    let mut inst: Vec<[f32; 16]> = Vec::new();
+    let mut inst: Vec<[f32; 17]> = Vec::new();
     let mut ends: Vec<u32> = Vec::with_capacity(layers.len());
-    let mut joints: Vec<[f32; 11]> = Vec::new();
+    let mut joints: Vec<[f32; 12]> = Vec::new();
     let mut joint_ends: Vec<u32> = Vec::with_capacity(layers.len());
+    let mut caps: Vec<[f32; 12]> = Vec::new();
+    let mut cap_ends: Vec<u32> = Vec::with_capacity(layers.len());
     let (ah, as_, _) = accent;
     // Travels whisper on the complement (hairline, usually toggled off);
     // seams scream on it (debug dots must pop against the accent shell).
@@ -8690,7 +8714,7 @@ fn build_instances(
                 for &pt in &tr.points {
                     // Travels keep their baked accent color in all modes (tool id
                     // unused for CAT_TRAVEL).
-                    push_inst(&mut inst, origin_x, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL, 0.0, f32::NAN, f32::NAN);
+                    push_inst(&mut inst, origin_x, from, pt, zc, travel_dim, travel_dim, travel_color, layer_id, CAT_TRAVEL, 0.0, f32::NAN, f32::NAN, travel_dim);
                     from = pt;
                 }
             }
@@ -8732,72 +8756,74 @@ fn build_instances(
                     _ => (c, cat),
                 }
             };
-            // Per-vertex miter tangent: the mean direction of the two segments
-            // meeting there (path caps keep their lone segment's direction).
-            // Both segments at a vertex hand this same angle to the shader, so
-            // their billboard cross-sections land on the identical edge — no
-            // seam at any turn or zoom. A hairpin's opposed directions cancel;
-            // fall back to the lone segment there (the joint blob covers it).
-            let seg_dir = |k: usize| -> (f64, f64) {
-                let (a, b) = (path.points[k], path.points[(k + 1) % n_pts]);
+            // Expand tight corners into real fillet arcs (render-only; the
+            // toolpath is untouched). The weld makes consecutive segments
+            // share their exact cross-section at every vertex, so a corner
+            // replaced by a few arc vertices renders as one smooth rounded
+            // elbow — which is what the plastic does. This replaces the
+            // corner joint blobs entirely; blobs remain only as caps on open
+            // path ends.
+            let wv: Vec<f32> = (0..n_pts).map(vert_w).collect();
+            let rp = fillet_corners(&path.points, &wv, path.closed);
+            let m = rp.len();
+            let spans = if path.closed { m } else { m - 1 };
+            // Per-vertex miter tangent on the EXPANDED polyline: the mean
+            // direction of the two spans meeting there (path caps keep their
+            // lone span's direction). Both spans at a vertex hand this same
+            // angle to the shader, so their cross-sections land on the
+            // identical edge — no seam at any turn or zoom. Fillets keep
+            // per-vertex turns shallow, so the residual hairpin fallback
+            // (opposed directions cancelling) is a degenerate-geometry guard.
+            let span_dir = |k: usize| -> (f64, f64) {
+                let (a, b) = (rp[k].0, rp[(k + 1) % m].0);
                 let (dx, dy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
                 let l = dx.hypot(dy).max(1.0e-9);
                 (dx / l, dy / l)
             };
-            let n_segs = if path.closed { n_pts } else { n_pts - 1 };
-            let vtx_tang: Vec<f32> = (0..n_pts)
+            let vtx_tang: Vec<f32> = (0..m)
                 .map(|vi| {
                     let into = if vi == 0 {
-                        if path.closed { Some(seg_dir(n_pts - 1)) } else { None }
+                        if path.closed { Some(span_dir(m - 1)) } else { None }
                     } else {
-                        Some(seg_dir(vi - 1))
+                        Some(span_dir(vi - 1))
                     };
-                    let outof = if vi < n_segs { Some(seg_dir(vi)) } else { None };
+                    let outof = if vi < spans { Some(span_dir(vi)) } else { None };
                     let (ix, iy) = into.or(outof).unwrap_or((1.0, 0.0));
                     let (ox, oy) = outof.or(into).unwrap_or((1.0, 0.0));
                     let (mx, my) = (ix + ox, iy + oy);
                     if mx.hypot(my) < 1.0e-3 {
-                        (oy).atan2(ox) as f32 // hairpin: keep the leaving leg
+                        (oy).atan2(ox) as f32 // degenerate reversal: keep the leaving leg
                     } else {
                         (my).atan2(mx) as f32
                     }
                 })
                 .collect();
-            for k in 0..n_pts - 1 {
-                let sw = (vert_w(k) + vert_w(k + 1)) * 0.5;
-                let (sc, scat) = seg_cc(k);
-                push_bead(&mut inst, origin_x, path.points[k], path.points[k + 1], zc, sw, bh, sc, layer_id, scat, tool, max_seg, vtx_tang[k], vtx_tang[k + 1]);
+            for k in 0..spans {
+                let (p0, w0, seg) = rp[k];
+                let (p1, w1, _) = rp[(k + 1) % m];
+                let (sc, scat) = seg_cc(seg);
+                push_bead(&mut inst, origin_x, p0, p1, zc, w0, bh, sc, layer_id, scat, tool, max_seg, vtx_tang[k], vtx_tang[(k + 1) % m], w1);
             }
-            if path.closed {
-                let (sc, scat) = seg_cc(n_pts - 1);
-                push_bead(&mut inst, origin_x, path.points[n_pts - 1], path.points[0], zc, w, bh, sc, layer_id, scat, tool, max_seg, vtx_tang[n_pts - 1], vtx_tang[0]);
-            }
-            // Joint blobs round path ends and fill the outer wedge at CORNERS
-            // (extrusion paths only — travels stay bare). A shallow bend's two
-            // tube-ends already abut — the gap is a sliver of the bead width, so
-            // the blob there is fully hidden under the beads. Emit one only at an
-            // open-path cap or a turn sharper than JOINT_MIN_TURN; this cuts the
-            // joint count several-fold, the biggest per-frame cost of a dense
-            // preview, with no visible change.
-            let closed = path.closed;
-            for (vi, p) in path.points.iter().enumerate() {
-                let keep = if !closed && (vi == 0 || vi == n_pts - 1) {
-                    true // open-path cap
-                } else {
-                    let prev = path.points[(vi + n_pts - 1) % n_pts];
-                    let next = path.points[(vi + 1) % n_pts];
-                    joint_needed(prev, *p, next)
-                };
-                if !keep {
-                    continue;
+            // End caps on open paths (extrusion only — travels stay bare):
+            // a half-dome at each end's own width, rotated to point OUT along
+            // the end tangent, whose base hexagon lands exactly on the tube's
+            // welded end ring — the cap continues the bead surface. Corners
+            // need nothing: the fillet rounds them with real geometry.
+            if !path.closed {
+                let out_start = vtx_tang[0] + std::f32::consts::PI;
+                let out_end = vtx_tang[m - 1];
+                for &(vi, seg, ang) in
+                    &[(0usize, 0usize, out_start), (m - 1, n_pts.saturating_sub(2), out_end)]
+                {
+                    let (p, pw, _) = rp[vi];
+                    let (sc, scat) = seg_cc(seg);
+                    caps.push([
+                        p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
+                        pw, bh, ang,
+                        sc[0], sc[1], sc[2],
+                        layer_id, scat, tool,
+                    ]);
                 }
-                let (sc, scat) = seg_cc(vi);
-                joints.push([
-                    p.x_mm() as f32 + origin_x, p.y_mm() as f32, zc,
-                    vert_w(vi), bh,
-                    sc[0], sc[1], sc[2],
-                    layer_id, scat, tool,
-                ]);
             }
             // Highlight the external-perimeter seam (loop start) with a larger
             // complement-colored marker, toggleable via the "seams" category.
@@ -8809,7 +8835,7 @@ fn build_instances(
                 let s = path.points[0];
                 joints.push([
                     s.x_mm() as f32 + origin_x, s.y_mm() as f32, zc,
-                    w * 2.5, h * 2.5,
+                    w * 2.5, h * 2.5, 0.0,
                     seam_color[0], seam_color[1], seam_color[2],
                     layer_id, CAT_SEAM, 0.0,
                 ]);
@@ -8822,32 +8848,170 @@ fn build_instances(
         }
         ends.push(inst.len() as u32);
         joint_ends.push(joints.len() as u32);
+        cap_ends.push(caps.len() as u32);
     }
-    (inst, ends, joints, joint_ends)
+    (inst, ends, joints, joint_ends, caps, cap_ends)
 }
 
-/// A path vertex needs a joint blob only where the tube turns enough that the
-/// two segment-ends leave a visible outer wedge. Below `JOINT_MIN_TURN` the
-/// ends abut (the gap is a sub-bead-width sliver hidden under the beads), so no
-/// blob is needed. `a→b→c` are consecutive path points.
-fn joint_needed(a: geo2d::Point, b: geo2d::Point, c: geo2d::Point) -> bool {
-    /// Emit a joint above this turn angle. ~22° leaves worst-case gaps under
-    /// ~0.1·bead-width — invisible — while culling the many shallow vertices of
-    /// a curved wall.
-    const JOINT_MIN_COS: f64 = 0.927; // cos(22°)
-    let (ix, iy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
-    let (ox, oy) = (c.x_mm() - b.x_mm(), c.y_mm() - b.y_mm());
-    let li = (ix * ix + iy * iy).sqrt();
-    let lo = (ox * ox + oy * oy).sqrt();
-    if li < 1.0e-9 || lo < 1.0e-9 {
-        return true; // a degenerate/zero-length neighbor — keep the blob
+/// Replace each aggressive corner of a path with a short tangent arc, so the
+/// welded tube sweeps around it as one smooth elbow instead of folding at a
+/// miter. Returns the expanded polyline as (point, width, original segment
+/// index of the span LEAVING this vertex) — widths and per-segment attrs
+/// follow the corner they replace.
+///
+/// "Aggressive" is judged on the AGGREGATE turn in a small neighbourhood,
+/// not the single vertex: a tight curve chopped into several 25–40° steps
+/// turns as hard as one 90° corner and facets just as visibly, while each
+/// of its vertices alone would duck a per-vertex threshold. Every vertex
+/// whose window (a couple of beads each way, arc-length capped) turns past
+/// ~80° gets rounded — and the arc SAMPLING densifies with the same
+/// aggregate, so harder corners get proportionally more vertices. Gentle
+/// curves keep their plain welded miters: the weld already closes them
+/// exactly, and a shallow miter reads as the crisp toolpath corner it is.
+///
+/// The arc's target radius is the bead's half-width (the plastic's own
+/// rounding), capped so a fillet never eats more than 40% of either
+/// adjacent segment — two fillets can share a segment without crossing.
+fn fillet_corners(pts: &[geo2d::Point], w: &[f32], closed: bool) -> Vec<(geo2d::Point, f32, usize)> {
+    /// Round a vertex when its WINDOW turns harder than this (~80°: an
+    /// interior angle tighter than ~100° concentrated in a couple of beads).
+    const FILLET_AGG_RAD: f64 = 1.40;
+    /// Ignore near-collinear vertices even inside a hot window — rounding a
+    /// 5° kink buys nothing and costs vertices.
+    const FILLET_MIN_TURN_RAD: f64 = 0.17;
+    /// The neighbourhood: this many vertices each side, arc-length capped.
+    const FILLET_WIN_VERTS: usize = 2;
+    const FILLET_WIN_MM: f64 = 1.5;
+    /// Arc sampling pitch at the trigger threshold (~26°/step), tightening
+    /// to half that as the window's aggregate climbs toward a full hairpin.
+    const FILLET_STEP_RAD: f64 = 0.45;
+    let n = pts.len();
+    let n_segs = if closed { n } else { n.saturating_sub(1) };
+    // Per-vertex turn angle and leaving-leg length (0 at open-path caps).
+    let mut turn = vec![0.0f64; n];
+    let mut leg = vec![0.0f64; n];
+    for vi in 0..n {
+        let b = pts[vi];
+        let c = pts[(vi + 1) % n];
+        if closed || vi < n - 1 {
+            leg[vi] = (c.x_mm() - b.x_mm()).hypot(c.y_mm() - b.y_mm());
+        }
+        if !closed && (vi == 0 || vi == n - 1) {
+            continue;
+        }
+        let a = pts[(vi + n - 1) % n];
+        let (ix, iy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+        let (ox, oy) = (c.x_mm() - b.x_mm(), c.y_mm() - b.y_mm());
+        let (li, lo) = (ix.hypot(iy), ox.hypot(oy));
+        if li < 1.0e-6 || lo < 1.0e-6 {
+            continue;
+        }
+        turn[vi] = (((ix * ox + iy * oy) / (li * lo)).clamp(-1.0, 1.0)).acos();
     }
-    (ix * ox + iy * oy) / (li * lo) < JOINT_MIN_COS
+    // Aggregate turn per window: the vertex's own turn plus its neighbours'
+    // within FILLET_WIN_VERTS hops AND FILLET_WIN_MM of arc each way.
+    let agg = |vi: usize| -> f64 {
+        let mut sum = turn[vi];
+        let mut arc = 0.0;
+        for o in 1..=FILLET_WIN_VERTS {
+            if !closed && vi < o {
+                break;
+            }
+            let j = (vi + n - o) % n;
+            arc += leg[j];
+            if arc > FILLET_WIN_MM {
+                break;
+            }
+            sum += turn[j];
+        }
+        arc = 0.0;
+        for o in 1..=FILLET_WIN_VERTS {
+            if !closed && vi + o >= n {
+                break;
+            }
+            arc += leg[(vi + n + o - 1) % n];
+            if arc > FILLET_WIN_MM {
+                break;
+            }
+            sum += turn[(vi + o) % n];
+        }
+        sum
+    };
+    let mut out: Vec<(geo2d::Point, f32, usize)> = Vec::with_capacity(n + 8);
+    for vi in 0..n {
+        let seg = vi.min(n_segs.saturating_sub(1));
+        let plain = (pts[vi], w[vi], seg);
+        if !closed && (vi == 0 || vi == n - 1) {
+            out.push(plain); // path caps: nothing to round
+            continue;
+        }
+        let window = if turn[vi] >= FILLET_MIN_TURN_RAD { agg(vi) } else { 0.0 };
+        if window < FILLET_AGG_RAD {
+            out.push(plain);
+            continue;
+        }
+        let a = pts[(vi + n - 1) % n];
+        let b = pts[vi];
+        let c = pts[(vi + 1) % n];
+        let (ix, iy) = (b.x_mm() - a.x_mm(), b.y_mm() - a.y_mm());
+        let (ox, oy) = (c.x_mm() - b.x_mm(), c.y_mm() - b.y_mm());
+        let (li, lo) = (ix.hypot(iy), ox.hypot(oy));
+        if li < 1.0e-6 || lo < 1.0e-6 {
+            out.push(plain);
+            continue;
+        }
+        let (dix, diy) = (ix / li, iy / li);
+        let (dox, doy) = (ox / lo, oy / lo);
+        // Sampling pitch scales with the window's aggregate: at the trigger
+        // it is FILLET_STEP_RAD, closing to half by a 180° window.
+        let hot = ((window - FILLET_AGG_RAD) / (std::f64::consts::PI - FILLET_AGG_RAD))
+            .clamp(0.0, 1.0);
+        let step = FILLET_STEP_RAD * (1.0 - 0.5 * hot);
+        let turn = turn[vi];
+        let half = turn * 0.5;
+        // Tangent offset along each leg for the target radius, capped by the
+        // legs themselves; the radius follows the cap back down.
+        let t = ((w[vi] as f64 * 0.5) * half.tan()).min(0.4 * li.min(lo));
+        let r = t / half.tan().max(1.0e-9);
+        // The centre sits on the interior bisector, r/cos(half) from the tip.
+        let (bx, by) = (dox - dix, doy - diy);
+        let bl = bx.hypot(by);
+        if r < 1.0e-4 || bl < 1.0e-9 {
+            out.push(plain);
+            continue;
+        }
+        let dist = r / half.cos();
+        let (cx, cy) = (b.x_mm() + bx / bl * dist, b.y_mm() + by / bl * dist);
+        let (p0x, p0y) = (b.x_mm() - dix * t, b.y_mm() - diy * t);
+        let (p1x, p1y) = (b.x_mm() + dox * t, b.y_mm() + doy * t);
+        let a0 = (p0y - cy).atan2(p0x - cx);
+        let a1 = (p1y - cy).atan2(p1x - cx);
+        let mut sweep = a1 - a0;
+        if dix * doy - diy * dox >= 0.0 {
+            while sweep < 0.0 {
+                sweep += std::f64::consts::TAU;
+            }
+        } else {
+            while sweep > 0.0 {
+                sweep -= std::f64::consts::TAU;
+            }
+        }
+        let steps = ((sweep.abs() / step).ceil() as usize).clamp(1, 12);
+        for i in 0..=steps {
+            let ang = a0 + sweep * (i as f64 / steps as f64);
+            out.push((
+                geo2d::Point::from_mm(cx + r * ang.cos(), cy + r * ang.sin()),
+                w[vi],
+                seg,
+            ));
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
 fn push_inst(
-    v: &mut Vec<[f32; 16]>,
+    v: &mut Vec<[f32; 17]>,
     origin_x: f32,
     a: geo2d::Point,
     b: geo2d::Point,
@@ -8865,6 +9029,11 @@ fn push_inst(
     // NaN = use the segment's own direction (path caps, travels).
     t0_ang: f32,
     t1_ang: f32,
+    // Width at the far (b) end; the `width` param is the width at `a`. Both
+    // ends carry their own so a tapering bead's segments weld mid-taper —
+    // one shared width per instance left a step ring at every joint of a
+    // width-modulated bead.
+    w1: f32,
 ) {
     let (ax, ay) = (a.x_mm() as f32 + origin_x, a.y_mm() as f32);
     let (bx, by) = (b.x_mm() as f32 + origin_x, b.y_mm() as f32);
@@ -8879,7 +9048,7 @@ fn push_inst(
     v.push([
         ax, ay, z_center,
         dx / len, dy / len, len,
-        width, height,
+        width, w1, height,
         color[0], color[1], color[2],
         layer, cat, tool,
         t0, t1,
