@@ -19,37 +19,24 @@ pub struct GcodeBuilder {
     buf: String,
     e_total: f64,
     last_feed: Option<f64>,
-    /// Lines written so far. Kept as a counter rather than counted on demand:
-    /// the point of it is to stamp a line number against every path emitted,
-    /// and rescanning the buffer for each would be quadratic.
-    lines: u32,
 }
 
 impl GcodeBuilder {
     pub fn new() -> Self {
         // Pre-size for a medium print; large models grow from here in few steps.
-        Self { buf: String::with_capacity(1 << 20), e_total: 0.0, last_feed: None, lines: 0 }
+        Self { buf: String::with_capacity(1 << 20), e_total: 0.0, last_feed: None }
     }
 
     pub fn comment(&mut self, text: &str) {
         self.buf.push_str("; ");
         self.buf.push_str(text);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Emit a raw line verbatim (no trailing newline needed).
     pub fn raw(&mut self, line: &str) {
         self.buf.push_str(line);
         self.buf.push('\n');
-        self.lines += 1;
-    }
-
-    /// The line number the NEXT line written will have (1-based) — the
-    /// handle a viewer needs to point at a bead and name the g-code that
-    /// made it.
-    pub fn line(&self) -> u32 {
-        self.lines + 1
     }
 
     /// Total filament consumed so far (mm), retraction included.
@@ -77,7 +64,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G0 X{x:.3} Y{y:.3}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Rapid travel that also changes Z — a z-hop lift slanted into the
@@ -87,7 +73,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G0 X{x:.3} Y{y:.3} Z{z:.3}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Extruding move; `e_delta` is the filament length (mm) for this segment.
@@ -96,7 +81,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G1 X{x:.3} Y{y:.3} E{e_delta:.5}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Extruding move that also changes Z (spiral-vase ramps Z continuously).
@@ -105,7 +89,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G1 X{x:.3} Y{y:.3} Z{z:.3} E{e_delta:.5}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Extruding circular arc — `cw` selects G2 (clockwise) vs G3; `i`/`j` are the
@@ -117,7 +100,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "{code} X{x:.3} Y{y:.3} I{i:.3} J{j:.3} E{e_delta:.5}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Retract filament by `len` mm.
@@ -126,7 +108,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G1 E-{len:.5}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Undo a retraction.
@@ -135,7 +116,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G1 E{len:.5}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     /// Change layer height (Z move only).
@@ -143,7 +123,6 @@ impl GcodeBuilder {
         let _ = write!(self.buf, "G1 Z{z:.3}");
         self.push_feed(feed_mm_min);
         self.buf.push('\n');
-        self.lines += 1;
     }
 
     pub fn set_bed_temp(&mut self, celsius: u32, wait: bool) {

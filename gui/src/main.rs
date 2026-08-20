@@ -1907,12 +1907,16 @@ struct App {
     last_status_poll: Option<std::time::Instant>,
     /// Viewport rect of the live-print overlay (blocks camera input under it).
     print_overlay_rect: Option<egui::Rect>,
-    /// Our OWN slice's g-code, indexed by (layer, path) to the line it starts
-    /// on, with the slice generation it was built for. A mirrored job reads
-    /// lines out of the file it came from; our own slice has no file until it
-    /// is emitted, so this emits it — once, lazily, the first time anyone
-    /// hovers, because most sessions never ask.
-    own_index: Option<(u64, engine::GcodeIndex)>,
+    /// Our OWN slice's emitted g-code, parsed back into motion, with the line
+    /// each byte offset falls on and the slice generation it was built for.
+    ///
+    /// A mirrored job reads lines out of the file it came from; our own slice
+    /// has no file until it is emitted, so this emits it — once, lazily, the
+    /// first time anyone hovers, because most sessions never ask. Parsed back
+    /// rather than indexed during emission because a path is not a line: arc
+    /// fitting turns a run of points into one G2, so the only honest way to
+    /// name the line under a bead is to find the MOVE under it.
+    own_gcode: Option<(u64, gcode::Timeline, Vec<u32>)>,
     /// The last hover readout and what it was computed for: pointer position,
     /// view, and which layers were drawn. A pick walks every visible bead, so
     /// it runs when the pointer MOVES, not on every frame the pointer happens
@@ -2215,7 +2219,7 @@ impl App {
             last_status_poll: None,
             print_overlay_rect: None,
             bed_overlay_rect: None,
-            own_index: None,
+            own_gcode: None,
             hover_pick: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
@@ -6531,7 +6535,7 @@ impl eframe::App for App {
                             // jobs, against every slice paying it up front for
                             // a readout most sessions never open.
                             if self.view != ViewMode::Machine
-                                && self.own_index.as_ref().is_none_or(|(g, _)| *g != self.slice_gen)
+                                && self.own_gcode.as_ref().is_none_or(|(g, ..)| *g != self.slice_gen)
                             {
                                 if let Some(plans) = self.sliced.clone() {
                                     let mut plans = plans;
@@ -6540,9 +6544,15 @@ impl eframe::App for App {
                                         &self.engine_dabs(),
                                         &self.settings,
                                     );
-                                    let (_, idx) =
-                                        engine::to_gcode_indexed(&plans, &self.settings);
-                                    self.own_index = Some((self.slice_gen, idx));
+                                    let text = engine::to_gcode(&plans, &self.settings);
+                                    let bytes = text.as_bytes();
+                                    let tl = gcode::Timeline::parse(bytes);
+                                    let mut starts = vec![0u32];
+                                    starts.extend(
+                                        bytes.iter().enumerate().filter(|(_, b)| **b == b'\n')
+                                            .map(|(i, _)| i as u32 + 1),
+                                    );
+                                    self.own_gcode = Some((self.slice_gen, tl, starts));
                                 }
                             }
                             let (o, d) = pointer_ray(vp, rect, p);
@@ -6565,9 +6575,6 @@ impl eframe::App for App {
                                 );
                                 if let Some((line, feed)) = hit.line {
                                     t.push_str(&format!("\ng-code line {line}"));
-                                    // A mirrored job knows the feed the file
-                                    // actually commanded; our own index does
-                                    // not carry one.
                                     if feed.is_finite() {
                                         t.push_str(&format!("   commanded {feed:.0} mm/s"));
                                     }
@@ -7970,9 +7977,6 @@ struct BeadHit {
     width_mm: f64,
     /// mm from the ray to the bead's centreline at closest approach.
     off_mm: f32,
-    /// Index of the path within its layer — the handle the g-code index is
-    /// keyed by.
-    path: usize,
     /// The point on the BEAD's centreline where the ray came closest, in
     /// world coordinates. Deliberately not the point on the ray: sighting
     /// along a wall, the two differ by up to a bead radius, and the number
@@ -7995,20 +7999,16 @@ fn pick_bead(&self, o: glam::Vec3, d: glam::Vec3) -> Option<BeadHit> {
     let plans = self.preview_plans()?;
     let top = self.top_visible_layer(plans.len());
     let mut hit = pick_in_plans(plans, top, self.preview_origin_x(), o, d)?;
-    // Name the line. A mirrored job reads it out of the file it was parsed
-    // from; our own slice reads it off the index built from the emitter.
+    // Name the line — the same way for a mirrored job and for our own slice,
+    // because it is the same question: which MOVE is under this point. A path
+    // is not a line (arc fitting folds a run of points into one G2), so
+    // reporting where the path began puts the answer metres away from the
+    // bead being pointed at.
     hit.line = match self.view {
-        ViewMode::Machine => self
-            .job
-            .as_ref()
-            .and_then(|job| job.line_at(hit.at, hit.z)),
-        _ => self
-            .own_index
-            .as_ref()
-            .and_then(|(_, idx)| idx.get(hit.layer)?.get(hit.path).copied())
-            .filter(|l| *l > 0)
-            .map(|l| (l as usize, f32::NAN)),
-    };
+        ViewMode::Machine => self.job.as_ref().map(|j| (&j.timeline, &j.line_starts)),
+        _ => self.own_gcode.as_ref().map(|(_, tl, ls)| (tl, ls)),
+    }
+    .and_then(|(tl, ls)| line_at(tl, ls, hit.at, hit.z));
     Some(hit)
 }
 }
@@ -8036,7 +8036,7 @@ fn pick_in_plans(
     let mut best: Option<(f32, BeadHit)> = None;
     for (li, layer) in plans.iter().enumerate().take(top + 1) {
         let z = layer.print_z_mm as f32;
-        for (pi, path) in layer.paths.iter().enumerate() {
+        for path in &layer.paths {
             let half = (path.width_mm * 0.5 + 0.15) as f32;
             for w in path.points.windows(2) {
                 let a = glam::Vec3::new(w[0].x_mm() as f32 + ox, w[0].y_mm() as f32, z);
@@ -8063,7 +8063,6 @@ fn pick_in_plans(
                             kind: path.kind,
                             width_mm: path.width_mm,
                             off_mm: dist,
-                            path: pi,
                             at: on_bead,
                             line: None,
                         },
@@ -8127,23 +8126,26 @@ fn point_seg_mm(px: f64, py: f64, a: geo2d::Point, b: geo2d::Point) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-impl JobMirror {
-    /// The source line (and its commanded feed) for the extruding move under
-    /// a ray crossing this layer's plane. The plans a mirrored job draws come
-    /// one-per-extruding-move, but the mapping back is not kept — so the move
-    /// is found the same way the bead was: nearest segment on the plane.
-    fn line_at(&self, p: glam::Vec3, z: f32) -> Option<(usize, f32)> {
-        let li = self.timeline.layers.iter().position(|l| (l.z - z).abs() < 1.0e-3)?;
-        let first = self.timeline.layers[li].first_move as usize;
-        let last = self
-            .timeline
+/// The source line (and its commanded feed) for the extruding move nearest a
+/// point on a layer's plane. Works off the parsed g-code, so it answers for a
+/// mirrored job and for our own emitted slice identically.
+fn line_at(
+    timeline: &gcode::Timeline,
+    line_starts: &[u32],
+    p: glam::Vec3,
+    z: f32,
+) -> Option<(usize, f32)> {
+    {
+        let li = timeline.layers.iter().position(|l| (l.z - z).abs() < 1.0e-3)?;
+        let first = timeline.layers[li].first_move as usize;
+        let last = timeline
             .layers
             .get(li + 1)
             .map(|n| n.first_move as usize)
-            .unwrap_or(self.timeline.moves.len());
+            .unwrap_or(timeline.moves.len());
         let mut best: Option<(f64, usize)> = None;
-        let mut prev = if first == 0 { self.timeline.start } else { self.timeline.moves[first - 1].to };
-        for (i, m) in self.timeline.moves[first..last].iter().enumerate() {
+        let mut prev = if first == 0 { timeline.start } else { timeline.moves[first - 1].to };
+        for (i, m) in timeline.moves[first..last].iter().enumerate() {
             if m.extruding {
                 let dist = point_seg_mm(
                     p.x as f64,
@@ -8161,13 +8163,13 @@ impl JobMirror {
         if dist > 1.0 {
             return None;
         }
-        let byte = self.timeline.moves[mi].at_byte;
-        let line = match self.line_starts.binary_search(&byte) {
+        let byte = timeline.moves[mi].at_byte;
+        let line = match line_starts.binary_search(&byte) {
             Ok(i) => i + 1,
             Err(0) => 1,
             Err(i) => i,
         };
-        Some((line, self.timeline.moves[mi].feed_mm_s))
+        Some((line, timeline.moves[mi].feed_mm_s))
     }
 }
 
@@ -9372,5 +9374,40 @@ mod tests {
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         println!("{} beads picked in {ms:.1} ms", layers * per_layer);
         assert!(ms < 60.0, "a pick over {} beads took {ms:.1} ms", layers * per_layer);
+    }
+
+    /// The readout has to name the line under the CURSOR, not the line a path
+    /// happened to start on. Pointing at a wall and being handed a line 13 mm
+    /// away is worse than being handed nothing — it sends the reader off to
+    /// read the wrong moves, which is exactly what happened in practice.
+    #[test]
+    fn the_reported_line_is_the_move_under_the_point() {
+        let g = "\
+G21
+G90
+M83
+;TYPE:Outer wall
+G1 X0 Y0 Z0.2 F1800
+G1 X0 Y10 E0.33
+G1 X10 Y10 E0.33
+G1 X10 Y0 E0.33
+G1 X0 Y0 E0.33
+";
+        let bytes = g.as_bytes();
+        let tl = gcode::Timeline::parse(bytes);
+        let mut starts = vec![0u32];
+        starts.extend(
+            bytes.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i as u32 + 1),
+        );
+        let line_of = |x: f32, y: f32| {
+            super::line_at(&tl, &starts, glam::Vec3::new(x, y, 0.2), 0.2).map(|(l, _)| l)
+        };
+        // Each side of the square is its own line; the point picks the side.
+        assert_eq!(line_of(0.0, 5.0), Some(6), "the left side is line 6");
+        assert_eq!(line_of(5.0, 10.0), Some(7), "the top is line 7");
+        assert_eq!(line_of(10.0, 5.0), Some(8), "the right side is line 8");
+        assert_eq!(line_of(5.0, 0.0), Some(9), "the bottom is line 9");
+        // A point off the path names nothing rather than the nearest thing.
+        assert_eq!(line_of(40.0, 40.0), None, "a point off the part has no line");
     }
 }

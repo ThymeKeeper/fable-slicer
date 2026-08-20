@@ -129,19 +129,7 @@ fn emit_toolchange(g: &mut GcodeBuilder, s: &Settings, from: u32, to: u32, purge
 }
 
 /// Emit complete G-code for a planned model.
-/// Where each path's g-code begins: `index[layer][path]` is a 1-based line
-/// number into the emitted file (0 for a path that emitted nothing). Lets a
-/// viewer point at a bead and name the g-code that made it.
-pub type GcodeIndex = Vec<Vec<u32>>;
-
 pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
-    to_gcode_indexed(layers, s).0
-}
-
-/// [`to_gcode`], plus the line each path started on. Identical bytes — the
-/// index is read off the writer as it goes, never written into it.
-pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeIndex) {
-    let mut index: GcodeIndex = layers.iter().map(|l| vec![0u32; l.paths.len()]).collect();
     let mut g = GcodeBuilder::new();
     let tools = Tools::new(s);
     // A toolchanger print. tool_count is authoritative: it alone gates every
@@ -383,7 +371,7 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
     // pressure while moving instead of parked on the seam.
     let mut wipe_tail: Option<Vec<Point>> = None;
 
-    for (li, layer) in layers.iter().enumerate() {
+    for layer in layers {
         g.comment(&format!("LAYER {} z={:.3}", layer.index, layer.print_z_mm));
         // Time-based progress for the printer's display.
         let done = if layer.index == 0 { 0.0 } else { cum_secs[layer.index - 1] };
@@ -538,7 +526,6 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
             if path.points.len() < 2 {
                 continue;
             }
-            index[li][i] = g.line();
             let tr = &layer.travels[i];
             let mut retract_done = hoisted_retract == Some(i);
             let mut force_z = false;
@@ -996,7 +983,7 @@ pub fn to_gcode_indexed(layers: &[LayerPlan], s: &Settings) -> (String, GcodeInd
     }
     emit_template(&mut g, &s.end_gcode, s, init, init_tool);
 
-    (g.finish(), index)
+    g.finish()
 }
 
 /// The single closed external-perimeter loop of a vase layer, if the layer is
@@ -4474,58 +4461,6 @@ mod tests {
         assert!(!g.contains("M109 T"), "no blocking waits");
     }
 
-    #[test]
-    fn the_gcode_index_points_at_the_line_that_prints_that_path() {
-        // The index is what lets someone point at a bead on screen and name
-        // the g-code that made it, so it has to actually land on that path's
-        // own motion — not merely somewhere in the right layer.
-        let mut s = Settings::default();
-        s.wall_count = 2;
-        s.top_layers = 1;
-        s.bottom_layers = 1;
-        let plans = generate(&mesh::Mesh::cube(10.0), &s);
-        let (g, index) = crate::to_gcode_indexed(&plans, &s);
-        let lines: Vec<&str> = g.lines().collect();
-        assert_eq!(index.len(), plans.len(), "one row per layer");
-
-        let mut checked = 0;
-        for (li, layer) in plans.iter().enumerate() {
-            for (pi, path) in layer.paths.iter().enumerate() {
-                if path.points.len() < 2 {
-                    continue;
-                }
-                let at = index[li][pi];
-                assert!(at > 0, "layer {li} path {pi} was emitted but got no line");
-                // The recorded line opens the path's emission, so the lead-in
-                // travel to the path's START lands just after it. Checked
-                // against points[0], not [1]: arc fitting replaces the middle
-                // of a polyline with G2/G3 sweeps, so no interior point is
-                // guaranteed to appear literally.
-                let want = path.points[0];
-                let (wx, wy) = (want.x_mm(), want.y_mm());
-                let found = lines
-                    .iter()
-                    .skip(at as usize - 1)
-                    .take(24)
-                    .any(|l| {
-                        let num = |k: char| {
-                            l.split_whitespace()
-                                .find_map(|w| w.strip_prefix(k))
-                                .and_then(|v| v.parse::<f64>().ok())
-                        };
-                        matches!((num('X'), num('Y')), (Some(x), Some(y))
-                            if (x - wx).abs() < 0.02 && (y - wy).abs() < 0.02)
-                    });
-                assert!(
-                    found,
-                    "layer {li} path {pi}: line {at} does not reach ({wx:.2}, {wy:.2}) — got {:?}",
-                    &lines[at as usize - 1..(at as usize + 3).min(lines.len())]
-                );
-                checked += 1;
-            }
-        }
-        assert!(checked > 20, "only {checked} paths checked");
-    }
 
     /// A small feature is paced whether or not its loop is closed, and the gap
     /// stroke inside it is paced with it.
