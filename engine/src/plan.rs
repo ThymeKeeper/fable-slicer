@@ -4947,6 +4947,7 @@ fn point_segment_dist_mm(q: Point, a: Point, b: Point) -> f64 {
 const GAP_BEAD_MIN_W: f64 = 0.75;
 
 
+
 fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
     if raw.is_empty() {
         return;
@@ -5017,13 +5018,51 @@ fn emit_tapered_bead(tp: &crate::medial::ThickPolyline, lw: f64, out: &mut Vec<T
     // The medial clearance to the raster void's jagged (~0.18mm) boundary
     // oscillates, which reads as a lumpy bead pinching below the real channel
     // width. Low-pass the width profile (~2mm window) so the bead fills the
-    // channel smoothly; the centerline itself is already smooth.
+    // channel smoothly.
     let ws = smooth_widths(&ws, lw * 0.5, 2.0);
+    // And the CENTERLINE takes the same treatment, which it did not use to —
+    // the note here claimed it was already smooth, and measurement says
+    // otherwise: a 12.9 mm bead ran within 63 µm of dead straight while
+    // turning 7.7° at EVERY 0.2 mm vertex. That is the same raster jaggies,
+    // arriving as direction rather than width. Geometrically it is a ±13 µm
+    // zigzag and prints as nothing, but the planner corners at all 65 of them,
+    // and a viewer draws each segment on its own heading — which is what makes
+    // a straight bead read as a chain of arcs.
+    let pts = smooth_points(&pts, lw * 0.5, 1.0);
     let widths: Vec<f64> = ws.iter().map(|&w| w.max(FLOOR)).collect();
     let mean = widths.iter().sum::<f64>() / widths.len() as f64;
     let mut p = ToolPath::new(PathKind::GapFill, false, mean, pts);
     p.widths = Some(widths);
     out.push(p);
+}
+
+/// Moving-average a resampled centerline over a ~`window_mm` window, to strip
+/// the same raster jaggies out of its DIRECTION. The endpoints are pinned: a
+/// medial bead has to still reach both ends of the channel it fills, and an
+/// averaged endpoint walks inward. The window stays short for the same reason
+/// a corner-cutting filter always must — on a curved channel a moving average
+/// pulls toward the inside of the curve, and the sagitta grows with the square
+/// of the window.
+fn smooth_points(pts: &[Point], step_mm: f64, window_mm: f64) -> Vec<Point> {
+    let n = pts.len();
+    let r = ((window_mm / step_mm / 2.0).round() as usize).max(1);
+    if n <= 2 * r + 2 {
+        return pts.to_vec();
+    }
+    (0..n)
+        .map(|i| {
+            if i < r || i + r >= n {
+                return pts[i]; // pinned ends
+            }
+            let (mut sx, mut sy) = (0.0, 0.0);
+            for k in (i - r)..=(i + r) {
+                sx += pts[k].x_mm();
+                sy += pts[k].y_mm();
+            }
+            let m = (2 * r + 1) as f64;
+            Point::from_mm(sx / m, sy / m)
+        })
+        .collect()
 }
 
 /// Moving-average the width profile over a ~`window_mm` window (samples spaced
@@ -8303,6 +8342,57 @@ mod tests {
         assert!(
             plans[shelf].paths.iter().all(|p| p.tool == 1),
             "a sliver ledge must not trigger the override"
+        );
+    }
+
+
+    /// A medial centreline carries the void raster's jaggies as DIRECTION, and
+    /// nothing used to take them out — the width got a low-pass and the
+    /// centreline did not. Measured on a real job, a 12.9 mm gap bead ran
+    /// within 63 µm of dead straight while turning 7.7° at every 0.2 mm
+    /// vertex: invisible as geometry, but the planner corners at all 65 of
+    /// them and a viewer draws each segment on its own heading, which is what
+    /// makes a straight bead read as a chain of arcs.
+    #[test]
+    fn a_gap_bead_down_a_straight_channel_runs_straight() {
+        use crate::medial::ThickPolyline;
+        // A dead-straight centreline with ±15 µm of raster noise on it, the
+        // scale the marching-squares boundary actually injects.
+        let n = 80;
+        let pts: Vec<Point> = (0..n)
+            .map(|i| {
+                let jitter = if i % 2 == 0 { 0.015 } else { -0.015 };
+                Point::from_mm(i as f64 * 0.2, 10.0 + jitter)
+            })
+            .collect();
+        let tp = ThickPolyline {
+            points: pts,
+            widths: vec![0.45; n],
+            endpoints: (true, true),
+        };
+        let mut out: Vec<ToolPath> = Vec::new();
+        super::emit_tapered_bead(&tp, 0.4, &mut out);
+        let bead = out.first().expect("a bead");
+        let p = &bead.points;
+        let turn = |k: usize| {
+            let a = (p[k].x_mm() - p[k - 1].x_mm(), p[k].y_mm() - p[k - 1].y_mm());
+            let b = (p[k + 1].x_mm() - p[k].x_mm(), p[k + 1].y_mm() - p[k].y_mm());
+            let (na, nb) = (a.0.hypot(a.1), b.0.hypot(b.1));
+            if na < 1e-9 || nb < 1e-9 {
+                return 0.0;
+            }
+            ((a.0 * b.0 + a.1 * b.1) / (na * nb)).clamp(-1.0, 1.0).acos().to_degrees()
+        };
+        let turns: Vec<f64> = (1..p.len() - 1).map(turn).collect();
+        let mean = turns.iter().sum::<f64>() / turns.len() as f64;
+        assert!(mean < 3.0, "bead zigzags {mean:.1}° per vertex down a straight channel");
+        // And it still spans the channel: the ends are pinned, so the bead
+        // reaches both ends rather than shrinking inward.
+        assert!((p[0].x_mm() - 0.0).abs() < 1e-6, "start moved to {}", p[0].x_mm());
+        assert!(
+            (p[p.len() - 1].x_mm() - (n - 1) as f64 * 0.2).abs() < 1e-6,
+            "end moved to {}",
+            p[p.len() - 1].x_mm()
         );
     }
 
