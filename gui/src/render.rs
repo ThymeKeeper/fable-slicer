@@ -231,17 +231,27 @@ struct BeadOut {
     @location(5) color: vec3<f32>,
     @location(6) lc: vec2<f32>,
     @location(7) tool: f32,
+    @location(8) tang: vec2<f32>,
 ) -> BeadOut {
     let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
     let zaxis = vec3<f32>(0.0, 0.0, 1.0);
-    let yaxis = cross(zaxis, xaxis);                  // across, in the bed plane
+    // Place each END's cross-section ring in its vertex's MITER frame (the
+    // mean direction of the two segments meeting there, from the instance).
+    // Both segments at a shared vertex then generate the identical world
+    // hexagon, so consecutive tubes weld into one continuous mitered surface —
+    // per-segment frames left an open wedge at every turn, and at close
+    // oblique zoom the view INTO those open ends read as sawtooth slits.
+    let ang = select(tang.x, tang.y, lpos.x > 0.5);
+    let taxis = vec3<f32>(cos(ang), sin(ang), 0.0);
+    let yaxis = cross(zaxis, taxis);                  // across, in the bed plane
     let local = xaxis * (lpos.x * dir_len.z) + yaxis * (lpos.y * dims.x) + zaxis * (lpos.z * dims.y);
     var o: BeadOut;
     o.clip = u.mvp * vec4<f32>(p0 + local, 1.0);
     // Correct the normal for the non-uniform (width, height) scaling of the
-    // cross-section (inverse scale), then rotate into the segment frame.
+    // cross-section (inverse scale), then rotate into the end frame (so
+    // shading is continuous across the welded joint too).
     let n_local = normalize(vec3<f32>(lnorm.x, lnorm.y / dims.x, lnorm.z / dims.y));
-    o.normal = xaxis * n_local.x + yaxis * n_local.y + zaxis * n_local.z;
+    o.normal = taxis * n_local.x + yaxis * n_local.y + zaxis * n_local.z;
     o.color = color;
     o.layer = lc.x;
     o.cat = lc.y;
@@ -265,13 +275,22 @@ struct BeadOut {
     @location(5) color: vec3<f32>,
     @location(6) lc: vec2<f32>,
     @location(7) tool: f32,
+    @location(8) tang: vec2<f32>,
 ) -> BeadOut {
     let xaxis = vec3<f32>(dir_len.x, dir_len.y, 0.0); // along the segment (unit)
     let zaxis = vec3<f32>(0.0, 0.0, 1.0);
-    let yaxis = cross(zaxis, xaxis);                  // across, in the bed plane
     let along = xaxis * (lpos.x * dir_len.z);
-    let mid = p0 + xaxis * (0.5 * dir_len.z);
-    var view = u.cam_eye.xyz - mid;
+    // Frame each END on its vertex's MITER tangent (the mean of the two
+    // segments meeting there) and view from the vertex itself, not the
+    // segment midpoint. Both segments at a shared vertex then receive the
+    // same angle and the same eye ray, so they compute the IDENTICAL
+    // cross-section edge — the quads weld, where per-segment frames left
+    // view-dependent slit gaps between them at close zoom.
+    let ang = select(tang.x, tang.y, lpos.x > 0.5);
+    let taxis = vec3<f32>(cos(ang), sin(ang), 0.0);
+    let yaxis = cross(zaxis, taxis);                  // across, in the bed plane
+    let pend = p0 + along;
+    var view = u.cam_eye.xyz - pend;
     let vlen = length(view);
     view = select(zaxis, view / vlen, vlen > 1.0e-6);
     // Walk the cross-section, not the screen. The half of the ellipse facing
@@ -288,7 +307,7 @@ struct BeadOut {
     let a = dims.x * 0.5;
     let b = dims.y * 0.5;
     var o: BeadOut;
-    o.clip = u.mvp * vec4<f32>(p0 + along + yaxis * (a * c) + zaxis * (b * s), 1.0);
+    o.clip = u.mvp * vec4<f32>(pend + yaxis * (a * c) + zaxis * (b * s), 1.0);
     // The ellipse's own normal at that angle (gradient of x²/a² + z²/b²).
     let n_local = normalize(vec2<f32>(c / a, s / b));
     o.normal = yaxis * n_local.x + zaxis * n_local.y;
@@ -704,9 +723,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (14 * 4) as u64,
+                    array_stride: (16 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -724,9 +743,9 @@ impl Scene {
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: (14 * 4) as u64,
+                    array_stride: (16 * 4) as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32],
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Float32x3, 6 => Float32x2, 7 => Float32, 8 => Float32x2],
                 },
             ],
             wgpu::PrimitiveTopology::TriangleList,
@@ -1222,7 +1241,7 @@ impl Scene {
     }
 
     /// Upload bead instances: `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, cat, tool]`.
-    pub fn set_toolpaths(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[[f32; 14]]) {
+    pub fn set_toolpaths(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[[f32; 16]]) {
         self.inst_count = instances.len() as u32;
         self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
