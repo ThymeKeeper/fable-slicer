@@ -521,6 +521,7 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
         g.move_z(layer.print_z_mm, travel_f);
         let mut cur_z = layer.print_z_mm;
 
+        let island_pace = island_pace_factors(layer);
         let mut cur_type: Option<&'static str> = None;
         for (i, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
@@ -655,7 +656,13 @@ pub fn to_gcode(layers: &[LayerPlan], s: &Settings) -> String {
             // The first layer's speed is an absolute off the filament card —
             // one pace for every feature, chosen for adhesion. Thermal pacing
             // on top of it would quietly override the number the user set.
-            let small = if layer.index == 0 { 1.0 } else { small_loop_factor(path) };
+            // Inside a small ISLAND the island's factor is the ceiling for
+            // every path — min() so a short bead keeps its own harder pace.
+            let small = if layer.index == 0 {
+                1.0
+            } else {
+                small_loop_factor(path).min(island_pace[i])
+            };
             let feed =
                 feed_for(path, layer.index, layer.height_mm, layer_flow_cap_mm3_s(layer, t), t, s)
                     * layer.speed_scale
@@ -1297,6 +1304,74 @@ fn small_loop_factor(path: &ToolPath) -> f64 {
         }
     }
     (circ / SMALL_LOOP_MM).clamp(0.5, 1.0)
+}
+
+/// Per-path ISLAND pace factors for one layer. The island — a connected
+/// region, one outer contour of the layer outline — is the thermal unit:
+/// nothing inside a small island can shed heat any better than its outer
+/// wall can, so everything printed in it paces together. Keying only on each
+/// PATH's length missed exactly the biggest deposit: `spiralize_shells`
+/// chains a small island's inner rings and concentric fill into one stroke
+/// whose summed length clears [`SMALL_LOOP_MM`] — the outer wall slowed while
+/// most of the island's volume went down at full speed.
+///
+/// A path's island factor is `clamp(outer perimeter / SMALL_LOOP_MM, 0.5, 1)`
+/// for the innermost outer contour containing its start; emission takes
+/// `min(own-length factor, island factor)`, so membership only ever slows a
+/// path further — a hair bead keeps its own harder pace, and behavior in
+/// islands with no small outer contour is untouched (the early return).
+///
+/// Out of scope by design: bridges keep their calibrated strand speed
+/// (slower bridging sags MORE, not less), the skirt rings the whole plate,
+/// and ironing's trickle is a finish parameter.
+fn island_pace_factors(layer: &LayerPlan) -> Vec<f64> {
+    let cs = &layer.outline.contours;
+    // Outer contours (even containment depth), with perimeter and area.
+    let mut outers: Vec<(usize, f64, f64)> = Vec::new();
+    for (ci, c) in cs.iter().enumerate() {
+        if c.points.len() < 3 {
+            continue;
+        }
+        let depth = cs
+            .iter()
+            .enumerate()
+            .filter(|(cj, o)| *cj != ci && o.contains(c.points[0]))
+            .count();
+        if depth % 2 != 0 {
+            continue; // a hole, not an island
+        }
+        let m = c.points.len();
+        let mut perim = 0.0;
+        let mut area2 = 0.0;
+        for k in 0..m {
+            let (a, b) = (c.points[k], c.points[(k + 1) % m]);
+            perim += dist_mm(a, b);
+            area2 += a.x_mm() * b.y_mm() - b.x_mm() * a.y_mm();
+        }
+        outers.push((ci, perim, area2.abs() * 0.5));
+    }
+    if !outers.iter().any(|&(_, p, _)| p < SMALL_LOOP_MM) {
+        return vec![1.0; layer.paths.len()]; // no small island (the common case)
+    }
+    layer
+        .paths
+        .iter()
+        .map(|path| {
+            if matches!(
+                path.kind,
+                PathKind::Skirt | PathKind::Bridge | PathKind::InternalBridge | PathKind::Ironing
+            ) || path.points.is_empty()
+            {
+                return 1.0;
+            }
+            let q = path.points[0];
+            outers
+                .iter()
+                .filter(|&&(ci, _, _)| cs[ci].contains(q))
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map_or(1.0, |&(_, perim, _)| (perim / SMALL_LOOP_MM).clamp(0.5, 1.0))
+        })
+        .collect()
 }
 
 /// Feed rate (mm/min) for a path: the per-feature speed, clamped so the
@@ -2027,6 +2102,7 @@ const FAN_COOL_LAYER_TIME_S: f64 = 35.0;
 /// short layers semi-molten (the shrink band above a shelf).
 fn layer_naive_seconds(plan: &LayerPlan, s: &Settings, tools: &Tools) -> f64 {
     let mut t = 0.0;
+    let island_pace = island_pace_factors(plan);
     for (i, path) in plan.paths.iter().enumerate() {
         if let Some(tr) = plan.travels.get(i) {
             let mut d = 0.0;
@@ -2045,7 +2121,11 @@ fn layer_naive_seconds(plan: &LayerPlan, s: &Settings, tools: &Tools) -> f64 {
         let tool = tools.get(path.tool);
         // Mirrors emission, first layer included (see `small_loop_factor`),
         // so the estimate and the g-code cannot disagree about pacing.
-        let small = if plan.index == 0 { 1.0 } else { small_loop_factor(path) };
+        let small = if plan.index == 0 {
+            1.0
+        } else {
+            small_loop_factor(path).min(island_pace[i])
+        };
         let feed =
             feed_for(path, plan.index, plan.height_mm, layer_flow_cap_mm3_s(plan, tool), tool, s)
                 * small
@@ -3502,9 +3582,11 @@ mod tests {
 
     #[test]
     fn shell_solids_split_into_skins() {
-        // A 10 mm cube: layer 0 is all bottom skin (the bed face), the roof
-        // layer all top skin, and the shell layers between stay buried Solid.
-        let m = mesh::Mesh::cube(10.0);
+        // A 15 mm cube (big enough that island pacing stays out of the feeds —
+        // this test is about skin CLASSIFICATION and skin pace, not thermal
+        // pacing): layer 0 is all bottom skin (the bed face), the roof layer
+        // all top skin, and the shell layers between stay buried Solid.
+        let m = mesh::Mesh::cube(15.0);
         let mut s = Settings::default();
         s.min_layer_time_s = 0.0; // keep nominal feeds visible in the g-code
         let layers = generate(&m, &s);
@@ -4555,6 +4637,95 @@ mod tests {
         assert!(
             super::small_loop_factor(&gap) < 1.0,
             "a short gap stroke must be paced, not run at wall speed"
+        );
+    }
+
+    /// Everything inside a small ISLAND paces at the island's factor — the
+    /// island is the thermal unit. A spiralized interior stroke whose summed
+    /// length clears SMALL_LOOP_MM used to escape the per-path rule and dump
+    /// most of a small island's volume at full speed while its outer wall was
+    /// being paced.
+    #[test]
+    fn a_small_island_paces_everything_inside_it() {
+        // Two islands on one layer: a 12x2 fin (perimeter 28 mm — small) and
+        // a 100x100 slab (perimeter 400 mm — not).
+        let mut outline = Polygons::new();
+        outline.push(Contour::new(vec![
+            Point::from_mm(0.0, 0.0),
+            Point::from_mm(12.0, 0.0),
+            Point::from_mm(12.0, 2.0),
+            Point::from_mm(0.0, 2.0),
+        ]));
+        outline.push(Contour::new(vec![
+            Point::from_mm(20.0, 0.0),
+            Point::from_mm(120.0, 0.0),
+            Point::from_mm(120.0, 100.0),
+            Point::from_mm(20.0, 100.0),
+        ]));
+        // A long serpentine Perimeter stroke inside the fin (60 mm — its own
+        // length clears the threshold), a bridge inside the fin, and a wall
+        // inside the slab.
+        let mut serp = Vec::new();
+        for k in 0..6 {
+            let y = 0.6 + 0.16 * (k as f64);
+            serp.push(Point::from_mm(if k % 2 == 0 { 1.0 } else { 11.0 }, y));
+            serp.push(Point::from_mm(if k % 2 == 0 { 11.0 } else { 1.0 }, y));
+        }
+        let paths = vec![
+            bead(PathKind::Perimeter, false, serp),
+            bead(
+                PathKind::Bridge,
+                false,
+                vec![Point::from_mm(2.0, 1.0), Point::from_mm(10.0, 1.0)],
+            ),
+            bead(
+                PathKind::Perimeter,
+                false,
+                vec![Point::from_mm(30.0, 50.0), Point::from_mm(110.0, 50.0)],
+            ),
+        ];
+        let plan = &one_layer(paths, outline)[0];
+        let f = super::island_pace_factors(plan);
+        let fin = 28.0 / super::SMALL_LOOP_MM;
+        assert!(
+            (f[0] - fin).abs() < 1e-9,
+            "the fin's interior stroke must take the island factor {fin:.2}, got {:.2}",
+            f[0]
+        );
+        assert!(
+            super::small_loop_factor(&plan.paths[0]) >= 1.0,
+            "precondition: the stroke's own length must NOT pace it (the escape)"
+        );
+        assert_eq!(f[1], 1.0, "a bridge keeps its calibrated strand speed");
+        assert_eq!(f[2], 1.0, "the big island is not paced");
+    }
+
+    /// A pillar standing inside another island's hole is its own island: the
+    /// containment parity must hand it the pillar's factor, not the ring's.
+    #[test]
+    fn island_pace_resolves_nesting_through_holes() {
+        let mut outline = Polygons::new();
+        // A 60x60 ring with a 40x40 hole, and an 8x8 pillar inside the hole.
+        for (lo, hi) in [(0.0, 60.0), (10.0, 50.0), (26.0, 34.0)] {
+            outline.push(Contour::new(vec![
+                Point::from_mm(lo, lo),
+                Point::from_mm(hi, lo),
+                Point::from_mm(hi, hi),
+                Point::from_mm(lo, hi),
+            ]));
+        }
+        let paths = vec![bead(
+            PathKind::Perimeter,
+            false,
+            vec![Point::from_mm(28.0, 30.0), Point::from_mm(32.0, 30.0)],
+        )];
+        let plan = &one_layer(paths, outline)[0];
+        let f = super::island_pace_factors(plan);
+        let pillar = 32.0 / super::SMALL_LOOP_MM;
+        assert!(
+            (f[0] - pillar).abs() < 1e-9,
+            "the pillar wall must take the pillar's factor {pillar:.2}, got {:.2}",
+            f[0]
         );
     }
 }
