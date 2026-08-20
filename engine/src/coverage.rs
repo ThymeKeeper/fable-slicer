@@ -69,6 +69,25 @@ struct Grid {
 /// Upper bound on grid cells, to bail on pathological inputs rather than OOM.
 const CELLS_CAP: usize = 8_000_000;
 
+/// The cell size `uncovered` will use for this region — exposed so consumers
+/// of the void polygons can correct for the raster's quantization (a void's
+/// measured width reads systematically NARROW by about one cell; see
+/// `emit_gap_fill`). Mirrors `Grid::new` exactly, coarsening cap included.
+pub(crate) fn cell_mm(region: &Polygons, lw: f64) -> f64 {
+    let mut cell = (lw * 0.18).clamp(0.05, 0.12);
+    if let Some(bb) = region.bounds() {
+        let pad = lw;
+        let (w, h) = (
+            bb.max.x_mm() - bb.min.x_mm() + 2.0 * pad,
+            bb.max.y_mm() - bb.min.y_mm() + 2.0 * pad,
+        );
+        if w > 0.0 && h > 0.0 && (w / cell) * (h / cell) > CELLS_CAP as f64 {
+            cell = (w * h / CELLS_CAP as f64).sqrt();
+        }
+    }
+    cell
+}
+
 impl Grid {
     fn new(region: &Polygons, lw: f64) -> Option<Grid> {
         let bb = region.bounds()?;

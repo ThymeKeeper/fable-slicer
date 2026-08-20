@@ -3084,7 +3084,7 @@ fn plan_part(
                 } else {
                     voids
                 };
-                emit_gap_fill(&voids, lw, sp, &mut paths);
+                emit_gap_fill(&voids, lw, sp, crate::coverage::cell_mm(&dense, lw), layers[i].print_z_mm, &mut paths);
             }
         }
 
@@ -5303,7 +5303,7 @@ const GAP_BEAD_MIN_W: f64 = 0.75;
 
 
 
-fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
+fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, raster_cell_mm: f64, dbg_z: f64, out: &mut Vec<ToolPath>) {
     if raw.is_empty() {
         return;
     }
@@ -5314,11 +5314,47 @@ fn emit_gap_fill(raw: &Polygons, lw: f64, sp: f64, out: &mut Vec<ToolPath>) {
     let opened_min = offset(&offset(&raw, -min * 0.5), min * 0.5);
     let wide = offset(&offset(&raw, -max * 0.5), max * 0.5);
     let gaps = difference(&opened_min, &wide);
+    let dbg = std::env::var("FABLE_DEBUG_GAPS").is_ok();
+    if dbg {
+        eprintln!(
+            "gapdbg[z{dbg_z:.2}]: raw {:.2} mm2, opened {:.2}, wide {:.2}, band {:.2}",
+            raw.net_area_mm2().abs(),
+            opened_min.net_area_mm2().abs(),
+            wide.net_area_mm2().abs(),
+            gaps.net_area_mm2().abs()
+        );
+    }
     if gaps.is_empty() {
         return;
     }
     let (beads, _runts) = crate::medial::medial_axis_with_runts(&gaps, min, max);
-    for tp in beads {
+    for mut tp in beads {
+        // The coverage raster ERODES a void before the medial measures it:
+        // marching squares on the binary mask quantizes each edge inward and
+        // the medial's clearance reads the jag peaks, so the measured width
+        // sits about one cell below the true channel (measured on the slit
+        // fixture: a true 0.32 mm channel reads 0.228, a true 0.40 reads
+        // 0.360). Uncorrected, that had two real costs: every gap bead was
+        // EMITTED a cell narrower than its channel (systematic underfill —
+        // "it would need to over extrude to fill it"), and channels whose
+        // true width straddles the floor FLICKERED layer to layer — an 11 mm
+        // channel read 0.374 on one layer, 0.297 on the next (1% under the
+        // floor: the entire bead culled, a bare void between two beaded
+        // layers), 0.46 on the third. Add the cell back before judging or
+        // printing anything.
+        for w in &mut tp.widths {
+            *w += raster_cell_mm;
+        }
+        if dbg {
+            let wmean = tp.widths.iter().sum::<f64>() / tp.widths.len().max(1) as f64;
+            let q = tp.points[0];
+            eprintln!(
+                "gapdbg[z{dbg_z:.2}]: bead len {:.2} wmean {wmean:.3} at ({:.1},{:.1})",
+                tp.length_mm(),
+                q.x_mm(),
+                q.y_mm()
+            );
+        }
         if tp.length_mm() < GAP_BEAD_MIN_MM {
             continue;
         }
@@ -8389,15 +8425,28 @@ mod tests {
         let mid = &layers[layers.len() / 2];
         let floor = 0.75 * 0.4;
 
-        // Nothing the nozzle cannot draw, anywhere.
+        // Nothing the nozzle cannot draw, anywhere. Walls hold the printable
+        // floor at every point (the pinch/starve clamps). A gap bead holds it
+        // in the MEAN — its tips taper by design (extend_to_boundary tapers
+        // into the channel ends, clamped at the 0.1 mm emission floor), and a
+        // short taper through low widths is not a sustained sub-floor bead.
         for p in &mid.paths {
             if let Some(ws) = &p.widths {
-                let w = ws.iter().cloned().fold(f64::INFINITY, f64::min);
-                assert!(
-                    w >= floor - 1.0e-9,
-                    "{:?} carries a {w:.3} mm bead; the floor is {floor:.3}",
-                    p.kind
-                );
+                let wmin = ws.iter().cloned().fold(f64::INFINITY, f64::min);
+                if p.kind == PathKind::GapFill {
+                    let mean = ws.iter().sum::<f64>() / ws.len() as f64;
+                    assert!(
+                        mean >= floor - 1.0e-9,
+                        "a gap bead with mean {mean:.3} mm; the floor is {floor:.3}"
+                    );
+                    assert!(wmin >= 0.1 - 1.0e-9, "gap tip under the emission floor: {wmin:.3}");
+                } else {
+                    assert!(
+                        wmin >= floor - 1.0e-9,
+                        "{:?} carries a {wmin:.3} mm bead; the floor is {floor:.3}",
+                        p.kind
+                    );
+                }
             }
         }
 
