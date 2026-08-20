@@ -1315,8 +1315,12 @@ fn small_loop_factor(path: &ToolPath) -> f64 {
 /// whose summed length clears [`SMALL_LOOP_MM`] — the outer wall slowed while
 /// most of the island's volume went down at full speed.
 ///
-/// A path's island factor is `clamp(outer perimeter / SMALL_LOOP_MM, 0.5, 1)`
-/// for the innermost outer contour containing its start; emission takes
+/// A path's island factor is `clamp(outer perimeter / SMALL_ISLAND_MM, 0.5, 1)`
+/// for the innermost outer contour containing its start — the island
+/// threshold sits above the per-path one because an island deposits its
+/// whole volume back-to-back with no travel elsewhere to shed heat in, so
+/// the slowdown starts earlier and bites harder for the same size; emission
+/// takes
 /// `min(own-length factor, island factor)`, so membership only ever slows a
 /// path further — a hair bead keeps its own harder pace, and behavior in
 /// islands with no small outer contour is untouched (the early return).
@@ -1324,6 +1328,12 @@ fn small_loop_factor(path: &ToolPath) -> f64 {
 /// Out of scope by design: bridges keep their calibrated strand speed
 /// (slower bridging sags MORE, not less), the skirt rings the whole plate,
 /// and ironing's trickle is a finish parameter.
+///
+/// The island fade starts at this perimeter, wider than [`SMALL_LOOP_MM`]:
+/// a 29 mm island paces to 0.58 here where the per-path rule alone gave its
+/// outer wall 0.72.
+const SMALL_ISLAND_MM: f64 = 50.0;
+
 fn island_pace_factors(layer: &LayerPlan) -> Vec<f64> {
     let cs = &layer.outline.contours;
     // Outer contours (even containment depth), with perimeter and area.
@@ -1350,7 +1360,7 @@ fn island_pace_factors(layer: &LayerPlan) -> Vec<f64> {
         }
         outers.push((ci, perim, area2.abs() * 0.5));
     }
-    if !outers.iter().any(|&(_, p, _)| p < SMALL_LOOP_MM) {
+    if !outers.iter().any(|&(_, p, _)| p < SMALL_ISLAND_MM) {
         return vec![1.0; layer.paths.len()]; // no small island (the common case)
     }
     layer
@@ -1369,7 +1379,7 @@ fn island_pace_factors(layer: &LayerPlan) -> Vec<f64> {
                 .iter()
                 .filter(|&&(ci, _, _)| cs[ci].contains(q))
                 .min_by(|a, b| a.2.total_cmp(&b.2))
-                .map_or(1.0, |&(_, perim, _)| (perim / SMALL_LOOP_MM).clamp(0.5, 1.0))
+                .map_or(1.0, |&(_, perim, _)| (perim / SMALL_ISLAND_MM).clamp(0.5, 1.0))
         })
         .collect()
 }
@@ -4686,7 +4696,7 @@ mod tests {
         ];
         let plan = &one_layer(paths, outline)[0];
         let f = super::island_pace_factors(plan);
-        let fin = 28.0 / super::SMALL_LOOP_MM;
+        let fin = 28.0 / super::SMALL_ISLAND_MM;
         assert!(
             (f[0] - fin).abs() < 1e-9,
             "the fin's interior stroke must take the island factor {fin:.2}, got {:.2}",
@@ -4721,7 +4731,7 @@ mod tests {
         )];
         let plan = &one_layer(paths, outline)[0];
         let f = super::island_pace_factors(plan);
-        let pillar = 32.0 / super::SMALL_LOOP_MM;
+        let pillar = 32.0 / super::SMALL_ISLAND_MM;
         assert!(
             (f[0] - pillar).abs() < 1e-9,
             "the pillar wall must take the pillar's factor {pillar:.2}, got {:.2}",
