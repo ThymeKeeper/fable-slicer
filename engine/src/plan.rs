@@ -4767,6 +4767,13 @@ const GAP_BEAD_MIN_MM: f64 = 0.5;
 /// follow the pinch through a corner arc.
 const PINCH_STEP_MM: f64 = 0.5;
 
+/// A pinch-cut survivor shorter than this is a wall CRUMB, not a wall: too
+/// short to shed its travel + pressurize overhead, and by construction it
+/// sits between two gap channels that its footprint splits. Dropping it
+/// hands the whole line to one continuous gap bead. (Compare: the pinch
+/// resample is 0.5 mm/sample, so this is runs of ≲ 4 samples.)
+const MICRO_RUN_MM: f64 = 2.0;
+
 /// Starve hysteresis, in bead widths: an opposing side must sit at least this
 /// far away before the sliver between counts as a starving channel. Below it
 /// the residue is thinner than the coverage raster can even see, and widening
@@ -5046,6 +5053,24 @@ fn resolve_pinched_rings(walls: &mut Vec<ToolPath>, lw: f64, below: Option<&Poly
             // will run one bead down the middle of it.
             Some(runs) => {
                 for run in runs {
+                    // A microscopic surviving stretch — a wall crumb where the
+                    // pinch briefly relaxes between two cut channels — is
+                    // ABSORBED into the gap fill: dropped here, its footprint
+                    // reads uncovered and the medial bead runs straight
+                    // through, one continuous stroke where the crumb made
+                    // blob-crumb-blob (measured: 0.2 mm two-sample stubs
+                    // splitting an 8 mm channel into three gap fragments,
+                    // each stub costing a travel + pressurize and leaving
+                    // ~0.35 mm unprinted on either side of itself). Never
+                    // over air: a lintel-bridging stretch stays, whatever
+                    // its length.
+                    let len: f64 = run
+                        .windows(2)
+                        .map(|w| pt_dist_mm(rp[w[0]], rp[w[1]]))
+                        .sum();
+                    if len < MICRO_RUN_MM && !run.iter().any(|&k| air[k]) {
+                        continue;
+                    }
                     let pts: Vec<Point> = run.iter().map(|&k| rp[k]).collect();
                     let ws: Vec<f64> = run.iter().map(|&k| widths[k]).collect();
                     let mean = ws.iter().sum::<f64>() / ws.len() as f64;
