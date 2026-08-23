@@ -8835,11 +8835,21 @@ fn build_instances(
             }
             // Highlight the external-perimeter seam (loop start) with a larger
             // complement-colored marker, toggleable via the "seams" category.
-            // Only closed
-            // loops have a seam — the open pieces of an overhang-split wall
-            // start mid-loop wherever the split fell, and marking those reads
-            // as scatter that no seam strategy could fix.
-            if path.kind == engine::PathKind::ExternalPerimeter && path.closed {
+            // Only LOOPS have a seam — but by render time no outer wall is
+            // literally closed: apply_seam_gap opens every loop a hair short
+            // of its own start (which silently killed every marker for as
+            // long as this tested `path.closed`). A seam-carrying loop is
+            // recognized the way the emitter recognizes one: its endpoints
+            // still meet within a bead width. The open pieces of an
+            // overhang-split wall fail that test — their ends fell wherever
+            // the split did, and marking those reads as scatter that no seam
+            // strategy could fix.
+            let nearly_ring = path.closed || {
+                let a = path.points[0];
+                let b = path.points[n_pts - 1];
+                (a.x_mm() - b.x_mm()).hypot(a.y_mm() - b.y_mm()) <= path.width_mm
+            };
+            if path.kind == engine::PathKind::ExternalPerimeter && nearly_ring {
                 let s = path.points[0];
                 joints.push([
                     s.x_mm() as f32 + origin_x, s.y_mm() as f32, zc,
