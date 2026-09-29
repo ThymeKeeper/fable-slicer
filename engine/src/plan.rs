@@ -543,6 +543,8 @@ pub struct GeometryPlan {
     part_plans: Vec<Vec<LayerPlan>>,
     occupied: Vec<Vec<bool>>,
     n: usize,
+    /// Every part's support base on the bed (layer 0) — the skirt rings it.
+    support_base: Polygons,
 }
 
 impl GeometryPlan {
@@ -557,6 +559,7 @@ impl GeometryPlan {
             part_plans: Vec::new(),
             occupied: Vec::new(),
             n: 0,
+            support_base: Polygons::new(),
         }
     }
 }
@@ -735,10 +738,11 @@ fn plan_geometry_inner(
     if let Some(p) = progress {
         p.add_total(n * parts.len());
     }
+    let mut ground = SupportGround::new(parts, &phys, settings);
     let mut part_plans: Vec<Vec<LayerPlan>> = Vec::with_capacity(parts.len());
     for layers in &part_layers {
         let mut plans = plan_part(layers, &phys, settings, progress);
-        add_supports(&mut plans, layers, &phys, settings);
+        add_supports(&mut plans, layers, &phys, &mut ground, settings);
         part_plans.push(plans);
     }
 
@@ -754,7 +758,8 @@ fn plan_geometry_inner(
         })
         .collect();
 
-    GeometryPlan { norm_settings, grid, part_layers, phys, part_plans, occupied, n }
+    let support_base = ground.base;
+    GeometryPlan { norm_settings, grid, part_layers, phys, part_plans, occupied, n, support_base }
 }
 
 /// The paint half of the plan: stamp each path's tool (uniform or blend
@@ -941,7 +946,8 @@ fn stamp_and_finish(
     // Skirt: priming loops around the first layer, printed before anything else.
     if settings.skirt_loops > 0 {
         if let Some(plan0) = plans.first_mut() {
-            let mut skirt = skirt_paths(&phys[0], settings);
+            let bed = bed_in_plan_frame(parts, settings);
+            let mut skirt = skirt_paths(&phys[0], &geo.support_base, &bed, settings);
             for p in &mut skirt {
                 p.tool = initial_tool;
             }
@@ -2517,7 +2523,7 @@ fn plan_part(
             // beads stitch into continuous runs exactly like solid — and a bridge wants
             // unbroken flow most of all, since a stop on an unsupported span sags. Same
             // safety: only a turnaround that stays inside the walls connects.
-            connect_fill_runs(&mut paths, bridge_start, &ftw, lw * 3.0);
+            connect_fill_runs(&mut paths, bridge_start, &ftw, lw * 3.0, FILL_JOINT_FLOW);
 
             // `solid_all` was bound above (for the lintel pull). Exclude the lintels
             // from both fills so they aren't traced twice.
@@ -2864,7 +2870,7 @@ fn plan_part(
                         // visible and connecting would add material and defeat the
                         // sparseness).
                         if matches!(kind, PathKind::Solid | PathKind::TopSkin | PathKind::BottomSkin) {
-                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
+                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM, FILL_JOINT_FLOW);
                         }
                         // PER-BEAD reach for the ends still OPEN after connecting —
                         // run ends and the hole/concavity-facing turnarounds connect
@@ -2896,7 +2902,7 @@ fn plan_part(
                             // Stitch them (and the surviving solid arcs) back into
                             // continuous runs — a bridge surface should print without
                             // stopping the flow at every line, same as solid.
-                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM);
+                            connect_fill_runs(&mut paths, n0, &ftw, CONNECT_MAX_MM, FILL_JOINT_FLOW);
                         }
                     }
                 }
@@ -2943,7 +2949,7 @@ fn plan_part(
                 // rectilinear — the turnaround along the boundary bonds the
                 // ends and quiets hundreds of travels); the sp-based floor
                 // keeps dense staircase gaps stitching.
-                connect_fill_runs(&mut paths, n0, &sparse_fill, CONNECT_MAX_MM);
+                connect_fill_runs(&mut paths, n0, &sparse_fill, CONNECT_MAX_MM, FILL_JOINT_FLOW);
                 // Same per-bead reach, for the ends still open after connecting:
                 // a sparse line that runs into a WALL anchors to it; one facing
                 // other infill doesn't move. Target the non-solid part of the
@@ -3138,6 +3144,85 @@ fn plan_part(
     plans
 }
 
+/// Density of the support's first layer — the base every column stands on. A
+/// sparse base meets the bed with a sixth of its footprint, strands whose ends
+/// peel as the column above shrinks (an ASA support block lifted this way);
+/// Orca and Prusa print this layer at 90%.
+const SUPPORT_BASE_DENSITY: f64 = 0.9;
+
+/// How far the support's first layer spreads past the column it carries: a lip
+/// that holds the column's edges down against its pull (the user's Orca profile
+/// runs a 2 mm first-layer expansion).
+const SUPPORT_BASE_EXPANSION_MM: f64 = 2.0;
+
+/// Density of the contact layer right under an overhang (the top of the
+/// interface ramp). Dense enough that the part's first layer bridges gaps of
+/// about a tenth of a millimetre, open enough that it is no solid sheet
+/// shrinking as one; Orca's contact layer runs about 67%.
+const SUPPORT_INTERFACE_DENSITY: f64 = 0.7;
+
+/// What support must respect on the bed, shared by every part's support pass.
+struct SupportGround {
+    /// The brim's footprint grown by the support's xy gap, outside the part's
+    /// own first layer. Empty without a brim.
+    brim_band: Polygons,
+    /// Per layer, where support may not stand because of the brim: `brim_band`
+    /// minus wherever the part lies below that layer (a column there lands on
+    /// the part, never reaching the brim). Built on first use, so a job that
+    /// needs no support never pays for it; runs of layers with the same shadow
+    /// share one polygon.
+    brim_keep_out: Option<Vec<std::sync::Arc<Polygons>>>,
+    /// The bed in the frame paths are planned in — a widened base never leaves
+    /// it. Empty = unbounded.
+    bed: Polygons,
+    /// The support bases laid so far. A later part's base never prints over an
+    /// earlier one's.
+    base: Polygons,
+}
+
+impl SupportGround {
+    fn new(parts: &[(&Mesh, PartPaint)], phys: &[Polygons], settings: &Settings) -> Self {
+        let grid_support = settings.support_mode == SupportMode::Grid;
+        let brim_band = match phys.first() {
+            Some(first) if grid_support && settings.brim_loops > 0 && !first.is_empty() => {
+                let band = offset(&brim_footprint(first, settings), settings.support_xy_clearance_mm);
+                difference(&band, first)
+            }
+            _ => Polygons::new(),
+        };
+        let bed = if grid_support { bed_in_plan_frame(parts, settings) } else { Polygons::new() };
+        Self { brim_band, brim_keep_out: None, bed, base: Polygons::new() }
+    }
+
+    /// The brim's keep-out on layer `i`, if any support there must avoid it.
+    fn brim_keep_out(&mut self, phys: &[Polygons], i: usize) -> Option<&Polygons> {
+        if self.brim_band.is_empty() {
+            return None;
+        }
+        let band = &self.brim_band;
+        let per_layer = self.brim_keep_out.get_or_insert_with(|| {
+            // The part's shadow inside the band, grown layer by layer from the bed.
+            let under: Vec<Polygons> = phys.par_iter().map(|layer| intersection(layer, band)).collect();
+            let mut per_layer = Vec::with_capacity(under.len());
+            let mut keep_out = std::sync::Arc::new(band.clone());
+            let mut shadow = Polygons::new();
+            for layer_under in &under {
+                per_layer.push(keep_out.clone());
+                if layer_under.is_empty() || keep_out.is_empty() {
+                    continue;
+                }
+                let grown = union(&shadow, layer_under);
+                if grown.net_area_mm2() > shadow.net_area_mm2() + 1e-3 {
+                    shadow = grown;
+                    keep_out = std::sync::Arc::new(difference(band, &shadow));
+                }
+            }
+            per_layer
+        });
+        per_layer.get(i).map(|k| k.as_ref()).filter(|k| !k.is_empty())
+    }
+}
+
 /// Generate removable grid support under overhangs. For each layer, the overhang
 /// is the region not over the layer below within a printable cantilever; this is
 /// projected downward and the support area (minus the part + clearance) is filled
@@ -3146,8 +3231,16 @@ fn plan_part(
 /// `layers` is the part being supported; `phys` is the per-layer union of ALL
 /// parts — overhangs resting on another part need no support, and a support
 /// column stops on (and keeps clearance from) whatever part it meets on the
-/// way down.
-fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], settings: &Settings) {
+/// way down. Columns also keep clear of the brim (`ground`): one standing on
+/// it fuses to the brim, and through the brim to the part. A column that
+/// reaches the bed stands on a dense, widened base.
+fn add_supports(
+    plans: &mut [LayerPlan],
+    layers: &[Layer],
+    phys: &[Polygons],
+    ground: &mut SupportGround,
+    settings: &Settings,
+) {
     // Only Grid mode adds support structure below; None leaves overhangs as-is.
     if settings.support_mode != SupportMode::Grid {
         return;
@@ -3190,36 +3283,64 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
     // Project downward: support at layer i holds overhangs accumulated from above,
     // minus the part (+clearance). Where the part is, the column rests and stops.
     // A z-gap of `gap` empty layers under each overhang aids removal, and the top
-    // `iface` support layers are printed solid for a smoother overhang underside.
+    // `iface` support layers ramp up to a denser contact layer for a smoother
+    // overhang underside.
     let sp = config::bead_spacing_mm(lw, settings.layer_height_mm);
     let spacing = sp / settings.support_density.clamp(0.02, 1.0);
     let gap = settings.support_z_gap_layers;
     let iface = settings.support_interface_layers;
+    // Interface spacing by depth under the overhang (t = 1 is the contact layer):
+    // a geometric ramp from the contact density down toward the column's, so each
+    // layer bridges a fraction of the gaps below it and none is a solid sheet
+    // shrinking as one (a big ASA support pulls itself off the bed that way).
+    let contact = (sp / SUPPORT_INTERFACE_DENSITY).min(spacing);
+    let iface_spacing =
+        |t: usize| contact * (spacing / contact).powf((t - 1) as f64 / iface.max(1) as f64);
     let mut accum = Polygons::new();
     for i in (0..n).rev() {
-        let blocked = offset(&phys[i], clearance);
-        // Open the projected support footprint (erode then dilate a line-width) so a
-        // one-off single-layer ledge — a lone thin rim that never accumulates into a
-        // real column — drops out, while the swept footprint under a genuine gradual
-        // overhang (many stacked rims) stays. This replaces the old per-layer open.
-        let here = offset(&offset(&difference(&accum, &blocked), -lw), lw);
-        if !here.is_empty() {
+        // Nothing projected down to this layer yet: nothing to place or block.
+        let mut blocked = Polygons::new();
+        let mut here = Polygons::new();
+        if !accum.is_empty() {
+            blocked = offset(&phys[i], clearance);
+            if let Some(brim) = ground.brim_keep_out(phys, i) {
+                blocked = union(&blocked, brim);
+            }
+            // Open the projected support footprint (erode then dilate a line-width) so a
+            // one-off single-layer ledge — a lone thin rim that never accumulates into a
+            // real column — drops out, while the swept footprint under a genuine gradual
+            // overhang (many stacked rims) stays. This replaces the old per-layer open.
+            here = offset(&offset(&difference(&accum, &blocked), -lw), lw);
+        }
+        if i == 0 && !here.is_empty() {
+            // On the bed: the base replaces the column's sparse (or interface) layer.
+            let base = support_base(&here, &blocked, ground, lw);
+            if !base.is_empty() {
+                add_support_base(&mut plans[0].paths, &base, settings, layers[0].z_mm);
+                ground.base = union(&ground.base, &base);
+            }
+        } else if !here.is_empty() {
             let angle = if i % 2 == 0 { 0.0 } else { 90.0 };
             // Interface = the top `iface` support layers below an overhang (its top
-            // sits `gap` layers under the overhang). Those layers print solid.
-            let mut iface_region = Polygons::new();
-            for j in (i + 1 + gap)..=(i + gap + iface).min(n - 1) {
-                iface_region = union(&iface_region, &overhang[j]);
+            // sits `gap` layers under the overhang), denser the closer they sit to
+            // it. Where two overhangs claim the same spot, the nearer one wins.
+            let mut iface_here = Polygons::new();
+            for t in 1..=iface {
+                let j = i + gap + t;
+                if j >= n {
+                    break;
+                }
+                let depth_t = difference(&intersection(&here, &overhang[j]), &iface_here);
+                if !depth_t.is_empty() {
+                    add_support_region(&mut plans[i].paths, &depth_t, iface_spacing(t), angle, lw,
+                        settings.seam_mode, i, layers[i].z_mm, false);
+                    iface_here = union(&iface_here, &depth_t);
+                }
             }
-            let iface_here = intersection(&here, &iface_region);
             let body_here = difference(&here, &iface_here);
             if !body_here.is_empty() {
                 add_support_region(&mut plans[i].paths, &body_here, spacing, angle, lw,
-                    settings.seam_mode, i, layers[i].z_mm);
-            }
-            if !iface_here.is_empty() {
-                add_support_region(&mut plans[i].paths, &iface_here, sp, angle, lw,
-                    settings.seam_mode, i, layers[i].z_mm);
+                    settings.seam_mode, i, layers[i].z_mm, false);
             }
         }
         accum = difference(&accum, &phys[i]);
@@ -3240,10 +3361,20 @@ fn add_supports(plans: &mut [LayerPlan], layers: &[Layer], phys: &[Polygons], se
     }
 }
 
-/// Draw one support region: a perimeter loop first — so thin and tiny sections
-/// become continuous, self-supporting tubes and the interior fill anchors to an
-/// edge instead of floating as one-direction lines — then the pattern fill
-/// tucked a line-width inside it.
+/// Draw one support region: lines at `spacing`, joined into zigzags. A support
+/// line left on its own pays a retract, wipe, z-hop and travel at each end
+/// (about 60 a layer on a large block, a quarter of its time); a turnaround
+/// costs a short bead.
+///
+/// A perimeter loop rings an island only where it earns its keep: on the base
+/// (`base`: the continuous edge bead holding the bed where a peel starts), and
+/// on an island too narrow for two lines across, where it turns a thin column
+/// into a self-supporting tube instead of a stack of loose rungs. A wide island
+/// gets none: a loop re-laid on every layer stacks into a thin closed wall —
+/// the classic warping shape — that pries a big block's corners off the bed
+/// (Orca prints none above the first layer). There the zigzag runs out to the
+/// island's edge and its turnarounds carry the edge.
+#[allow(clippy::too_many_arguments)]
 fn add_support_region(
     paths: &mut Vec<ToolPath>,
     region: &Polygons,
@@ -3253,21 +3384,68 @@ fn add_support_region(
     seam_mode: SeamMode,
     layer_index: usize,
     z_mm: f64,
+    base: bool,
 ) {
-    let perim = offset(region, -lw * 0.5);
-    for c in perim.contours {
+    let (mut looped, mut bare) = (Polygons::new(), Polygons::new());
+    for island in islands(region) {
+        let target = if base || offset(&island, -spacing).is_empty() { &mut looped } else { &mut bare };
+        target.contours.extend(island.contours);
+    }
+    for c in offset(&looped, -lw * 0.5).contours {
         if c.points.len() >= 3 {
             let points = place_seam(c.points, seam_mode, layer_index);
             paths.push(ToolPath::new(PathKind::Support, true, lw, points));
         }
     }
-    // Inset by a full line so the fill meets the perimeter rather than doubling
-    // it; a section thinner than that is covered by the perimeter bead alone.
-    let inner = offset(region, -lw);
-    if !inner.is_empty() {
-        fill_region(&inner, InfillPattern::Lines, spacing, angle, lw,
+    // Inside a loop the fill sits a full line in, meeting the loop rather than
+    // doubling it (a section thinner than that is the loop's bead alone); a bare
+    // island's fill reaches its edge.
+    let fill = union(&offset(&looped, -lw), &offset(&bare, -lw * 0.5));
+    if !fill.is_empty() {
+        let start = paths.len();
+        fill_region(&fill, InfillPattern::Lines, spacing, angle, lw,
             PathKind::Support, seam_mode, layer_index, z_mm, false, paths);
+        // A turnaround spans one line pitch, a little more where the edge slants,
+        // and lays down only what the gap it crosses lacks: in sparse support
+        // that is most of a bead — the edge a bare island stands on.
+        let joint = ((1.0 - lw / spacing) as f32).max(FILL_JOINT_FLOW);
+        connect_fill_runs(paths, start, &fill, (spacing * 1.5).max(lw * 3.0), joint);
     }
+}
+
+/// Spread the support's footprint on the bed (`here`, layer 0) into its base:
+/// [`SUPPORT_BASE_EXPANSION_MM`] outward, grown in sub-bead steps with the
+/// obstacles (`blocked`: the part and the brim, each plus the xy gap) removed
+/// after every step, so it can't hop a thin wall into a neighbouring cavity
+/// (at least five steps, as Orca and Prusa grow theirs). Never off the bed,
+/// never over another part's base.
+fn support_base(here: &Polygons, blocked: &Polygons, ground: &SupportGround, lw: f64) -> Polygons {
+    let steps = (SUPPORT_BASE_EXPANSION_MM / lw).ceil().max(5.0);
+    let step = SUPPORT_BASE_EXPANSION_MM / steps;
+    let mut base = here.clone();
+    for _ in 0..steps as usize {
+        base = difference(&offset(&base, step), blocked);
+    }
+    if !ground.bed.is_empty() {
+        base = intersection(&base, &ground.bed);
+    }
+    if !ground.base.is_empty() {
+        base = difference(&base, &ground.base);
+    }
+    // A sliver pinched between obstacles holds no bead.
+    offset(&offset(&base, -lw * 0.5), lw * 0.5)
+}
+
+/// Lay a support base: its perimeter loop, then lines at
+/// [`SUPPORT_BASE_DENSITY`] joined into serpentines. The column's first layer
+/// then grips the bed with nearly its whole footprint instead of a sparse
+/// grid's strands, and no line ends in a retraction on the bed.
+fn add_support_base(paths: &mut Vec<ToolPath>, base: &Polygons, settings: &Settings, z_mm: f64) {
+    let lw = settings.line_width_mm;
+    // Across the sparse layer above (odd layers run at 90°), so every line of
+    // layer 1 lands on the base along its whole length.
+    let spacing = config::bead_spacing_mm(lw, settings.first_layer_height_mm) / SUPPORT_BASE_DENSITY;
+    add_support_region(paths, base, spacing, 0.0, lw, settings.seam_mode, 0, z_mm, true);
 }
 
 /// Split a region into its disjoint islands (each CCW outer plus the holes inside
@@ -4175,7 +4353,15 @@ fn pt_dist_mm(a: Point, b: Point) -> f64 {
 /// cross-void turnaround into a separate line. Every join is still a short in-region
 /// turnaround (nothing crosses the void, so no scribble), and only same-kind,
 /// same-group open beads join, so bridges and separate islands keep their own flow.
-fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons, max_jump: f64) {
+/// Each turnaround chord deposits `joint_flow` of a full bead ([`FILL_JOINT_FLOW`]
+/// where the joined beads' own shares already cover the slot it crosses).
+fn connect_fill_runs(
+    paths: &mut Vec<ToolPath>,
+    start: usize,
+    inside: &Polygons,
+    max_jump: f64,
+    joint_flow: f32,
+) {
     if paths.len() < start + 2 {
         return;
     }
@@ -4576,7 +4762,7 @@ fn connect_fill_runs(paths: &mut Vec<ToolPath>, start: usize, inside: &Polygons,
                         r.points.len() - 1
                     ]
                 });
-                segs.push(SegAttr { kind: r.kind, overhang: r.overhang, flow: FILL_JOINT_FLOW });
+                segs.push(SegAttr { kind: r.kind, overhang: r.overhang, flow: joint_flow });
                 match &bead.segs {
                     Some(bs) if flip => segs.extend(bs.iter().rev().copied()),
                     Some(bs) => segs.extend(bs.iter().copied()),
@@ -6191,24 +6377,77 @@ fn dist2(a: Point, b: Point) -> i128 {
     dx * dx + dy * dy
 }
 
-/// Loops around the first-layer outline, offset outward, to prime the nozzle and
-/// establish flow before the part starts.
-fn skirt_paths(first_layer: &Polygons, settings: &Settings) -> Vec<ToolPath> {
+/// Loops around everything on the first layer — the part (outside its brim) and
+/// any support base — offset outward, to prime the nozzle and establish flow
+/// before the part starts. A loop that would run off the bed keeps only its
+/// arcs on it.
+fn skirt_paths(
+    first_layer: &Polygons,
+    support_base: &Polygons,
+    bed: &Polygons,
+    settings: &Settings,
+) -> Vec<ToolPath> {
     let lw = settings.line_width_mm;
     // Keep the skirt outside any brim (brim extends ~brim_loops line widths out).
     let brim_extent = lw * settings.brim_loops as f64;
     let mut paths = Vec::new();
     for k in 0..settings.skirt_loops {
         let delta = brim_extent + settings.skirt_gap_mm + lw * (0.5 + k as f64);
-        for c in offset(first_layer, delta).contours {
+        let mut ring = offset(first_layer, delta);
+        if !support_base.is_empty() {
+            // Support has no brim of its own: ring its base at the plain gap.
+            let base_delta = settings.skirt_gap_mm + lw * (0.5 + k as f64);
+            ring = union(&ring, &offset(support_base, base_delta));
+        }
+        for c in ring.contours {
             // Outer loops only (CCW) — offsetting outward also shrinks holes into
             // loops inside the part's holes, which we must not print.
             if c.points.len() >= 3 && c.is_ccw() {
-                paths.push(ToolPath::new(PathKind::Skirt, true, lw, c.points));
+                push_skirt_loop(&mut paths, lw, c.points, bed);
             }
         }
     }
     paths
+}
+
+/// A skirt arc shorter than this primes nothing — the nozzle barely reaches
+/// pressure before it stops — and still costs a travel, so it is dropped.
+const SKIRT_MIN_ARC_MM: f64 = 5.0;
+
+/// Push a skirt loop as-is when its whole bead lies on the bed; otherwise push
+/// the arcs of it that do (the one straddling the loop's start is rejoined).
+fn push_skirt_loop(paths: &mut Vec<ToolPath>, lw: f64, points: Vec<Point>, bed: &Polygons) {
+    // The centreline keeps a bead-width in from the edge, so the bead (and its
+    // end caps) never hangs off.
+    let usable = offset(bed, -lw);
+    let Some(b) = usable.bounds() else {
+        paths.push(ToolPath::new(PathKind::Skirt, true, lw, points));
+        return;
+    };
+    if points.iter().all(|p| p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y) {
+        paths.push(ToolPath::new(PathKind::Skirt, true, lw, points));
+        return;
+    }
+    let ring: Vec<(f64, f64)> =
+        points.iter().chain(points.first()).map(|p| (p.x_mm(), p.y_mm())).collect();
+    let mut arcs = crate::fill::clip_polylines(vec![ring], &usable);
+    if arcs.len() >= 2 && arcs[0][0] == points[0] && *arcs[arcs.len() - 1].last().unwrap() == points[0] {
+        let head = arcs.remove(0);
+        arcs.last_mut().unwrap().extend(head.into_iter().skip(1));
+    }
+    arcs.retain(|arc| arc.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum::<f64>() >= SKIRT_MIN_ARC_MM);
+    paths.extend(arcs.into_iter().map(|arc| ToolPath::new(PathKind::Skirt, false, lw, arc)));
+}
+
+/// The bed the brim covers: every loop [`brim_paths`] lays, swept to its bead.
+fn brim_footprint(first_layer: &Polygons, settings: &Settings) -> Polygons {
+    let mut footprint = Polygons::new();
+    for loop_path in brim_paths(first_layer, settings) {
+        let mut ring = loop_path.points;
+        ring.push(ring[0]);
+        footprint = union(&footprint, &geo2d::stroke_open(&ring, loop_path.width_mm * 0.5));
+    }
+    footprint
 }
 
 /// Loops extending outward from the first-layer outline, the innermost touching
@@ -6254,10 +6493,12 @@ fn coverage(inners: &[Polygons], i: usize, dir: isize, count: usize, n: usize) -
     acc.unwrap_or_default()
 }
 
-/// Shift all toolpaths so the model's XY center sits at the bed center.
-fn center_on_bed(plans: &mut [LayerPlan], parts: &[(&Mesh, PartPaint)], settings: &Settings) {
+/// How far (mm) [`center_on_bed`] moves the planned paths: the bed center
+/// minus the parts' XY center. `None` when nothing is shifted — the caller
+/// placed the parts (the GUI's layout) or there is no geometry.
+fn centering_shift(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Option<(f64, f64)> {
     if !settings.auto_center_on_bed {
-        return; // caller positioned the geometry already (e.g. GUI multi-object layout)
+        return None; // caller positioned the geometry already (e.g. GUI multi-object layout)
     }
     let mut bounds: Option<(f64, f64, f64, f64)> = None;
     for (m, _) in parts {
@@ -6268,13 +6509,39 @@ fn center_on_bed(plans: &mut [LayerPlan], parts: &[(&Mesh, PartPaint)], settings
             });
         }
     }
-    let Some((min_x, min_y, max_x, max_y)) = bounds else {
-        return;
-    };
+    let (min_x, min_y, max_x, max_y) = bounds?;
     let model_cx = (min_x + max_x) / 2.0;
     let model_cy = (min_y + max_y) / 2.0;
-    let dx = to_units(settings.bed_size_x_mm / 2.0 - model_cx);
-    let dy = to_units(settings.bed_size_y_mm / 2.0 - model_cy);
+    Some((settings.bed_size_x_mm / 2.0 - model_cx, settings.bed_size_y_mm / 2.0 - model_cy))
+}
+
+/// The bed rectangle in the frame paths are planned in: bed coordinates, or —
+/// when [`center_on_bed`] will move everything afterwards — the bed shifted
+/// back by that move. Empty (no bound at all) when the profile gives no bed.
+fn bed_in_plan_frame(parts: &[(&Mesh, PartPaint)], settings: &Settings) -> Polygons {
+    if settings.bed_size_x_mm <= 0.0 || settings.bed_size_y_mm <= 0.0 {
+        return Polygons::new();
+    }
+    let (dx, dy) = centering_shift(parts, settings).unwrap_or((0.0, 0.0));
+    let (x0, y0) = (-dx, -dy);
+    let (x1, y1) = (x0 + settings.bed_size_x_mm, y0 + settings.bed_size_y_mm);
+    let mut bed = Polygons::new();
+    bed.push(Contour::new(vec![
+        Point::from_mm(x0, y0),
+        Point::from_mm(x1, y0),
+        Point::from_mm(x1, y1),
+        Point::from_mm(x0, y1),
+    ]));
+    bed
+}
+
+/// Shift all toolpaths so the model's XY center sits at the bed center.
+fn center_on_bed(plans: &mut [LayerPlan], parts: &[(&Mesh, PartPaint)], settings: &Settings) {
+    let Some((sx, sy)) = centering_shift(parts, settings) else {
+        return;
+    };
+    let dx = to_units(sx);
+    let dy = to_units(sy);
     if dx == 0 && dy == 0 {
         return;
     }
@@ -7220,6 +7487,34 @@ mod tests {
             fp(&full_b),
             "test setup: paints A and B must produce different plans",
         );
+    }
+
+    #[test]
+    fn restamp_keeps_the_skirt_around_the_support_base() {
+        // The skirt is laid in the paint stage — which a paint-only restamp
+        // re-runs — around the support base the geometry stage built, so the
+        // cached plan must carry that base or a restamp would drop it.
+        let mut s = grid_support(4, 1);
+        s.tool_count = 2;
+        s.tools = (0..2).map(|i| s.flat_tool(format!("t{i}"))).collect();
+        let arm = post_and_cantilever(40.0);
+        let parts_a: Vec<(&Mesh, PartPaint)> = vec![(&arm, PartPaint::Tool(0))];
+        let parts_b: Vec<(&Mesh, PartPaint)> = vec![(&arm, PartPaint::Tool(1))];
+        let geo = plan_geometry(&parts_a, &s);
+        for parts in [&parts_a, &parts_b] {
+            assert_eq!(
+                fp(&restamp_paint(&geo, parts)),
+                fp(&generate_painted(parts, &s)),
+                "restamp must equal a full slice",
+            );
+        }
+        // Not vacuous: the skirt really rings the base, past the cantilever's column.
+        let plans = restamp_paint(&geo, &parts_b);
+        let reach = |kind: PathKind| {
+            plans[0].paths.iter().filter(|p| p.kind == kind).flat_map(|p| &p.points).map(|q| q.x_mm()).fold(f64::MIN, f64::max)
+        };
+        let (skirt, base) = (reach(PathKind::Skirt), reach(PathKind::Support));
+        assert!(skirt > base + s.skirt_gap_mm, "skirt reaches x={skirt:.1}, the base x={base:.1}");
     }
 
     /// Axis-aligned box as a triangle soup (outward winding, same pattern as
@@ -8895,5 +9190,356 @@ mod tests {
             plans[slab_base].paths.iter().all(|p| p.tool == 1),
             "an interface onto another part must not trigger the override"
         );
+    }
+
+    /// The bed area a layer's `kind` beads cover, each swept to its width.
+    fn beads_of(layer: &LayerPlan, kind: PathKind) -> Polygons {
+        let mut fp = Polygons::new();
+        for p in layer.paths.iter().filter(|p| p.kind == kind) {
+            let mut pts = p.points.clone();
+            if p.closed {
+                pts.push(pts[0]);
+            }
+            fp = union(&fp, &geo2d::stroke_open(&pts, p.width_mm * 0.5));
+        }
+        fp
+    }
+
+    /// A 10 mm post on the bed with a slab cantilevered 20 mm off its top in
+    /// +x: grid support fills the bed beside the post, right where a brim goes.
+    fn post_and_cantilever(x0: f64) -> Mesh {
+        let mut t = Vec::new();
+        push_box(&mut t, [x0, 40.0, 0.0], [x0 + 10.0, 50.0, 10.0]);
+        push_box(&mut t, [x0, 40.0, 10.0], [x0 + 30.0, 50.0, 12.0]);
+        Mesh::from_triangle_soup(&t)
+    }
+
+    fn grid_support(brim_loops: usize, skirt_loops: usize) -> Settings {
+        let mut s = Settings::default();
+        s.skirt_loops = skirt_loops;
+        s.brim_loops = brim_loops;
+        s.support_mode = SupportMode::Grid;
+        s.auto_center_on_bed = false;
+        s
+    }
+
+    #[test]
+    fn support_never_stands_on_the_brim() {
+        let s = grid_support(8, 0);
+        let plans = generate(&post_and_cantilever(40.0), &s);
+        let brim = beads_of(&plans[0], PathKind::Skirt);
+        assert!(!brim.is_empty(), "test setup: the post has a brim");
+        // Support keeps its xy gap from the brim on EVERY layer — not just
+        // off the brim's beads on layer 0, but never stacked over them either.
+        let keep_out = offset(&brim, s.support_xy_clearance_mm - 0.05);
+        let mut columns = 0.0;
+        for layer in &plans {
+            let support = beads_of(layer, PathKind::Support);
+            let on_brim = intersection(&support, &keep_out).net_area_mm2();
+            assert!(on_brim < 0.01, "layer {}: {on_brim:.2} mm² of support on the brim", layer.index);
+            columns += support.net_area_mm2();
+        }
+        assert!(columns > 1000.0, "the cantilever must still be supported, got {columns:.0} mm²");
+    }
+
+    #[test]
+    fn support_base_is_dense_widened_and_clear_of_the_part() {
+        let s = grid_support(0, 0);
+        let plans = generate(&post_and_cantilever(40.0), &s);
+        let base = beads_of(&plans[0], PathKind::Support);
+        let column = beads_of(&plans[2], PathKind::Support);
+        // Dense: the base's beads cover its footprint (a sparse grid covered
+        // ~15%, the strands the lifting ASA support stood on).
+        let footprint = offset(&offset(&base, 1.0), -1.0);
+        let cover = base.net_area_mm2() / footprint.net_area_mm2();
+        assert!(cover > 0.85, "support base covers only {:.0}% of its footprint", cover * 100.0);
+        // Widened: a lip past the column on its free sides.
+        let (b, c) = (base.bounds().unwrap(), column.bounds().unwrap());
+        assert!(b.max.x_mm() > c.max.x_mm() + 1.5, "no lip past the column's free end");
+        assert!(b.min.y_mm() < c.min.y_mm() - 1.5, "no lip past the column's free side");
+        // ...but never onto the part: the xy gap holds on the bed too.
+        let post = offset(&plans[0].outline, s.support_xy_clearance_mm - 0.05);
+        let on_part = intersection(&base, &post).net_area_mm2();
+        assert!(on_part < 0.01, "{on_part:.2} mm² of the base crowds the part");
+        // Only the base is dense: the column above is the sparse grid it was.
+        let above = beads_of(&plans[1], PathKind::Support);
+        let above_cover = above.net_area_mm2() / offset(&offset(&above, 2.0), -2.0).net_area_mm2();
+        assert!(above_cover < 0.4, "layer 1 should be the sparse column, covers {:.0}%", above_cover * 100.0);
+    }
+
+    #[test]
+    fn support_base_stays_on_the_bed() {
+        // The cantilever's free end 0.5 mm from the bed's edge: the base's lip
+        // must be clipped there, in both planning frames — the GUI's bed frame
+        // and the CLI's auto-centered one (planned in the model's own frame and
+        // shifted onto the bed afterwards).
+        let mut s = grid_support(0, 0);
+        let edge = s.bed_size_x_mm;
+        for auto_center in [false, true] {
+            s.auto_center_on_bed = auto_center;
+            let m = if auto_center {
+                // A cantilever spanning the whole bed once centered.
+                let mut t = Vec::new();
+                push_box(&mut t, [0.0, 40.0, 0.0], [10.0, 50.0, 10.0]);
+                push_box(&mut t, [0.0, 40.0, 10.0], [edge - 1.0, 50.0, 12.0]);
+                Mesh::from_triangle_soup(&t)
+            } else {
+                post_and_cantilever(edge - 30.5)
+            };
+            let plans = generate(&m, &s);
+            let base = &plans[0];
+            assert!(count(base, PathKind::Support) > 0, "test setup: support reaches the bed");
+            for p in base.paths.iter().filter(|p| p.kind == PathKind::Support) {
+                for q in &p.points {
+                    assert!(
+                        q.x_mm() >= -1e-3 && q.x_mm() <= edge + 1e-3,
+                        "auto_center={auto_center}: base point x={:.2} is off the bed",
+                        q.x_mm()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn support_resting_on_the_part_ignores_the_brim() {
+        // A 20 mm block on the bed carries a shelf overhanging 6 mm all round,
+        // and a post on the shelf carries a cap. The cap's support lands on the
+        // shelf — inside the block's brim band, but on the PART, nowhere near the
+        // brim below — so it must stay; under the shelf the band stays empty.
+        let mut t = Vec::new();
+        push_box(&mut t, [40.0, 40.0, 0.0], [60.0, 60.0, 3.0]);
+        push_box(&mut t, [34.0, 34.0, 3.0], [66.0, 66.0, 4.0]);
+        push_box(&mut t, [45.0, 45.0, 4.0], [55.0, 55.0, 8.0]);
+        push_box(&mut t, [35.0, 35.0, 8.0], [65.0, 65.0, 9.0]);
+        let m = Mesh::from_triangle_soup(&t);
+        let with_brim = generate(&m, &grid_support(8, 0));
+        let without = generate(&m, &grid_support(0, 0));
+        // The band left of the block: within 3 mm of its x=40 face.
+        let mut band = Polygons::new();
+        band.push(Contour::new(vec![
+            Point::from_mm(37.2, 45.0),
+            Point::from_mm(39.5, 45.0),
+            Point::from_mm(39.5, 55.0),
+            Point::from_mm(37.2, 55.0),
+        ]));
+        let in_band = |l: &LayerPlan| intersection(&beads_of(l, PathKind::Support), &band).net_area_mm2();
+        let mut above = 0;
+        for (a, b) in with_brim.iter().zip(&without) {
+            if a.print_z_mm > 4.5 && a.print_z_mm < 7.5 {
+                above += 1;
+                let (kept, free) = (in_band(a), in_band(b));
+                assert!((kept - free).abs() < 0.5, "z {:.1}: shelf support {kept:.1} vs {free:.1} mm²", a.print_z_mm);
+            }
+            if a.print_z_mm < 2.5 {
+                assert!(in_band(a) < 0.01, "z {:.1}: support stands on the brim under the shelf", a.print_z_mm);
+            }
+        }
+        assert!(above > 5, "test setup: layers between shelf and cap");
+        let shelf_support: f64 = without.iter().filter(|l| l.print_z_mm > 4.5 && l.print_z_mm < 7.5).map(in_band).sum();
+        assert!(shelf_support > 10.0, "test setup: the cap's support crosses the band ({shelf_support:.1} mm²)");
+    }
+
+    #[test]
+    fn support_inside_a_hole_ignores_the_brim() {
+        // A square frame (a 20 mm hole through a 40 mm block) under a lid: the
+        // lid's support rises inside the hole, where no brim loop runs.
+        let mut t = Vec::new();
+        push_box(&mut t, [30.0, 30.0, 0.0], [70.0, 40.0, 10.0]);
+        push_box(&mut t, [30.0, 60.0, 0.0], [70.0, 70.0, 10.0]);
+        push_box(&mut t, [30.0, 40.0, 0.0], [40.0, 60.0, 10.0]);
+        push_box(&mut t, [60.0, 40.0, 0.0], [70.0, 60.0, 10.0]);
+        push_box(&mut t, [30.0, 30.0, 10.0], [70.0, 70.0, 11.0]);
+        let frame = Mesh::from_triangle_soup(&t);
+        let with_brim = generate(&frame, &grid_support(8, 0));
+        let without = generate(&frame, &grid_support(0, 0));
+        let mid = with_brim.len() / 3;
+        let inside = |l: &LayerPlan| intersection(&beads_of(l, PathKind::Support), &{
+            let mut hole = Polygons::new();
+            hole.push(Contour::new(vec![
+                Point::from_mm(40.0, 40.0),
+                Point::from_mm(60.0, 40.0),
+                Point::from_mm(60.0, 60.0),
+                Point::from_mm(40.0, 60.0),
+            ]));
+            hole
+        })
+        .net_area_mm2();
+        let (a, b) = (inside(&with_brim[mid]), inside(&without[mid]));
+        assert!(b > 50.0, "test setup: support fills the hole ({b:.0} mm²)");
+        assert!((a - b).abs() < 1.0, "the outer brim cut into the hole's support: {a:.0} vs {b:.0} mm²");
+    }
+
+    /// A 10 mm post carrying a 40 × 30 mm slab 10 mm up: a column wide enough
+    /// for a dozen support lines per layer.
+    fn post_and_table() -> Mesh {
+        let mut t = Vec::new();
+        push_box(&mut t, [40.0, 40.0, 0.0], [50.0, 50.0, 10.0]);
+        push_box(&mut t, [40.0, 40.0, 10.0], [80.0, 70.0, 12.0]);
+        Mesh::from_triangle_soup(&t)
+    }
+
+    #[test]
+    fn support_lines_join_into_zigzags() {
+        // Each line used to be its own path — a retract, wipe, hop and travel at
+        // both ends. Joined, a layer of the column is a serpentine or two.
+        let plans = generate(&post_and_table(), &grid_support(0, 0));
+        let layer = &plans[plans.len() / 4];
+        let open = layer.paths.iter().filter(|p| p.kind == PathKind::Support && !p.closed).count();
+        let lines: usize = layer
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Support && !p.closed)
+            .map(|p| p.points.len() / 2)
+            .sum();
+        assert!(lines >= 8, "test setup: a column of many lines ({lines})");
+        assert!(open <= 2, "{open} separate support strokes for {lines} lines — not joined");
+    }
+
+    #[test]
+    fn wide_support_drops_its_perimeter_loop_above_the_base() {
+        // Re-laid every layer, a loop round a wide block stacks into a thin
+        // closed wall that warps; the zigzag's turnarounds carry the edge
+        // instead — at most of a bead's flow, since in sparse support the gap
+        // a turnaround crosses is mostly empty. The base keeps its edge bead.
+        let plans = generate(&post_and_table(), &grid_support(0, 0));
+        assert!(
+            plans[0].paths.iter().any(|p| p.kind == PathKind::Support && p.closed),
+            "the base keeps its perimeter loop"
+        );
+        let column = &plans[plans.len() / 4];
+        assert!(count(column, PathKind::Support) > 0, "test setup: the column prints here");
+        assert!(
+            !column.paths.iter().any(|p| p.kind == PathKind::Support && p.closed),
+            "a wide column prints no perimeter loop"
+        );
+        let turns: Vec<f32> = column
+            .paths
+            .iter()
+            .filter(|p| p.kind == PathKind::Support)
+            .flat_map(|p| p.segs.iter().flatten())
+            .map(|s| s.flow)
+            .filter(|&f| f < 1.0)
+            .collect();
+        assert!(!turns.is_empty(), "test setup: the zigzag has turnarounds");
+        assert!(turns.iter().all(|&f| f > 0.8), "sparse turnarounds starved: {turns:?}");
+    }
+
+    #[test]
+    fn narrow_support_keeps_its_perimeter_loop() {
+        // A 4 mm lip off a wall: its support is a strip too narrow for two
+        // lines across, so the loop stays and makes it a tube.
+        let mut t = Vec::new();
+        push_box(&mut t, [40.0, 40.0, 0.0], [60.0, 60.0, 10.0]);
+        push_box(&mut t, [60.0, 40.0, 6.0], [64.0, 60.0, 7.0]);
+        let plans = generate(&Mesh::from_triangle_soup(&t), &grid_support(0, 0));
+        let column = plans.iter().find(|l| l.print_z_mm > 3.0 && count(l, PathKind::Support) > 0).unwrap();
+        assert!(
+            column.paths.iter().any(|p| p.kind == PathKind::Support && p.closed),
+            "the lip's thin support column lost its loop"
+        );
+    }
+
+    #[test]
+    fn support_interface_ramps_up_to_an_open_contact_layer() {
+        // Three interface layers under the slab: each denser than the one
+        // below, the contact layer ~70% — never a solid sheet.
+        let mut s = grid_support(0, 0);
+        s.support_interface_layers = 3;
+        let plans = generate(&post_and_table(), &s);
+        let sp = config::bead_spacing_mm(s.line_width_mm, s.layer_height_mm);
+        // Material density of a support layer, measured under the slab only.
+        let mut under = Polygons::new();
+        under.push(Contour::new(vec![
+            Point::from_mm(55.0, 43.0),
+            Point::from_mm(77.0, 43.0),
+            Point::from_mm(77.0, 67.0),
+            Point::from_mm(55.0, 67.0),
+        ]));
+        let density = |l: &LayerPlan| {
+            let mut len = 0.0;
+            for p in l.paths.iter().filter(|p| p.kind == PathKind::Support) {
+                let mut pts = p.points.clone();
+                if p.closed {
+                    pts.push(pts[0]);
+                }
+                // Only the length inside the window: a hairline stroke's area
+                // over its width.
+                for w in pts.windows(2) {
+                    len += intersection(&geo2d::stroke_open(w, 0.01), &under).net_area_mm2() / 0.02;
+                }
+            }
+            sp * len / under.net_area_mm2()
+        };
+        let top = plans.iter().rposition(|l| count(l, PathKind::Support) > 0).unwrap();
+        let d: Vec<f64> = (0..5).map(|k| density(&plans[top - k])).collect();
+        assert!(d[0] > 0.55 && d[0] < 0.85, "contact layer density {:.2}", d[0]);
+        assert!(d[0] > d[1] && d[1] > d[2] && d[2] > d[3], "interface must ramp: {d:.2?}");
+        assert!((d[3] - d[4]).abs() < 0.05, "below the ramp is the plain column: {d:.2?}");
+    }
+
+    #[test]
+    fn neighbouring_support_bases_never_overlap() {
+        // Two cantilevers tip to tip, 3 mm apart: each base's 2 mm lip reaches
+        // into the other's. The earlier part keeps the ground, the later base
+        // yields — nothing on the bed prints twice.
+        let mut ta = Vec::new();
+        push_box(&mut ta, [40.0, 40.0, 0.0], [50.0, 50.0, 10.0]);
+        push_box(&mut ta, [40.0, 40.0, 10.0], [70.0, 50.0, 12.0]);
+        let mut tb = Vec::new();
+        push_box(&mut tb, [93.0, 40.0, 0.0], [103.0, 50.0, 10.0]);
+        push_box(&mut tb, [73.0, 40.0, 10.0], [103.0, 50.0, 12.0]);
+        let (a, b) = (Mesh::from_triangle_soup(&ta), Mesh::from_triangle_soup(&tb));
+        let plans = generate_parts(&[(&a, 0), (&b, 1)], &grid_support(0, 0));
+        let base_of = |tool: u32| {
+            let mut fp = Polygons::new();
+            for p in plans[0].paths.iter().filter(|p| p.kind == PathKind::Support && p.tool == tool) {
+                let mut pts = p.points.clone();
+                if p.closed {
+                    pts.push(pts[0]);
+                }
+                fp = union(&fp, &geo2d::stroke_open(&pts, p.width_mm * 0.5));
+            }
+            fp
+        };
+        let (base_a, base_b) = (base_of(0), base_of(1));
+        assert!(base_a.net_area_mm2() > 100.0 && base_b.net_area_mm2() > 100.0, "test setup: both bases");
+        let twice = intersection(&base_a, &base_b).net_area_mm2();
+        assert!(twice < 0.01, "{twice:.2} mm² of support base printed twice");
+    }
+
+    #[test]
+    fn skirt_rings_the_support_base() {
+        let s = grid_support(0, 1);
+        let plans = generate(&post_and_cantilever(40.0), &s);
+        let base = beads_of(&plans[0], PathKind::Support);
+        let skirt: Vec<&ToolPath> = plans[0].paths.iter().filter(|p| p.kind == PathKind::Skirt).collect();
+        assert_eq!(skirt.len(), 1, "one closed loop around part and support");
+        // Clear of the base by the skirt gap, and around it — not through it.
+        let near = offset(&base, s.skirt_gap_mm - s.line_width_mm);
+        assert!(intersection(&beads_of(&plans[0], PathKind::Skirt), &near).is_empty(), "skirt crosses the support");
+        let ring = Contour::new(skirt[0].points.clone());
+        let base_points = plans[0].paths.iter().filter(|p| p.kind == PathKind::Support).flat_map(|p| &p.points);
+        assert!(base_points.clone().all(|q| ring.contains(*q)), "support base outside the skirt");
+    }
+
+    #[test]
+    fn skirt_stays_on_the_bed() {
+        // A part hard against the bed's edge: the skirt keeps its on-bed arcs.
+        let s = Settings { skirt_loops: 2, auto_center_on_bed: false, ..Settings::default() };
+        let mut t = Vec::new();
+        push_box(&mut t, [s.bed_size_x_mm - 11.0, 50.0, 0.0], [s.bed_size_x_mm - 1.0, 60.0, 5.0]);
+        let plans = generate(&Mesh::from_triangle_soup(&t), &s);
+        let skirt: Vec<&ToolPath> = plans[0].paths.iter().filter(|p| p.kind == PathKind::Skirt).collect();
+        assert!(skirt.len() >= 2 && skirt.iter().all(|p| !p.closed), "skirt loops should be cut to arcs");
+        for arc in &skirt {
+            // The whole bead stays on the bed, end caps included.
+            for q in &arc.points {
+                let edge = q.x_mm() + arc.width_mm * 0.5;
+                assert!(edge <= s.bed_size_x_mm + 1e-3, "skirt bead edge x={edge:.2} hangs off the bed");
+            }
+            let len: f64 = arc.points.windows(2).map(|w| pt_dist_mm(w[0], w[1])).sum();
+            assert!(len >= SKIRT_MIN_ARC_MM, "a {len:.1} mm skirt arc is too short to prime");
+        }
     }
 }

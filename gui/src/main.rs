@@ -5317,7 +5317,7 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.show_infill, "infill").on_hover_text("Show sparse interior infill.");
                     ui.checkbox(&mut self.show_ironing, "ironing").on_hover_text("Show the top-surface ironing pass.");
                     ui.checkbox(&mut self.show_skirt, "skirt").on_hover_text("Show skirt and brim.");
-                    ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support, bridge, and arc-overhang toolpaths.");
+                    ui.checkbox(&mut self.show_support, "support").on_hover_text("Show support and bridge toolpaths.");
                     ui.checkbox(&mut self.show_travel, "travel").on_hover_text("Show non-printing travel moves.");
                     ui.checkbox(&mut self.show_seams, "seams").on_hover_text("Highlight where each wall loop starts (the seam).");
                 });
@@ -6000,7 +6000,7 @@ impl eframe::App for App {
                     ui.add_enabled_ui(!vase, |ui| {
                         revert_row(ui, &mut s.support_mode, &self.baseline.support_mode, |ui, v| {
                             support_combo(ui, v)
-                                .on_hover_text("Overhang handling: none, grid supports, or self-supporting arcs.")
+                                .on_hover_text("Overhang handling: none, or grid supports.")
                                 .on_disabled_hover_text("Forced off in spiral vase mode.");
                         });
                     });
@@ -6011,11 +6011,11 @@ impl eframe::App for App {
                     });
                     revert_row(ui, &mut s.support_density, &self.baseline.support_density, |ui, v| {
                         hslider(ui, has_support, egui::Slider::new(v, 0.0..=1.0), "density",
-                            "Infill density of grid supports.");
+                            "Infill density of grid supports. Where support meets the bed, its first layer always prints as a dense base (90%) spread 2 mm past the column, so it grips the bed instead of peeling.");
                     });
                     revert_row(ui, &mut s.support_xy_clearance_mm, &self.baseline.support_xy_clearance_mm, |ui, v| {
                         hslider(ui, has_support, egui::Slider::new(v, 0.0..=2.0), "xy gap mm",
-                            "Horizontal gap between support and the model (for easy removal).");
+                            "Horizontal gap between support and the model, and between support and the brim (for easy removal).");
                     });
                     revert_row(ui, &mut s.support_z_gap_layers, &self.baseline.support_z_gap_layers, |ui, v| {
                         hslider(ui, has_support, egui::Slider::new(v, 0..=5), "z-gap layers",
@@ -6023,7 +6023,7 @@ impl eframe::App for App {
                     });
                     revert_row(ui, &mut s.support_interface_layers, &self.baseline.support_interface_layers, |ui, v| {
                         hslider(ui, has_support, egui::Slider::new(v, 0..=5), "interface",
-                            "Dense solid layers at the support top for a smoother overhang underside.");
+                            "Layers at the support top that ramp from the support's density up to a 70% contact layer under the overhang: a smooth underside that still releases, with no solid sheet pulling the support up. 0 = none.");
                     });
                     revert_row(ui, &mut s.max_bridge_span_mm, &self.baseline.max_bridge_span_mm, |ui, v| {
                         hslider(ui, !vase, egui::Slider::new(v, 0.0..=30.0), "bridge span mm",
@@ -6037,7 +6037,7 @@ impl eframe::App for App {
                 tier_section(ui, "Bed adhesion", TierKind::Process, false, |ui| {
                     revert_row(ui, &mut s.skirt_loops, &self.baseline.skirt_loops, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 0..=5), "skirt loops",
-                            "Loops printed around the first layer to prime the nozzle. 0 = off.");
+                            "Loops printed around everything on the first layer — the model and any support base — to prime the nozzle. Stretches that would leave the bed are dropped. 0 = off.");
                     });
                     revert_row(ui, &mut s.skirt_gap_mm, &self.baseline.skirt_gap_mm, |ui, v| {
                         hslider(ui, s.skirt_loops > 0, egui::Slider::new(v, 0.0..=10.0), "skirt gap mm",
@@ -6045,7 +6045,7 @@ impl eframe::App for App {
                     });
                     revert_row(ui, &mut s.brim_loops, &self.baseline.brim_loops, |ui, v| {
                         hslider(ui, true, egui::Slider::new(v, 0..=20), "brim loops",
-                            "Loops attached around the first layer for adhesion. 0 = off.");
+                            "Loops attached around the first layer for adhesion. Support keeps its xy gap from the brim and never stands on it, so both peel away separately. 0 = off.");
                     });
                 });
                 tier_section(ui, "Retraction", TierKind::Printer, false, |ui| {
