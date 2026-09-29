@@ -5419,7 +5419,7 @@ impl eframe::App for App {
                     let tip = "Paint tool-color regions on the model. Click a spot to smart-fill \
                          (crease-bounded); drag to freehand brush; drag empty space orbits. \
                          Boundaries resolve at bead resolution when you slice.";
-                    if ui.add(egui::Button::selectable(self.paint_mode, "🖌 paint")).on_hover_text(tip).clicked() {
+                    if ui.add(egui::Button::selectable(self.paint_mode, "🎨 paint")).on_hover_text(tip).clicked() {
                         self.paint_mode = !self.paint_mode;
                         // Entering/leaving paint mode toggles bead subdivision, so
                         // rebuild the sliced beads (kept ready for a Preview switch).
@@ -7426,21 +7426,44 @@ impl eframe::App for App {
                                             ui.weak(format!("{m:.0} min printing"));
                                         }
                                         ui.separator();
-                                        let temp_row = |ui: &mut egui::Ui, what: &str, v: Option<(f64, f64)>| {
-                                            if let Some((now, target)) = v {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(what);
-                                                    ui.label(
-                                                        egui::RichText::new(format!("{now:.0} °C")).strong(),
-                                                    );
-                                                    if target > 0.0 {
-                                                        ui.weak(format!("→ {target:.0}"));
-                                                    }
-                                                });
-                                            }
+                                        // Reading, then the target it is heading
+                                        // for. The separator is a plain slash (the
+                                        // printer-panel convention): an arrow isn't
+                                        // in the UI font and drew as a box.
+                                        let temp_row = |ui: &mut egui::Ui, what: &str, now: f64, target: Option<f64>, tenths: bool| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(what);
+                                                let reading = if tenths { format!("{now:.1} °C") } else { format!("{now:.0} °C") };
+                                                ui.label(egui::RichText::new(reading).strong());
+                                                if let Some(target) = target.filter(|&t| t > 0.0) {
+                                                    ui.weak(format!("/ {target:.0}"));
+                                                }
+                                            });
                                         };
-                                        temp_row(ui, "nozzle", st.nozzle);
-                                        temp_row(ui, "bed", st.bed);
+                                        for (what, v) in [("nozzle", st.nozzle), ("bed", st.bed)] {
+                                            if let Some((now, target)) = v {
+                                                temp_row(ui, what, now, Some(target), false);
+                                            }
+                                        }
+                                        if let Some(now) = st.chamber {
+                                            // A bare sensor has no target of its
+                                            // own; the job's soak floor is the one
+                                            // that matters — it holds the print
+                                            // until the chamber gets there.
+                                            let object = format!("temperature_sensor {}", self.settings.chamber_sensor.trim());
+                                            let floor = self.job.as_ref().and_then(|j| {
+                                                j.timeline
+                                                    .temperature_waits
+                                                    .iter()
+                                                    .find(|w| w.sensor.eq_ignore_ascii_case(&object))?
+                                                    .minimum
+                                            });
+                                            // In tenths: a soak creeps up its
+                                            // last degree for minutes, and a
+                                            // rounded "40 / 40" would claim it
+                                            // done while the print still waits.
+                                            temp_row(ui, "chamber", now, floor.map(f64::from), true);
+                                        }
                                         if let Some(f) = st.fan {
                                             ui.horizontal(|ui| {
                                                 ui.label("part fan");
@@ -7745,7 +7768,8 @@ impl eframe::App for App {
                 }),
                 HostOp::Status => {
                     self.last_status_poll = Some(std::time::Instant::now());
-                    self.spawn_host_op(&ctx, true, |c| HostReply::Status(c.print_status()));
+                    let chamber_sensor = self.settings.chamber_sensor.clone();
+                    self.spawn_host_op(&ctx, true, move |c| HostReply::Status(c.print_status(&chamber_sensor)));
                 }
                 HostOp::Circulate { on } => self.spawn_host_op(&ctx, false, move |c| {
                     let script = if on { "M106 P2 S153" } else { "M106 P2 S0" };

@@ -46,6 +46,9 @@ pub struct PrintStatus {
     /// against a file we sliced ourselves. Runs AHEAD of the plastic: the
     /// reader fills a buffer the motion queue then drains.
     pub file_position: u64,
+    /// The chamber's temperature (°C), when the printer declares a chamber
+    /// sensor — a bare sensor, so no target of its own.
+    pub chamber: Option<f64>,
     /// Where the nozzle is RIGHT NOW (mm), queue-corrected — Klipper's
     /// `motion_report.live_position`, the one position report that isn't
     /// ahead of the deposited material. `toolhead.position` is the end of
@@ -142,11 +145,17 @@ impl Client {
     }
 
     /// Current print state / file / progress / temperatures — one round trip.
-    pub fn print_status(&self) -> Result<PrintStatus, String> {
-        let v = self.call(
-            "GET",
-            "/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan&motion_report",
-        )?;
+    /// `chamber_sensor` is the printer's declared Klipper sensor name (empty
+    /// when it declares none), read as `temperature_sensor <name>`.
+    pub fn print_status(&self, chamber_sensor: &str) -> Result<PrintStatus, String> {
+        let mut query =
+            "/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan&motion_report".to_string();
+        let chamber_object = format!("temperature_sensor {}", chamber_sensor.trim());
+        if !chamber_sensor.trim().is_empty() {
+            query.push('&');
+            query.push_str(&chamber_object.replace(' ', "%20"));
+        }
+        let v = self.call("GET", &query)?;
         let status = &v["result"]["status"];
         let pair = |o: &serde_json::Value| {
             o["temperature"].as_f64().map(|t| (t, o["target"].as_f64().unwrap_or(0.0)))
@@ -161,6 +170,7 @@ impl Client {
             print_duration_s: status["print_stats"]["print_duration"].as_f64().unwrap_or(0.0),
             total_duration_s: status["print_stats"]["total_duration"].as_f64().unwrap_or(0.0),
             file_position: status["virtual_sdcard"]["file_position"].as_u64().unwrap_or(0),
+            chamber: status[chamber_object.as_str()]["temperature"].as_f64(),
             live_pos: status["motion_report"]["live_position"].as_array().and_then(|a| {
                 Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])
             }),
@@ -425,11 +435,23 @@ mod tests {
             "{\"result\": {\"status\": {\"print_stats\": {\"state\": \"printing\", \"filename\": \"a.gcode\"}, \"virtual_sdcard\": {\"progress\": 0.42}}}}",
         );
         let client = Client::new(&addr, "");
-        let st = client.print_status().unwrap();
+        let st = client.print_status("").unwrap();
         assert_eq!(st.state, "printing");
         assert_eq!(st.filename, "a.gcode");
         assert!((st.progress - 0.42).abs() < 1e-9);
+        assert_eq!(st.chamber, None, "no chamber sensor declared, none read");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn status_reads_the_declared_chamber_sensor() {
+        let (addr, server) = one_shot(
+            "{\"result\": {\"status\": {\"print_stats\": {\"state\": \"printing\"}, \"temperature_sensor chamber_temp\": {\"temperature\": 35.8}}}}",
+        );
+        let st = Client::new(&addr, "").print_status("chamber_temp").unwrap();
+        assert_eq!(st.chamber, Some(35.8));
+        let req = server.join().unwrap();
+        assert!(req.contains("&temperature_sensor%20chamber_temp"), "sensor not queried: {}", &req[..160]);
     }
 
     #[test]

@@ -117,6 +117,42 @@ pub struct Timeline {
     pub layers: Vec<Layer>,
     /// Total seconds the timeline spans.
     pub seconds: f32,
+    /// Every `TEMPERATURE_WAIT` the file blocks on, in file order.
+    pub temperature_waits: Vec<TemperatureWait>,
+}
+
+/// A `TEMPERATURE_WAIT` in the file: which sensor it watches and the bounds it
+/// holds for — a chamber soak's floor, typically. A bare sensor has no target
+/// of its own, so this is what a mirror shows as one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemperatureWait {
+    /// Klipper's object name as written, e.g. `temperature_sensor chamber`.
+    pub sensor: String,
+    pub minimum: Option<f32>,
+    pub maximum: Option<f32>,
+}
+
+impl TemperatureWait {
+    /// Read `TEMPERATURE_WAIT SENSOR=… [MINIMUM=…] [MAXIMUM=…]`. A sensor
+    /// name holding a space comes quoted (`"temperature_sensor chamber"`),
+    /// which is why this doesn't go through the word splitter.
+    fn parse(code: &str) -> Option<TemperatureWait> {
+        let upper = code.to_ascii_uppercase();
+        let rest = &code[upper.find("SENSOR=")? + "SENSOR=".len()..];
+        let sensor = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next()?,
+            None => rest.split_whitespace().next()?,
+        };
+        let bound = |key: &str| {
+            let at = upper.find(key)? + key.len();
+            code[at..].split_whitespace().next()?.parse::<f32>().ok()
+        };
+        Some(TemperatureWait {
+            sensor: sensor.trim().to_string(),
+            minimum: bound("MINIMUM="),
+            maximum: bound("MAXIMUM="),
+        })
+    }
 }
 
 /// Machine state carried across lines while parsing.
@@ -332,6 +368,10 @@ impl Parser {
         let mut words = code.split_whitespace();
         let Some(cmd) = words.next() else { return };
         let cmd = cmd.to_ascii_uppercase();
+        if cmd == "TEMPERATURE_WAIT" {
+            tl.temperature_waits.extend(TemperatureWait::parse(code));
+            return;
+        }
         // A word is a letter plus a number; anything unparseable is skipped,
         // which is what keeps macros and firmware-specific lines harmless.
         let mut w = [f64::NAN; 8]; // X Y Z E F S P T
@@ -1105,6 +1145,28 @@ impl Playhead {
     /// Start over (a new job, or a job that stopped).
     pub fn reset(&mut self) {
         *self = Playhead::default();
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn temperature_waits_are_read_from_the_file() {
+        let tl = Timeline::parse(
+            b"TEMPERATURE_WAIT SENSOR=\"temperature_sensor chamber_temp\" MINIMUM=40\n\
+              temperature_wait sensor=extruder maximum=60.5\n\
+              G1 X10 Y10 F3000\n",
+        );
+        assert_eq!(
+            tl.temperature_waits,
+            vec![
+                TemperatureWait { sensor: "temperature_sensor chamber_temp".into(), minimum: Some(40.0), maximum: None },
+                TemperatureWait { sensor: "extruder".into(), minimum: None, maximum: Some(60.5) },
+            ]
+        );
+        assert_eq!(tl.moves.len(), 1, "a wait is not a move");
     }
 }
 
