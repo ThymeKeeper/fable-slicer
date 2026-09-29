@@ -206,9 +206,126 @@ struct JobMirror {
     /// wipe, and running the head through the first layers during those
     /// draws a print that hasn't started.
     locked: bool,
+    /// Index of the file's first extruding move. Only a nozzle seen on the
+    /// path from here on can lock the mirror: the start g-code parks the head
+    /// on its own moves (a nozzle waiting out the heat-up sits exactly on the
+    /// file's opening travel), and locking there walks the print while the
+    /// machine is still heating.
+    first_extrusion: usize,
+    /// Extruding moves before each move (one more entry than moves): which
+    /// drawn segment the nozzle is laying — each extruding move is exactly
+    /// one source segment of the mirrored plans.
+    ext_prefix: Vec<u32>,
+    /// The longest the machine has said this job has been running. A reading
+    /// that comes back shorter is a new job under the same file name.
+    total_seen: f64,
     /// Byte offset of the start of each source line, so `Move::at_byte` can be
     /// turned into a line number for the hover readout.
     line_starts: Vec<u32>,
+}
+
+/// Where the machine really is on a mirrored job's timeline, if a reading can
+/// be believed: the phase it may steer the playhead by. `live` is the
+/// machine's reported nozzle position, `t_read` where its file reader has got
+/// to (the anchor the search runs back from), `extruded` whether Klipper's
+/// print clock has started — it stays at zero until the job's first
+/// extrusion, through homing, probing, heating and the nozzle wipe.
+///
+/// A mirror that isn't tracking yet believes only the print itself: a nozzle
+/// that has extruded and sits on the path from the file's first extrusion on.
+/// The start g-code's own moves prove nothing — the head parks on them to wait
+/// out the heat-up — and believing one walked the model while the machine sat
+/// still, then dragged it back to start over at the next reading.
+fn believed_phase(
+    tl: &gcode::Timeline,
+    first_extrusion: usize,
+    live: Option<[f64; 3]>,
+    t_read: f32,
+    extruded: bool,
+    tracking: bool,
+) -> Option<f32> {
+    let p = live?;
+    let (t, off) = tl.locate([p[0] as f32, p[1] as f32, p[2] as f32], t_read, 30.0)?;
+    if off >= 1.5 {
+        return None;
+    }
+    if !tracking && !(extruded && tl.move_at_time(t) >= first_extrusion) {
+        return None;
+    }
+    Some(t)
+}
+
+/// How much of a mirrored print is on the bed at playhead time `t`: the
+/// bead, cap and seam-marker instance counts to draw, and the bead the nozzle
+/// is laying — its instance index and how much of its length is down.
+#[derive(Debug, PartialEq)]
+struct Reveal {
+    count: u32,
+    joint_count: u32,
+    cap_count: u32,
+    live: Option<(usize, f32)>,
+}
+
+/// Every extruding move before the one at `t` is laid, and that one (if it
+/// extrudes) as far as the nozzle has got along it. Counted through the bead
+/// INDEX, never one bead per move: a filleted corner draws as several
+/// instances and a zero-length segment as none, and a plain count drifts
+/// ahead of the nozzle or behind it by exactly those — beads appearing before
+/// it arrives, or not until the layer is done. `None` when the index doesn't
+/// describe these plans (one source segment per extruding move).
+fn reveal(
+    tl: &gcode::Timeline,
+    ext_prefix: &[u32],
+    index: &BeadIndex,
+    beads: &[[f32; 17]],
+    origin_x: f32,
+    t: f32,
+) -> Option<Reveal> {
+    if tl.moves.is_empty() || index.seg_ends.len() != *ext_prefix.last()? as usize {
+        return None;
+    }
+    let (pos, mv) = tl.at(t);
+    let m = tl.moves[mv];
+    let done = ext_prefix[mv] as usize;
+    let frac = if m.extruding {
+        let t0 = if mv == 0 { 0.0 } else { tl.moves[mv - 1].t_end };
+        let span = m.t_end - t0;
+        if span > 1.0e-6 { ((t - t0) / span).clamp(0.0, 1.0) } else { 1.0 }
+    } else {
+        0.0
+    };
+    let lo = if done == 0 { 0 } else { index.seg_ends[done - 1] as usize };
+    let hi = if m.extruding { index.seg_ends.get(done).map_or(lo, |&e| e as usize) } else { lo };
+    let hi = hi.min(beads.len());
+    // The bead in progress grows with the nozzle: laid up to where the nozzle
+    // projects onto this move's instances. Projected rather than measured off
+    // as a fraction of their length, because rounding a corner trims the
+    // segments either side of it and a fraction then lands short of the
+    // nozzle all along the straight.
+    let (px, py) = (pos[0] + origin_x, pos[1]);
+    let mut best: Option<(f32, usize, f32)> = None; // (distance², instance, laid)
+    for (k, b) in beads.iter().enumerate().take(hi).skip(lo) {
+        let u = ((px - b[0]) * b[3] + (py - b[1]) * b[4]).clamp(0.0, b[5]);
+        let (ex, ey) = (b[0] + b[3] * u - px, b[1] + b[4] * u - py);
+        let d2 = ex * ex + ey * ey;
+        // Ties (where one instance hands over to the next) go to the later.
+        if best.is_none_or(|(bd, ..)| d2 <= bd + 1.0e-6) {
+            best = Some((d2, k, u));
+        }
+    }
+    let (count, live) = match best {
+        Some((_, k, u)) if u >= beads[k][5] - 1.0e-4 => (k as u32 + 1, None),
+        Some((_, k, u)) if u > 1.0e-3 => (k as u32 + 1, Some((k, u))),
+        Some((_, k, _)) => (k as u32, None),
+        None => (lo as u32, None),
+    };
+    let progress = done as f32 + frac;
+    Some(Reveal {
+        count,
+        joint_count: index.joint_at.partition_point(|&at| at <= progress) as u32,
+        cap_count: index.cap_at.partition_point(|&at| at <= progress) as u32,
+        live,
+    })
 }
 
 /// What the preview colors encode.
@@ -1932,6 +2049,12 @@ struct App {
     /// to be still over the viewport.
     hover_pick: Option<((i32, i32, u8, usize, u64), Option<String>)>,
     /// Cumulative bead-instance count after each layer (for the layer slider).
+    /// Where each source segment's beads sit in the instance buffer, and when
+    /// caps and seam markers appear — what a mirrored print reveals by.
+    bead_index: BeadIndex,
+    /// The bead instance currently cut short at the nozzle (a mirrored print's
+    /// bead in progress), so it can be restored once the nozzle moves on.
+    live_bead: Option<usize>,
     layer_ends: Vec<u32>,
     /// Cumulative joint-blob count after each layer.
     joint_layer_ends: Vec<u32>,
@@ -2232,6 +2355,8 @@ impl App {
             bed_overlay_rect: None,
             own_gcode: None,
             hover_pick: None,
+            bead_index: BeadIndex::default(),
+            live_bead: None,
             layer_ends: Vec::new(),
             joint_layer_ends: Vec::new(),
             cap_layer_ends: Vec::new(),
@@ -3739,7 +3864,7 @@ impl App {
         let Some(layers) = self.preview_plans() else { return };
         let hop = self.settings.z_hop_mm;
         let layer_colors = self.layer_color_table();
-        let (verts, ends, joints, joint_ends, caps, cap_ends) = build_instances(
+        let (verts, ends, joints, joint_ends, caps, cap_ends, bead_index) = build_instances(
             layers,
             hop as f32,
             layer_colors.as_deref(),
@@ -3760,6 +3885,7 @@ impl App {
         self.layer_ends = ends;
         self.joint_layer_ends = joint_ends;
         self.cap_layer_ends = cap_ends;
+        self.bead_index = bead_index;
     }
 
     /// Take a fresh bead instance buffer (from `build_instances` — pristine
@@ -3774,6 +3900,7 @@ impl App {
         self.bead_pristine = verts;
         self.replay_bead_dabs();
         self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+        self.live_bead = None;
     }
 
     /// Rebuild the working bead buffer from pristine and re-apply every dab in
@@ -3823,6 +3950,7 @@ impl App {
     fn commit_paint_stroke(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         if self.sliced.is_some() && !self.bead_pristine.is_empty() {
             self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+            self.live_bead = None;
             self.content_version += 1;
             self.refresh_bead_summary();
         }
@@ -3881,6 +4009,7 @@ impl App {
         }
         self.replay_bead_dabs();
         self.scene.set_toolpaths(&rs.device, &rs.queue, &self.bead_inst);
+        self.live_bead = None;
         self.content_version += 1;
     }
 
@@ -4551,8 +4680,21 @@ impl eframe::App for App {
                         // is the playback rate (see gcode::Playhead).
                         if let Ok(st) = &st {
                             let running = st.state == "printing" || st.state == "paused";
+                            // The same file name can start over — cancel,
+                            // re-slice, re-send. Its job clock restarts, and
+                            // the mirror must fetch the file again rather than
+                            // walk the old one's path.
+                            let restarted = self
+                                .job
+                                .as_ref()
+                                .is_some_and(|j| st.total_duration_s + 5.0 < j.total_seen);
+                            if restarted {
+                                self.job = None;
+                                self.job_wanted = None;
+                            }
                             match &mut self.job {
                                 Some(job) if running && job.filename == st.filename => {
+                                    job.total_seen = job.total_seen.max(st.total_duration_s);
                                     // Where the machine REALLY is. Its live
                                     // position is queue-corrected, so unlike
                                     // the file position (which is the reader,
@@ -4580,24 +4722,26 @@ impl eframe::App for App {
                                     // "the head is seconds ahead", which
                                     // stalls it. A bad match is better
                                     // ignored: the rate is already learned,
-                                    // so free-running is nearly right.
-                                    let phase = st
-                                        .live_pos
-                                        .and_then(|p| {
-                                            let p = [p[0] as f32, p[1] as f32, p[2] as f32];
-                                            job.timeline.locate(p, t_read, 30.0)
-                                        })
-                                        .filter(|&(_, off)| off < 1.5)
-                                        .map(|(t, _)| t);
-                                    // Seeing the nozzle on the path is what
-                                    // says the file is under way; before that
-                                    // the machine is heating and wiping, and
-                                    // the head belongs at the start.
-                                    if phase.is_some() {
-                                        job.locked = true;
-                                    }
+                                    // so free-running is nearly right. And
+                                    // until the print's own first extrusion
+                                    // nothing is believed (believed_phase).
+                                    let extruded = st.print_duration_s > 0.0;
+                                    let phase = believed_phase(
+                                        &job.timeline,
+                                        job.first_extrusion,
+                                        st.live_pos,
+                                        t_read,
+                                        extruded,
+                                        job.locked,
+                                    );
+                                    job.locked |= phase.is_some();
                                     let before = job.head.t;
-                                    job.head.sync(st.print_duration_s as f32, t_read, phase);
+                                    // Nothing to learn from a clock that isn't
+                                    // running yet: the rate's first reference
+                                    // must be taken once it is.
+                                    if extruded {
+                                        job.head.sync(st.print_duration_s as f32, t_read, phase);
+                                    }
                                     if self.sync_log {
                                         let m = st.live_pos.and_then(|p| {
                                             let p = [p[0] as f32, p[1] as f32, p[2] as f32];
@@ -4659,6 +4803,16 @@ impl eframe::App for App {
                                     &timeline,
                                     self.settings.filament_diameter_mm,
                                 );
+                                let mut ext_prefix = Vec::with_capacity(timeline.moves.len() + 1);
+                                ext_prefix.push(0u32);
+                                for m in &timeline.moves {
+                                    ext_prefix.push(ext_prefix.last().unwrap() + m.extruding as u32);
+                                }
+                                let first_extrusion = timeline
+                                    .moves
+                                    .iter()
+                                    .position(|m| m.extruding)
+                                    .unwrap_or(timeline.moves.len());
                                 self.job_gen += 1;
                                 self.job = Some(JobMirror {
                                     filename,
@@ -4667,6 +4821,9 @@ impl eframe::App for App {
                                     head: gcode::Playhead::default(),
                                     ticked: std::time::Instant::now(),
                                     locked: false,
+                                    first_extrusion,
+                                    ext_prefix,
+                                    total_seen: 0.0,
                                     line_starts,
                                 });
                                 // Sync on the next poll rather than guessing.
@@ -6654,6 +6811,9 @@ impl eframe::App for App {
                 // the nozzle is. Everything drawn has been printed, so nothing
                 // dims.
                 let mut nozzle_at: Option<[f32; 3]> = None;
+                // The bead the nozzle is laying: instance index, and how much of
+                // its length is down.
+                let mut live: Option<(usize, f32)> = None;
                 if self.view == ViewMode::Machine {
                     // Before the file's own motion begins — homing, heating,
                     // a nozzle wipe — the hotend still belongs on screen,
@@ -6675,37 +6835,30 @@ impl eframe::App for App {
                     if let Some(job) = self.job.as_ref().filter(|j| j.locked) {
                         let (pos, mv) = job.timeline.at(job.head.t);
                         let li = job.timeline.layer_of(mv);
-                        // How much of the layer exists is a count of BEADS, not
-                        // a fraction of its time: a layer spends much of itself
-                        // travelling, and time-fraction drifts the drawn print
-                        // ahead of and behind the nozzle within every layer.
-                        // Each extruding move became exactly one bead segment
-                        // in plans_from_timeline, so counting them is exact.
-                        let first = job.timeline.layers[li].first_move as usize;
-                        let laid = job.timeline.moves[first..=mv.max(first)]
-                            .iter()
-                            .filter(|m| m.extruding)
-                            .count() as u32;
-                        let span = |ends: &[u32]| -> u32 {
-                            let a = if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
-                            let b = ends.get(li).copied().unwrap_or(a);
-                            (a + laid).min(b)
-                        };
-                        count = span(&self.layer_ends);
-                        // Joints (bead ends and corners) have no such 1:1 move,
-                        // so they ride the same proportion of their own layer.
-                        let layer_frac = {
-                            let a = if li == 0 { 0 } else { self.layer_ends.get(li - 1).copied().unwrap_or(0) };
-                            let b = self.layer_ends.get(li).copied().unwrap_or(a);
-                            if b > a { (count - a) as f32 / (b - a) as f32 } else { 1.0 }
-                        };
-                        let ride = |ends: &[u32]| -> u32 {
-                            let a = if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
-                            let b = ends.get(li).copied().unwrap_or(a);
-                            a + ((b - a) as f32 * layer_frac) as u32
-                        };
-                        joint_count = ride(&self.joint_layer_ends);
-                        cap_count = ride(&self.cap_layer_ends);
+                        match reveal(
+                            &job.timeline,
+                            &job.ext_prefix,
+                            &self.bead_index,
+                            &self.bead_inst,
+                            self.preview_origin_x(),
+                            job.head.t,
+                        ) {
+                            Some(r) => {
+                                count = r.count;
+                                joint_count = r.joint_count;
+                                cap_count = r.cap_count;
+                                live = r.live;
+                            }
+                            None => {
+                                // An index that doesn't describe these plans yet
+                                // (it is rebuilt with the beads, a frame behind
+                                // a new job): the finished layers and no more.
+                                let below = |ends: &[u32]| if li == 0 { 0 } else { ends.get(li - 1).copied().unwrap_or(0) };
+                                count = below(&self.layer_ends);
+                                joint_count = below(&self.joint_layer_ends);
+                                cap_count = below(&self.cap_layer_ends);
+                            }
+                        }
                         current_layer = (li + 1) as f32;
                         dim = 1.0;
                         // The hotend itself, parked with its tip on the bead
@@ -6714,6 +6867,27 @@ impl eframe::App for App {
                         // multi-bed layout.
                         nozzle_at = Some([pos[0] + self.preview_origin_x(), pos[1], pos[2]]);
                     }
+                }
+                // Cut the bead in progress short at the nozzle, and put the one
+                // before it back whole once the nozzle has moved on. Rewritten
+                // in place every frame: 68 bytes against a rebuild.
+                if let Some(prev) = self.live_bead.filter(|&p| live.map(|(k, _)| k) != Some(p)) {
+                    if let Some(b) = self.bead_inst.get(prev) {
+                        self.scene.patch_bead(&rs.queue, prev, b);
+                    }
+                    self.live_bead = None;
+                }
+                if let Some((k, laid)) = live {
+                    let mut b = self.bead_inst[k];
+                    let full = b[5].max(1.0e-6);
+                    b[5] = laid;
+                    // Width where it is cut, and the cut end squared to the
+                    // bead's own direction rather than welded to a neighbour
+                    // that isn't printed yet.
+                    b[7] = b[6] + (b[7] - b[6]) * (laid / full);
+                    b[16] = b[4].atan2(b[3]);
+                    self.scene.patch_bead(&rs.queue, k, &b);
+                    self.live_bead = Some(k);
                 }
                 // Park (or hide) the hotend. Rebuilt in world coordinates when
                 // it moves — a few hundred vertices, cheaper than threading a
@@ -8343,7 +8517,29 @@ const CAT_SURFACE: f32 = 9.0;
 /// each with a cumulative per-layer count for the layer slider.
 /// Bead:  `[p0.xyz, dir.xy, len, width, height, r, g, b, layer, category]`.
 /// Joint: `[p.xyz, width, height, r, g, b, layer, category]`.
-type Instances = (Vec<[f32; 17]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>);
+type Instances = (Vec<[f32; 17]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>, Vec<[f32; 12]>, Vec<u32>, BeadIndex);
+
+/// Where the drawn beads of each source segment sit in the instance buffer,
+/// and when each cap and seam marker belongs on screen — what lets a mirrored
+/// print reveal exactly the plastic the nozzle has laid. Rendering does not
+/// keep one instance per segment: corners become several fillet spans, a
+/// zero-length segment draws nothing, a painted bead is subdivided. So the
+/// buffer is indexed rather than assumed.
+///
+/// Positions are measured in SEGMENTS along the whole print, in source order
+/// (layer, path, segment): `p` = segments finished plus the fraction of the
+/// one in progress.
+#[derive(Default)]
+struct BeadIndex {
+    /// Per source segment: the instance count once its beads are all laid.
+    seg_ends: Vec<u32>,
+    /// Per cap instance, in buffer order: the position `p` it appears at — a
+    /// path's start cap as its first segment begins, its end cap once its
+    /// last segment is done.
+    cap_at: Vec<f32>,
+    /// Per joint instance (seam markers), in buffer order: likewise.
+    joint_at: Vec<f32>,
+}
 
 /// The active metric mapped to per-path colors — or `None` in feature mode
 /// (`build_instances` then colors by path kind). Filament = each path's tool
@@ -8439,7 +8635,7 @@ fn finish_slice(
         toolchanges,
     };
     let color_table = build_color_table(&layers, color_by, settings, accent, &layer_stats);
-    let (verts, ends, joints, joint_ends, caps, cap_ends) =
+    let (verts, ends, joints, joint_ends, caps, cap_ends, _) =
         build_instances(&layers, z_hop, color_table.as_deref(), accent, origin_x, None);
     SliceOutput { layers, geo, summary, layer_stats, verts, ends, joints, joint_ends, caps, cap_ends }
 }
@@ -8704,6 +8900,10 @@ fn build_instances(
     let seam_color = hsl_to_rgb(ah + 180.0, (as_ * 0.90).clamp(0.0, 0.9), 0.55);
     let travel_dim = 0.08_f32;
     let mut prev_end: Option<geo2d::Point> = None;
+    let mut index = BeadIndex::default();
+    // A cap or marker that shows as soon as its path begins sits a hair past
+    // the path's first segment boundary.
+    const BEGUN: f32 = 1.0e-3;
 
     for (li, layer) in layers.iter().enumerate() {
         let layer_id = (li + 1) as f32; // 1-based, matches preview_layer
@@ -8806,12 +9006,29 @@ fn build_instances(
                     }
                 })
                 .collect();
+            // Source segments in this path, and where each one's instances end
+            // (a fillet's spans belong to the segment leaving its corner).
+            let n_segs = if path.closed { n_pts } else { n_pts - 1 };
+            let seg_base = index.seg_ends.len();
+            let path_start = inst.len() as u32;
+            index.seg_ends.resize(seg_base + n_segs, u32::MAX);
             for k in 0..spans {
                 let (p0, w0, seg) = rp[k];
                 let (p1, w1, _) = rp[(k + 1) % m];
                 let (sc, scat) = seg_cc(seg);
                 push_bead(&mut inst, origin_x, p0, p1, zc, w0, bh, sc, layer_id, scat, tool, max_seg, vtx_tang[k], vtx_tang[(k + 1) % m], w1);
+                index.seg_ends[seg_base + seg.min(n_segs - 1)] = inst.len() as u32;
             }
+            // A segment that drew nothing (zero length) ends where its
+            // predecessor did.
+            let mut last = path_start;
+            for end in &mut index.seg_ends[seg_base..] {
+                if *end == u32::MAX {
+                    *end = last;
+                }
+                last = *end;
+            }
+            let (path_begun, path_done) = (seg_base as f32 + BEGUN, (seg_base + n_segs) as f32);
             // End caps on open paths (extrusion only — travels stay bare):
             // a half-dome at each end's own width, rotated to point OUT along
             // the end tangent, whose base hexagon lands exactly on the tube's
@@ -8820,9 +9037,10 @@ fn build_instances(
             if !path.closed {
                 let out_start = vtx_tang[0] + std::f32::consts::PI;
                 let out_end = vtx_tang[m - 1];
-                for &(vi, seg, ang) in
-                    &[(0usize, 0usize, out_start), (m - 1, n_pts.saturating_sub(2), out_end)]
-                {
+                for &(vi, seg, ang, at) in &[
+                    (0usize, 0usize, out_start, path_begun),
+                    (m - 1, n_pts.saturating_sub(2), out_end, path_done),
+                ] {
                     let (p, pw, _) = rp[vi];
                     let (sc, scat) = seg_cc(seg);
                     caps.push([
@@ -8831,6 +9049,7 @@ fn build_instances(
                         sc[0], sc[1], sc[2],
                         layer_id, scat, tool,
                     ]);
+                    index.cap_at.push(at);
                 }
             }
             // Highlight the external-perimeter seam (loop start) with a larger
@@ -8857,6 +9076,7 @@ fn build_instances(
                     seam_color[0], seam_color[1], seam_color[2],
                     layer_id, CAT_SEAM, 0.0,
                 ]);
+                index.joint_at.push(path_begun);
             }
             prev_end = Some(if path.closed {
                 path.points[0]
@@ -8868,7 +9088,7 @@ fn build_instances(
         joint_ends.push(joints.len() as u32);
         cap_ends.push(caps.len() as u32);
     }
-    (inst, ends, joints, joint_ends, caps, cap_ends)
+    (inst, ends, joints, joint_ends, caps, cap_ends, index)
 }
 
 /// Replace each aggressive corner of a path with a short tangent arc, so the
@@ -9118,6 +9338,160 @@ fn color_for(kind: engine::PathKind, accent: (f32, f32, f32)) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job that parks on its own opening moves to heat, then prints.
+    const START_THEN_PRINT: &[u8] = b"G90\nM83\n\
+        G1 X-1 Y2 F12000\nG1 Z5 F600\nG1 Z0.25 F600\nG1 X10 Y10 F6000\n\
+        ;TYPE:Outer wall\n\
+        G1 X30 Y10 E1.0 F1800\nG1 X30 Y30 E1.0\nG1 X10 Y30 E1.0\nG1 X10 Y10.2 E1.0\n\
+        G1 Z0.26 E0.01\n\
+        ;TYPE:Support\n\
+        G1 X12 Y12 E0.1\nG1 X40 Y12 E1.4\nG1 X40 Y14 E0.1\nG1 X12 Y14 E1.4\n\
+        G0 X50 Y50\nG1 X60 Y50 E0.5\n\
+        G1 Z0.45 F600\nG1 X10 Y10 F6000\n\
+        ;TYPE:Inner wall\n\
+        G1 X30 Y10 E1.0 F1800\nG1 X30 Y30 E1.0\nG1 X10 Y30 E1.0\n";
+
+    #[test]
+    fn a_mirror_waits_for_the_prints_first_extrusion() {
+        let tl = gcode::Timeline::parse(START_THEN_PRINT);
+        let first = tl.moves.iter().position(|m| m.extruding).unwrap();
+        // The reader a little past the first extrusion, as it is at print start
+        // (layer two repeats this path; the search runs back from the reader).
+        let anchor = tl.moves[first + 2].t_end;
+        let park = Some([-1.0, 2.0, 5.0]);
+        let on_print = Some([20.0, 10.0, 0.25]);
+        // Heating, parked right on the start g-code's own moves: nothing yet.
+        assert_eq!(believed_phase(&tl, first, park, anchor, false, false), None);
+        // Even once the clock runs (a macro that purges), the park proves nothing.
+        assert_eq!(believed_phase(&tl, first, park, anchor, true, false), None);
+        // On the print's path but Klipper has extruded nothing: not yet either.
+        assert_eq!(believed_phase(&tl, first, on_print, anchor, false, false), None);
+        // On the print and extruding: believed — on the first extrusion.
+        let t = believed_phase(&tl, first, on_print, anchor, true, false).expect("the print began");
+        assert_eq!(tl.move_at_time(t), first);
+        // A mirror already tracking keeps believing any good match.
+        assert!(believed_phase(&tl, first, park, anchor, true, true).is_some());
+    }
+
+    /// Mirror `src` and walk its playhead end to end, checking what is drawn
+    /// against where the nozzle is. Returns every extruding sample's
+    /// tip-to-nozzle gap (mm) with the move it was on.
+    fn walk_mirror(src: &[u8], steps: usize) -> Vec<(f32, usize)> {
+        let tl = gcode::Timeline::parse(src);
+        let plans = engine::plans_from_timeline(&tl, 1.75);
+        let (beads, _, _, _, _, _, index) = build_instances(&plans, 0.0, None, (200.0, 0.4, 0.5), 0.0, None);
+        let mut ext_prefix = vec![0u32];
+        for m in &tl.moves {
+            ext_prefix.push(ext_prefix.last().unwrap() + m.extruding as u32);
+        }
+        let mut last = (0, 0, 0);
+        let mut gaps = Vec::new();
+        for s in 0..=steps {
+            let t = tl.seconds * s as f32 / steps as f32;
+            let r = reveal(&tl, &ext_prefix, &index, &beads, 0.0, t).expect("the index describes the plans");
+            // Nothing ever un-draws.
+            assert!(
+                (r.count, r.cap_count, r.joint_count) >= last && r.count >= last.0 && r.cap_count >= last.1,
+                "t {t:.2}: drawn went backwards {last:?} -> {:?}",
+                (r.count, r.cap_count, r.joint_count)
+            );
+            last = (r.count, r.cap_count, r.joint_count);
+            // While extruding, the drawn print ends where the nozzle is.
+            let (pos, mv) = tl.at(t);
+            if tl.moves[mv].extruding && r.count > 0 {
+                let (k, laid) = r.live.unwrap_or_else(|| {
+                    let k = r.count as usize - 1;
+                    (k, beads[k][5])
+                });
+                let b = beads[k];
+                let tip = (b[0] + b[3] * laid, b[1] + b[4] * laid);
+                gaps.push(((tip.0 - pos[0]).hypot(tip.1 - pos[1]), mv));
+            }
+        }
+        gaps
+    }
+
+    #[test]
+    fn a_mirrored_print_is_drawn_up_to_the_nozzle() {
+        // Corners draw as several fillet instances, a Z-only extruding move as
+        // none: counted one bead per move, the drawn print ran ahead of the
+        // nozzle or lagged it to the end of the layer. It must end at the tip.
+        let worst = walk_mirror(START_THEN_PRINT, 4000).iter().map(|g| g.0).fold(0.0, f32::max);
+        assert!(worst < 0.35, "drawn print ends {worst:.2} mm from the nozzle");
+    }
+
+    /// Replay a real print start, reading by reading, through the mirror's lock
+    /// and playhead: `FABLE_MIRROR_FILE=job.gcode FABLE_REPLAY_LOG=log.tsv
+    /// cargo test -p gui --release replay_print_start -- --ignored --nocapture`.
+    /// The log is tab-separated `wall state print_dur total_dur filament
+    /// file_pos x y z vel`, one row per poll, as Klipper reported them.
+    #[test]
+    #[ignore]
+    fn replay_print_start() {
+        let src = std::fs::read(std::env::var("FABLE_MIRROR_FILE").expect("FABLE_MIRROR_FILE")).unwrap();
+        let log = std::fs::read_to_string(std::env::var("FABLE_REPLAY_LOG").expect("FABLE_REPLAY_LOG")).unwrap();
+        let tl = gcode::Timeline::parse(&src);
+        let first = tl.moves.iter().position(|m| m.extruding).unwrap();
+        let mut head = gcode::Playhead::default();
+        let (mut locked, mut old_locked) = (false, false);
+        let mut prev_wall: Option<f64> = None;
+        let mut snaps = 0;
+        for row in log.lines().filter(|l| !l.starts_with("wall")) {
+            let c: Vec<&str> = row.split('\t').collect();
+            let num = |i: usize| c[i].parse::<f64>().unwrap();
+            let (wall, dur, pos) = (num(0), num(2), [num(6), num(7), num(8)]);
+            if locked {
+                head.advance(prev_wall.map_or(0.0, |p| (wall - p) as f32));
+            }
+            prev_wall = Some(wall);
+            let t_read = tl.time_at_byte(num(5) as u32);
+            let extruded = dur > 0.0;
+            // The rule this replaced: any match within 1.5 mm locked the mirror.
+            if !old_locked && tl.locate([pos[0] as f32, pos[1] as f32, pos[2] as f32], t_read, 30.0).is_some_and(|m| m.1 < 1.5) {
+                old_locked = true;
+                eprintln!("old rule locked at print_duration {dur:.1} s, nozzle {pos:?}");
+            }
+            let phase = believed_phase(&tl, first, Some(pos), t_read, extruded, locked);
+            if !locked && phase.is_some() {
+                eprintln!("new rule locked at print_duration {dur:.1} s, nozzle {pos:?}, move {}", tl.move_at_time(phase.unwrap()));
+            }
+            locked |= phase.is_some();
+            let before = head.t;
+            if extruded {
+                head.sync(dur as f32, t_read, phase);
+            }
+            if locked && before > 0.0 && (head.t - before).abs() > 1.0 {
+                snaps += 1;
+                eprintln!("  snap at print_duration {dur:.1}: head {before:.1} -> {:.1}", head.t);
+            }
+        }
+        eprintln!("locked: {locked}  snaps after locking: {snaps}");
+    }
+
+    /// The same walk over a real job: `FABLE_MIRROR_FILE=path cargo test -p gui
+    /// --release mirror_file -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mirror_file_is_drawn_up_to_the_nozzle() {
+        let path = std::env::var("FABLE_MIRROR_FILE").expect("FABLE_MIRROR_FILE");
+        let src = std::fs::read(&path).unwrap();
+        let mut gaps = walk_mirror(&src, 200_000);
+        gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let q = |f: f64| gaps[((gaps.len() - 1) as f64 * f) as usize].0;
+        eprintln!(
+            "{path}: {} extruding samples, tip-to-nozzle gap median {:.3} p99 {:.3} p99.9 {:.3} worst {:.3} mm",
+            gaps.len(), q(0.5), q(0.99), q(0.999), q(1.0)
+        );
+        let tl = gcode::Timeline::parse(&src);
+        for &(g, mv) in gaps.iter().rev().take(5) {
+            let m = tl.moves[mv];
+            let from = if mv == 0 { tl.start } else { tl.moves[mv - 1].to };
+            let len = (m.to[0] - from[0]).hypot(m.to[1] - from[1]);
+            eprintln!("  gap {g:.3} mm on move {mv} ({:?}, {len:.2} mm long, byte {})", m.feature, m.at_byte);
+        }
+        assert!(q(1.0) < 0.6, "drawn print ends {:.2} mm from the nozzle", q(1.0));
+    }
 
     #[test]
     fn accent_saturation_carries_through_the_palette() {

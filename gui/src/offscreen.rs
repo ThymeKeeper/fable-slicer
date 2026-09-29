@@ -138,7 +138,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         ),
         _ => None,
     };
-    let (inst, ends, joints, joint_ends, caps, cap_ends) =
+    let (inst, ends, joints, joint_ends, caps, cap_ends, _) =
         build_instances(&layers, 0.0, path_colors.as_deref(), accent, 0.0, None);
     let count = ends.get(layer - 1).copied().unwrap_or(0);
     let joint_count = joint_ends.get(layer - 1).copied().unwrap_or(0);

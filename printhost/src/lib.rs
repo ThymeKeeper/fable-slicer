@@ -34,8 +34,14 @@ pub struct PrintStatus {
     pub fan: Option<f64>,
     /// Seconds of printing executed, pauses excluded — Klipper's own clock.
     /// The signal a local playhead disciplines against: unlike a position or
-    /// a file offset it isn't running ahead of the motion queue.
+    /// a file offset it isn't running ahead of the motion queue. Klipper only
+    /// starts it at the job's first extrusion, so 0 means homing, heating and
+    /// wiping are still going on.
     pub print_duration_s: f64,
+    /// Seconds since the job started, everything included. Only ever grows
+    /// within one job, so a drop means a new job — even one re-sent under the
+    /// same file name.
+    pub total_duration_s: f64,
     /// Byte offset the g-code reader has reached, for matching progress
     /// against a file we sliced ourselves. Runs AHEAD of the plastic: the
     /// reader fills a buffer the motion queue then drains.
@@ -153,6 +159,7 @@ impl Client {
             bed: pair(&status["heater_bed"]),
             fan: status["fan"]["speed"].as_f64(),
             print_duration_s: status["print_stats"]["print_duration"].as_f64().unwrap_or(0.0),
+            total_duration_s: status["print_stats"]["total_duration"].as_f64().unwrap_or(0.0),
             file_position: status["virtual_sdcard"]["file_position"].as_u64().unwrap_or(0),
             live_pos: status["motion_report"]["live_position"].as_array().and_then(|a| {
                 Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])

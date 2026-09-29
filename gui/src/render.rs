@@ -1276,6 +1276,16 @@ impl Scene {
         self.inst_vbuf.write(device, queue, "bead_instances", bytemuck::cast_slice(instances));
     }
 
+    /// Rewrite one uploaded bead instance in place — 68 bytes, for the bead a
+    /// mirrored print's nozzle is laying, cut short where the nozzle is. An
+    /// index past the uploaded beads is ignored.
+    pub fn patch_bead(&self, queue: &wgpu::Queue, index: usize, instance: &[f32; 17]) {
+        if let (true, Some(buf)) = ((index as u32) < self.inst_count, &self.inst_vbuf.buf) {
+            let at = (index * std::mem::size_of::<[f32; 17]>()) as u64;
+            queue.write_buffer(buf, at, bytemuck::cast_slice(instance));
+        }
+    }
+
     /// Upload the nozzle body, in world coordinates: `[pos.xyz, normal.xyz,
     /// rgb]` per vertex. Rewritten whenever it moves — a few hundred vertices,
     /// which is cheaper than threading a model matrix through the uniform.
